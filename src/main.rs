@@ -16,8 +16,17 @@ pub extern "C" fn kmain() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    use core::fmt::Write;
+    let mut uart = Uart::new();
+
+    let _ = writeln!(uart, "\n!!! KERNEL PANIC !!!");
+    if let Some(location) = info.location() {
+        let _ = writeln!(uart, "  at {}:{}", location.file(), location.line());
+    }
+    let _ = writeln!(uart, "  {}", info.message());
+
     loop {
-        core::hint::spin_loop();
+        unsafe { core::arch::asm!("wfi") };
     }
 }
