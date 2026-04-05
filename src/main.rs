@@ -2,6 +2,7 @@
 #![no_main]
 
 mod arch;
+mod print;
 
 use arch::aarch64::uart::Uart;
 
