@@ -57,6 +57,15 @@ pub extern "C" fn kmain() -> ! {
     }
     kprintln!("MMU enabled — UART still working!");
 
+    // Enable higher-half kernel mapping
+    kprintln!();
+    kprintln!("Enabling higher-half kernel mapping...");
+    unsafe {
+        arch::aarch64::mmu::enable_higher_half();
+        Uart::use_high_addresses();
+    }
+    kprintln!("Higher-half active — UART at {:#x}", 0xFFFF_0000_0900_0000u64);
+
     // Verification: alloc 10 frames, dealloc, realloc — should get same addresses
     kprintln!();
     kprintln!("Frame allocator test:");

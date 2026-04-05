@@ -1,4 +1,4 @@
-use crate::mm::addr::PhysAddr;
+use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
 use crate::mm::page_table::*;
 use core::arch::asm;
 
@@ -15,6 +15,13 @@ static mut BOOT_L0: PageTable = PageTable::empty();
 ///   [0] = 0x0000_0000 device memory (UART, GIC, flash)
 ///   [1] = 0x4000_0000 normal memory (128 MB RAM)
 static mut BOOT_L1: PageTable = PageTable::empty();
+
+/// L0 table for TTBR1 (higher-half kernel, upper VA half).
+static mut KERNEL_L0: PageTable = PageTable::empty();
+
+/// L1 table for TTBR1 higher-half mapping.
+/// Same physical mapping as BOOT_L1 but accessed via upper-half VAs.
+static mut KERNEL_L1: PageTable = PageTable::empty();
 
 // ---------------------------------------------------------------------------
 // Identity map setup
@@ -139,5 +146,73 @@ pub unsafe fn enable_mmu() {
     // 9. Final ISB — ensure MMU is active for all subsequent instructions
     asm!(
         "isb",                               // Pipeline flush after MMU enable
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Higher-half kernel mapping (Milestone 2.5)
+// ---------------------------------------------------------------------------
+
+/// Build TTBR1 page tables and install them, enabling higher-half addresses.
+///
+/// After this call, the kernel is reachable at both identity-mapped (TTBR0)
+/// and higher-half (TTBR1) addresses simultaneously. Both resolve to the
+/// same physical memory.
+///
+/// Higher-half VA scheme:
+///   PA 0x0000_0000 → VA 0xFFFF_0000_0000_0000 (device)
+///   PA 0x4000_0000 → VA 0xFFFF_0000_4000_0000 (RAM)
+///
+/// # Safety
+/// MMU must already be enabled with identity mapping.
+pub unsafe fn enable_higher_half() {
+    // Build KERNEL_L1 with the same physical mappings as BOOT_L1
+    KERNEL_L1.entries[0] = PageTableEntry::new_block(
+        PhysAddr::new(0x0000_0000),
+        MAIR_DEVICE,
+        AP_RW_EL1,
+        SH_NON,
+    );
+
+    KERNEL_L1.entries[1] = PageTableEntry::new_block(
+        PhysAddr::new(0x4000_0000),
+        MAIR_NORMAL,
+        AP_RW_EL1,
+        SH_INNER,
+    );
+
+    KERNEL_L0.entries[0] = PageTableEntry::new_table(
+        PhysAddr::new(&raw const KERNEL_L1 as u64),
+    );
+
+    // Install TTBR1
+    let ttbr1 = &raw const KERNEL_L0 as u64;
+    asm!(
+        "msr TTBR1_EL1, {val}",             // Write kernel page table base
+        val = in(reg) ttbr1,
+    );
+
+    // Synchronize: ISB + TLB invalidate + barriers
+    asm!(
+        "isb",                               // Sync TTBR1 write
+    );
+    asm!(
+        "tlbi vmalle1is",                    // Invalidate all TLB entries
+    );
+    asm!(
+        "dsb ish",                           // Ensure TLB invalidation completes
+    );
+    asm!(
+        "isb",                               // Sync before using new mappings
+    );
+
+    // Move stack pointer to higher-half address.
+    // Both addresses map to the same physical page, so stack contents are unchanged.
+    asm!(
+        "mov {tmp}, sp",                     // Read current SP (identity-mapped address)
+        "add {tmp}, {tmp}, {offset}",        // Add higher-half offset
+        "mov sp, {tmp}",                     // Write new SP (higher-half address)
+        tmp = out(reg) _,
+        offset = in(reg) KERNEL_VA_OFFSET,
     );
 }
