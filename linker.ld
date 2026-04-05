@@ -51,6 +51,7 @@ SECTIONS
      * __stack_bottom = lowest usable stack byte
      * __stack_top    = initial SP value
      */
+    __guard_page = .;
     . = . + 4K;
     __stack_bottom = .;
     . = . + 4K;

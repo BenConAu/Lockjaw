@@ -23,6 +23,15 @@ static mut KERNEL_L0: PageTable = PageTable::empty();
 /// Same physical mapping as BOOT_L1 but accessed via upper-half VAs.
 static mut KERNEL_L1: PageTable = PageTable::empty();
 
+/// L2 table for the 1 GB RAM region (0x4000_0000). Replaces the L1 block
+/// with 512 × 2 MB block entries, except the one containing the guard page
+/// which gets broken down to L3.
+static mut KERNEL_L2_RAM: PageTable = PageTable::empty();
+
+/// L3 table for the 2 MB region containing the guard page.
+/// 512 × 4 KB page entries, with the guard page entry left invalid.
+static mut KERNEL_L3_GUARD: PageTable = PageTable::empty();
+
 // ---------------------------------------------------------------------------
 // Identity map setup
 // ---------------------------------------------------------------------------
@@ -214,5 +223,76 @@ pub unsafe fn enable_higher_half() {
         "mov sp, {tmp}",                     // Write new SP (higher-half address)
         tmp = out(reg) _,
         offset = in(reg) KERNEL_VA_OFFSET,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Guard page setup (Milestone 2.6)
+// ---------------------------------------------------------------------------
+
+/// Refine the TTBR1 RAM mapping from a single 1 GB block into 2 MB blocks
+/// and 4 KB pages around the stack, leaving the guard page unmapped.
+///
+/// Before: KERNEL_L1[1] = 1 GB block covering all RAM
+/// After:  KERNEL_L1[1] → L2 table of 2 MB blocks
+///         One L2 entry  → L3 table of 4 KB pages
+///         Guard page L3 entry = invalid (unmapped)
+///
+/// # Safety
+/// Higher-half mapping must be active. `guard_page_phys` must be the
+/// physical address of the guard page (from linker symbol `__guard_page`).
+pub unsafe fn setup_guard_page(guard_page_phys: PhysAddr) {
+    let ram_base: u64 = 0x4000_0000;
+
+    // Step 1: Fill L2 with 2 MB block descriptors covering the 1 GB RAM region
+    for i in 0..512 {
+        let block_phys = ram_base + (i as u64) * (2 * 1024 * 1024); // 2 MB per entry
+        KERNEL_L2_RAM.entries[i] = PageTableEntry::new_block(
+            PhysAddr::new(block_phys),
+            MAIR_NORMAL,
+            AP_RW_EL1,
+            SH_INNER,
+        );
+    }
+
+    // Step 2: Find the 2 MB block containing the guard page
+    let guard_offset = guard_page_phys.as_u64() - ram_base;
+    let l2_index = (guard_offset >> 21) as usize; // 2 MB = 1 << 21
+    let l3_base_phys = ram_base + (l2_index as u64) * (2 * 1024 * 1024);
+
+    // Step 3: Fill L3 with 4 KB page descriptors for that 2 MB region
+    for i in 0..512 {
+        let page_phys = l3_base_phys + (i as u64) * 4096;
+        KERNEL_L3_GUARD.entries[i] = PageTableEntry::new_page(
+            PhysAddr::new(page_phys),
+            MAIR_NORMAL,
+            AP_RW_EL1,
+            SH_INNER,
+        );
+    }
+
+    // Step 4: Unmap the guard page — set its L3 entry to invalid
+    let l3_index = ((guard_offset & 0x001F_FFFF) >> 12) as usize;
+    KERNEL_L3_GUARD.entries[l3_index] = PageTableEntry::empty();
+
+    // Step 5: Replace the L2 block entry with a table descriptor to L3
+    KERNEL_L2_RAM.entries[l2_index] = PageTableEntry::new_table(
+        PhysAddr::new(&raw const KERNEL_L3_GUARD as u64),
+    );
+
+    // Step 6: Replace the L1 block entry with a table descriptor to L2
+    KERNEL_L1.entries[1] = PageTableEntry::new_table(
+        PhysAddr::new(&raw const KERNEL_L2_RAM as u64),
+    );
+
+    // Step 7: TLB invalidate + barriers
+    asm!(
+        "tlbi vmalle1is",                    // Invalidate all TLB entries
+    );
+    asm!(
+        "dsb ish",                           // Ensure invalidation completes
+    );
+    asm!(
+        "isb",                               // Sync pipeline
     );
 }

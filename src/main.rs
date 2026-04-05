@@ -11,6 +11,7 @@ extern "C" {
     static __bss_start: u8;
     static __bss_end: u8;
     static __kernel_end: u8;
+    static __guard_page: u8;
     static __stack_bottom: u8;
     static __stack_top: u8;
 }
@@ -65,6 +66,19 @@ pub extern "C" fn kmain() -> ! {
         Uart::use_high_addresses();
     }
     kprintln!("Higher-half active — UART at {:#x}", 0xFFFF_0000_0900_0000u64);
+
+    // Set up guard page (unmapped) and stack canary
+    kprintln!();
+    unsafe {
+        let guard_phys = mm::addr::PhysAddr::new(&__guard_page as *const u8 as u64);
+        kprintln!("Setting up guard page at phys {:#x}...", guard_phys.as_u64());
+        arch::aarch64::mmu::setup_guard_page(guard_phys);
+        kprintln!("Guard page active (unmapped).");
+
+        mm::stack::init_canary();
+    }
+    mm::stack::check_canary();
+    kprintln!("Stack canary intact.");
 
     // Verification: alloc 10 frames, dealloc, realloc — should get same addresses
     kprintln!();
