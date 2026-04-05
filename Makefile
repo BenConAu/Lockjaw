@@ -2,7 +2,7 @@ KERNEL_ELF := target/aarch64-unknown-none/debug/lockjaw
 KERNEL_ELF_RELEASE := target/aarch64-unknown-none/release/lockjaw
 
 QEMU := qemu-system-aarch64
-QEMU_FLAGS := -machine virt -cpu cortex-a53 -nographic -kernel
+QEMU_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -nographic -kernel
 
 .PHONY: build build-release run run-release objdump nm check-stack clean
 

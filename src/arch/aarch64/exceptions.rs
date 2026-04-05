@@ -29,6 +29,9 @@ extern "C" fn handle_exception_sync(ctx: &ExceptionContext) {
     crate::kprintln!("  ELR_EL1:  {:#018x}", ctx.elr);
     crate::kprintln!("  ESR_EL1:  {:#018x} (EC={:#04x} ISS={:#07x})", esr, ec, iss);
     crate::kprintln!("  SPSR_EL1: {:#018x}", ctx.spsr);
+    let far: u64;
+    unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
+    crate::kprintln!("  FAR_EL1:  {:#018x}", far);
 
     match ec {
         0x00 => crate::kprintln!("  Cause: Unknown reason"),

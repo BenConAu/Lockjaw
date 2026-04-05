@@ -1,10 +1,16 @@
 mod boot;
 pub mod exceptions;
+pub mod gic;
 pub mod mmu;
 pub mod uart;
 
 /// IRQ dispatch — called from the exception vector IRQ stub.
-/// Will be filled in with GIC + timer handling in Milestones 3.2/3.3.
+/// Acknowledges the interrupt via GIC and logs unexpected IRQs.
 pub fn irq_dispatch() {
-    // Placeholder — no IRQ sources configured yet
+    let intid = unsafe { gic::handle_irq() };
+
+    if intid != 1023 {
+        crate::kprintln!("WARNING: unexpected IRQ INTID={}", intid);
+    }
+    // INTID 1023 = spurious, silently ignore
 }

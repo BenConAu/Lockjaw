@@ -85,6 +85,9 @@ pub extern "C" fn kmain() -> ! {
     unsafe { arch::aarch64::exceptions::init(); }
     kprintln!("Exception vectors installed.");
 
+    // Initialize GICv3 interrupt controller
+    unsafe { arch::aarch64::gic::init(); }
+
     // Verification: alloc 10 frames, dealloc, realloc — should get same addresses
     kprintln!();
     kprintln!("Frame allocator test:");
