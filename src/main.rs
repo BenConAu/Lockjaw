@@ -3,10 +3,15 @@
 
 mod arch;
 
+use arch::aarch64::uart::Uart;
+
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
+    let uart = Uart::new();
+    uart.puts("Hello from kernel\n");
+
     loop {
-        core::hint::spin_loop();
+        unsafe { core::arch::asm!("wfi") };
     }
 }
 
