@@ -88,6 +88,22 @@ pub extern "C" fn kmain() -> ! {
     // Initialize GICv3 interrupt controller
     unsafe { arch::aarch64::gic::init(); }
 
+    // Initialize timer and unmask IRQs
+    unsafe {
+        arch::aarch64::timer::init();
+        // Unmask IRQ exceptions (clear the I bit in DAIF)
+        core::arch::asm!("msr DAIFClr, #2");    // Unmask IRQ (bit 1 of DAIF)
+    }
+    kprintln!("IRQs unmasked.");
+
+    // Wait for a few ticks to verify timer is working
+    kprintln!();
+    kprintln!("Waiting for timer ticks...");
+    while arch::aarch64::timer::tick_count() < 5 {
+        core::hint::spin_loop();
+    }
+    kprintln!("  {} ticks received!", arch::aarch64::timer::tick_count());
+
     // Verification: alloc 10 frames, dealloc, realloc — should get same addresses
     kprintln!();
     kprintln!("Frame allocator test:");

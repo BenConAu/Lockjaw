@@ -20,8 +20,9 @@ const GICR_SGI_BASE: u64 = 0x10000;
 const GICR_IGROUPR0: u64 = GICR_SGI_BASE + 0x0080;
 const GICR_ISENABLER0: u64 = GICR_SGI_BASE + 0x0100;
 
-/// Virtual timer PPI — INTID 30 on GICv3.
-const TIMER_PPI_INTID: u32 = 30;
+/// Virtual timer PPI — INTID 27 on GICv3.
+/// (INTID 30 is the non-secure physical timer; 27 is the virtual timer.)
+const TIMER_PPI_INTID: u32 = 27;
 
 // ---------------------------------------------------------------------------
 // GICv3 system register helpers (ICC_* accessed via MSR/MRS)
