@@ -1,0 +1,28 @@
+KERNEL_ELF := target/aarch64-unknown-none/debug/lockjaw
+KERNEL_ELF_RELEASE := target/aarch64-unknown-none/release/lockjaw
+
+QEMU := qemu-system-aarch64
+QEMU_FLAGS := -machine virt -cpu cortex-a53 -nographic -kernel
+
+.PHONY: build build-release run run-release objdump nm clean
+
+build:
+	cargo build
+
+build-release:
+	cargo build --release
+
+run: build
+	$(QEMU) $(QEMU_FLAGS) $(KERNEL_ELF)
+
+run-release: build-release
+	$(QEMU) $(QEMU_FLAGS) $(KERNEL_ELF_RELEASE)
+
+objdump: build
+	cargo objdump -- -d | head -80
+
+nm: build
+	cargo nm -- --defined-only
+
+clean:
+	cargo clean
