@@ -6,3 +6,6 @@ rustflags = [
     "-C", "link-arg=-Tlinker.ld",
     "-C", "link-arg=--gc-sections",
 ]
+
+[alias]
+xtask = "run --package xtask --target x86_64-apple-darwin --"
