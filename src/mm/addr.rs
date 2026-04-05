@@ -36,10 +36,6 @@ impl PhysAddr {
         PhysFrame(self.0 >> PAGE_SHIFT)
     }
 
-    /// True if this address is 4 KB-aligned.
-    pub const fn is_page_aligned(self) -> bool {
-        self.0 & (PAGE_SIZE - 1) == 0
-    }
 }
 
 impl fmt::Debug for PhysAddr {
@@ -55,60 +51,6 @@ impl fmt::LowerHex for PhysAddr {
 }
 
 // ---------------------------------------------------------------------------
-// VirtAddr
-// ---------------------------------------------------------------------------
-
-/// A virtual memory address.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(transparent)]
-pub struct VirtAddr(u64);
-
-impl VirtAddr {
-    pub const fn new(addr: u64) -> Self {
-        Self(addr)
-    }
-
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-
-    /// Extract the 4-level page table indices for 4 KB granule.
-    ///   L0 index = bits [47:39]   (each entry covers 512 GB)
-    ///   L1 index = bits [38:30]   (each entry covers 1 GB)
-    ///   L2 index = bits [29:21]   (each entry covers 2 MB)
-    ///   L3 index = bits [20:12]   (each entry covers 4 KB)
-    pub const fn page_indices(self) -> (usize, usize, usize, usize) {
-        let addr = self.0;
-        let l0 = ((addr >> 39) & 0x1FF) as usize;
-        let l1 = ((addr >> 30) & 0x1FF) as usize;
-        let l2 = ((addr >> 21) & 0x1FF) as usize;
-        let l3 = ((addr >> 12) & 0x1FF) as usize;
-        (l0, l1, l2, l3)
-    }
-
-    /// Offset within the 4 KB page (bits [11:0]).
-    pub const fn page_offset(self) -> u64 {
-        self.0 & (PAGE_SIZE - 1)
-    }
-
-    pub const fn is_page_aligned(self) -> bool {
-        self.0 & (PAGE_SIZE - 1) == 0
-    }
-}
-
-impl fmt::Debug for VirtAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "VirtAddr({:#x})", self.0)
-    }
-}
-
-impl fmt::LowerHex for VirtAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::LowerHex::fmt(&self.0, f)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // PhysFrame
 // ---------------------------------------------------------------------------
 
@@ -118,19 +60,9 @@ impl fmt::LowerHex for VirtAddr {
 pub struct PhysFrame(u64);
 
 impl PhysFrame {
-    /// Create from a frame number (not an address).
-    pub const fn from_number(n: u64) -> Self {
-        Self(n)
-    }
-
     /// Return the frame containing the given physical address.
     pub const fn containing(addr: PhysAddr) -> Self {
         addr.containing_frame()
-    }
-
-    /// Frame number.
-    pub const fn number(self) -> u64 {
-        self.0
     }
 
     /// Physical address of the first byte in this frame.
