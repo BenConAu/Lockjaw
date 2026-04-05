@@ -48,6 +48,15 @@ pub extern "C" fn kmain() -> ! {
         mm::frame::init(kernel_start, stack_top);
     }
 
+    // Enable MMU with identity mapping
+    kprintln!();
+    kprintln!("Enabling MMU (identity map)...");
+    unsafe {
+        arch::aarch64::mmu::init_boot_page_tables();
+        arch::aarch64::mmu::enable_mmu();
+    }
+    kprintln!("MMU enabled — UART still working!");
+
     // Verification: alloc 10 frames, dealloc, realloc — should get same addresses
     kprintln!();
     kprintln!("Frame allocator test:");
