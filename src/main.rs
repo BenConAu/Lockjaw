@@ -65,6 +65,30 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("  realloc {}: {:#x}", i, f.start_addr().as_u64());
     }
 
+    // Page table entry verification
+    kprintln!();
+    kprintln!("Page table entry test:");
+    use mm::page_table::*;
+    let entry = PageTableEntry::new_page(
+        mm::addr::PhysAddr::new(0x4008_0000),
+        MAIR_NORMAL,
+        AP_RW_EL1,
+        SH_INNER,
+    );
+    kprintln!("  raw:  {:#018x}", entry.raw());
+    kprintln!("  {:?}", entry);
+
+    let table_entry = PageTableEntry::new_table(mm::addr::PhysAddr::new(0x4009_0000));
+    kprintln!("  table: {:#018x} valid={} is_table={}", table_entry.raw(), table_entry.is_valid(), table_entry.is_table());
+
+    let block_entry = PageTableEntry::new_block(
+        mm::addr::PhysAddr::new(0x0000_0000),
+        MAIR_DEVICE,
+        AP_RW_EL1,
+        SH_NON,
+    );
+    kprintln!("  block: {:#018x} is_block={} attr={}", block_entry.raw(), block_entry.is_block(), block_entry.attr_index());
+
     kprintln!();
     kprintln!("Boot complete.");
 
