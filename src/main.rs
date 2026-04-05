@@ -80,6 +80,11 @@ pub extern "C" fn kmain() -> ! {
     mm::stack::check_canary();
     kprintln!("Stack canary intact.");
 
+    // Install exception vector table
+    kprintln!();
+    unsafe { arch::aarch64::exceptions::init(); }
+    kprintln!("Exception vectors installed.");
+
     // Verification: alloc 10 frames, dealloc, realloc — should get same addresses
     kprintln!();
     kprintln!("Frame allocator test:");
