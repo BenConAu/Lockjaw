@@ -2,6 +2,7 @@
 #![no_main]
 
 mod arch;
+mod mm;
 mod print;
 
 use arch::aarch64::uart::Uart;
@@ -34,6 +35,11 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("  Stack:        0x{:08x} - 0x{:08x} ({} bytes)", stack_bottom, stack_top, stack_top - stack_bottom);
     }
 
+    kprintln!();
+    kprintln!("Physical memory: {:#x} - {:#x} ({} frames)",
+        mm::addr::RAM_START.as_u64(),
+        mm::addr::RAM_END.as_u64(),
+        mm::addr::TOTAL_FRAMES);
     kprintln!();
     kprintln!("Boot complete.");
 
