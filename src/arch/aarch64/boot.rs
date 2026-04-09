@@ -27,6 +27,11 @@ _start:
     eret                             // Return from EL2 → EL1 at .Lat_el1
 
 .Lat_el1:
+    // --- Enable FP/NEON (the compiler may generate SIMD instructions) ---
+    mov     x0, #(3 << 20)          // CPACR_EL1.FPEN = 0b11: no FP/NEON trapping
+    msr     CPACR_EL1, x0           // Write Coprocessor Access Control Register
+    isb                              // Ensure CPACR is active before any FP use
+
     // --- Set up the kernel stack ---
     ldr     x0, =__stack_top         // Load stack top address from linker symbol
     mov     sp, x0                   // Initialize stack pointer (grows downward)
