@@ -2,6 +2,7 @@
 #![no_main]
 
 mod arch;
+mod cap;
 mod mm;
 mod print;
 
@@ -144,6 +145,24 @@ pub extern "C" fn kmain() -> ! {
         SH_NON,
     );
     kprintln!("  block: {:#018x} is_block={} attr={}", block_entry.raw(), block_entry.is_block(), block_entry.attr_index());
+
+    // Object model: query sizes and create a handle table
+    kprintln!();
+    kprintln!("Object model test:");
+    use cap::object::*;
+    let ht_info = HandleTableCreateInfo { slot_count: 8 };
+    let ht_size = query_handle_table_size(&ht_info);
+    kprintln!("  HandleTable(8 slots) needs {} page(s)", ht_size.pages);
+
+    let ht_frame = mm::frame::alloc_frame().expect("out of memory");
+    unsafe {
+        create_handle_table(&ht_info, ht_frame.start_addr()).expect("create failed");
+    }
+    // Read back the header to verify
+    let header_va = ht_frame.start_addr().as_u64() + mm::addr::KERNEL_VA_OFFSET;
+    let header = unsafe { &*(header_va as *const HandleTableHeader) };
+    kprintln!("  Created: type={:?}, pages={}, slots={}",
+        header.header.obj_type, header.header.page_count, header.slot_count);
 
     kprintln!();
     kprintln!("Boot complete.");
