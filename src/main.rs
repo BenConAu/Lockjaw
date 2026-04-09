@@ -164,6 +164,33 @@ pub extern "C" fn kmain() -> ! {
     kprintln!("  Created: type={:?}, pages={}, slots={}",
         header.header.obj_type, header.header.page_count, header.slot_count);
 
+    // Handle table operations: insert, lookup, rights check, remove
+    use cap::handle_table::*;
+    use cap::rights::*;
+    let ht_paddr = ht_frame.start_addr();
+
+    // Insert a handle pointing to the table itself (for testing)
+    let h0 = unsafe {
+        handle_insert(ht_paddr, ht_paddr, ObjectType::HandleTable, Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
+    }.expect("insert failed");
+    kprintln!("  Inserted handle {} (RW)", h0);
+
+    // Look up with matching rights — should succeed
+    let entry = unsafe { handle_lookup(ht_paddr, h0, Rights::from_bits(RIGHT_READ)) }.expect("lookup failed");
+    kprintln!("  Lookup h{}: type={:?}, rights={:#04x}", h0, entry.obj_type, entry.rights.bits());
+
+    // Look up with Grant right — should fail (we only gave RW)
+    let bad = unsafe { handle_lookup(ht_paddr, h0, Rights::from_bits(RIGHT_GRANT)) };
+    kprintln!("  Lookup h{} with Grant: {:?}", h0, bad.err().unwrap());
+
+    // Remove the handle
+    let removed = unsafe { handle_remove(ht_paddr, h0) }.expect("remove failed");
+    kprintln!("  Removed h{}: type={:?}", h0, removed.obj_type);
+
+    // Verify slot is now empty
+    let empty = unsafe { handle_lookup(ht_paddr, h0, Rights::none()) };
+    kprintln!("  Lookup h{} after remove: {:?}", h0, empty.err().unwrap());
+
     kprintln!();
     kprintln!("Boot complete.");
 
