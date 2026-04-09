@@ -1,6 +1,6 @@
 # Memory Model
 
-Lockjaw follows the seL4 memory model: **the kernel does not dynamically allocate memory**. There is no `alloc` crate, no heap, no `malloc`. All kernel data structures are either statically sized (in BSS) or carved from user-provided memory via the capability system.
+Lockjaw's kernel does not dynamically allocate memory. There is no `alloc` crate, no heap, no `malloc`. All kernel data structures are either statically sized (in BSS) or initialized in pages donated by userspace via PageSets.
 
 ## Who owns physical memory?
 
@@ -11,30 +11,29 @@ At boot, the kernel knows about all physical RAM (hardcoded for QEMU virt: 128 M
 - **Kernel stack** — one 4 KB page, plus a guard page gap
 - **Boot page tables** — static arrays in BSS used to set up the MMU
 
-Everything else is **free physical memory** that the kernel will hand to userspace.
+Everything else is **free physical memory** that the kernel will hand to userspace as PageSets.
 
-## The bitmap frame allocator
+## The page allocator
 
-The kernel maintains a static bitmap (`[u8; 4096]` in BSS) that tracks which of the 32,768 physical frames (4 KB each) are reserved vs. free. This is **not** a general-purpose allocator — it exists for two narrow purposes:
+The kernel maintains a static bitmap (`[u8; 4096]` in BSS) that tracks which of the 32,768 physical pages (4 KB each) are reserved vs. free. This is **not** a general-purpose allocator — it exists for two purposes:
 
-1. **Boot-time bookkeeping**: track what's reserved so the kernel doesn't hand out frames that contain its own code or page tables.
-2. **Untyped capability creation (Phase 4)**: when the init process starts, all remaining free frames are wrapped into Untyped capabilities and given to it. After that, the kernel's frame allocator has done its job.
+1. **Boot-time bookkeeping**: track what is reserved so the kernel does not hand out pages that contain its own code or page tables.
+2. **PageSet allocation**: when userspace requests physical pages via `sys_alloc_pages`, the kernel allocates from this bitmap and returns a PageSet handle.
 
-Once userspace has all the Untypeds, memory allocation works like this:
+Once userspace has PageSets, object creation works like this:
 
 ```
 Userspace: "I want a new TCB"
-         → sys_retype(untyped_cap, ObjectType::TCB, size)
-
-Kernel:   Carves bytes from the Untyped's region (watermark allocator)
-         → Returns a new TCB capability to the caller
+         → sys_alloc_pages(query_tcb_size(&info).pages)  // get pages
+         → sys_create_tcb(&info, pageset_handle)          // donate pages, create object
+         → receives a handle to the new TCB
 ```
 
-The kernel never calls `alloc_frame()` after boot. Userspace drives all memory allocation through the Retype syscall, and the kernel just does the bookkeeping.
+The kernel writes the object into the donated pages. Userspace cannot see the raw memory — it interacts only through handles and syscalls.
 
 ## Why not skip the bitmap entirely?
 
-The boot page tables in Milestones 2.4–2.6 are statically allocated (fixed-size arrays in BSS), so they don't need the frame allocator. But Phase 4 needs the bitmap to know which frames are free when constructing the initial Untyped capabilities for the init process. Building it early also lets us verify that reserved frame tracking is correct before the system gets more complex.
+The boot page tables in Milestones 2.4–2.6 are statically allocated (fixed-size arrays in BSS), so they don't need the page allocator. But the page allocator is the backing for all PageSet allocations — it is the mechanism by which userspace obtains physical memory. Building it early also lets us verify that reserved page tracking is correct before the system gets more complex.
 
 ## Static kernel memory budget
 
@@ -42,7 +41,7 @@ All kernel-resident memory fits in BSS:
 
 | Item | Size | Notes |
 |------|------|-------|
-| Frame bitmap | 4,096 bytes | 1 bit per 4 KB frame, 128 MB RAM |
+| Page bitmap | 4,096 bytes | 1 bit per 4 KB page, 128 MB RAM |
 | Boot page tables | ~24 KB | L0 + L1 + L2 + L3 tables (static arrays) |
 | Kernel stack | 4,096 bytes | One page, guard page below |
 | BSS zero-init data | varies | Global state, counters, etc. |

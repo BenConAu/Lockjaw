@@ -16,13 +16,13 @@ We follow YAGNI: don't write it until you need it. This doc prevents knowledge l
 
 ---
 
-## PhysFrame::from_number / PhysFrame::number (removed from `src/mm/addr.rs`)
+## PhysPage::from_number / PhysPage::number (removed from `src/mm/addr.rs`)
 
-**What:** Construct a `PhysFrame` from its frame number (not address), and retrieve the frame number.
+**What:** Construct a `PhysPage` from its page number (not address), and retrieve the page number.
 
-**When needed:** Phase 4 (capabilities) — the Untyped retype system tracks frames by number for the watermark allocator.
+**When needed:** If direct page-number manipulation is needed beyond `PhysPage::containing()` and `start_addr()`.
 
-**Key detail:** Frame number = `phys_addr >> 12`. `from_number(n)` stores `n` directly; `start_addr()` already exists and does `n << 12`.
+**Key detail:** Page number = `phys_addr >> 12`. `from_number(n)` stores `n` directly; `start_addr()` already exists and does `n << 12`.
 
 ---
 
@@ -30,7 +30,7 @@ We follow YAGNI: don't write it until you need it. This doc prevents knowledge l
 
 **What:** `self.0 & (PAGE_SIZE - 1) == 0`
 
-**When needed:** Any phase that adds assertions on page-aligned addresses (mapping, retype).
+**When needed:** Any phase that adds assertions on page-aligned addresses (mapping, object creation).
 
 ---
 

@@ -84,12 +84,12 @@ Goal: Physical frame allocator + page tables + virtual memory enabled.
 ### Milestone 2.1: Physical memory map
 - Parse QEMU DTB (device tree blob) or hardcode QEMU virt RAM range (`0x4000_0000` — `0x4800_0000` for 128MB)
 - Define `PhysAddr` / `VirtAddr` newtypes (no raw `usize` outside this module)
-- `PhysFrame` newtype representing an aligned 4KB physical page
+- `PhysPage` newtype representing an aligned 4KB physical page
 - **Verify:** Boot log prints detected memory range and frame count
 
 ### Milestone 2.2: Bitmap frame allocator
 - Bitmap allocator over physical frames (static array sized to max RAM)
-- `alloc_frame() -> Option<PhysFrame>`, `dealloc_frame(PhysFrame)`
+- `alloc_page() -> Option<PhysPage>`, `dealloc_page(PhysPage)`
 - Mark kernel image frames and DTB as reserved at boot
 - **Verify:** Allocate 10 frames, print their addresses, dealloc, reallocate — same addresses returned
 
@@ -174,8 +174,8 @@ Goal: Typed kernel objects created via PageSet donation, accessed through handle
 Goal: Two kernel threads alternating via timer preemption.
 
 ### Milestone 5.1: Thread Control Block
-- `TCB` struct: saved register file (31 GPRs + SP + PC + PSTATE), CSpace root, VSpace root, scheduling state
-- `thread_create(tcb_cap, cspace_cap, vspace_cap, entry_point, stack_pointer)`
+- `TCB` struct: saved register file (31 GPRs + SP + PC + PSTATE), handle table root, VSpace root, scheduling state
+- `thread_create(tcb_handle, handle_table_handle, vspace_handle, entry_point, stack_pointer)`
 - **Verify:** Create a TCB, print its fields
 
 ### Milestone 5.2: Context switch
