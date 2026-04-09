@@ -69,12 +69,42 @@ fn check_stack() {
         total_edges += targets.len();
     }
     println!("  {} functions, {} call edges", functions.len(), total_edges);
+
+    // Check all indirect calls (BLR) are annotated in stack-annotations.toml
+    let annotations = load_annotations();
     if !indirect_calls.is_empty() {
-        println!("  WARNING: {} functions contain indirect calls (BLR):", indirect_calls.len());
-        for name in &indirect_calls {
-            println!("    - {}", name);
+        // Demangle the indirect call function names for matching against annotations
+        let demangled_names: Vec<String> = indirect_calls
+            .iter()
+            .map(|name| demangle(name).trim().to_string())
+            .collect();
+
+        println!("  {} functions contain indirect calls (BLR):", indirect_calls.len());
+        let mut unannotated = Vec::new();
+        for (i, name) in demangled_names.iter().enumerate() {
+            if annotations.contains_key(name.as_str()) {
+                println!("    - {} [annotated]", name);
+            } else {
+                // Also try the mangled name
+                if annotations.contains_key(indirect_calls[i].as_str()) {
+                    println!("    - {} [annotated]", name);
+                } else {
+                    println!("    - {} [UNANNOTATED]", name);
+                    unannotated.push(name.clone());
+                }
+            }
         }
-        println!("  Indirect calls cannot be traced — treat as leaves in depth analysis.");
+        if !unannotated.is_empty() {
+            eprintln!();
+            eprintln!("  [FAIL] {} unannotated indirect call site(s)!", unannotated.len());
+            eprintln!("  Every BLR must be listed in xtask/stack-annotations.toml.");
+            eprintln!("  Unannotated functions:");
+            for name in &unannotated {
+                eprintln!("    - {}", name);
+            }
+            process::exit(1);
+        }
+        println!("  [PASS] All indirect calls annotated");
     }
     println!();
 
@@ -364,6 +394,41 @@ fn compute_depth(
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
+
+/// Load indirect call annotations from xtask/stack-annotations.toml.
+/// Returns a map of function_name -> annotation (either "fmt-internal" or a list of targets).
+fn load_annotations() -> HashMap<String, String> {
+    let mut annotations = HashMap::new();
+
+    let path = "xtask/stack-annotations.toml";
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("WARN: Could not read {}", path);
+            return annotations;
+        }
+    };
+
+    // Simple TOML parser: look for lines under [indirect_calls]
+    let mut in_section = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_section = line == "[indirect_calls]";
+            continue;
+        }
+        if !in_section || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Parse: "function_name" = "value" or "function_name" = ["a", "b"]
+        if let Some((key, _value)) = line.split_once('=') {
+            let key = key.trim().trim_matches('"');
+            annotations.insert(key.to_string(), "annotated".to_string());
+        }
+    }
+
+    annotations
+}
 
 fn parse_hex_or_dec(s: &str) -> Result<u64, std::num::ParseIntError> {
     if let Some(hex) = s.strip_prefix("0x") {

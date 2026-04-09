@@ -1,0 +1,22 @@
+# Stack analysis annotations for indirect calls (BLR instructions).
+#
+# Every function containing a BLR must be listed here with its known
+# call targets. The xtask check-stack command FAILS if any BLR site
+# is unannotated. No silent underestimation.
+#
+# When adding a new kernel thread, add its entry function here.
+
+[indirect_calls]
+
+# core::fmt uses function pointers internally for formatter dispatch.
+# These are leaf-level formatting functions with bounded stack usage.
+# We accept them as unresolvable — their individual frame sizes are
+# already measured and small.
+"core::fmt::write" = "fmt-internal"
+"<core::fmt::Formatter>::pad" = "fmt-internal"
+"<core::fmt::Formatter>::pad_integral" = "fmt-internal"
+"<core::fmt::Formatter>::pad_integral::write_prefix" = "fmt-internal"
+
+# Thread entry trampoline calls the thread's entry function via blr x19.
+# All possible targets listed here:
+"thread_entry" = ["thread_a", "thread_b", "idle_thread"]
