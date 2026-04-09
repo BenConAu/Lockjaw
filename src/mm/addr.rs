@@ -7,7 +7,7 @@ pub const PAGE_SHIFT: u64 = 12;
 pub const RAM_START: PhysAddr = PhysAddr(0x4000_0000);
 pub const RAM_END: PhysAddr = PhysAddr(0x4800_0000);
 pub const RAM_SIZE: u64 = 0x0800_0000;
-pub const TOTAL_FRAMES: usize = (RAM_SIZE / PAGE_SIZE) as usize; // 32768
+pub const TOTAL_PAGES: usize = (RAM_SIZE / PAGE_SIZE) as usize; // 32768
 
 /// Offset added to physical addresses to produce kernel virtual addresses.
 pub const KERNEL_VA_OFFSET: u64 = 0xFFFF_0000_0000_0000;
@@ -31,11 +31,10 @@ impl PhysAddr {
         self.0
     }
 
-    /// Round down to the containing 4 KB frame.
-    pub const fn containing_frame(self) -> PhysFrame {
-        PhysFrame(self.0 >> PAGE_SHIFT)
+    /// Round down to the containing 4 KB page.
+    pub const fn containing_page(self) -> PhysPage {
+        PhysPage(self.0 >> PAGE_SHIFT)
     }
-
 }
 
 impl fmt::Debug for PhysAddr {
@@ -51,28 +50,28 @@ impl fmt::LowerHex for PhysAddr {
 }
 
 // ---------------------------------------------------------------------------
-// PhysFrame
+// PhysPage
 // ---------------------------------------------------------------------------
 
-/// A 4 KB-aligned physical frame, identified by its frame number.
+/// A 4 KB-aligned physical page, identified by its page number.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
-pub struct PhysFrame(u64);
+pub struct PhysPage(u64);
 
-impl PhysFrame {
-    /// Return the frame containing the given physical address.
+impl PhysPage {
+    /// Return the page containing the given physical address.
     pub const fn containing(addr: PhysAddr) -> Self {
-        addr.containing_frame()
+        addr.containing_page()
     }
 
-    /// Physical address of the first byte in this frame.
+    /// Physical address of the first byte in this page.
     pub const fn start_addr(self) -> PhysAddr {
         PhysAddr(self.0 << PAGE_SHIFT)
     }
 }
 
-impl fmt::Debug for PhysFrame {
+impl fmt::Debug for PhysPage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PhysFrame(#{}, {:#x})", self.0, self.start_addr().as_u64())
+        write!(f, "PhysPage(#{}, {:#x})", self.0, self.start_addr().as_u64())
     }
 }

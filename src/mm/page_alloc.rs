@@ -1,7 +1,7 @@
-use crate::mm::addr::{PhysAddr, PhysFrame, RAM_START, TOTAL_FRAMES, PAGE_SIZE};
+use crate::mm::addr::{PhysAddr, PhysPage, RAM_START, TOTAL_PAGES, PAGE_SIZE};
 
-/// Bitmap size in bytes: 32768 frames / 8 bits per byte = 4096 bytes.
-const BITMAP_SIZE: usize = (TOTAL_FRAMES + 7) / 8;
+/// Bitmap size in bytes: 32768 pages / 8 bits per byte = 4096 bytes.
+const BITMAP_SIZE: usize = (TOTAL_PAGES + 7) / 8;
 
 /// Static bitmap — lives in BSS, zeroed at boot. A set bit means allocated/reserved.
 ///
@@ -9,59 +9,58 @@ const BITMAP_SIZE: usize = (TOTAL_FRAMES + 7) / 8;
 /// interrupts or scheduling are introduced.
 static mut BITMAP: [u8; BITMAP_SIZE] = [0u8; BITMAP_SIZE];
 
-/// Hint for next-fit allocation — index of the next frame to check.
+/// Hint for next-fit allocation — index of the next page to check.
 static mut NEXT_FREE_HINT: usize = 0;
 
-/// Number of frames currently marked as reserved or allocated.
+/// Number of pages currently marked as reserved or allocated.
 static mut ALLOCATED_COUNT: usize = 0;
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Initialize the frame allocator. Marks firmware, kernel image, and stack
-/// frames as reserved. Must be called exactly once during boot.
+/// Initialize the page allocator. Marks firmware, kernel image, and stack
+/// pages as reserved. Must be called exactly once during boot.
 ///
 /// # Safety
 /// `kernel_start` and `kernel_end` must be valid physical addresses bounding
 /// the kernel image (including stack). Typically derived from linker symbols.
 pub unsafe fn init(kernel_start: PhysAddr, kernel_end: PhysAddr) {
-    // Reserve frames below the kernel load address (firmware, DTB, etc.)
-    // 0x4000_0000 to kernel_start
-    let firmware_end_frame = frame_index(kernel_start);
-    mark_range_reserved(0, firmware_end_frame);
+    // Reserve pages below the kernel load address (firmware, DTB, etc.)
+    let firmware_end_page = page_index(kernel_start);
+    mark_range_reserved(0, firmware_end_page);
 
-    // Reserve kernel image + stack frames
-    let kernel_start_frame = frame_index(kernel_start);
-    let kernel_end_frame = frame_index(kernel_end);
-    // Round up in case kernel_end isn't page-aligned
-    let kernel_end_frame = if kernel_end.as_u64() & (PAGE_SIZE - 1) != 0 {
-        kernel_end_frame + 1
+    // Reserve kernel image + stack pages
+    let kernel_start_page = page_index(kernel_start);
+    let kernel_end_page = page_index(kernel_end);
+    // Round up in case kernel_end is not page-aligned
+    let kernel_end_page = if kernel_end.as_u64() & (PAGE_SIZE - 1) != 0 {
+        kernel_end_page + 1
     } else {
-        kernel_end_frame
+        kernel_end_page
     };
-    mark_range_reserved(kernel_start_frame, kernel_end_frame);
+    mark_range_reserved(kernel_start_page, kernel_end_page);
 
-    // Set hint past all reserved frames
-    NEXT_FREE_HINT = kernel_end_frame;
+    // Set hint past all reserved pages
+    NEXT_FREE_HINT = kernel_end_page;
 
     let reserved = ALLOCATED_COUNT;
-    crate::kprintln!("  Frame allocator: {} reserved, {} free",
-        reserved, TOTAL_FRAMES - reserved);
+    crate::kprintln!("  Page allocator: {} reserved, {} free",
+        reserved, TOTAL_PAGES - reserved);
 }
 
-/// Allocate a single physical frame. Returns `None` if out of memory.
-pub fn alloc_frame() -> Option<PhysFrame> {
+/// Allocate a single physical page. Returns `None` if out of memory.
+pub fn alloc_page() -> Option<PhysPage> {
     unsafe {
         let start = NEXT_FREE_HINT;
 
         // Scan from hint to end
-        for i in start..TOTAL_FRAMES {
+        for i in start..TOTAL_PAGES {
             if !is_set(i) {
                 set_bit(i);
                 ALLOCATED_COUNT += 1;
                 NEXT_FREE_HINT = i + 1;
-                return Some(index_to_frame(i));
+                return Some(index_to_page(i));
             }
         }
 
@@ -71,7 +70,7 @@ pub fn alloc_frame() -> Option<PhysFrame> {
                 set_bit(i);
                 ALLOCATED_COUNT += 1;
                 NEXT_FREE_HINT = i + 1;
-                return Some(index_to_frame(i));
+                return Some(index_to_page(i));
             }
         }
 
@@ -79,15 +78,15 @@ pub fn alloc_frame() -> Option<PhysFrame> {
     }
 }
 
-/// Free a previously allocated frame. Panics on double-free.
-pub fn dealloc_frame(frame: PhysFrame) {
+/// Free a previously allocated page. Panics on double-free.
+pub fn dealloc_page(page: PhysPage) {
     unsafe {
-        let idx = frame_index(frame.start_addr());
-        assert!(is_set(idx), "dealloc_frame: double free of frame {:#x}", frame.start_addr().as_u64());
+        let idx = page_index(page.start_addr());
+        assert!(is_set(idx), "dealloc_page: double free of page {:#x}", page.start_addr().as_u64());
         clear_bit(idx);
         ALLOCATED_COUNT -= 1;
 
-        // Update hint if this frame is lower
+        // Update hint if this page is lower
         if idx < NEXT_FREE_HINT {
             NEXT_FREE_HINT = idx;
         }
@@ -98,14 +97,14 @@ pub fn dealloc_frame(frame: PhysFrame) {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a physical address to a frame index relative to RAM_START.
-fn frame_index(addr: PhysAddr) -> usize {
+/// Convert a physical address to a page index relative to RAM_START.
+fn page_index(addr: PhysAddr) -> usize {
     ((addr.as_u64() - RAM_START.as_u64()) / PAGE_SIZE) as usize
 }
 
-/// Convert a frame index back to a PhysFrame.
-fn index_to_frame(idx: usize) -> PhysFrame {
-    PhysFrame::containing(PhysAddr::new(RAM_START.as_u64() + (idx as u64) * PAGE_SIZE))
+/// Convert a page index back to a PhysPage.
+fn index_to_page(idx: usize) -> PhysPage {
+    PhysPage::containing(PhysAddr::new(RAM_START.as_u64() + (idx as u64) * PAGE_SIZE))
 }
 
 fn set_bit(idx: usize) {

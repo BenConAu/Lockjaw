@@ -1,6 +1,6 @@
 use crate::cap::object::CreateError;
-use crate::mm::addr::{PhysAddr, PhysFrame};
-use crate::mm::frame;
+use crate::mm::addr::{PhysAddr, PhysPage};
+use crate::mm::page_alloc;
 
 /// Maximum pages in a single PageSet.
 const MAX_PAGESET_PAGES: usize = 16;
@@ -25,7 +25,7 @@ pub enum AllocError {
     TooManyPages,
 }
 
-/// Allocate `count` physical pages from the frame bitmap and return a PageSet.
+/// Allocate `count` physical pages from the page bitmap and return a PageSet.
 pub fn alloc_pages(count: usize) -> Result<PageSet, AllocError> {
     if count == 0 || count > MAX_PAGESET_PAGES {
         return Err(AllocError::TooManyPages);
@@ -37,12 +37,12 @@ pub fn alloc_pages(count: usize) -> Result<PageSet, AllocError> {
     };
 
     for i in 0..count {
-        match frame::alloc_frame() {
-            Some(f) => ps.pages[i] = f.start_addr(),
+        match page_alloc::alloc_page() {
+            Some(p) => ps.pages[i] = p.start_addr(),
             None => {
                 // Roll back: free any pages we already allocated
                 for j in 0..i {
-                    frame::dealloc_frame(PhysFrame::containing(ps.pages[j]));
+                    page_alloc::dealloc_page(PhysPage::containing(ps.pages[j]));
                 }
                 return Err(AllocError::OutOfMemory);
             }
