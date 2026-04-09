@@ -6,10 +6,10 @@ A capability-based microkernel inspired by seL4 and Zircon, written in Rust, tar
 
 - **Target:** AArch64 (ARMv8-A), QEMU `virt` machine, GICv3 interrupt controller
 - **Language:** Rust (`#![no_std]`, `#![no_main]`), minimal inline assembly
-- **Security model:** Capability-based (seL4-style CSpaces, not Zircon handles)
+- **Security model:** Handle-based access control (Lockjaw model — see docs/object-model.md)
 - **IPC:** Synchronous endpoint-based (fast path register transfer)
 - **Drivers:** All in userspace except interrupt controller (GIC) and timer
-- **Memory:** User-provided untyped memory (seL4 model) — no in-kernel dynamic allocation
+- **Memory:** User-allocated pages via PageSets — no in-kernel dynamic allocation
 - **Toolchain:** `aarch64-unknown-none` target, `cargo` + linker script, QEMU for testing
 
 ## Prerequisites
@@ -68,7 +68,7 @@ This is a build-time gate that runs on every build from this point forward. It p
 **Design rules enforced from this point forward (to keep the call graph statically analyzable):**
 - No `dyn Trait` in kernel code — use generics or concrete types
 - No function pointer tables — syscall dispatch uses `match`, not `fn` arrays
-- No recursive data structures or recursive traversal (CSpace lookup must be iterative)
+- No recursive data structures or recursive traversal (handle table lookup must be iterative)
 - `core::fmt` goes through a concrete UART type, not `&mut dyn Write` — may need a thin wrapper to inline the write path so the tool can trace through it
 - Interrupt handlers must be minimal (set flag, return) — all printing/complex logic runs in the non-interrupt path
 
@@ -143,28 +143,29 @@ Goal: Trap to kernel on exceptions, handle timer interrupts for preemption.
 
 ---
 
-## Phase 4 — Kernel Object Model & Capabilities
+## Phase 4 — Kernel Object Model & Handles
 
-Goal: Typed kernel objects referenced through capability slots.
+Goal: Typed kernel objects created via PageSet donation, accessed through handles.
 
 ### Milestone 4.1: Kernel object types
-- Define enum of kernel object types: `Untyped`, `CNode`, `TCB`, `Endpoint`, `PageTable`, `Frame`
-- Each object is a `repr(C)` struct with a header containing type tag + size
-- Objects live in a flat kernel object table (static array for now)
-- **Verify:** Create objects of each type, print their type tags and sizes
+- `ObjectType` enum (YAGNI: only types needed now — `HandleTable`, `PageSet`)
+- Per-type create-info structs (Vulkan pattern: same struct for size query and creation)
+- `ObjectHeader` with type tag + page count at the start of every object
+- **Verify:** Query sizes, create objects in donated pages, print headers
 
-### Milestone 4.2: Capability slots (CSpace)
-- `CapSlot` = (object pointer, rights bitmask)
-- `CNode` = array of `CapSlot` (power-of-2 sized, radix-tree addressable)
-- `cap_lookup(cspace_root, cap_index) -> Result<&CapSlot>`
-- Rights: `Read`, `Write`, `Grant`, `Retype` as bitflags
-- **Verify:** Create a CNode, insert caps, look them up by index, verify rights checks pass/fail
+### Milestone 4.2: Handle table
+- `HandleEntry` = (object physical address, type, rights bitmask)
+- `HandleTable` = array of `HandleEntry` stored in donated pages
+- `handle_lookup(table_paddr, handle, required_rights) -> Result<HandleEntry>`
+- Rights: `Read`, `Write`, `Grant` as bitflags
+- **Verify:** Create a HandleTable, insert handles, look them up, verify rights checks pass/fail
 
-### Milestone 4.3: Untyped memory & retype
-- `Untyped` capability represents a region of unallocated physical memory
-- `retype(untyped_cap, object_type, size) -> Result<Cap>` carves a new typed object
-- Watermark allocator within each untyped (seL4 style: allocate forward, no individual free)
-- **Verify:** Retype an untyped into a TCB + a CNode + a Frame, print results
+### Milestone 4.3: PageSets & object creation flow
+- `PageSet` = 1..N physical pages allocated from the kernel page bitmap
+- `alloc_pages(count) -> PageSet` allocates from the bitmap
+- `donate(pageset) -> PhysAddr` hands pages to kernel for object creation
+- A PageSet is either donated (kernel object) or mapped (MappedPages, Phase 6) — never both
+- **Verify:** Alloc pageset, donate, create HandleTable, insert/lookup/remove handles
 
 ---
 
@@ -252,12 +253,12 @@ Goal: Multiple isolated address spaces running independent ELF binaries.
 
 ### Milestone 8.2: Init process
 - Kernel boots, creates init process from embedded ELF blob
-- Init receives: all remaining untyped capabilities, endpoint caps for IPC to kernel
+- Init receives: PageSet handles for all remaining free pages, endpoint handles for IPC to kernel
 - Init prints "Hello from userspace init" via debug syscall
 - **Verify:** Init runs, prints, doesn't crash
 
 ### Milestone 8.3: Process spawning from init
-- Init retypes untypeds → new TCB + CNode + VSpace + Frames
+- Init donates PageSets → creates new TCB + HandleTable + VSpace + MappedPages
 - Loads a second ELF binary, sets up its address space, starts it
 - Two independent processes running
 - **Verify:** Init and child both printing, isolated address spaces confirmed (child can't read init memory)
@@ -311,10 +312,10 @@ Goal: Run a simple POSIX binary (e.g. busybox echo) on the microkernel.
 
 ## Key Design Constraints
 
-- **No `alloc` in kernel.** All kernel memory comes from user-provided untypeds. The kernel has a fixed-size boot region (stack, boot page tables, frame allocator bitmap) and that's it. `core::fmt` scratch space lives on the stack.
+- **No `alloc` in kernel.** All kernel object memory comes from user-donated PageSets. The kernel has a fixed-size boot region (stack, boot page tables, page allocator bitmap) and that's it. `core::fmt` scratch space lives on the stack.
 - **Proven stack safety.** `cargo-call-stack` runs on every build (from Milestone 1.5). Build fails on any call graph cycle (recursion) or if worst-case depth exceeds budget. Normal path ≤ 3072 bytes, interrupt path ≤ 1024 bytes, total ≤ 4096 (one page). Guard page + canary provide runtime backup.
 - **Statically analyzable call graph.** No `dyn Trait`, no function pointer tables, no recursion in kernel code. Syscall dispatch uses `match`. `core::fmt` writes through a concrete type, not `&mut dyn Write`. These rules exist to keep `cargo-call-stack` analysis precise.
-- **Minimal syscall count.** Target ~10 syscalls (Send, Recv, Call, Reply, Yield, Retype, Map, Unmap, IRQBind, DebugPutc). Resist adding more.
+- **Minimal syscall count.** Target ~10 syscalls (Send, Recv, Call, Reply, Yield, AllocPages, CreateObject, Map, IRQBind, DebugPutc). Resist adding more.
 - **`unsafe` containment.** All unsafe code lives in arch/, mm/, and context switch modules. Everything above the HAL (capability system, scheduler, IPC logic) is safe Rust.
 - **One architecture.** AArch64 only. Don't abstract over architectures until Phase 8+. YAGNI until then.
 - **Test in QEMU first, always.** No real hardware until the full IPC path works.
@@ -341,14 +342,15 @@ microkernel/
 │   │       ├── mmu.rs          # page table manipulation
 │   │       └── gic.rs          # GICv3 driver
 │   ├── mm/
-│   │   ├── frame.rs            # physical frame allocator
+│   │   ├── page_alloc.rs       # physical page allocator (bitmap)
 │   │   ├── page_table.rs       # page table types + mapping API
-│   │   ├── addr.rs             # PhysAddr / VirtAddr newtypes
+│   │   ├── addr.rs             # PhysAddr / PhysPage newtypes
 │   │   └── stack.rs            # guard page setup, canary write/check
 │   ├── cap/
-│   │   ├── cspace.rs           # CNode + capability lookup
+│   │   ├── object.rs           # ObjectType, create-info structs, query/create
+│   │   ├── handle_table.rs     # HandleEntry + handle insert/lookup/remove
 │   │   ├── rights.rs           # rights bitmask
-│   │   └── untyped.rs          # untyped retype logic
+│   │   └── pageset.rs          # PageSet allocation and donation
 │   ├── sched/
 │   │   ├── tcb.rs              # thread control block
 │   │   └── scheduler.rs        # run queue + scheduling policy
