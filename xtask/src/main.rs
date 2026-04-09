@@ -183,7 +183,9 @@ fn extract_call_graph() -> (Vec<String>, HashMap<String, Vec<String>>, Vec<Strin
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stdout = demangle(&stdout);
+    // Note: we don't demangle here — objdump output is large (thousands of lines)
+    // and piping through rustfilt is slow. Function names from <name>: headers
+    // are sufficient for call graph analysis.
 
     let mut functions: Vec<String> = Vec::new();
     let mut call_graph: HashMap<String, Vec<String>> = HashMap::new();
