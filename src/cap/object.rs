@@ -10,6 +10,7 @@ use core::ptr;
 #[repr(u8)]
 pub enum ObjectType {
     HandleTable = 0,
+    ThreadControlBlock = 1,
 }
 
 /// Header written at the start of every kernel object's donated memory.

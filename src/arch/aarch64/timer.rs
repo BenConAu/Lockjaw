@@ -41,11 +41,14 @@ pub unsafe fn init() {
     crate::kprintln!("  Timer armed (10ms interval)");
 }
 
-/// Called from the IRQ handler when INTID 30 fires.
-/// Increments the tick counter and rearms the timer.
+/// Called from the IRQ handler when INTID 27 fires.
+/// Increments the tick counter, rearms the timer, and triggers the scheduler.
 pub fn handle_tick() {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-    unsafe { arm_timer(10); }
+    unsafe {
+        arm_timer(10);
+        crate::sched::scheduler::tick();
+    }
 }
 
 /// Read the current tick count.

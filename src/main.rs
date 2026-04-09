@@ -5,6 +5,7 @@ mod arch;
 mod cap;
 mod mm;
 mod print;
+mod sched;
 
 use arch::aarch64::uart::Uart;
 
@@ -193,9 +194,81 @@ pub extern "C" fn kmain() -> ! {
     let empty = unsafe { handle_lookup(ht_paddr, h0, Rights::none()) };
     kprintln!("  Lookup h{} after remove: {:?}", h0, empty.err().unwrap());
 
+    // --- Phase 5: Threads & Scheduling ---
     kprintln!();
-    kprintln!("Boot complete.");
+    kprintln!("Starting threads...");
 
+    // Create two test threads, each with its own stack page and TCB page
+    unsafe {
+        use sched::tcb::{TcbCreateInfo, create_tcb};
+
+        // Thread A
+        let stack_a = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
+        let tcb_a_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
+        create_tcb(&TcbCreateInfo { entry: thread_a, stack_paddr: stack_a }, tcb_a_page)
+            .expect("create tcb a");
+
+        // Thread B
+        let stack_b = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
+        let tcb_b_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
+        create_tcb(&TcbCreateInfo { entry: thread_b, stack_paddr: stack_b }, tcb_b_page)
+            .expect("create tcb b");
+
+        // Register idle thread (index 0 = this boot thread, uses the boot stack)
+        // We create a minimal TCB for it on another page
+        let idle_stack_base = &__stack_bottom as *const u8 as u64 + mm::addr::KERNEL_VA_OFFSET;
+        let idle_tcb_page = mm::page_alloc::alloc_page().expect("idle tcb alloc").start_addr();
+        let idle_tcb_va = (idle_tcb_page.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut sched::tcb::Tcb;
+        core::ptr::write(idle_tcb_va, sched::tcb::Tcb {
+            header: ObjectHeader { obj_type: ObjectType::ThreadControlBlock, page_count: 1 },
+            saved_sp: 0, // filled by first context_switch
+            state: sched::tcb::ThreadState::Running,
+            entry: idle_thread,
+            stack_base: idle_stack_base,
+        });
+
+        sched::scheduler::add_thread(idle_tcb_page);  // index 0: idle/boot
+        sched::scheduler::add_thread(tcb_a_page);      // index 1: thread A
+        sched::scheduler::add_thread(tcb_b_page);      // index 2: thread B
+        sched::scheduler::start();
+    }
+
+    kprintln!("Scheduler started. Entering idle loop.");
+    kprintln!();
+
+    // Idle thread: this is what the boot thread becomes
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test threads
+// ---------------------------------------------------------------------------
+
+fn thread_a() -> ! {
+    let mut count = 0u64;
+    loop {
+        count += 1;
+        if count % 100 == 0 {
+            kprintln!("[A] count={}", count);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn thread_b() -> ! {
+    let mut count = 0u64;
+    loop {
+        count += 1;
+        if count % 150 == 0 {
+            kprintln!("[B] count={}", count);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn idle_thread() -> ! {
     loop {
         unsafe { core::arch::asm!("wfi") };
     }
