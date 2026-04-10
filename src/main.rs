@@ -216,13 +216,13 @@ pub extern "C" fn kmain() -> ! {
         let ht_info = cap::object::HandleTableCreateInfo { slot_count: 8 };
         cap::object::create_handle_table(&ht_info, ht_a_page).expect("create ht a");
         handle_table::handle_insert(ht_a_page, ep_page, ObjectType::Endpoint,
-            cap::rights::Rights::from_bits(cap::rights::RIGHT_WRITE)).expect("insert ep handle");
+            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE)).expect("insert ep handle");
 
-        // Create handle table for receiver (Thread B)
+        // Create handle table for receiver (Thread B) — also needs RW for ping-pong
         let ht_b_page = mm::page_alloc::alloc_page().expect("ht alloc").start_addr();
         cap::object::create_handle_table(&ht_info, ht_b_page).expect("create ht b");
         handle_table::handle_insert(ht_b_page, ep_page, ObjectType::Endpoint,
-            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ)).expect("insert ep handle");
+            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE)).expect("insert ep handle");
 
         // Thread A (sender) — sends messages on the endpoint
         let stack_a = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
@@ -329,52 +329,72 @@ extern "C" fn user_test_function() -> ! {
 // IPC test threads (Phase 7)
 // ---------------------------------------------------------------------------
 
-/// Sender thread: sends incrementing counter values on endpoint handle 0.
-/// Uses the kernel IPC API directly (not syscalls — this is a kernel thread).
+/// Helper: look up endpoint at handle 0 for the current thread.
+unsafe fn lookup_endpoint() -> (mm::addr::PhysAddr, mm::addr::PhysAddr) {
+    let tcb_paddr = sched::scheduler::current_tcb_paddr();
+    let tcb = (tcb_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *const sched::tcb::Tcb;
+    let ht_paddr = mm::addr::PhysAddr::new((*tcb).handle_table_paddr);
+    let entry = cap::handle_table::handle_lookup(
+        ht_paddr, 0,
+        cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
+    ).expect("handle lookup");
+    (mm::addr::PhysAddr::new(entry.object_paddr), tcb_paddr)
+}
+
+/// Ping thread: sends a counter value, then receives the pong reply.
+/// After N rounds, prints the round-trip benchmark.
 fn ipc_sender() -> ! {
+    const BENCHMARK_ROUNDS: u64 = 10000;
     let mut counter: u64 = 1;
-    loop {
-        let msg = [counter, 0, 0, 0];
+
+    // Warm up: a few rounds before measuring
+    for _ in 0..10 {
         unsafe {
-            let tcb_paddr = sched::scheduler::current_tcb_paddr();
-            let tcb = (tcb_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *const sched::tcb::Tcb;
-            let ht_paddr = mm::addr::PhysAddr::new((*tcb).handle_table_paddr);
+            let (ep, tcb) = lookup_endpoint();
+            ipc::endpoint::ipc_send(ep, [counter, 0, 0, 0], tcb).expect("send");
+            ipc::endpoint::ipc_receive(ep, tcb).expect("receive");
+        }
+        counter += 1;
+    }
 
-            // Look up endpoint at handle 0
-            let entry = cap::handle_table::handle_lookup(
-                ht_paddr, 0,
-                cap::rights::Rights::from_bits(cap::rights::RIGHT_WRITE),
-            ).expect("sender: handle lookup");
+    // Benchmark
+    let start_tick = arch::aarch64::timer::tick_count();
+    for _ in 0..BENCHMARK_ROUNDS {
+        unsafe {
+            let (ep, tcb) = lookup_endpoint();
+            ipc::endpoint::ipc_send(ep, [counter, 0, 0, 0], tcb).expect("send");
+            ipc::endpoint::ipc_receive(ep, tcb).expect("receive");
+        }
+        counter += 1;
+    }
+    let end_tick = arch::aarch64::timer::tick_count();
+    let elapsed_ticks = end_tick - start_tick;
 
-            let ep_paddr = mm::addr::PhysAddr::new(entry.object_paddr);
-            ipc::endpoint::ipc_send(ep_paddr, msg, tcb_paddr).expect("send failed");
+    kprintln!();
+    kprintln!("[IPC BENCHMARK] {} round-trips in {} ticks", BENCHMARK_ROUNDS, elapsed_ticks);
+    if elapsed_ticks > 0 {
+        kprintln!("[IPC BENCHMARK] {} round-trips per tick", BENCHMARK_ROUNDS / elapsed_ticks);
+    }
+
+    // Continue with regular IPC after benchmark
+    loop {
+        unsafe {
+            let (ep, tcb) = lookup_endpoint();
+            ipc::endpoint::ipc_send(ep, [counter, 0, 0, 0], tcb).expect("send");
+            ipc::endpoint::ipc_receive(ep, tcb).expect("receive");
         }
         counter += 1;
     }
 }
 
-/// Receiver thread: receives messages on endpoint handle 0 and prints the value.
+/// Pong thread: receives a value, sends it back.
 fn ipc_receiver() -> ! {
     loop {
         unsafe {
-            let tcb_paddr = sched::scheduler::current_tcb_paddr();
-            let tcb = (tcb_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *const sched::tcb::Tcb;
-            let ht_paddr = mm::addr::PhysAddr::new((*tcb).handle_table_paddr);
-
-            let entry = cap::handle_table::handle_lookup(
-                ht_paddr, 0,
-                cap::rights::Rights::from_bits(cap::rights::RIGHT_READ),
-            ).expect("receiver: handle lookup");
-
-            let ep_paddr = mm::addr::PhysAddr::new(entry.object_paddr);
-            match ipc::endpoint::ipc_receive(ep_paddr, tcb_paddr) {
-                Ok(msg) => {
-                    kprintln!("[IPC] received: {}", msg[0]);
-                }
-                Err(e) => {
-                    kprintln!("[IPC] receive error: {:?}", e);
-                }
-            }
+            let (ep, tcb) = lookup_endpoint();
+            let msg = ipc::endpoint::ipc_receive(ep, tcb).expect("receive");
+            // Send the same message back (pong)
+            ipc::endpoint::ipc_send(ep, msg, tcb).expect("send pong");
         }
     }
 }
