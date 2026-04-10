@@ -23,6 +23,9 @@ pub const MAIR_EL1_VALUE: u64 = (0x00 << 0) | (0xFF << 8);
 /// Read-write at EL1, no access at EL0.
 pub const AP_RW_EL1: u8 = 0b00;
 
+/// Read-write at EL1 and EL0.
+pub const AP_RW_ALL: u8 = 0b01;
+
 // ---------------------------------------------------------------------------
 // Shareability constants (SH field, bits [9:8])
 // ---------------------------------------------------------------------------
@@ -37,6 +40,8 @@ pub const SH_INNER: u8 = 0b11;
 const PTE_VALID: u64 = 1 << 0;
 const PTE_TABLE: u64 = 1 << 1; // For L0-L2: table descriptor. For L3: page descriptor.
 const PTE_AF: u64 = 1 << 10;
+const PTE_PXN: u64 = 1 << 53; // Privileged Execute-Never
+const PTE_UXN: u64 = 1 << 54; // Unprivileged Execute-Never (User Execute-Never)
 
 const PTE_ATTR_SHIFT: u64 = 2;
 const PTE_AP_SHIFT: u64 = 6;
@@ -131,6 +136,15 @@ impl PageTableEntry {
         )
     }
 
+    /// Set the Privileged Execute-Never bit.
+    pub const fn with_pxn(self) -> Self {
+        Self(self.0 | PTE_PXN)
+    }
+
+    /// Set the Unprivileged Execute-Never bit.
+    pub const fn with_uxn(self) -> Self {
+        Self(self.0 | PTE_UXN)
+    }
 }
 
 impl fmt::Debug for PageTableEntry {
