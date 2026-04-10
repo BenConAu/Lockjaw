@@ -6,10 +6,10 @@ QEMU_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -nographic -kernel
 
 .PHONY: build build-release run run-release objdump nm check-stack clean
 
-build:
+build: check-stack
 	cargo build
 
-build-release:
+build-release: check-stack
 	cargo build --release
 
 run: build
