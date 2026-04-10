@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = ["xtask"]
+members = ["xtask", "lockjaw-types"]
+
+[dependencies]
+lockjaw-types = { path = "lockjaw-types" }
 
 [profile.dev]
 panic = "abort"

@@ -4,7 +4,7 @@ KERNEL_ELF_RELEASE := target/aarch64-unknown-none/release/lockjaw
 QEMU := qemu-system-aarch64
 QEMU_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -nographic -kernel
 
-.PHONY: build build-release run run-release objdump nm check-stack clean
+.PHONY: build build-release run run-release objdump nm check-stack test test-unit test-qemu clean
 
 build: check-stack
 	cargo build
@@ -26,6 +26,14 @@ nm: build
 
 check-stack:
 	cargo xtask check-stack
+
+test: test-unit test-qemu
+
+test-unit:
+	cargo test -p lockjaw-types --target x86_64-apple-darwin
+
+test-qemu: build
+	bash tests/qemu_integration.sh
 
 clean:
 	cargo clean

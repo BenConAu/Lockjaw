@@ -71,7 +71,7 @@ pub unsafe fn create_tcb(
     extern "C" {
         fn thread_entry();
     }
-    ptr::write(ctx.add(11), thread_entry as u64);
+    ptr::write(ctx.add(11), thread_entry as *const () as u64);
 
     // Write the TCB header
     ptr::write(tcb_va, Tcb {
