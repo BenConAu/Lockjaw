@@ -341,29 +341,31 @@ unsafe fn lookup_endpoint() -> (mm::addr::PhysAddr, mm::addr::PhysAddr) {
     (mm::addr::PhysAddr::new(entry.object_paddr), tcb_paddr)
 }
 
-/// Ping thread: sends a counter value, then receives the pong reply.
-/// After N rounds, prints the round-trip benchmark.
+/// Client thread: calls the server with a request, gets a reply.
+/// Uses ipc_call (send + block for reply in one operation).
 fn ipc_sender() -> ! {
     const BENCHMARK_ROUNDS: u64 = 10000;
     let mut counter: u64 = 1;
 
-    // Warm up: a few rounds before measuring
+    // Warm up
     for _ in 0..10 {
         unsafe {
             let (ep, tcb) = lookup_endpoint();
-            ipc::endpoint::ipc_send(ep, [counter, 0, 0, 0], tcb).expect("send");
-            ipc::endpoint::ipc_receive(ep, tcb).expect("receive");
+            ipc::endpoint::ipc_call(ep, [counter, 0, 0, 0], tcb).expect("call");
         }
         counter += 1;
     }
 
-    // Benchmark
+    // Benchmark using call/reply pattern
     let start_tick = arch::aarch64::timer::tick_count();
     for _ in 0..BENCHMARK_ROUNDS {
         unsafe {
             let (ep, tcb) = lookup_endpoint();
-            ipc::endpoint::ipc_send(ep, [counter, 0, 0, 0], tcb).expect("send");
-            ipc::endpoint::ipc_receive(ep, tcb).expect("receive");
+            let reply = ipc::endpoint::ipc_call(ep, [counter, 0, 0, 0], tcb).expect("call");
+            // Print first few to verify the server doubled our value
+            if counter <= 13 {
+                kprintln!("[IPC] call({}) -> reply({})", counter, reply[0]);
+            }
         }
         counter += 1;
     }
@@ -371,30 +373,29 @@ fn ipc_sender() -> ! {
     let elapsed_ticks = end_tick - start_tick;
 
     kprintln!();
-    kprintln!("[IPC BENCHMARK] {} round-trips in {} ticks", BENCHMARK_ROUNDS, elapsed_ticks);
+    kprintln!("[IPC BENCHMARK] {} call/reply round-trips in {} ticks", BENCHMARK_ROUNDS, elapsed_ticks);
     if elapsed_ticks > 0 {
         kprintln!("[IPC BENCHMARK] {} round-trips per tick", BENCHMARK_ROUNDS / elapsed_ticks);
     }
 
-    // Continue with regular IPC after benchmark
     loop {
         unsafe {
             let (ep, tcb) = lookup_endpoint();
-            ipc::endpoint::ipc_send(ep, [counter, 0, 0, 0], tcb).expect("send");
-            ipc::endpoint::ipc_receive(ep, tcb).expect("receive");
+            ipc::endpoint::ipc_call(ep, [counter, 0, 0, 0], tcb).expect("call");
         }
         counter += 1;
     }
 }
 
-/// Pong thread: receives a value, sends it back.
+/// Server thread: receives a request, doubles the first value, replies.
 fn ipc_receiver() -> ! {
     loop {
         unsafe {
             let (ep, tcb) = lookup_endpoint();
             let msg = ipc::endpoint::ipc_receive(ep, tcb).expect("receive");
-            // Send the same message back (pong)
-            ipc::endpoint::ipc_send(ep, msg, tcb).expect("send pong");
+            // Server logic: double the first value
+            let reply = [msg[0] * 2, msg[1], msg[2], msg[3]];
+            ipc::endpoint::ipc_reply(ep, reply).expect("reply");
         }
     }
 }
