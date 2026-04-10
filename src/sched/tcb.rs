@@ -10,6 +10,7 @@ use core::ptr;
 pub enum ThreadState {
     Ready,
     Running,
+    Blocked,
 }
 
 // ---------------------------------------------------------------------------
@@ -24,6 +25,9 @@ pub struct Tcb {
     pub state: ThreadState,
     pub entry: fn() -> !,
     pub stack_base: u64,
+    pub handle_table_paddr: u64,
+    pub ipc_blocked_on: u64,
+    pub ipc_msg: [u64; 4],
 }
 
 // ---------------------------------------------------------------------------
@@ -34,6 +38,7 @@ pub struct Tcb {
 pub struct TcbCreateInfo {
     pub entry: fn() -> !,
     pub stack_paddr: PhysAddr,
+    pub handle_table_paddr: PhysAddr,
 }
 
 /// Initialize a TCB in donated memory and set up its stack with a
@@ -73,7 +78,7 @@ pub unsafe fn create_tcb(
     }
     ptr::write(ctx.add(11), thread_entry as *const () as u64);
 
-    // Write the TCB header
+    // Write the TCB
     ptr::write(tcb_va, Tcb {
         header: ObjectHeader {
             obj_type: ObjectType::ThreadControlBlock,
@@ -83,6 +88,9 @@ pub unsafe fn create_tcb(
         state: ThreadState::Ready,
         entry: info.entry,
         stack_base: stack_va,
+        handle_table_paddr: info.handle_table_paddr.as_u64(),
+        ipc_blocked_on: 0,
+        ipc_msg: [0; 4],
     });
 
     Ok(())

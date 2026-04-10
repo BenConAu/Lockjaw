@@ -3,6 +3,7 @@
 
 mod arch;
 mod cap;
+mod ipc;
 mod mm;
 mod print;
 mod sched;
@@ -199,20 +200,40 @@ pub extern "C" fn kmain() -> ! {
     kprintln!();
     kprintln!("Starting threads...");
 
-    // Create two test threads, each with its own stack page and TCB page
+    // --- Phase 7: IPC Setup ---
+    // Create an endpoint and handle tables for the sender/receiver threads
     unsafe {
         use sched::tcb::{TcbCreateInfo, create_tcb};
+        use cap::handle_table;
 
-        // Thread A
+        // Create endpoint object
+        let ep_page = mm::page_alloc::alloc_page().expect("endpoint alloc").start_addr();
+        ipc::endpoint::create_endpoint(ep_page).expect("create endpoint");
+        kprintln!("  Endpoint created at phys {:#x}", ep_page.as_u64());
+
+        // Create handle table for sender (Thread A)
+        let ht_a_page = mm::page_alloc::alloc_page().expect("ht alloc").start_addr();
+        let ht_info = cap::object::HandleTableCreateInfo { slot_count: 8 };
+        cap::object::create_handle_table(&ht_info, ht_a_page).expect("create ht a");
+        handle_table::handle_insert(ht_a_page, ep_page, ObjectType::Endpoint,
+            cap::rights::Rights::from_bits(cap::rights::RIGHT_WRITE)).expect("insert ep handle");
+
+        // Create handle table for receiver (Thread B)
+        let ht_b_page = mm::page_alloc::alloc_page().expect("ht alloc").start_addr();
+        cap::object::create_handle_table(&ht_info, ht_b_page).expect("create ht b");
+        handle_table::handle_insert(ht_b_page, ep_page, ObjectType::Endpoint,
+            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ)).expect("insert ep handle");
+
+        // Thread A (sender) — sends messages on the endpoint
         let stack_a = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
         let tcb_a_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
-        create_tcb(&TcbCreateInfo { entry: thread_a, stack_paddr: stack_a }, tcb_a_page)
+        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, handle_table_paddr: ht_a_page }, tcb_a_page)
             .expect("create tcb a");
 
-        // Thread B
+        // Thread B (receiver) — receives and prints messages
         let stack_b = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
         let tcb_b_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
-        create_tcb(&TcbCreateInfo { entry: thread_b, stack_paddr: stack_b }, tcb_b_page)
+        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, handle_table_paddr: ht_b_page }, tcb_b_page)
             .expect("create tcb b");
 
         // Register idle thread (index 0 = this boot thread, uses the boot stack)
@@ -222,10 +243,13 @@ pub extern "C" fn kmain() -> ! {
         let idle_tcb_va = (idle_tcb_page.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut sched::tcb::Tcb;
         core::ptr::write(idle_tcb_va, sched::tcb::Tcb {
             header: ObjectHeader { obj_type: ObjectType::ThreadControlBlock, page_count: 1 },
-            saved_sp: 0, // filled by first context_switch
+            saved_sp: 0,
             state: sched::tcb::ThreadState::Running,
             entry: idle_thread,
             stack_base: idle_stack_base,
+            handle_table_paddr: 0,
+            ipc_blocked_on: 0,
+            ipc_msg: [0; 4],
         });
 
         sched::scheduler::add_thread(idle_tcb_page);  // index 0: idle/boot
@@ -302,28 +326,56 @@ extern "C" fn user_test_function() -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// Kernel test threads (Phase 5 verification)
+// IPC test threads (Phase 7)
 // ---------------------------------------------------------------------------
 
-fn thread_a() -> ! {
-    let mut count = 0u64;
+/// Sender thread: sends incrementing counter values on endpoint handle 0.
+/// Uses the kernel IPC API directly (not syscalls — this is a kernel thread).
+fn ipc_sender() -> ! {
+    let mut counter: u64 = 1;
     loop {
-        count += 1;
-        if count % 100 == 0 {
-            kprintln!("[A] count={}", count);
+        let msg = [counter, 0, 0, 0];
+        unsafe {
+            let tcb_paddr = sched::scheduler::current_tcb_paddr();
+            let tcb = (tcb_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *const sched::tcb::Tcb;
+            let ht_paddr = mm::addr::PhysAddr::new((*tcb).handle_table_paddr);
+
+            // Look up endpoint at handle 0
+            let entry = cap::handle_table::handle_lookup(
+                ht_paddr, 0,
+                cap::rights::Rights::from_bits(cap::rights::RIGHT_WRITE),
+            ).expect("sender: handle lookup");
+
+            let ep_paddr = mm::addr::PhysAddr::new(entry.object_paddr);
+            ipc::endpoint::ipc_send(ep_paddr, msg, tcb_paddr).expect("send failed");
         }
-        core::hint::spin_loop();
+        counter += 1;
     }
 }
 
-fn thread_b() -> ! {
-    let mut count = 0u64;
+/// Receiver thread: receives messages on endpoint handle 0 and prints the value.
+fn ipc_receiver() -> ! {
     loop {
-        count += 1;
-        if count % 150 == 0 {
-            kprintln!("[B] count={}", count);
+        unsafe {
+            let tcb_paddr = sched::scheduler::current_tcb_paddr();
+            let tcb = (tcb_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *const sched::tcb::Tcb;
+            let ht_paddr = mm::addr::PhysAddr::new((*tcb).handle_table_paddr);
+
+            let entry = cap::handle_table::handle_lookup(
+                ht_paddr, 0,
+                cap::rights::Rights::from_bits(cap::rights::RIGHT_READ),
+            ).expect("receiver: handle lookup");
+
+            let ep_paddr = mm::addr::PhysAddr::new(entry.object_paddr);
+            match ipc::endpoint::ipc_receive(ep_paddr, tcb_paddr) {
+                Ok(msg) => {
+                    kprintln!("[IPC] received: {}", msg[0]);
+                }
+                Err(e) => {
+                    kprintln!("[IPC] receive error: {:?}", e);
+                }
+            }
         }
-        core::hint::spin_loop();
     }
 }
 

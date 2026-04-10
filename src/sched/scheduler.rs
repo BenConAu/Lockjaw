@@ -45,6 +45,26 @@ pub unsafe fn tick() {
     schedule();
 }
 
+/// Return the physical address of the currently running thread's TCB.
+pub unsafe fn current_tcb_paddr() -> PhysAddr {
+    THREADS[CURRENT].unwrap()
+}
+
+/// Block the current thread. Sets state to Blocked and schedules away.
+/// The caller must have already set the TCB's ipc_blocked_on field.
+pub unsafe fn block_current() {
+    let paddr = THREADS[CURRENT].unwrap();
+    let tcb = tcb_ptr_mut(paddr);
+    (*tcb).state = ThreadState::Blocked;
+    schedule();
+}
+
+/// Unblock a thread by setting its state back to Ready.
+pub unsafe fn unblock_thread(tcb_paddr: PhysAddr) {
+    let tcb = tcb_ptr_mut(tcb_paddr);
+    (*tcb).state = ThreadState::Ready;
+}
+
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
@@ -54,8 +74,10 @@ unsafe fn schedule() {
     let old_paddr = THREADS[old_idx].unwrap();
     let old_tcb = tcb_ptr_mut(old_paddr);
 
-    // Mark old thread as Ready (it was Running)
-    (*old_tcb).state = ThreadState::Ready;
+    // Only mark old thread as Ready if it was Running (not if it was just Blocked)
+    if (*old_tcb).state == ThreadState::Running {
+        (*old_tcb).state = ThreadState::Ready;
+    }
 
     // Find next Ready thread (round-robin)
     let mut next_idx = (old_idx + 1) % THREAD_COUNT;

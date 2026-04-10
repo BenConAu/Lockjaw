@@ -10,6 +10,7 @@ use crate::addr::PAGE_SIZE;
 pub enum ObjectType {
     HandleTable = 0,
     ThreadControlBlock = 1,
+    Endpoint = 2,
 }
 
 /// Header written at the start of every kernel object's donated memory.
@@ -56,6 +57,20 @@ pub fn query_handle_table_size(info: &HandleTableCreateInfo) -> ObjectSize {
     ObjectSize { pages }
 }
 
+// ---------------------------------------------------------------------------
+// Endpoint create-info (Vulkan pattern)
+// ---------------------------------------------------------------------------
+
+/// Describes an Endpoint to create. Endpoints are simple rendezvous points
+/// with no configuration parameters.
+#[derive(Clone, Copy, Debug)]
+pub struct EndpointCreateInfo;
+
+/// How many pages does an Endpoint need? Always 1.
+pub fn query_endpoint_size(_info: &EndpointCreateInfo) -> ObjectSize {
+    ObjectSize { pages: 1 }
+}
+
 /// Error from object creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateError {
@@ -94,9 +109,16 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_fits_in_one_page() {
+        let size = query_endpoint_size(&EndpointCreateInfo);
+        assert_eq!(size.pages, 1);
+    }
+
+    #[test]
     fn object_type_equality() {
         assert_eq!(ObjectType::HandleTable, ObjectType::HandleTable);
         assert_ne!(ObjectType::HandleTable, ObjectType::ThreadControlBlock);
+        assert_ne!(ObjectType::Endpoint, ObjectType::HandleTable);
     }
 
     #[test]
