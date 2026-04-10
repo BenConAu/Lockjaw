@@ -233,17 +233,75 @@ pub extern "C" fn kmain() -> ! {
         sched::scheduler::start();
     }
 
-    kprintln!("Scheduler started. Entering idle loop.");
+    kprintln!("Scheduler started.");
     kprintln!();
 
-    // Idle thread: this is what the boot thread becomes
-    loop {
-        unsafe { core::arch::asm!("wfi") };
+    // --- Phase 6: Drop to EL0 ---
+    kprintln!("Setting up user page tables...");
+    unsafe {
+        // Allocate a code page and a stack page for userspace
+        let code_page = mm::page_alloc::alloc_page().expect("user code page").start_addr();
+        let stack_page = mm::page_alloc::alloc_page().expect("user stack page").start_addr();
+
+        // Copy user test function bytes into the code page
+        let code_src = user_test_function as *const u8;
+        let code_dst = (code_page.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut u8;
+        // Copy 64 bytes (more than enough for the small test function)
+        core::ptr::copy_nonoverlapping(code_src, code_dst, 64);
+
+        // Flush caches so the I-cache sees the copied code bytes
+        for offset in (0u64..64).step_by(64) {
+            let addr = code_dst as u64 + offset;
+            core::arch::asm!(
+                "dc cvau, {addr}",               // Clean D-cache line to Point of Unification
+                addr = in(reg) addr,
+            );
+        }
+        core::arch::asm!(
+            "dsb ish",                            // Ensure D-cache clean completes
+            "ic iallu",                           // Invalidate entire I-cache
+            "dsb ish",                            // Ensure I-cache invalidation completes
+            "isb",                                // Sync pipeline
+        );
+
+        // Set up user page tables: map code + stack at user VAs
+        arch::aarch64::mmu::setup_user_page_tables(code_page, stack_page);
+        kprintln!("  Code page:  phys {:#x} -> VA {:#x}", code_page.as_u64(), arch::aarch64::mmu::USER_CODE_VA);
+        kprintln!("  Stack page: phys {:#x} -> VA {:#x}", stack_page.as_u64(), arch::aarch64::mmu::USER_STACK_VA);
+
+        kprintln!("Dropping to EL0...");
+        arch::aarch64::mmu::drop_to_el0(
+            arch::aarch64::mmu::USER_CODE_VA,
+            arch::aarch64::mmu::USER_STACK_TOP,
+        );
     }
 }
 
 // ---------------------------------------------------------------------------
-// Test threads
+// User test function — compiled as kernel code, bytes copied to user page
+// ---------------------------------------------------------------------------
+
+/// Trivial EL0 function: tries to make syscalls (SVC #0).
+/// Before syscall handler is wired (6.1), this will trap as EC=0x15.
+/// After syscall handler (6.2), it will print "Hi" via sys_debug_putc.
+#[unsafe(naked)]
+extern "C" fn user_test_function() -> ! {
+    core::arch::naked_asm!(
+        "mov x0, #0x48",                    // 'H' character
+        "mov x8, #0",                        // syscall number: debug_putc
+        "svc #0",                            // trap to kernel
+        "mov x0, #0x69",                     // 'i' character
+        "mov x8, #0",                        // syscall number: debug_putc
+        "svc #0",                            // trap to kernel
+        "mov x0, #0x0a",                     // newline character
+        "mov x8, #0",                        // syscall number: debug_putc
+        "svc #0",                            // trap to kernel
+        "b .",                               // loop forever
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Kernel test threads (Phase 5 verification)
 // ---------------------------------------------------------------------------
 
 fn thread_a() -> ! {

@@ -33,6 +33,24 @@ static mut KERNEL_L2_RAM: PageTable = PageTable::empty();
 static mut KERNEL_L3_GUARD: PageTable = PageTable::empty();
 
 // ---------------------------------------------------------------------------
+// User page tables (Phase 6 — EL0 userspace)
+// ---------------------------------------------------------------------------
+
+/// L0 table for user TTBR0. Replaces the boot identity map.
+static mut USER_L0: PageTable = PageTable::empty();
+static mut USER_L1: PageTable = PageTable::empty();
+static mut USER_L2: PageTable = PageTable::empty();
+static mut USER_L3: PageTable = PageTable::empty();
+
+/// User VA layout:
+///   0x0040_0000 — code page (execute, no-write for user; PXN for kernel)
+///   0x0040_1000 — stack page (read-write for user; UXN so no execute)
+///   Stack grows down from 0x0040_2000.
+pub const USER_CODE_VA: u64 = 0x0040_0000;
+pub const USER_STACK_VA: u64 = 0x0040_1000;
+pub const USER_STACK_TOP: u64 = 0x0040_2000;
+
+// ---------------------------------------------------------------------------
 // Identity map setup
 // ---------------------------------------------------------------------------
 
@@ -294,5 +312,100 @@ pub unsafe fn setup_guard_page(guard_page_phys: PhysAddr) {
     );
     asm!(
         "isb",                               // Sync pipeline
+    );
+}
+
+// ---------------------------------------------------------------------------
+// User page tables (Phase 6)
+// ---------------------------------------------------------------------------
+
+/// Set up user page tables mapping two physical pages into the lower VA half:
+///   USER_CODE_VA  → code_paddr  (user read-write + execute, kernel no-execute)
+///   USER_STACK_VA → stack_paddr (user read-write, no execute)
+///
+/// # Safety
+/// `code_paddr` and `stack_paddr` must be valid physical page addresses.
+pub unsafe fn setup_user_page_tables(code_paddr: PhysAddr, stack_paddr: PhysAddr) {
+    // User code page: AP_RW_ALL (user can read-write-execute), PXN (kernel cannot execute)
+    // Code page VA 0x0040_0000: L0=0, L1=0, L2=2, L3=0
+    USER_L3.entries[0] = PageTableEntry::new_page(
+        code_paddr,
+        MAIR_NORMAL,
+        AP_RW_ALL,
+        SH_INNER,
+    ).with_pxn();
+
+    // User stack page: AP_RW_ALL (user can read-write), UXN (no execute for user)
+    // Stack page VA 0x0040_1000: L0=0, L1=0, L2=2, L3=1
+    USER_L3.entries[1] = PageTableEntry::new_page(
+        stack_paddr,
+        MAIR_NORMAL,
+        AP_RW_ALL,
+        SH_INNER,
+    ).with_uxn().with_pxn();
+
+    // L2[2] → USER_L3 (covers VA 0x0040_0000 - 0x005F_FFFF)
+    USER_L2.entries[2] = PageTableEntry::new_table(
+        PhysAddr::new(&raw const USER_L3 as u64),
+    );
+
+    // L1[0] → USER_L2 (covers 0x00000000-0x3FFFFFFF, user pages are here)
+    USER_L1.entries[0] = PageTableEntry::new_table(
+        PhysAddr::new(&raw const USER_L2 as u64),
+    );
+
+    // Also identity-map the kernel's physical memory in TTBR0 so that
+    // VBAR_EL1 (at a physical address) and kernel code remain reachable
+    // when exceptions are taken from EL0. The kernel binary is linked at
+    // physical addresses, not higher-half VAs.
+    //
+    // Device MMIO (UART at 0x0900_0000, GIC at 0x0800_0000) — kernel-only access
+    // L2[4] covers 0x0080_0000-0x009F_FFFF (includes UART and GIC distributor)
+    USER_L2.entries[4] = PageTableEntry::new_block(
+        PhysAddr::new(0x0080_0000),
+        MAIR_DEVICE,
+        AP_RW_EL1,
+        SH_NON,
+    );
+
+    // L1[1] = 0x4000_0000 RAM (1GB block, kernel-only: AP_RW_EL1)
+    USER_L1.entries[1] = PageTableEntry::new_block(
+        PhysAddr::new(0x4000_0000),
+        MAIR_NORMAL,
+        AP_RW_EL1,
+        SH_INNER,
+    );
+
+    // L0[0] → USER_L1
+    USER_L0.entries[0] = PageTableEntry::new_table(
+        PhysAddr::new(&raw const USER_L1 as u64),
+    );
+}
+
+/// Drop from EL1 to EL0 and begin executing user code.
+///
+/// Installs the user page tables in TTBR0, sets user SP and entry point,
+/// then `eret` drops to EL0. This function never returns.
+///
+/// # Safety
+/// `setup_user_page_tables` must have been called first.
+pub unsafe fn drop_to_el0(entry_va: u64, stack_top: u64) -> ! {
+    let ttbr0 = &raw const USER_L0 as u64;
+
+    asm!(
+        "msr TTBR0_EL1, {ttbr0}",           // Install user page table
+        "dsb ish",                            // Ensure TTBR0 write completes
+        "tlbi vmalle1is",                     // Flush all TLB entries
+        "dsb ish",                            // Ensure TLB flush completes
+        "isb",                                // Sync pipeline
+        "msr SP_EL0, {sp}",                  // Set user stack pointer
+        "msr ELR_EL1, {pc}",                 // Set user entry point
+        "mov x0, #0",                         // SPSR = 0: EL0t mode, all DAIF clear (IRQs on)
+        "msr SPSR_EL1, x0",                  // Write Saved Program Status Register
+        "eret",                               // Drop to EL0
+        ttbr0 = in(reg) ttbr0,
+        sp = in(reg) stack_top,
+        pc = in(reg) entry_va,
+        options(noreturn),
     );
 }
