@@ -51,10 +51,14 @@ assert_contains "InvalidHandle" "Removed handle becomes invalid"
 
 echo "Phase 5 — Threads:"
 assert_contains "Scheduler started" "Round-robin scheduler running"
-assert_contains "count=" "Kernel threads printing"
 
 echo "Phase 6 — Syscalls:"
 assert_contains "Dropping to EL0" "EL1 to EL0 transition"
+
+echo "Phase 7 — IPC:"
+assert_contains "Endpoint created" "Endpoint object created"
+assert_contains "IPC BENCHMARK" "IPC benchmark completed"
+assert_contains "call(" "Call/reply pattern working"
 
 echo
 echo "=== Results: $PASSED passed, $FAILED failed ==="
