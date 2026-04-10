@@ -48,6 +48,35 @@ extern "C" fn handle_exception_sync(ctx: &ExceptionContext) {
     }
 }
 
+/// Synchronous exception from lower EL (userspace).
+/// Dispatches SVC (syscalls) and prints faults.
+#[no_mangle]
+extern "C" fn handle_exception_sync_lower(ctx: &mut ExceptionContext) {
+    let esr = ctx.esr;
+    let ec = (esr >> 26) & 0x3F;
+
+    match ec {
+        0x15 => {
+            // SVC from AArch64 — syscall dispatch
+            crate::syscall::handler::handle_syscall(ctx);
+        }
+        _ => {
+            // Userspace fault — print details and halt
+            let iss = esr & 0x01FF_FFFF;
+            crate::kprintln!();
+            crate::kprintln!("!!! USERSPACE FAULT !!!");
+            crate::kprintln!("  ELR_EL1:  {:#018x}", ctx.elr);
+            crate::kprintln!("  ESR_EL1:  {:#018x} (EC={:#04x} ISS={:#07x})", esr, ec, iss);
+            let far: u64;
+            unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
+            crate::kprintln!("  FAR_EL1:  {:#018x}", far);
+            loop {
+                unsafe { core::arch::asm!("wfi") };
+            }
+        }
+    }
+}
+
 #[no_mangle]
 extern "C" fn handle_exception_irq(ctx: &ExceptionContext) {
     // Dispatch to the IRQ handler (GIC + timer, added in 3.2/3.3)
@@ -177,8 +206,8 @@ __exception_vectors:
     VECTOR_STUB __vec_serror             // 0x380: SError
 
     // --- Lower EL, AArch64 (userspace exceptions — Phase 6) ---
-    VECTOR_STUB __vec_sync               // 0x400: Synchronous
-    VECTOR_STUB __vec_irq                // 0x480: IRQ
+    VECTOR_STUB __vec_sync_lower         // 0x400: Synchronous (syscalls land here)
+    VECTOR_STUB __vec_irq                // 0x480: IRQ (timer works the same)
     VECTOR_STUB __vec_fiq                // 0x500: FIQ
     VECTOR_STUB __vec_serror             // 0x580: SError
 
@@ -211,6 +240,11 @@ __vec_serror:
     SAVE_REGS                            // Save all registers
     bl      handle_exception_serror      // Call Rust SError handler
     RESTORE_REGS                         // Restore and eret
+
+__vec_sync_lower:
+    SAVE_REGS                            // Save all registers, x0 = &mut ExceptionContext
+    bl      handle_exception_sync_lower  // Call lower-EL sync handler (syscall dispatch)
+    RESTORE_REGS                         // Restore and eret back to EL0
 "#
 );
 

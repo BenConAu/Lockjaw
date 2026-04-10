@@ -6,6 +6,7 @@ mod cap;
 mod mm;
 mod print;
 mod sched;
+mod syscall;
 
 use arch::aarch64::uart::Uart;
 
