@@ -282,22 +282,22 @@ pub extern "C" fn kmain() -> ! {
 // User test function — compiled as kernel code, bytes copied to user page
 // ---------------------------------------------------------------------------
 
-/// Trivial EL0 function: tries to make syscalls (SVC #0).
-/// Before syscall handler is wired (6.1), this will trap as EC=0x15.
-/// After syscall handler (6.2), it will print "Hi" via sys_debug_putc.
+/// EL0 test function: prints characters via sys_debug_putc, yields between
+/// them via sys_yield, then loops to repeat. Demonstrates both syscalls
+/// and voluntary rescheduling from userspace.
 #[unsafe(naked)]
 extern "C" fn user_test_function() -> ! {
     core::arch::naked_asm!(
-        "mov x0, #0x48",                    // 'H' character
-        "mov x8, #0",                        // syscall number: debug_putc
-        "svc #0",                            // trap to kernel
-        "mov x0, #0x69",                     // 'i' character
+        "2:",                                // loop label
+        "mov x0, #0x55",                     // 'U' character (for "User")
         "mov x8, #0",                        // syscall number: debug_putc
         "svc #0",                            // trap to kernel
         "mov x0, #0x0a",                     // newline character
         "mov x8, #0",                        // syscall number: debug_putc
         "svc #0",                            // trap to kernel
-        "b .",                               // loop forever
+        "mov x8, #1",                        // syscall number: yield
+        "svc #0",                            // trap to kernel — reschedule
+        "b 2b",                              // loop back to print again
     )
 }
 

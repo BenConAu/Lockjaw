@@ -3,6 +3,7 @@ use crate::arch::aarch64::uart::Uart;
 
 /// Syscall numbers.
 const SYS_DEBUG_PUTC: u64 = 0;
+const SYS_YIELD: u64 = 1;
 
 /// Dispatch a syscall from userspace.
 /// Called from handle_exception_sync_lower when EC = 0x15 (SVC from AArch64).
@@ -15,6 +16,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
 
     ctx.gpr[0] = match syscall_num {
         SYS_DEBUG_PUTC => sys_debug_putc(arg0),
+        SYS_YIELD => sys_yield(),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             u64::MAX
@@ -28,5 +30,12 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
 fn sys_debug_putc(char_val: u64) -> u64 {
     let uart = Uart::new();
     uart.putc(char_val as u8);
+    0
+}
+
+/// sys_yield: voluntarily reschedule. The calling thread goes to the back
+/// of the run queue and the next ready thread runs.
+fn sys_yield() -> u64 {
+    unsafe { crate::sched::scheduler::tick(); }
     0
 }
