@@ -26,6 +26,7 @@ pub struct Tcb {
     pub entry: fn() -> !,
     pub stack_base: u64,
     pub handle_table_paddr: u64,
+    pub ttbr0_paddr: u64,
     pub ipc_blocked_on: u64,
     pub ipc_msg: [u64; 4],
 }
@@ -39,6 +40,7 @@ pub struct TcbCreateInfo {
     pub entry: fn() -> !,
     pub stack_paddr: PhysAddr,
     pub handle_table_paddr: PhysAddr,
+    pub ttbr0_paddr: PhysAddr,
 }
 
 /// Initialize a TCB in donated memory and set up its stack with a
@@ -89,6 +91,7 @@ pub unsafe fn create_tcb(
         entry: info.entry,
         stack_base: stack_va,
         handle_table_paddr: info.handle_table_paddr.as_u64(),
+        ttbr0_paddr: info.ttbr0_paddr.as_u64(),
         ipc_blocked_on: 0,
         ipc_msg: [0; 4],
     });

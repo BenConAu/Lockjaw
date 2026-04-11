@@ -104,6 +104,22 @@ unsafe fn schedule() {
     // Check stack canary of the thread we're switching away from
     check_thread_canary(old_tcb);
 
+    // Swap TTBR0 if the new thread has a different address space.
+    // TTBR0 is irrelevant during kernel execution (all kernel code
+    // accessed via TTBR1), so swapping before context_switch is safe.
+    // When the new thread eventually erets to EL0, TTBR0 is already set.
+    let new_ttbr0 = (*new_tcb).ttbr0_paddr;
+    if new_ttbr0 != 0 {
+        core::arch::asm!(
+            "msr TTBR0_EL1, {val}",         // Install new process page table
+            "dsb ish",                        // Ensure TTBR0 write completes
+            "tlbi vmalle1is",                 // Flush TLB (all entries, inner shareable)
+            "dsb ish",                        // Ensure TLB flush completes
+            "isb",                            // Sync pipeline
+            val = in(reg) new_ttbr0,
+        );
+    }
+
     // Context switch: save old SP, load new SP, swap callee-saved regs
     let old_sp_ptr = &mut (*old_tcb).saved_sp as *mut u64;
     let new_sp_ptr = &(*new_tcb).saved_sp as *const u64;
