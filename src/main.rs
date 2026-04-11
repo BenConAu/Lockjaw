@@ -393,7 +393,6 @@ fn ipc_receiver() -> ! {
         unsafe {
             let (ep, tcb) = lookup_endpoint();
             let msg = ipc::endpoint::ipc_receive(ep, tcb).expect("receive");
-            // Server logic: double the first value
             let reply = [msg[0] * 2, msg[1], msg[2], msg[3]];
             ipc::endpoint::ipc_reply(ep, reply).expect("reply");
         }

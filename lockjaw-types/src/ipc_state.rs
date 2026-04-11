@@ -50,6 +50,30 @@ pub struct SystemState {
     pub thread_b: ThreadState,
 }
 
+/// An effect the kernel must execute after a state transition.
+/// Derived by comparing before/after SystemState. The kernel maps each
+/// effect to a concrete operation (pointer write, scheduler call) without
+/// making any decisions of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpcEffect {
+    /// Set the endpoint to a new state.
+    SetEndpointState(EpState),
+    /// Block the acting thread (call scheduler::block_current).
+    BlockCurrent,
+    /// Unblock the previously blocked/caller thread (call scheduler::unblock_thread).
+    UnblockThread,
+    /// Store the message in the endpoint buffer (slow path: no partner yet).
+    StoreMessage,
+    /// Transfer the message directly to the blocked thread's ipc_msg field.
+    TransferMessageToBlocked,
+    /// Read the message from the endpoint buffer (receiver taking a stored msg).
+    TakeMessageFromEndpoint,
+    /// Record the caller's TCB paddr in the endpoint (for sys_reply).
+    RecordCaller,
+    /// Clear the caller's TCB paddr after replying.
+    ClearCaller,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransitionError {
     Busy,
@@ -219,6 +243,80 @@ fn step_reply(state: SystemState, _who: Thread) -> Result<SystemState, Transitio
 }
 
 // ---------------------------------------------------------------------------
+// Effect derivation — compare before/after to determine what the kernel does
+// ---------------------------------------------------------------------------
+
+/// Derive the list of effects the kernel must execute for a transition.
+/// The kernel calls step() to get the new state, then derive_effects() to
+/// get the effect list, then executes each effect mechanically.
+///
+/// This function requires `std` (returns Vec) and is only used in tests
+/// and in the kernel (which links against alloc-free code that uses a
+/// fixed-size array instead).
+
+/// Non-allocating version for the kernel: returns effects in a fixed-size array.
+/// Returns (effects, count).
+pub fn derive_effects_array(before: &SystemState, after: &SystemState, who: Thread, op: IpcOp) -> ([IpcEffect; 8], usize) {
+    let mut effects = [IpcEffect::SetEndpointState(EpState::Idle); 8];
+    let mut count = 0;
+
+    let mut push = |e: IpcEffect| {
+        effects[count] = e;
+        count += 1;
+    };
+
+    // Message routing
+    match op {
+        IpcOp::Send | IpcOp::Call => {
+            if before.endpoint == EpState::HasReceiver {
+                push(IpcEffect::TransferMessageToBlocked);
+            } else {
+                push(IpcEffect::StoreMessage);
+            }
+        }
+        IpcOp::Receive => {
+            if before.endpoint == EpState::HasSender || before.endpoint == EpState::HasCaller {
+                push(IpcEffect::TakeMessageFromEndpoint);
+            }
+        }
+        IpcOp::Reply => {
+            push(IpcEffect::TransferMessageToBlocked);
+        }
+    }
+
+    // Caller tracking: record before block, clear after unblock
+    if !before.has_caller && after.has_caller {
+        push(IpcEffect::RecordCaller);
+    }
+
+    // Unblock must happen BEFORE ClearCaller, because the kernel reads
+    // caller_tcb_paddr to know who to unblock.
+    let other = match who { Thread::A => Thread::B, Thread::B => Thread::A };
+    if before.thread_state(other) == ThreadState::Blocked && after.thread_state(other) == ThreadState::Ready {
+        push(IpcEffect::UnblockThread);
+    }
+
+    if before.has_caller && !after.has_caller {
+        push(IpcEffect::ClearCaller);
+    }
+
+    // Endpoint state change — must happen before BlockCurrent
+    if before.endpoint != after.endpoint {
+        push(IpcEffect::SetEndpointState(after.endpoint));
+    }
+
+    // BlockCurrent MUST be last — block_current() context-switches away
+    // and does not return until the thread is unblocked.
+    let who_before = before.thread_state(who);
+    let who_after = after.thread_state(who);
+    if who_before != ThreadState::Blocked && who_after == ThreadState::Blocked {
+        push(IpcEffect::BlockCurrent);
+    }
+
+    (effects, count)
+}
+
+// ---------------------------------------------------------------------------
 // Invariant checks
 // ---------------------------------------------------------------------------
 
@@ -300,6 +398,83 @@ mod tests {
                     if let Ok(next) = step(state, who, op) {
                         next.check_invariants();
                         transition_count += 1;
+
+                        // Derive effects and verify structural invariants
+                        let (effect_arr, effect_count) = derive_effects_array(&state, &next, who, op);
+                        let effects = &effect_arr[..effect_count];
+
+                        assert!(!effects.is_empty(),
+                            "No effects for valid transition: {:?} {:?} {:?} -> {:?}",
+                            state.endpoint, who, op, next.endpoint);
+
+                        // If acting thread became Blocked, must have BlockCurrent
+                        if state.thread_state(who) != ThreadState::Blocked
+                            && next.thread_state(who) == ThreadState::Blocked {
+                            assert!(effects.contains(&IpcEffect::BlockCurrent),
+                                "Thread blocked but no BlockCurrent effect: {:?} {:?}", op, effects);
+                        }
+
+                        // If other thread was unblocked, must have UnblockThread
+                        let other = match who { Thread::A => Thread::B, Thread::B => Thread::A };
+                        if state.thread_state(other) == ThreadState::Blocked
+                            && next.thread_state(other) == ThreadState::Ready {
+                            assert!(effects.contains(&IpcEffect::UnblockThread),
+                                "Thread unblocked but no UnblockThread effect: {:?} {:?}", op, effects);
+                        }
+
+                        // If endpoint state changed, must have SetEndpointState
+                        if state.endpoint != next.endpoint {
+                            let has_set = effects.iter().any(|e| matches!(e, IpcEffect::SetEndpointState(_)));
+                            assert!(has_set,
+                                "Endpoint changed but no SetEndpointState: {:?} {:?}", op, effects);
+                        }
+
+                        // Send/Call must move a message somewhere
+                        if matches!(op, IpcOp::Send | IpcOp::Call) {
+                            let has_msg = effects.contains(&IpcEffect::StoreMessage)
+                                || effects.contains(&IpcEffect::TransferMessageToBlocked);
+                            assert!(has_msg,
+                                "Send/Call without message effect: {:?} {:?}", op, effects);
+                        }
+
+                        // Receive from HasSender/HasCaller must take message
+                        if op == IpcOp::Receive
+                            && (state.endpoint == EpState::HasSender || state.endpoint == EpState::HasCaller) {
+                            assert!(effects.contains(&IpcEffect::TakeMessageFromEndpoint),
+                                "Receive from sender/caller without TakeMessage: {:?}", effects);
+                        }
+
+                        // Caller tracking
+                        if !state.has_caller && next.has_caller {
+                            assert!(effects.contains(&IpcEffect::RecordCaller),
+                                "Caller recorded but no RecordCaller: {:?}", effects);
+                        }
+                        if state.has_caller && !next.has_caller {
+                            assert!(effects.contains(&IpcEffect::ClearCaller),
+                                "Caller cleared but no ClearCaller: {:?}", effects);
+                        }
+
+                        // ORDERING: BlockCurrent must be the LAST effect.
+                        // block_current() context-switches away — any effects
+                        // after it would not execute until the thread wakes up.
+                        if let Some(pos) = effects.iter().position(|e| *e == IpcEffect::BlockCurrent) {
+                            assert_eq!(pos, effect_count - 1,
+                                "BlockCurrent must be last effect but was at position {} of {}: {:?}",
+                                pos, effect_count, effects);
+                        }
+
+                        // ORDERING: UnblockThread must be the FIRST effect
+                        // (excluding message effects). The kernel reads
+                        // blocked_tcb_paddr/caller_tcb_paddr to find who to
+                        // unblock — these fields must not be cleared first.
+                        if effects.contains(&IpcEffect::UnblockThread)
+                            && effects.contains(&IpcEffect::ClearCaller) {
+                            let unblock_pos = effects.iter().position(|e| *e == IpcEffect::UnblockThread).unwrap();
+                            let clear_pos = effects.iter().position(|e| *e == IpcEffect::ClearCaller).unwrap();
+                            assert!(unblock_pos < clear_pos,
+                                "UnblockThread must come before ClearCaller: {:?}", effects);
+                        }
+
                         if !visited.contains(&next) {
                             queue.push_back(next);
                         }

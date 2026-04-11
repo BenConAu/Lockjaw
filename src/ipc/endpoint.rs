@@ -2,7 +2,10 @@ use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
 use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
 use crate::sched::scheduler;
 use crate::sched::tcb::Tcb;
-use lockjaw_types::ipc_state::{EpState, IpcOp, SystemState, TransitionError};
+use lockjaw_types::ipc_state::{
+    EpState, IpcEffect, IpcOp, SystemState, Thread, ThreadState as ModelThreadState,
+    derive_effects_array, step,
+};
 use core::ptr;
 
 // ---------------------------------------------------------------------------
@@ -61,7 +64,7 @@ pub unsafe fn create_endpoint(base_paddr: PhysAddr) -> Result<(), CreateError> {
 }
 
 // ---------------------------------------------------------------------------
-// IPC operations — validated by the lockjaw-types state machine
+// IPC operations — driven entirely by the state machine model
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
@@ -71,184 +74,182 @@ pub enum IpcError {
     InvalidTransition,
 }
 
-impl From<TransitionError> for IpcError {
-    fn from(e: TransitionError) -> Self {
+impl From<lockjaw_types::ipc_state::TransitionError> for IpcError {
+    fn from(e: lockjaw_types::ipc_state::TransitionError) -> Self {
         match e {
-            TransitionError::Busy => IpcError::EndpointBusy,
-            TransitionError::NoCaller => IpcError::NoCaller,
-            TransitionError::ThreadNotRunnable => IpcError::InvalidTransition,
+            lockjaw_types::ipc_state::TransitionError::Busy => IpcError::EndpointBusy,
+            lockjaw_types::ipc_state::TransitionError::NoCaller => IpcError::NoCaller,
+            lockjaw_types::ipc_state::TransitionError::ThreadNotRunnable => IpcError::InvalidTransition,
         }
     }
 }
 
-/// Validate an IPC operation against the state machine model.
-/// Returns the current endpoint state for the caller to act on.
-unsafe fn validate_transition(ep: *const EndpointObject, op: IpcOp) -> Result<EpState, IpcError> {
+/// Build the model SystemState from the live endpoint.
+unsafe fn build_model_state(ep: *const EndpointObject) -> SystemState {
     let current = u8_to_ep_state((*ep).state);
     let has_caller = (*ep).caller_tcb_paddr != 0;
-
-    // Build a SystemState for validation. We model the acting thread as A
-    // (Running) and use B as the blocked/caller thread if one exists.
     let has_blocked = (*ep).blocked_tcb_paddr != 0;
-    let dummy = SystemState {
+
+    SystemState {
         endpoint: current,
         has_caller,
-        blocked_thread: if has_blocked { Some(lockjaw_types::ipc_state::Thread::B) } else { None },
-        caller_thread: if has_caller { Some(lockjaw_types::ipc_state::Thread::B) } else { None },
-        thread_a: lockjaw_types::ipc_state::ThreadState::Running,
+        blocked_thread: if has_blocked { Some(Thread::B) } else { None },
+        caller_thread: if has_caller { Some(Thread::B) } else { None },
+        thread_a: ModelThreadState::Running,
         thread_b: if has_blocked || has_caller {
-            lockjaw_types::ipc_state::ThreadState::Blocked
+            ModelThreadState::Blocked
         } else {
-            lockjaw_types::ipc_state::ThreadState::Ready
+            ModelThreadState::Ready
         },
-    };
-
-    // Validate the transition is legal
-    lockjaw_types::ipc_state::step(dummy, lockjaw_types::ipc_state::Thread::A, op)?;
-    Ok(current)
+    }
 }
 
-/// Send a message on an endpoint.
+/// Execute an IPC operation by consulting the state machine model, deriving
+/// effects, and executing each effect mechanically. The kernel makes zero
+/// decisions — the model decides everything.
+unsafe fn execute_ipc(
+    endpoint_paddr: PhysAddr,
+    op: IpcOp,
+    acting_tcb_paddr: PhysAddr,
+    msg: Option<[u64; 4]>,
+) -> Result<Option<[u64; 4]>, IpcError> {
+    let ep = ep_ptr_mut(endpoint_paddr);
+    let before = build_model_state(ep);
+
+    // Ask the model: is this transition valid? What's the new state?
+    let after = step(before, Thread::A, op)?;
+
+    // Derive effects from the state diff
+    let (effect_arr, effect_count) = derive_effects_array(&before, &after, Thread::A, op);
+
+    // Execute each effect mechanically.
+    // BlockCurrent must be last because it context-switches away — any effects
+    // after it would not execute until the thread is unblocked.
+    let mut received_msg: Option<[u64; 4]> = None;
+    let mut needs_block = false;
+
+    for i in 0..effect_count {
+        match effect_arr[i] {
+            IpcEffect::BlockCurrent => {
+                needs_block = true;
+                continue; // defer to after all other effects
+            }
+            IpcEffect::SetEndpointState(new_state) => {
+                (*ep).state = ep_state_to_u8(new_state);
+            }
+            IpcEffect::StoreMessage => {
+                (*ep).msg = msg.unwrap();
+                (*ep).blocked_tcb_paddr = acting_tcb_paddr.as_u64();
+            }
+            IpcEffect::TransferMessageToBlocked => {
+                if op == IpcOp::Reply {
+                    // Reply: transfer to the caller
+                    let caller_paddr = PhysAddr::new((*ep).caller_tcb_paddr);
+                    let caller_tcb = tcb_ptr_mut(caller_paddr);
+                    (*caller_tcb).ipc_msg = msg.unwrap();
+                } else {
+                    // Send/Call: transfer to the blocked receiver
+                    let blocked_paddr = PhysAddr::new((*ep).blocked_tcb_paddr);
+                    let blocked_tcb = tcb_ptr_mut(blocked_paddr);
+                    (*blocked_tcb).ipc_msg = msg.unwrap();
+                }
+            }
+            IpcEffect::TakeMessageFromEndpoint => {
+                received_msg = Some((*ep).msg);
+                (*ep).msg = [0; 4];
+                (*ep).blocked_tcb_paddr = 0;
+            }
+            IpcEffect::RecordCaller => {
+                (*ep).caller_tcb_paddr = acting_tcb_paddr.as_u64();
+            }
+            IpcEffect::ClearCaller => {
+                (*ep).caller_tcb_paddr = 0;
+            }
+            IpcEffect::UnblockThread => {
+                if op == IpcOp::Reply {
+                    let caller_paddr = PhysAddr::new((*ep).caller_tcb_paddr);
+                    scheduler::unblock_thread(caller_paddr);
+                    // If blocked_tcb_paddr points to the caller (set by
+                    // deferred BlockCurrent during Call fast path), clear it.
+                    // Otherwise a stale paddr poisons build_model_state on
+                    // the next round.
+                    if (*ep).blocked_tcb_paddr == (*ep).caller_tcb_paddr {
+                        (*ep).blocked_tcb_paddr = 0;
+                    }
+                } else {
+                    let blocked_paddr = PhysAddr::new((*ep).blocked_tcb_paddr);
+                    scheduler::unblock_thread(blocked_paddr);
+                    (*ep).blocked_tcb_paddr = 0;
+                }
+            }
+        }
+    }
+
+    // Execute BlockCurrent last — it context-switches away and doesn't
+    // return until the thread is unblocked.
+    if needs_block {
+        // Record this thread as blocked on the endpoint (so the partner can find us)
+        if (*ep).blocked_tcb_paddr == 0 {
+            (*ep).blocked_tcb_paddr = acting_tcb_paddr.as_u64();
+        }
+        let tcb = tcb_ptr_mut(acting_tcb_paddr);
+        (*tcb).ipc_blocked_on = endpoint_paddr.as_u64();
+        scheduler::block_current();
+    }
+
+    // For receive: if we blocked (slow path), message is in our TCB when we wake
+    if op == IpcOp::Receive && received_msg.is_none() {
+        let tcb = tcb_ptr(acting_tcb_paddr);
+        received_msg = Some((*tcb).ipc_msg);
+    }
+
+    // For call: we always block waiting for reply, message is in TCB when we wake
+    if op == IpcOp::Call {
+        let tcb = tcb_ptr(acting_tcb_paddr);
+        received_msg = Some((*tcb).ipc_msg);
+    }
+
+    Ok(received_msg)
+}
+
+// ---------------------------------------------------------------------------
+// Public API — thin wrappers over execute_ipc
+// ---------------------------------------------------------------------------
+
 pub unsafe fn ipc_send(
     endpoint_paddr: PhysAddr,
     msg: [u64; 4],
     sender_tcb_paddr: PhysAddr,
 ) -> Result<(), IpcError> {
-    let ep = ep_ptr_mut(endpoint_paddr);
-    let current = validate_transition(ep, IpcOp::Send)?;
-
-    match current {
-        EpState::HasReceiver => {
-            // Fast path: receiver waiting. Transfer msg, unblock receiver.
-            let receiver_paddr = PhysAddr::new((*ep).blocked_tcb_paddr);
-            let receiver_tcb = tcb_ptr_mut(receiver_paddr);
-            (*receiver_tcb).ipc_msg = msg;
-            scheduler::unblock_thread(receiver_paddr);
-
-            (*ep).state = EP_IDLE;
-            (*ep).blocked_tcb_paddr = 0;
-            Ok(())
-        }
-        EpState::Idle => {
-            // Slow path: block sender.
-            (*ep).state = EP_HAS_SENDER;
-            (*ep).blocked_tcb_paddr = sender_tcb_paddr.as_u64();
-            (*ep).msg = msg;
-
-            let sender_tcb = tcb_ptr_mut(sender_tcb_paddr);
-            (*sender_tcb).ipc_blocked_on = endpoint_paddr.as_u64();
-            scheduler::block_current();
-            Ok(())
-        }
-        _ => Err(IpcError::EndpointBusy),
-    }
+    execute_ipc(endpoint_paddr, IpcOp::Send, sender_tcb_paddr, Some(msg))?;
+    Ok(())
 }
 
-/// Receive a message from an endpoint.
 pub unsafe fn ipc_receive(
     endpoint_paddr: PhysAddr,
     receiver_tcb_paddr: PhysAddr,
 ) -> Result<[u64; 4], IpcError> {
-    let ep = ep_ptr_mut(endpoint_paddr);
-    let current = validate_transition(ep, IpcOp::Receive)?;
-
-    match current {
-        EpState::HasSender => {
-            // Fast path: regular sender waiting. Take msg, unblock sender.
-            let msg = (*ep).msg;
-            let sender_paddr = PhysAddr::new((*ep).blocked_tcb_paddr);
-            scheduler::unblock_thread(sender_paddr);
-
-            (*ep).state = EP_IDLE;
-            (*ep).blocked_tcb_paddr = 0;
-            (*ep).msg = [0; 4];
-            Ok(msg)
-        }
-        EpState::HasCaller => {
-            // Caller waiting. Take msg, do NOT unblock caller.
-            let msg = (*ep).msg;
-            (*ep).state = EP_IDLE;
-            (*ep).blocked_tcb_paddr = 0;
-            (*ep).msg = [0; 4];
-            Ok(msg)
-        }
-        EpState::Idle => {
-            // Slow path: block receiver.
-            (*ep).state = EP_HAS_RECEIVER;
-            (*ep).blocked_tcb_paddr = receiver_tcb_paddr.as_u64();
-
-            let receiver_tcb = tcb_ptr_mut(receiver_tcb_paddr);
-            (*receiver_tcb).ipc_blocked_on = endpoint_paddr.as_u64();
-            scheduler::block_current();
-
-            let receiver_tcb = tcb_ptr(receiver_tcb_paddr);
-            Ok((*receiver_tcb).ipc_msg)
-        }
-        _ => Err(IpcError::EndpointBusy),
-    }
+    let result = execute_ipc(endpoint_paddr, IpcOp::Receive, receiver_tcb_paddr, None)?;
+    Ok(result.unwrap_or([0; 4]))
 }
 
-/// Call: send a message and block waiting for a reply.
 pub unsafe fn ipc_call(
     endpoint_paddr: PhysAddr,
     msg: [u64; 4],
     caller_tcb_paddr: PhysAddr,
 ) -> Result<[u64; 4], IpcError> {
-    let ep = ep_ptr_mut(endpoint_paddr);
-    let current = validate_transition(ep, IpcOp::Call)?;
-
-    (*ep).caller_tcb_paddr = caller_tcb_paddr.as_u64();
-
-    match current {
-        EpState::HasReceiver => {
-            // Fast path: server waiting. Transfer msg, unblock server, block caller.
-            let receiver_paddr = PhysAddr::new((*ep).blocked_tcb_paddr);
-            let receiver_tcb = tcb_ptr_mut(receiver_paddr);
-            (*receiver_tcb).ipc_msg = msg;
-            scheduler::unblock_thread(receiver_paddr);
-
-            (*ep).state = EP_IDLE;
-            (*ep).blocked_tcb_paddr = 0;
-
-            let caller_tcb = tcb_ptr_mut(caller_tcb_paddr);
-            (*caller_tcb).ipc_blocked_on = endpoint_paddr.as_u64();
-            scheduler::block_current();
-
-            let caller_tcb = tcb_ptr(caller_tcb_paddr);
-            Ok((*caller_tcb).ipc_msg)
-        }
-        EpState::Idle => {
-            // Slow path: block caller with message.
-            (*ep).state = EP_HAS_CALLER;
-            (*ep).blocked_tcb_paddr = caller_tcb_paddr.as_u64();
-            (*ep).msg = msg;
-
-            let caller_tcb = tcb_ptr_mut(caller_tcb_paddr);
-            (*caller_tcb).ipc_blocked_on = endpoint_paddr.as_u64();
-            scheduler::block_current();
-
-            let caller_tcb = tcb_ptr(caller_tcb_paddr);
-            Ok((*caller_tcb).ipc_msg)
-        }
-        _ => Err(IpcError::EndpointBusy),
-    }
+    let result = execute_ipc(endpoint_paddr, IpcOp::Call, caller_tcb_paddr, Some(msg))?;
+    Ok(result.unwrap_or([0; 4]))
 }
 
-/// Reply to the last caller on an endpoint.
 pub unsafe fn ipc_reply(
     endpoint_paddr: PhysAddr,
     reply_msg: [u64; 4],
 ) -> Result<(), IpcError> {
-    let ep = ep_ptr_mut(endpoint_paddr);
-    validate_transition(ep, IpcOp::Reply)?;
-
-    let caller_paddr = PhysAddr::new((*ep).caller_tcb_paddr);
-    let caller_tcb = tcb_ptr_mut(caller_paddr);
-    (*caller_tcb).ipc_msg = reply_msg;
-    scheduler::unblock_thread(caller_paddr);
-
-    let ep = ep_ptr_mut(endpoint_paddr);
-    (*ep).caller_tcb_paddr = 0;
+    // For reply, the "acting TCB" is the server — but we only need the endpoint
+    // to find the caller. Pass a dummy for acting_tcb_paddr since reply doesn't
+    // block the acting thread.
+    execute_ipc(endpoint_paddr, IpcOp::Reply, PhysAddr::new(0), Some(reply_msg))?;
     Ok(())
 }
 
