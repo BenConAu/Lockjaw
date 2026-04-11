@@ -3,6 +3,7 @@
 
 mod arch;
 mod cap;
+mod elf;
 mod ipc;
 mod mm;
 mod print;

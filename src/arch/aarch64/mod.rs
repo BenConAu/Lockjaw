@@ -4,6 +4,7 @@ pub mod gic;
 pub mod mmu;
 pub mod timer;
 pub mod uart;
+pub mod vmem;
 
 /// IRQ dispatch — called from the exception vector IRQ stub.
 /// Acknowledges the interrupt via GIC and dispatches by INTID.

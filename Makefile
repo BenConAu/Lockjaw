@@ -4,9 +4,14 @@ KERNEL_ELF_RELEASE := target/aarch64-unknown-none/release/lockjaw
 QEMU := qemu-system-aarch64
 QEMU_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -nographic -kernel
 
-.PHONY: build build-release run run-release objdump nm check-stack test test-unit test-qemu clean
+INIT_ELF := user/init/target/aarch64-unknown-none/release/lockjaw-init
 
-build: check-stack
+.PHONY: build build-release build-user run run-release objdump nm check-stack test test-unit test-qemu clean
+
+build-user:
+	cd user/init && cargo build --release
+
+build: build-user check-stack
 	cargo build
 
 build-release: check-stack
