@@ -13,42 +13,32 @@ The design follows a few core principles:
 - **Vulkan-inspired create-info pattern.** Each object type has its own create-info struct used for both size queries and creation. Same struct, no mismatch.
 - **Proven stack safety.** A custom build tool analyzes the call graph and per-function stack sizes on every build. Indirect calls must be annotated or the build fails.
 - **Map or donate, never both.** A PageSet is either mapped into userspace (MappedPages) or donated for a kernel object. This prevents userspace from reading kernel object internals.
+- **Verified IPC state machine.** The IPC endpoint logic is driven by a pure state machine model that is exhaustively explored at test time — all reachable states, all transitions, all effect orderings verified. The kernel executes effects mechanically; the model makes all decisions.
 
 ## What works today
 
-Lockjaw boots on QEMU, sets up virtual memory, handles interrupts, and runs preemptively scheduled kernel threads. Here is the boot output:
+Lockjaw boots on QEMU, manages virtual memory, handles interrupts, runs preemptively scheduled threads, serves syscalls from EL0 userspace, and passes messages between threads via synchronous IPC with a client/server call/reply pattern.
 
 ```
 === Lockjaw Microkernel v0.1.0 ===
 Target: AArch64 (ARMv8-A), QEMU virt
 
-Memory layout:
-  Kernel load:  0x40080000
-  BSS:          0x40087000 - 0x4008f000 (32768 bytes)
-  Kernel end:   0x4008f000
-  Stack:        0x40090000 - 0x40091000 (4096 bytes)
-
 Physical memory: 0x40000000 - 0x48000000 (32768 pages)
-  Page allocator: 145 reserved, 32623 free
-
-Enabling MMU (identity map)...
+  Page allocator: 153 reserved, 32615 free
 MMU enabled
-Enabling higher-half kernel mapping...
 Higher-half active
 Guard page active (unmapped).
 Stack canary intact.
 Exception vectors installed.
-  GIC distributor: 288 IRQ lines
   GIC initialized, timer PPI 27 enabled
-  Timer frequency: 62500000 Hz
-IRQs unmasked.
-Scheduler started. Entering idle loop.
-
-[A] count=100
-[B] count=150
-[A] count=200
-[B] count=300
-...
+Scheduler started.
+  Endpoint created
+Dropping to EL0...
+[IPC] call(11) -> reply(22)
+[IPC] call(12) -> reply(24)
+[IPC] call(13) -> reply(26)
+[IPC BENCHMARK] 10000 call/reply round-trips in 16 ticks
+[IPC BENCHMARK] 625 round-trips per tick
 ```
 
 ### Completed phases
@@ -63,13 +53,30 @@ Scheduler started. Entering idle loop.
 
 **Phase 5 -- Threads and Context Switching.** Thread Control Blocks with per-thread 4 KB stacks. Assembly `context_switch` saves/restores callee-saved registers and swaps SP. Round-robin scheduler driven by the timer interrupt. Preemptive multithreading verified with interleaved output from concurrent threads.
 
+**Phase 6 -- Syscall Interface.** Userspace code runs at EL0 (unprivileged). SVC traps to kernel via separate lower-EL exception vector. Syscall dispatch on x8 register. `sys_debug_putc` for UART output, `sys_yield` for voluntary rescheduling. User page tables in TTBR0 with PXN/UXN security bits.
+
+**Phase 7 -- IPC.** Synchronous rendezvous message passing through Endpoint objects. Four message registers (x0-x3) transferred between threads. Send/receive with blocking, call/reply for client/server patterns. IPC state machine exhaustively verified: 20 reachable states, 36 transitions, all invariants checked. The kernel's IPC is driven entirely by the verified model — it executes derived effects mechanically without making decisions. 10,000 call/reply round-trips in 16 ticks on QEMU.
+
+### Testing
+
+Three layers of automated testing run on every build:
+
+| Layer | Count | What it tests |
+|-------|-------|---------------|
+| Unit tests (host) | 36 | Pure logic: address types, PTE bitfields, rights, object sizes, IPC state machine |
+| Integration tests (QEMU) | 19 | Full boot through all phases, expected serial output |
+| Stack analysis | 3 | No recursion, depth within budget, all indirect calls annotated |
+| **Total** | **58** | `make test` runs everything |
+
+The IPC state machine test exhaustively explores all reachable system states (endpoint state x thread states) via BFS and verifies: no kernel-caused deadlocks, all invariants hold, all effect orderings correct (BlockCurrent always last, UnblockThread before ClearCaller).
+
 ### Build tool: stack depth verification
 
-`cargo xtask check-stack` runs on every build and verifies:
+`cargo xtask check-stack` runs automatically before every `make build` and verifies:
 
 - **No recursion** -- detects cycles in the call graph (DFS on disassembly)
 - **Stack depth within budget** -- sums per-function frame sizes along the worst-case path (normal path budget: 3072 bytes, interrupt path: 1024 bytes)
-- **All indirect calls annotated** -- every `BLR` instruction must be listed in `xtask/stack-annotations.toml` with its known targets, or the build fails
+- **All indirect calls annotated** -- every `BLR` instruction must be listed in `xtask/stack-annotations.toml` with its known targets, or the build fails. No silent underestimation.
 
 ## Building and running
 
@@ -82,12 +89,15 @@ rustup component add llvm-tools
 brew install qemu  # or apt install qemu-system-aarch64
 ```
 
-### Build and run
+### Build, run, and test
 
 ```sh
-make build          # Build the kernel (debug)
+make build          # Build (runs stack check first)
 make run            # Build and run in QEMU
-make check-stack    # Verify stack depth and no recursion
+make test           # Run all tests (unit + integration + stack)
+make test-unit      # Host-side unit tests only
+make test-qemu      # QEMU integration tests only
+make check-stack    # Stack depth and call graph analysis
 make objdump        # Disassemble the kernel
 ```
 
@@ -97,29 +107,41 @@ QEMU is invoked with `-machine virt,gic-version=3 -cpu cortex-a53 -nographic`. P
 
 ```
 src/
-  main.rs                    # kmain, panic handler, boot banner, test threads
+  main.rs                    # kmain, panic handler, boot banner, IPC threads
   print.rs                   # kprintln! macro
   arch/aarch64/
-    boot.rs                  # _start entry point (EL2 to EL1, stack, BSS)
+    boot.rs                  # _start entry point (EL2 to EL1, FP enable, stack, BSS)
     uart.rs                  # PL011 UART driver
-    mmu.rs                   # Page tables, MMU enable, higher-half, guard page
+    mmu.rs                   # Page tables, MMU enable, higher-half, guard page, user pages
     exceptions.rs            # Exception vector table, register save/restore
     gic.rs                   # GICv3 interrupt controller
     timer.rs                 # Virtual timer (10ms periodic ticks)
   mm/
-    addr.rs                  # PhysAddr, PhysPage newtypes
+    addr.rs                  # PhysAddr, PhysPage newtypes (re-exports from lockjaw-types)
     page_alloc.rs            # Bitmap page allocator
-    page_table.rs            # PageTableEntry, PageTable types
+    page_table.rs            # PageTableEntry, PageTable types (re-exports from lockjaw-types)
     stack.rs                 # Stack canary init/check
   cap/
     object.rs                # ObjectType, create-info pattern, query/create
     handle_table.rs          # Handle insert/lookup/remove with rights
-    rights.rs                # Rights bitmask (Read, Write, Grant)
+    rights.rs                # Rights bitmask (re-exports from lockjaw-types)
     pageset.rs               # PageSet allocation and donation
   sched/
-    tcb.rs                   # Thread Control Block
+    tcb.rs                   # Thread Control Block with per-thread handle tables
     context.rs               # context_switch assembly, thread_entry trampoline
-    scheduler.rs             # Round-robin scheduler
+    scheduler.rs             # Round-robin scheduler with block/unblock
+  ipc/
+    endpoint.rs              # Endpoint object, effect-driven send/receive/call/reply
+  syscall/
+    handler.rs               # Syscall dispatch (debug_putc, yield, send, receive, call, reply)
+
+lockjaw-types/               # Pure-logic library crate, testable on host (x86_64)
+  src/
+    addr.rs                  # PhysAddr, PhysPage, PAGE_SIZE
+    page_table.rs            # PageTableEntry, PageTable, MAIR/AP/SH constants
+    rights.rs                # Rights bitmask
+    object.rs                # ObjectType, ObjectSize, create-info structs
+    ipc_state.rs             # IPC state machine model, exhaustive verification
 
 docs/                        # Book of Lockjaw -- design documentation
   memory-model.md            # Why the kernel never allocates
@@ -127,7 +149,13 @@ docs/                        # Book of Lockjaw -- design documentation
   higher-half-kernel.md      # Why the kernel lives in the upper VA half
   kernel-drivers.md          # Why GIC and timer are the only kernel drivers
   threads.md                 # Context switching and preemptive scheduling
+  syscalls.md                # Syscall ABI, EL0 drop, yield
+  ipc.md                     # IPC design, the two ABIs, message registers
+  development-journal.md     # Contemporaneous account of building Lockjaw
   yagni-parking-lot.md       # Removed code tracked for future phases
+
+tests/
+  qemu_integration.sh        # Boot QEMU, assert expected serial output
 ```
 
 ## Roadmap
@@ -139,9 +167,9 @@ docs/                        # Book of Lockjaw -- design documentation
 | 3. Exceptions and Interrupts | Done | Vector table, GICv3, timer |
 | 4. Object Model | Done | Typed objects, handles, rights, PageSets |
 | 5. Threads | Done | TCB, context switch, preemptive round-robin scheduler |
-| 6. Syscall Interface | Next | Drop to EL0, SVC handler, core syscalls |
-| 7. IPC | Planned | Synchronous endpoint-based message passing |
-| 8. Userspace Processes | Planned | ELF loader, init process, isolated address spaces |
+| 6. Syscall Interface | Done | Drop to EL0, SVC handler, debug_putc, yield |
+| 7. IPC | Done | Synchronous endpoints, call/reply, verified state machine |
+| 8. Userspace Processes | Next | ELF loader, init process, isolated address spaces |
 | 9. Userspace Drivers | Planned | UART driver in userspace, IRQ notifications |
 | 10. POSIX Compatibility | Stretch | POSIX personality server, musl libc port |
 
