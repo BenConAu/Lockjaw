@@ -263,68 +263,94 @@ pub extern "C" fn kmain() -> ! {
     kprintln!("Scheduler started.");
     kprintln!();
 
-    // --- Phase 6: Drop to EL0 ---
-    kprintln!("Setting up user page tables...");
+    // --- Phase 8: Load init process from embedded ELF ---
+    kprintln!();
+    kprintln!("Loading init process...");
+
+    // The init ELF binary, built separately and embedded at compile time
+    static INIT_ELF: &[u8] = include_bytes!("../user/init/target/aarch64-unknown-none/release/lockjaw-init");
+
     unsafe {
-        // Allocate a code page and a stack page for userspace
-        let code_page = mm::page_alloc::alloc_page().expect("user code page").start_addr();
-        let stack_page = mm::page_alloc::alloc_page().expect("user stack page").start_addr();
+        use arch::aarch64::vmem::{Mapping, create_address_space};
 
-        // Copy user test function bytes into the code page
-        let code_src = user_test_function as *const u8;
-        let code_dst = (code_page.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut u8;
-        // Copy 64 bytes (more than enough for the small test function)
-        core::ptr::copy_nonoverlapping(code_src, code_dst, 64);
+        // Parse the ELF
+        let elf_info = elf::parse_elf(INIT_ELF).expect("failed to parse init ELF");
+        kprintln!("  Entry point: {:#x}", elf_info.entry_point);
+        kprintln!("  {} loadable segment(s)", elf_info.segment_count);
 
-        // Flush caches so the I-cache sees the copied code bytes
-        for offset in (0u64..64).step_by(64) {
-            let addr = code_dst as u64 + offset;
-            core::arch::asm!(
-                "dc cvau, {addr}",               // Clean D-cache line to Point of Unification
-                addr = in(reg) addr,
-            );
+        // Build mappings: allocate pages for each segment, copy data
+        let mut mappings = [Mapping { virt_addr: 0, phys_addr: mm::addr::PhysAddr::new(0), user_accessible: false, executable: false }; 16];
+        let mut mapping_count = 0;
+
+        for i in 0..elf_info.segment_count {
+            let seg = &elf_info.segments[i];
+            let num_pages = ((seg.mem_size + mm::addr::PAGE_SIZE - 1) / mm::addr::PAGE_SIZE) as usize;
+            kprintln!("  Segment {}: VA {:#x}, {} page(s), {}{}",
+                i, seg.vaddr, num_pages,
+                if seg.executable { "X" } else { "-" },
+                if seg.writable { "W" } else { "R" });
+
+            for p in 0..num_pages {
+                let page = mm::page_alloc::alloc_page().expect("segment page");
+                let page_va = page.start_addr().as_u64() + mm::addr::KERNEL_VA_OFFSET;
+
+                // Copy file data into this page (if any)
+                let seg_page_offset = (p as u64) * mm::addr::PAGE_SIZE;
+                let file_start = seg.file_offset + seg_page_offset;
+                let file_remaining = if seg.file_size > seg_page_offset {
+                    core::cmp::min(seg.file_size - seg_page_offset, mm::addr::PAGE_SIZE)
+                } else {
+                    0
+                };
+
+                // Zero the page first (for BSS-style segments where mem_size > file_size)
+                core::ptr::write_bytes(page_va as *mut u8, 0, mm::addr::PAGE_SIZE as usize);
+
+                if file_remaining > 0 {
+                    let src = &INIT_ELF[file_start as usize..(file_start + file_remaining) as usize];
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), page_va as *mut u8, file_remaining as usize);
+                }
+
+                mappings[mapping_count] = Mapping {
+                    virt_addr: seg.vaddr + seg_page_offset,
+                    phys_addr: page.start_addr(),
+                    user_accessible: true,
+                    executable: seg.executable,
+                };
+                mapping_count += 1;
+            }
         }
-        core::arch::asm!(
-            "dsb ish",                            // Ensure D-cache clean completes
-            "ic iallu",                           // Invalidate entire I-cache
-            "dsb ish",                            // Ensure I-cache invalidation completes
-            "isb",                                // Sync pipeline
-        );
 
-        // Set up user page tables: map code + stack at user VAs
-        arch::aarch64::mmu::setup_user_page_tables(code_page, stack_page);
-        kprintln!("  Code page:  phys {:#x} -> VA {:#x}", code_page.as_u64(), arch::aarch64::mmu::USER_CODE_VA);
-        kprintln!("  Stack page: phys {:#x} -> VA {:#x}", stack_page.as_u64(), arch::aarch64::mmu::USER_STACK_VA);
+        // Allocate user stack page
+        let stack_page = mm::page_alloc::alloc_page().expect("user stack page");
+        let user_stack_va: u64 = 0x0080_0000; // 8 MB
+        let user_stack_top: u64 = user_stack_va + mm::addr::PAGE_SIZE;
+        mappings[mapping_count] = Mapping {
+            virt_addr: user_stack_va,
+            phys_addr: stack_page.start_addr(),
+            user_accessible: true,
+            executable: false,
+        };
+        mapping_count += 1;
+
+        // Create the address space (allocate page tables, map everything)
+        let ttbr0 = create_address_space(&mappings[..mapping_count]);
+        kprintln!("  Address space created: TTBR0 = {:#x}", ttbr0.as_u64());
+
+        // Flush I-cache (we copied code into pages)
+        core::arch::asm!(
+            "ic iallu",                           // Invalidate entire I-cache
+            "dsb ish",
+            "isb",
+        );
 
         kprintln!("Dropping to EL0...");
-        arch::aarch64::mmu::drop_to_el0(
-            arch::aarch64::mmu::USER_CODE_VA,
-            arch::aarch64::mmu::USER_STACK_TOP,
+        arch::aarch64::mmu::drop_to_el0_with_ttbr0(
+            ttbr0,
+            elf_info.entry_point,
+            user_stack_top,
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// User test function — compiled as kernel code, bytes copied to user page
-// ---------------------------------------------------------------------------
-
-/// EL0 test function: prints characters via sys_debug_putc, yields between
-/// them via sys_yield, then loops to repeat. Demonstrates both syscalls
-/// and voluntary rescheduling from userspace.
-#[unsafe(naked)]
-extern "C" fn user_test_function() -> ! {
-    core::arch::naked_asm!(
-        "2:",                                // loop label
-        "mov x0, #0x55",                     // 'U' character (for "User")
-        "mov x8, #0",                        // syscall number: debug_putc
-        "svc #0",                            // trap to kernel
-        "mov x0, #0x0a",                     // newline character
-        "mov x8, #0",                        // syscall number: debug_putc
-        "svc #0",                            // trap to kernel
-        "mov x8, #1",                        // syscall number: yield
-        "svc #0",                            // trap to kernel — reschedule
-        "b 2b",                              // loop back to print again
-    )
 }
 
 // ---------------------------------------------------------------------------

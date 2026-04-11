@@ -60,6 +60,12 @@ assert_contains "Endpoint created" "Endpoint object created"
 assert_contains "IPC BENCHMARK" "IPC benchmark completed"
 assert_contains "call(" "Call/reply pattern working"
 
+echo "Phase 8 — Userspace Processes:"
+assert_contains "Loading init process" "Init ELF loading started"
+assert_contains "Entry point: 0x400000" "ELF entry point parsed"
+assert_contains "Address space created" "Per-process page tables allocated"
+assert_contains "Hello from userspace init" "Init process running from ELF"
+
 echo
 echo "=== Results: $PASSED passed, $FAILED failed ==="
 

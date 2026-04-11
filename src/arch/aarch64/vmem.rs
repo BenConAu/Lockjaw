@@ -63,25 +63,41 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> PhysAddr {
 
     // Map each user page. Group by L2 index (2MB region) and allocate
     // L3 tables as needed.
-    // Track which L2 entries already have L3 tables
-    let mut l3_tables: [Option<*mut PageTable>; 512] = [None; 512];
+    // Track which L2 entries already have L3 tables.
+    // Only need to track the few L2 indices that user pages fall in.
+    // With our VA layout (pages around 0x400000-0x800000), at most ~4 L2 regions.
+    const MAX_L3_TABLES: usize = 8;
+    let mut l3_indices: [usize; MAX_L3_TABLES] = [usize::MAX; MAX_L3_TABLES];
+    let mut l3_ptrs: [*mut PageTable; MAX_L3_TABLES] = [core::ptr::null_mut(); MAX_L3_TABLES];
+    let mut l3_count: usize = 0;
 
     for m in mappings {
         let l2_idx = ((m.virt_addr >> 21) & 0x1FF) as usize;
         let l3_idx = ((m.virt_addr >> 12) & 0x1FF) as usize;
 
         // Allocate L3 table for this 2MB region if not already done
-        let l3_va = if let Some(existing) = l3_tables[l2_idx] {
-            existing
-        } else {
-            let l3_page = page_alloc::alloc_page().expect("L3 page");
-            let va = (l3_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
-            ptr::write_bytes(va, 0, 1);
+        let l3_va = {
+            let mut found: *mut PageTable = core::ptr::null_mut();
+            for j in 0..l3_count {
+                if l3_indices[j] == l2_idx {
+                    found = l3_ptrs[j];
+                    break;
+                }
+            }
+            if found.is_null() {
+                assert!(l3_count < MAX_L3_TABLES, "too many L3 tables needed");
+                let l3_page = page_alloc::alloc_page().expect("L3 page");
+                let va = (l3_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+                ptr::write_bytes(va, 0, 1);
 
-            // L2[idx] → L3
-            (*l2_va).entries[l2_idx] = PageTableEntry::new_table(l3_page.start_addr());
-            l3_tables[l2_idx] = Some(va);
-            va
+                (*l2_va).entries[l2_idx] = PageTableEntry::new_table(l3_page.start_addr());
+                l3_indices[l3_count] = l2_idx;
+                l3_ptrs[l3_count] = va;
+                l3_count += 1;
+                va
+            } else {
+                found
+            }
         };
 
         // Build the page entry with appropriate permissions
