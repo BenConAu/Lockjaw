@@ -78,11 +78,15 @@ pub fn alloc_page() -> Option<PhysPage> {
     }
 }
 
-/// Free a previously allocated page. Panics on double-free.
-pub fn dealloc_page(page: PhysPage) {
+/// Free a previously allocated page. Returns false on double-free
+/// (page was not allocated). Callers should treat double-free as a
+/// kernel bug and panic — but the decision is theirs.
+pub fn dealloc_page(page: PhysPage) -> bool {
     unsafe {
         let idx = page_index(page.start_addr());
-        assert!(is_set(idx), "dealloc_page: double free of page {:#x}", page.start_addr().as_u64());
+        if !is_set(idx) {
+            return false;
+        }
         clear_bit(idx);
         ALLOCATED_COUNT -= 1;
 
@@ -90,6 +94,7 @@ pub fn dealloc_page(page: PhysPage) {
         if idx < NEXT_FREE_HINT {
             NEXT_FREE_HINT = idx;
         }
+        true
     }
 }
 

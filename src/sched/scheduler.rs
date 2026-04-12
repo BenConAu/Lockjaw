@@ -23,11 +23,15 @@ static mut ACTIVE: bool = false;
 
 /// Register a thread in the run queue. The first thread registered (index 0)
 /// is the idle thread — its saved_sp will be filled on the first context switch.
-pub unsafe fn add_thread(tcb_paddr: PhysAddr) {
+/// Returns false if the run queue is full (MAX_THREADS reached).
+pub unsafe fn add_thread(tcb_paddr: PhysAddr) -> bool {
     let idx = THREAD_COUNT;
-    assert!(idx < MAX_THREADS, "too many threads");
+    if idx >= MAX_THREADS {
+        return false;
+    }
     THREADS[idx] = Some(tcb_paddr);
     THREAD_COUNT += 1;
+    true
 }
 
 /// Start the scheduler. Must be called after all initial threads are added.

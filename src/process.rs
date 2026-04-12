@@ -129,7 +129,9 @@ pub unsafe fn create_process(
     (*tcb_va).ipc_msg[0] = entry_point;
     (*tcb_va).ipc_msg[1] = stack_va + PAGE_SIZE;
 
-    scheduler::add_thread(tcb_page.start_addr());
+    if !scheduler::add_thread(tcb_page.start_addr()) {
+        return Err("scheduler run queue full");
+    }
 
     Ok(())
 }
