@@ -18,13 +18,13 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ## Static IRQ binding table (32-slot cap)
 
-**Where:** Not yet implemented (planned for Milestone 9.3)
+**Where:** `src/arch/aarch64/irq_bind.rs`
 
-**What:** IRQ-to-Notification bindings stored in a static array of 32 entries. Cannot grow dynamically.
+**What:** IRQ-to-Notification bindings stored in a static array of 32 entries. Cannot grow dynamically. No unbind, no conflict detection, no ownership tracking.
 
 **Why bootstrap:** Same pattern as PageSet table. A single UART IRQ binding doesn't need more.
 
-**Fix:** Device manager process owns the binding table in allocated pages, receives registration requests from drivers via IPC, calls sys_bind_irq on their behalf. Policy (which driver gets which IRQ, conflict detection) moves to userspace. The kernel syscall stays simple: one binding at a time.
+**Fix:** Superseded by the device manager (see below). The device manager owns the binding table, the kernel syscall stays simple: one binding at a time.
 
 ---
 
@@ -85,3 +85,25 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 **Why:** Adding dedicated fields to the TCB would increase its size. The ipc_msg fields are unused until the thread starts IPC operations.
 
 **Fix:** Add `user_entry_point: u64` and `user_stack_top: u64` fields to the TCB struct. The ipc_msg field should only be used for IPC.
+
+---
+
+## No device manager process
+
+**Where:** Affects `src/arch/aarch64/irq_bind.rs`, `src/syscall/handler.rs` (sys_map_pages with MAP_FLAG_DEVICE, sys_bind_irq)
+
+**What:** Drivers currently call sys_bind_irq and sys_map_pages(MAP_FLAG_DEVICE) directly with hardcoded physical addresses and INTIDs. There is no authority controlling which driver gets which hardware resources. Any process that can call these syscalls can map any MMIO region or claim any IRQ.
+
+The eventual design is a **device manager** process that:
+
+1. **Parses the DTB (device tree blob)** at boot to discover hardware: MMIO base addresses, sizes, IRQ numbers, compatible strings. QEMU `-machine virt` provides a DTB at a known address that the kernel can pass to the device manager.
+
+2. **Owns the IRQ binding table** in its own allocated pages (replacing the static 32-slot kernel table). Drivers request IRQ bindings via IPC to the device manager, which calls sys_bind_irq on their behalf.
+
+3. **Grants MMIO access** by allocating PageSets covering device memory regions and donating them to the requesting driver. The device manager is the only process that calls sys_map_pages with MAP_FLAG_DEVICE — drivers receive pre-mapped pages or capabilities to map them.
+
+4. **Enforces policy:** which driver gets which device (by compatible string or explicit config), conflict detection (two drivers claiming the same MMIO range or IRQ), and revocation.
+
+**Why bootstrap:** Phase 9 only needs one UART driver with one known MMIO address and one IRQ. Hardcoding works. The DTB parser and resource arbitration are substantial — worth their own phase.
+
+**Fix:** Dedicated phase. The kernel's sys_bind_irq and sys_map_pages syscalls stay as-is (simple, low-level primitives). The device manager sits on top as the userspace authority that decides who gets to call them and with what arguments.
