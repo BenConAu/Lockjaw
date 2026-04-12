@@ -66,6 +66,8 @@ assert_contains "Entry point: 0x400000" "ELF entry point parsed"
 assert_contains "Address space created" "Per-process page tables allocated"
 assert_contains "Hello from userspace init" "Init process running from ELF"
 assert_contains "alloc_pages(1) OK" "sys_alloc_pages works from userspace"
+assert_contains "map_pages OK" "sys_map_pages works from userspace"
+assert_contains "mapped memory read/write OK" "Mapped memory accessible from userspace"
 
 echo
 echo "=== Results: $PASSED passed, $FAILED failed ==="

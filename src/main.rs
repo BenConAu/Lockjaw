@@ -339,6 +339,12 @@ pub extern "C" fn kmain() -> ! {
             .expect("failed to create address space");
         kprintln!("  Address space created: TTBR0 = {:#x}", ttbr0.as_u64());
 
+        // Store the TTBR0 in the boot/idle thread's TCB so that syscalls
+        // from the init process can find the caller's address space.
+        let current_tcb_paddr = sched::scheduler::current_tcb_paddr();
+        let current_tcb = (current_tcb_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut sched::tcb::Tcb;
+        (*current_tcb).ttbr0_paddr = ttbr0.as_u64();
+
         // Flush I-cache (we copied code into pages)
         core::arch::asm!(
             "ic iallu",                           // Invalidate entire I-cache

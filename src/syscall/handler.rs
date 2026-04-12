@@ -16,6 +16,7 @@ const SYS_RECEIVE: u64 = 3;
 const SYS_CALL: u64 = 4;
 const SYS_REPLY: u64 = 5;
 const SYS_ALLOC_PAGES: u64 = 6;
+const SYS_MAP_PAGES: u64 = 7;
 
 /// Dispatch a syscall from userspace.
 /// Called from handle_exception_sync_lower when EC = 0x15 (SVC from AArch64).
@@ -33,6 +34,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_CALL => sys_call(ctx),
         SYS_REPLY => sys_reply(ctx),
         SYS_ALLOC_PAGES => sys_alloc_pages(ctx),
+        SYS_MAP_PAGES => sys_map_pages(ctx),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             u64::MAX
@@ -184,5 +186,37 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> u64 {
     match crate::cap::pageset_table::alloc_pages(count) {
         Some(id) => id,
         None => u64::MAX,
+    }
+}
+
+/// sys_map_pages(page_set_id, virt_addr) — map a PageSet into the caller's address space.
+/// x0 = PageSet ID (from sys_alloc_pages).
+/// x1 = virtual address to map at (must be page-aligned, in user range).
+/// Returns 0 on success, u64::MAX on failure.
+fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
+    let pageset_id = ctx.gpr[0];
+    let virt_addr = ctx.gpr[1];
+
+    unsafe {
+        // Look up the PageSet
+        let (count, pages) = match crate::cap::pageset_table::get_pageset(pageset_id) {
+            Some(ps) => ps,
+            None => return u64::MAX,
+        };
+
+        // Get the caller's TTBR0 from their TCB
+        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
+        let ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
+
+        if ttbr0.as_u64() == 0 {
+            return u64::MAX; // kernel threads don't have a user address space
+        }
+
+        // Map the pages into the caller's address space
+        match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages[..count]) {
+            Ok(()) => 0,
+            Err(_) => u64::MAX,
+        }
     }
 }

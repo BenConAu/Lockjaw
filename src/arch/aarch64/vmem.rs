@@ -141,3 +141,93 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
 
     Ok(l0_page.start_addr())
 }
+
+/// Map pages into an existing address space (identified by its L0 paddr).
+/// Walks L0→L1→L2, allocates an L3 table if the target 2MB region doesn't
+/// have one, and writes page entries for the given physical pages at the
+/// requested virtual address.
+///
+/// All mapped pages get AP_RW_ALL (user read-write), UXN + PXN (no execute).
+/// This is the mapping for user data/heap pages, not code.
+///
+/// Validation is done by the pure model in lockjaw_types::vmem (tested on host).
+///
+/// # Safety
+/// `ttbr0_paddr` must be a valid L0 page table. All page paddrs must be valid.
+pub unsafe fn map_pages_in_existing(
+    ttbr0_paddr: PhysAddr,
+    virt_addr: u64,
+    pages: &[PhysAddr],
+) -> Result<(), VmemError> {
+    use lockjaw_types::vmem::{validate_mapping, map_action_for_l2, MapValidation, MapAction, L2SlotState};
+
+    // Validate using the pure model (tested by unit tests)
+    let (l2_idx, l3_start) = match validate_mapping(virt_addr, pages.len()) {
+        MapValidation::Ok { l2_idx, l3_start } => (l2_idx, l3_start),
+        _ => return Err(VmemError::TooManyMappings),
+    };
+
+    // Walk L0 → L1 → L2 (read existing page table pointers)
+    let l0_va = (ttbr0_paddr.as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
+    let l0_entry = (*l0_va).entries[0];
+    if !l0_entry.is_table() {
+        return Err(VmemError::OutOfPages);
+    }
+
+    let l1_va = (l0_entry.output_addr().as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
+    let l1_entry = (*l1_va).entries[0];
+    if !l1_entry.is_table() {
+        return Err(VmemError::OutOfPages);
+    }
+
+    let l2_va = (l1_entry.output_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+
+    // Determine L2 slot state and ask the model what to do
+    let l2_entry = (*l2_va).entries[l2_idx];
+    let l2_state = if l2_entry.is_table() {
+        L2SlotState::HasL3Table
+    } else if !l2_entry.is_valid() {
+        L2SlotState::Empty
+    } else {
+        L2SlotState::IsBlock
+    };
+
+    let l3_va = match map_action_for_l2(l2_state) {
+        MapAction::UseExistingL3 => {
+            let l3_paddr = l2_entry.output_addr();
+            (l3_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut PageTable
+        }
+        MapAction::AllocateL3 => {
+            let l3_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
+            let va = (l3_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+            ptr::write_bytes(va, 0, 1);
+            (*l2_va).entries[l2_idx] = PageTableEntry::new_table(l3_page.start_addr());
+            va
+        }
+        MapAction::ErrorBlockConflict => {
+            return Err(VmemError::TooManyL3Regions);
+        }
+    };
+
+    // Map each page at the L3 indices computed by the model
+    for (i, phys) in pages.iter().enumerate() {
+        let l3_idx = l3_start + i;
+
+        // User data page: read-write, no execute
+        let entry = PageTableEntry::new_page(*phys, MAIR_NORMAL, AP_RW_ALL, SH_INNER)
+            .with_uxn()
+            .with_pxn();
+
+        (*l3_va).entries[l3_idx] = entry;
+    }
+
+    // TLB invalidate so the new mappings take effect
+    core::arch::asm!(
+        "dsb ish",
+        "tlbi vmalle1is",
+        "dsb ish",
+        "isb",
+    );
+
+    Ok(())
+}
