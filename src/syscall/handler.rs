@@ -35,6 +35,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_CREATE_PROCESS => sys_create_process(ctx),
         SYS_SIGNAL_NOTIFICATION => sys_signal_notification(ctx),
         SYS_WAIT_NOTIFICATION => sys_wait_notification(ctx),
+        SYS_BIND_IRQ => sys_bind_irq(ctx),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             SYS_ERR_INVALID_PARAMETER
@@ -270,6 +271,29 @@ fn sys_wait_notification(ctx: &mut ExceptionContext) -> u64 {
             Ok(value) => value,
             Err(lockjaw_types::notification_state::NotificationError::AlreadyHasWaiter) => SYS_ERR_ALREADY_WAITING,
             Err(_) => SYS_ERR_UNKNOWN,
+        }
+    }
+}
+
+/// sys_bind_irq(intid, notification_handle) — bind a hardware IRQ to a notification.
+/// x0 = hardware INTID, x1 = notification handle.
+/// When the IRQ fires, the kernel signals the notification (increments timeline by 1).
+/// Returns SYS_OK on success.
+fn sys_bind_irq(ctx: &mut ExceptionContext) -> u64 {
+    let intid = ctx.gpr[0] as u32;
+    let notif_handle = ctx.gpr[1] as u32;
+
+    unsafe {
+        let entry = match lookup_handle(notif_handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Notification) {
+            Ok(e) => e,
+            Err(code) => return code,
+        };
+
+        let notif_paddr = PhysAddr::new(entry.object_paddr);
+        if crate::arch::aarch64::irq_bind::bind(intid, notif_paddr) {
+            SYS_OK
+        } else {
+            SYS_ERR_INVALID_PARAMETER
         }
     }
 }

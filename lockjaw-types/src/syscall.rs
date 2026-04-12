@@ -49,3 +49,4 @@ pub const SYS_CREATE_PROCESS: u64 = 8;
 pub const SYS_MAP_DEVICE_MEMORY: u64 = 9;
 pub const SYS_SIGNAL_NOTIFICATION: u64 = 10;
 pub const SYS_WAIT_NOTIFICATION: u64 = 11;
+pub const SYS_BIND_IRQ: u64 = 12;
