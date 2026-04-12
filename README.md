@@ -17,28 +17,31 @@ The design follows a few core principles:
 
 ## What works today
 
-Lockjaw boots on QEMU, manages virtual memory, handles interrupts, runs preemptively scheduled threads, serves syscalls from EL0 userspace, and passes messages between threads via synchronous IPC with a client/server call/reply pattern.
+Lockjaw boots on QEMU, manages virtual memory, handles interrupts, runs preemptively scheduled threads, serves syscalls from EL0 userspace, passes messages between threads via synchronous IPC, and runs multiple isolated userspace processes loaded from ELF binaries.
 
 ```
 === Lockjaw Microkernel v0.1.0 ===
-Target: AArch64 (ARMv8-A), QEMU virt
-
 Physical memory: 0x40000000 - 0x48000000 (32768 pages)
-  Page allocator: 153 reserved, 32615 free
 MMU enabled
 Higher-half active
-Guard page active (unmapped).
-Stack canary intact.
 Exception vectors installed.
   GIC initialized, timer PPI 27 enabled
-Scheduler started.
   Endpoint created
+Loading init process...
+  Entry point: 0x400000
 Dropping to EL0...
-[IPC] call(11) -> reply(22)
-[IPC] call(12) -> reply(24)
-[IPC] call(13) -> reply(26)
-[IPC BENCHMARK] 10000 call/reply round-trips in 16 ticks
-[IPC BENCHMARK] 625 round-trips per tick
+Hello from userspace init!
+init: alloc_pages(1) OK, id=0
+init: map_pages OK
+init: mapped memory read/write OK
+init: parsing child ELF...
+init: spawning child process...
+init: child spawned successfully!
+init: alive
+Hello from child process!
+child: alive
+init: alive
+child: alive
 ```
 
 ### Completed phases
@@ -57,16 +60,18 @@ Dropping to EL0...
 
 **Phase 7 -- IPC.** Synchronous rendezvous message passing through Endpoint objects. Four message registers (x0-x3) transferred between threads. Send/receive with blocking, call/reply for client/server patterns. IPC state machine exhaustively verified: 20 reachable states, 36 transitions, all invariants checked. The kernel's IPC is driven entirely by the verified model — it executes derived effects mechanically without making decisions. 10,000 call/reply round-trips in 16 ticks on QEMU.
 
+**Phase 8 -- Userspace Processes.** Per-process TTBR0 page tables swapped by the scheduler on context switch. ELF64 parser loads the init process from an embedded binary. Init runs at EL0 and spawns a child process entirely from userspace: parses the child ELF, allocates pages via `sys_alloc_pages`, maps them via `sys_map_pages`, copies segment data, and calls `sys_create_process` with a mapping list. The kernel reads the list from init's memory and builds the child's address space. Two processes running at the same VA (0x400000) with separate page tables, printing different messages — isolation proven by construction.
+
 ### Testing
 
 Three layers of automated testing run on every build:
 
 | Layer | Count | What it tests |
 |-------|-------|---------------|
-| Unit tests (host) | 36 | Pure logic: address types, PTE bitfields, rights, object sizes, IPC state machine |
-| Integration tests (QEMU) | 19 | Full boot through all phases, expected serial output |
+| Unit tests (host) | 59 | Address types, PTE bitfields, rights, object sizes, IPC state machine, PageSet table, page table walk |
+| Integration tests (QEMU) | 29 | Full boot through all 8 phases, expected serial output |
 | Stack analysis | 3 | No recursion, depth within budget, all indirect calls annotated |
-| **Total** | **58** | `make test` runs everything |
+| **Total** | **91** | `make test` runs everything |
 
 The IPC state machine test exhaustively explores all reachable system states (endpoint state x thread states) via BFS and verifies: no kernel-caused deadlocks, all invariants hold, all effect orderings correct (BlockCurrent always last, UnblockThread before ClearCaller).
 
@@ -107,12 +112,15 @@ QEMU is invoked with `-machine virt,gic-version=3 -cpu cortex-a53 -nographic`. P
 
 ```
 src/
-  main.rs                    # kmain, panic handler, boot banner, IPC threads
+  main.rs                    # kmain, panic handler, boot banner, init ELF loading
   print.rs                   # kprintln! macro
+  elf.rs                     # ELF64 parser for loading init at boot
+  process.rs                 # sys_create_process kernel-side implementation
   arch/aarch64/
     boot.rs                  # _start entry point (EL2 to EL1, FP enable, stack, BSS)
     uart.rs                  # PL011 UART driver
-    mmu.rs                   # Page tables, MMU enable, higher-half, guard page, user pages
+    mmu.rs                   # Boot page tables, MMU enable, higher-half, guard page
+    vmem.rs                  # Dynamic per-process page table allocation
     exceptions.rs            # Exception vector table, register save/restore
     gic.rs                   # GICv3 interrupt controller
     timer.rs                 # Virtual timer (10ms periodic ticks)
@@ -126,14 +134,15 @@ src/
     handle_table.rs          # Handle insert/lookup/remove with rights
     rights.rs                # Rights bitmask (re-exports from lockjaw-types)
     pageset.rs               # PageSet allocation and donation
+    pageset_table.rs         # PageSet tracking table (wraps lockjaw-types model)
   sched/
-    tcb.rs                   # Thread Control Block with per-thread handle tables
+    tcb.rs                   # Thread Control Block with per-thread handle tables and TTBR0
     context.rs               # context_switch assembly, thread_entry trampoline
-    scheduler.rs             # Round-robin scheduler with block/unblock
+    scheduler.rs             # Round-robin scheduler with block/unblock and TTBR0 swap
   ipc/
     endpoint.rs              # Endpoint object, effect-driven send/receive/call/reply
   syscall/
-    handler.rs               # Syscall dispatch (debug_putc, yield, send, receive, call, reply)
+    handler.rs               # Syscall dispatch (10 syscalls: debug_putc through create_process)
 
 lockjaw-types/               # Pure-logic library crate, testable on host (x86_64)
   src/
@@ -142,6 +151,12 @@ lockjaw-types/               # Pure-logic library crate, testable on host (x86_6
     rights.rs                # Rights bitmask
     object.rs                # ObjectType, ObjectSize, create-info structs
     ipc_state.rs             # IPC state machine model, exhaustive verification
+    pageset_table.rs         # PageSet table model with unit tests
+    vmem.rs                  # Page table walk validation and index computation
+
+user/                        # Userspace binaries (separate Cargo projects)
+  init/                      # Init process — first userspace program, spawns children
+  hello/                     # Hello process — child spawned by init
 
 docs/                        # Book of Lockjaw -- design documentation
   memory-model.md            # Why the kernel never allocates
@@ -151,11 +166,13 @@ docs/                        # Book of Lockjaw -- design documentation
   threads.md                 # Context switching and preemptive scheduling
   syscalls.md                # Syscall ABI, EL0 drop, yield
   ipc.md                     # IPC design, the two ABIs, message registers
-  development-journal.md     # Contemporaneous account of building Lockjaw
+  process-creation.md        # Userspace-driven process creation, the Vulkan parallel
+  development-journal.md     # Journal entry 1: Phases 1-6
+  development-journal-2.md   # Journal entry 2: Phases 7-8
   yagni-parking-lot.md       # Removed code tracked for future phases
 
 tests/
-  qemu_integration.sh        # Boot QEMU, assert expected serial output
+  qemu_integration.sh        # Boot QEMU, assert expected serial output (29 checks)
 ```
 
 ## Roadmap
@@ -169,8 +186,8 @@ tests/
 | 5. Threads | Done | TCB, context switch, preemptive round-robin scheduler |
 | 6. Syscall Interface | Done | Drop to EL0, SVC handler, debug_putc, yield |
 | 7. IPC | Done | Synchronous endpoints, call/reply, verified state machine |
-| 8. Userspace Processes | Next | ELF loader, init process, isolated address spaces |
-| 9. Userspace Drivers | Planned | UART driver in userspace, IRQ notifications |
+| 8. Userspace Processes | Done | ELF loader, per-process TTBR0, init spawns child, isolation |
+| 9. Userspace Drivers | Next | UART driver in userspace, IRQ notifications |
 | 10. POSIX Compatibility | Stretch | POSIX personality server, musl libc port |
 
 ## License
