@@ -9,6 +9,7 @@ INIT_ELF := user/init/target/aarch64-unknown-none/release/lockjaw-init
 .PHONY: build build-release build-user run run-release objdump nm check-stack test test-unit test-qemu clean
 
 build-user:
+	cd user/hello && cargo build --release
 	cd user/init && cargo build --release
 
 build: build-user check-stack
