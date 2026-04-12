@@ -27,6 +27,12 @@ pub const SYS_ERR_NO_CALLER: u64 = 6;
 /// The scheduler's run queue is full.
 pub const SYS_ERR_QUEUE_FULL: u64 = 7;
 
+/// The notification value is not monotonically increasing.
+pub const SYS_ERR_NOT_MONOTONIC: u64 = 8;
+
+/// A thread is already waiting on this notification (single-waiter limit).
+pub const SYS_ERR_ALREADY_WAITING: u64 = 9;
+
 /// An unknown or unrecoverable error occurred.
 pub const SYS_ERR_UNKNOWN: u64 = u64::MAX;
 
@@ -40,3 +46,6 @@ pub const SYS_REPLY: u64 = 5;
 pub const SYS_ALLOC_PAGES: u64 = 6;
 pub const SYS_MAP_PAGES: u64 = 7;
 pub const SYS_CREATE_PROCESS: u64 = 8;
+pub const SYS_MAP_DEVICE_MEMORY: u64 = 9;
+pub const SYS_SIGNAL_NOTIFICATION: u64 = 10;
+pub const SYS_WAIT_NOTIFICATION: u64 = 11;

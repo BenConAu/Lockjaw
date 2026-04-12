@@ -1,0 +1,102 @@
+use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
+use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
+use crate::sched::scheduler;
+use lockjaw_types::notification_state::{NotificationState, SignalResult, WaitResult, NotificationError};
+use core::ptr;
+
+/// Kernel-side Notification object. Lives in a donated page.
+/// The state machine logic is in lockjaw-types (tested on host).
+/// The kernel reads/writes the state and executes side effects (block/unblock).
+#[repr(C)]
+pub struct NotificationObject {
+    pub header: ObjectHeader,
+    pub state: NotificationState,
+    pub blocked_tcb_paddr: u64,
+}
+
+/// Initialize a Notification in donated physical memory.
+///
+/// # Safety
+/// `base_paddr` must be a donated page.
+pub unsafe fn create_notification(base_paddr: PhysAddr) -> Result<(), CreateError> {
+    let obj_va = (base_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut NotificationObject;
+    ptr::write(obj_va, NotificationObject {
+        header: ObjectHeader {
+            obj_type: ObjectType::Notification,
+            page_count: 1,
+        },
+        state: NotificationState::new(),
+        blocked_tcb_paddr: 0,
+    });
+    Ok(())
+}
+
+/// Signal a notification with a new timeline value.
+/// If a waiter's threshold is met, unblocks it.
+///
+/// # Safety
+/// `notif_paddr` must be a valid NotificationObject.
+pub unsafe fn notification_signal(
+    notif_paddr: PhysAddr,
+    new_value: u64,
+) -> Result<(), NotificationError> {
+    let obj = obj_ptr_mut(notif_paddr);
+
+    match (*obj).state.signal(new_value)? {
+        SignalResult::Updated => Ok(()),
+        SignalResult::WakeWaiter => {
+            let waiter = PhysAddr::new((*obj).blocked_tcb_paddr);
+            (*obj).blocked_tcb_paddr = 0;
+            scheduler::unblock_thread(waiter);
+            Ok(())
+        }
+    }
+}
+
+/// Wait on a notification until the timeline value reaches the threshold.
+/// Returns immediately if the counter is already >= threshold.
+/// Otherwise blocks the calling thread.
+///
+/// # Safety
+/// `notif_paddr` must be a valid NotificationObject.
+/// `caller_tcb_paddr` must be the calling thread's TCB.
+pub unsafe fn notification_wait(
+    notif_paddr: PhysAddr,
+    threshold: u64,
+    caller_tcb_paddr: PhysAddr,
+) -> Result<u64, NotificationError> {
+    let obj = obj_ptr_mut(notif_paddr);
+
+    match (*obj).state.wait(threshold)? {
+        WaitResult::Ready => {
+            // Counter already past threshold — return current value
+            Ok((*obj).state.value)
+        }
+        WaitResult::Block => {
+            // Block until signaled
+            (*obj).blocked_tcb_paddr = caller_tcb_paddr.as_u64();
+
+            let tcb = (caller_tcb_paddr.as_u64() + KERNEL_VA_OFFSET)
+                as *mut crate::sched::tcb::Tcb;
+            (*tcb).ipc_blocked_on = notif_paddr.as_u64();
+
+            scheduler::block_current();
+
+            // When we wake up, return the current value
+            let obj = obj_ptr(notif_paddr);
+            Ok((*obj).state.value)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+unsafe fn obj_ptr(paddr: PhysAddr) -> *const NotificationObject {
+    (paddr.as_u64() + KERNEL_VA_OFFSET) as *const NotificationObject
+}
+
+unsafe fn obj_ptr_mut(paddr: PhysAddr) -> *mut NotificationObject {
+    (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut NotificationObject
+}

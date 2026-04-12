@@ -33,11 +33,30 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_ALLOC_PAGES => sys_alloc_pages(ctx),
         SYS_MAP_PAGES => sys_map_pages(ctx),
         SYS_CREATE_PROCESS => sys_create_process(ctx),
+        SYS_SIGNAL_NOTIFICATION => sys_signal_notification(ctx),
+        SYS_WAIT_NOTIFICATION => sys_wait_notification(ctx),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             SYS_ERR_INVALID_PARAMETER
         }
     };
+}
+
+/// Look up a handle in the current thread's handle table with type checking.
+/// Returns the HandleEntry on success, or a syscall error code on failure.
+unsafe fn lookup_handle(handle: u32, required_rights: Rights, expected_type: ObjectType) -> Result<handle_table::HandleEntry, u64> {
+    let tcb_paddr = scheduler::current_tcb_paddr();
+    let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
+    let ht_paddr = PhysAddr::new((*tcb).handle_table_paddr);
+
+    let entry = handle_table::handle_lookup(ht_paddr, handle, required_rights)
+        .map_err(|_| SYS_ERR_INVALID_HANDLE)?;
+
+    if entry.obj_type != expected_type {
+        return Err(SYS_ERR_INVALID_PARAMETER);
+    }
+
+    Ok(entry)
 }
 
 fn sys_debug_putc(char_val: u64) -> u64 {
@@ -58,21 +77,13 @@ fn sys_send(ctx: &mut ExceptionContext) -> u64 {
     let msg = [ctx.gpr[1], ctx.gpr[2], ctx.gpr[3], ctx.gpr[4]];
 
     unsafe {
-        let tcb_paddr = scheduler::current_tcb_paddr();
-        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
-        let ht_paddr = PhysAddr::new((*tcb).handle_table_paddr);
-
-        // Look up the endpoint handle
-        let entry = match handle_table::handle_lookup(ht_paddr, handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE)) {
+        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Endpoint) {
             Ok(e) => e,
-            Err(_) => return SYS_ERR_UNKNOWN,
+            Err(code) => return code,
         };
 
-        if entry.obj_type != ObjectType::Endpoint {
-            return SYS_ERR_INVALID_PARAMETER;
-        }
-
         let ep_paddr = PhysAddr::new(entry.object_paddr);
+        let tcb_paddr = scheduler::current_tcb_paddr();
         match endpoint::ipc_send(ep_paddr, msg, tcb_paddr) {
             Ok(()) => SYS_OK,
             Err(_) => SYS_ERR_ENDPOINT_BUSY,
@@ -86,20 +97,13 @@ fn sys_receive(ctx: &mut ExceptionContext) -> u64 {
     let handle = ctx.gpr[0] as u32;
 
     unsafe {
-        let tcb_paddr = scheduler::current_tcb_paddr();
-        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
-        let ht_paddr = PhysAddr::new((*tcb).handle_table_paddr);
-
-        let entry = match handle_table::handle_lookup(ht_paddr, handle, Rights::from_bits(crate::cap::rights::RIGHT_READ)) {
+        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ), ObjectType::Endpoint) {
             Ok(e) => e,
-            Err(_) => return SYS_ERR_UNKNOWN,
+            Err(code) => return code,
         };
 
-        if entry.obj_type != ObjectType::Endpoint {
-            return SYS_ERR_INVALID_PARAMETER;
-        }
-
         let ep_paddr = PhysAddr::new(entry.object_paddr);
+        let tcb_paddr = scheduler::current_tcb_paddr();
         match endpoint::ipc_receive(ep_paddr, tcb_paddr) {
             Ok(msg) => {
                 ctx.gpr[0] = msg[0];
@@ -120,20 +124,13 @@ fn sys_call(ctx: &mut ExceptionContext) -> u64 {
     let msg = [ctx.gpr[1], ctx.gpr[2], ctx.gpr[3], ctx.gpr[4]];
 
     unsafe {
-        let tcb_paddr = scheduler::current_tcb_paddr();
-        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
-        let ht_paddr = PhysAddr::new((*tcb).handle_table_paddr);
-
-        let entry = match handle_table::handle_lookup(ht_paddr, handle, Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE)) {
+        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE), ObjectType::Endpoint) {
             Ok(e) => e,
-            Err(_) => return SYS_ERR_UNKNOWN,
+            Err(code) => return code,
         };
 
-        if entry.obj_type != ObjectType::Endpoint {
-            return SYS_ERR_INVALID_PARAMETER;
-        }
-
         let ep_paddr = PhysAddr::new(entry.object_paddr);
+        let tcb_paddr = scheduler::current_tcb_paddr();
         match endpoint::ipc_call(ep_paddr, msg, tcb_paddr) {
             Ok(reply) => {
                 ctx.gpr[0] = reply[0];
@@ -154,18 +151,10 @@ fn sys_reply(ctx: &mut ExceptionContext) -> u64 {
     let reply_msg = [ctx.gpr[1], ctx.gpr[2], ctx.gpr[3], ctx.gpr[4]];
 
     unsafe {
-        let tcb_paddr = scheduler::current_tcb_paddr();
-        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
-        let ht_paddr = PhysAddr::new((*tcb).handle_table_paddr);
-
-        let entry = match handle_table::handle_lookup(ht_paddr, handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE)) {
+        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Endpoint) {
             Ok(e) => e,
-            Err(_) => return SYS_ERR_UNKNOWN,
+            Err(code) => return code,
         };
-
-        if entry.obj_type != ObjectType::Endpoint {
-            return SYS_ERR_INVALID_PARAMETER;
-        }
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
         match endpoint::ipc_reply(ep_paddr, reply_msg) {
@@ -233,7 +222,53 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> u64 {
 
     unsafe {
         match crate::process::create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id) {
-            Ok(()) => 0,
+            Ok(()) => SYS_OK,
+            Err(_) => SYS_ERR_UNKNOWN,
+        }
+    }
+}
+
+/// sys_signal_notification(handle, value) — signal a notification.
+/// x0 = notification handle, x1 = new timeline value (must be > current).
+/// Returns SYS_OK on success. Wakes any thread waiting with threshold <= value.
+fn sys_signal_notification(ctx: &mut ExceptionContext) -> u64 {
+    let handle = ctx.gpr[0] as u32;
+    let new_value = ctx.gpr[1];
+
+    unsafe {
+        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Notification) {
+            Ok(e) => e,
+            Err(code) => return code,
+        };
+
+        let notif_paddr = PhysAddr::new(entry.object_paddr);
+        match crate::ipc::notification::notification_signal(notif_paddr, new_value) {
+            Ok(()) => SYS_OK,
+            Err(lockjaw_types::notification_state::NotificationError::ValueNotMonotonic) => SYS_ERR_NOT_MONOTONIC,
+            Err(_) => SYS_ERR_UNKNOWN,
+        }
+    }
+}
+
+/// sys_wait_notification(handle, threshold) — wait on a notification.
+/// x0 = notification handle, x1 = threshold value to wait for.
+/// Returns the current counter value when counter >= threshold.
+/// Blocks if counter < threshold.
+fn sys_wait_notification(ctx: &mut ExceptionContext) -> u64 {
+    let handle = ctx.gpr[0] as u32;
+    let threshold = ctx.gpr[1];
+
+    unsafe {
+        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ), ObjectType::Notification) {
+            Ok(e) => e,
+            Err(code) => return code,
+        };
+
+        let notif_paddr = PhysAddr::new(entry.object_paddr);
+        let tcb_paddr = scheduler::current_tcb_paddr();
+        match crate::ipc::notification::notification_wait(notif_paddr, threshold, tcb_paddr) {
+            Ok(value) => value,
+            Err(lockjaw_types::notification_state::NotificationError::AlreadyHasWaiter) => SYS_ERR_ALREADY_WAITING,
             Err(_) => SYS_ERR_UNKNOWN,
         }
     }
