@@ -70,6 +70,8 @@ pub unsafe fn unblock_thread(tcb_paddr: PhysAddr) {
 // ---------------------------------------------------------------------------
 
 unsafe fn schedule() {
+    use lockjaw_types::scheduler::{select_next, SchedThreadState, SchedDecision};
+
     let old_idx = CURRENT;
     let old_paddr = THREADS[old_idx].unwrap();
     let old_tcb = tcb_ptr_mut(old_paddr);
@@ -79,21 +81,24 @@ unsafe fn schedule() {
         (*old_tcb).state = ThreadState::Ready;
     }
 
-    // Find next Ready thread (round-robin)
-    let mut next_idx = (old_idx + 1) % THREAD_COUNT;
-    loop {
-        let paddr = THREADS[next_idx].unwrap();
+    // Ask the model (tested on host) which thread to run next
+    let decision = select_next(old_idx, THREAD_COUNT, |i| {
+        let paddr = THREADS[i].unwrap();
         let tcb = tcb_ptr(paddr);
-        if (*tcb).state == ThreadState::Ready {
-            break;
+        match (*tcb).state {
+            ThreadState::Ready => SchedThreadState::Ready,
+            ThreadState::Running => SchedThreadState::Running,
+            ThreadState::Blocked => SchedThreadState::Blocked,
         }
-        next_idx = (next_idx + 1) % THREAD_COUNT;
-        if next_idx == old_idx {
-            // No other ready thread — stay on current
+    });
+
+    let next_idx = match decision {
+        SchedDecision::SwitchTo(idx) => idx,
+        SchedDecision::StayOnCurrent => {
             (*old_tcb).state = ThreadState::Running;
             return;
         }
-    }
+    };
 
     let new_paddr = THREADS[next_idx].unwrap();
     let new_tcb = tcb_ptr_mut(new_paddr);
