@@ -17,6 +17,7 @@ const SYS_CALL: u64 = 4;
 const SYS_REPLY: u64 = 5;
 const SYS_ALLOC_PAGES: u64 = 6;
 const SYS_MAP_PAGES: u64 = 7;
+const SYS_CREATE_PROCESS: u64 = 8;
 
 /// Dispatch a syscall from userspace.
 /// Called from handle_exception_sync_lower when EC = 0x15 (SVC from AArch64).
@@ -35,6 +36,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_REPLY => sys_reply(ctx),
         SYS_ALLOC_PAGES => sys_alloc_pages(ctx),
         SYS_MAP_PAGES => sys_map_pages(ctx),
+        SYS_CREATE_PROCESS => sys_create_process(ctx),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             u64::MAX
@@ -215,6 +217,26 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
 
         // Map the pages into the caller's address space
         match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages[..count]) {
+            Ok(()) => 0,
+            Err(_) => u64::MAX,
+        }
+    }
+}
+
+/// sys_create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id)
+/// x0 = pointer to ProcessMapping array in caller's memory
+/// x1 = number of mappings
+/// x2 = entry point VA for the new process
+/// x3 = PageSet ID for the stack page
+/// Returns 0 on success, u64::MAX on failure.
+fn sys_create_process(ctx: &mut ExceptionContext) -> u64 {
+    let mappings_ptr = ctx.gpr[0] as *const crate::process::ProcessMapping;
+    let mapping_count = ctx.gpr[1] as usize;
+    let entry_point = ctx.gpr[2];
+    let stack_pageset_id = ctx.gpr[3];
+
+    unsafe {
+        match crate::process::create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id) {
             Ok(()) => 0,
             Err(_) => u64::MAX,
         }

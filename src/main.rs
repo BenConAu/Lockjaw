@@ -7,6 +7,7 @@ mod elf;
 mod ipc;
 mod mm;
 mod print;
+mod process;
 mod sched;
 mod syscall;
 

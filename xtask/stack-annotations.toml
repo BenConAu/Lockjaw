@@ -19,4 +19,4 @@
 
 # Thread entry trampoline calls the thread's entry function via blr x19.
 # All possible targets listed here:
-"thread_entry" = ["ipc_sender", "ipc_receiver", "idle_thread"]
+"thread_entry" = ["ipc_sender", "ipc_receiver", "idle_thread", "process_entry"]
