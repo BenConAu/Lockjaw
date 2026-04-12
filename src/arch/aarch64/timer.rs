@@ -37,7 +37,7 @@ unsafe fn arm_timer(duration_ms: u64) {
 pub unsafe fn init() {
     let freq = timer_freq();
     crate::kprintln!("  Timer frequency: {} Hz", freq);
-    arm_timer(10);
+    arm_timer(lockjaw_types::constants::TIMER_TICK_MS);
     crate::kprintln!("  Timer armed (10ms interval)");
 }
 
@@ -46,7 +46,7 @@ pub unsafe fn init() {
 pub fn handle_tick() {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     unsafe {
-        arm_timer(10);
+        arm_timer(lockjaw_types::constants::TIMER_TICK_MS);
         crate::sched::scheduler::tick();
     }
 }

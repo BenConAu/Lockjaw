@@ -87,7 +87,7 @@ pub unsafe fn create_process(
     }
 
     // Use a fixed stack VA for new processes
-    let stack_va: u64 = 0x0080_0000;
+    let stack_va: u64 = lockjaw_types::constants::USER_STACK_BASE;
     mappings[count] = Mapping {
         virt_addr: stack_va,
         phys_addr: stack_pages[0],

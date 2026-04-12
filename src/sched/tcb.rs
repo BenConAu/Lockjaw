@@ -59,7 +59,7 @@ pub unsafe fn create_tcb(
 
     // Write canary at stack bottom
     let canary_ptr = stack_va as *mut u64;
-    ptr::write_volatile(canary_ptr, 0xDEAD_BEEF_DEAD_BEEF);
+    ptr::write_volatile(canary_ptr, lockjaw_types::constants::STACK_CANARY);
 
     // Set up synthetic SavedContext at top of stack so context_switch
     // can "return" into this thread. SavedContext is 12 x u64 = 96 bytes.

@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod addr;
+pub mod constants;
 pub mod elf;
 pub mod ipc_state;
 pub mod object;

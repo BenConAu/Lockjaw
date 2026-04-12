@@ -57,9 +57,9 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     (*l0_va).entries[0] = PageTableEntry::new_table(l1_page.start_addr());
 
     // Kernel identity map in L1 (same workaround as Phase 6):
-    // L1[1] = 1GB block at 0x40000000 (RAM, kernel-only)
+    // L1[1] = 1GB block at RAM_BASE (kernel-only)
     (*l1_va).entries[1] = PageTableEntry::new_block(
-        PhysAddr::new(0x4000_0000),
+        PhysAddr::new(super::platform::RAM_BASE),
         MAIR_NORMAL,
         AP_RW_EL1,
         SH_INNER,
@@ -76,7 +76,7 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     // Device MMIO (UART at 0x0900_0000, GIC at 0x0800_0000) — kernel-only
     // L2[4] covers 0x00800000-0x009FFFFF
     (*l2_va).entries[4] = PageTableEntry::new_block(
-        PhysAddr::new(0x0080_0000),
+        PhysAddr::new(super::platform::DEVICE_MMIO_BASE),
         MAIR_DEVICE,
         AP_RW_EL1,
         SH_NON,

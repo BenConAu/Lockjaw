@@ -1,7 +1,7 @@
 use core::ptr;
 
-/// PL011 UART0 physical base address on QEMU virt machine.
-const UART0_BASE_PHYS: usize = 0x0900_0000;
+/// PL011 UART0 physical base address (from platform constants).
+const UART0_BASE_PHYS: usize = super::platform::UART0_BASE_PHYS as usize;
 
 /// TX FIFO Full flag in UARTFR.
 const UARTFR_TXFF: u32 = 1 << 5;

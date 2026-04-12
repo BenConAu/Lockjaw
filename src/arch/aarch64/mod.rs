@@ -2,6 +2,7 @@ mod boot;
 pub mod exceptions;
 pub mod gic;
 pub mod mmu;
+pub mod platform;
 pub mod timer;
 pub mod uart;
 pub mod vmem;

@@ -147,10 +147,10 @@ unsafe fn tcb_ptr_mut(paddr: PhysAddr) -> *mut Tcb {
 unsafe fn check_thread_canary(tcb: *const Tcb) {
     let canary_ptr = (*tcb).stack_base as *const u64;
     let value = ptr::read_volatile(canary_ptr);
-    if value != 0xDEAD_BEEF_DEAD_BEEF {
+    if value != lockjaw_types::constants::STACK_CANARY {
         panic!(
             "Thread stack canary corrupted! Expected {:#018x}, got {:#018x}",
-            0xDEAD_BEEF_DEAD_BEEFu64, value
+            lockjaw_types::constants::STACK_CANARY, value
         );
     }
 }

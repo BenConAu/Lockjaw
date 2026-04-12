@@ -36,7 +36,7 @@ pub extern "C" fn kmain() -> ! {
         let stack_top = &__stack_top as *const u8 as usize;
 
         kprintln!("Memory layout:");
-        kprintln!("  Kernel load:  0x{:08x}", 0x4008_0000u64);
+        kprintln!("  Kernel load:  0x{:08x}", arch::aarch64::platform::KERNEL_LOAD_ADDR);
         kprintln!("  BSS:          0x{:08x} - 0x{:08x} ({} bytes)", bss_start, bss_end, bss_end - bss_start);
         kprintln!("  Kernel end:   0x{:08x}", kernel_end);
         kprintln!("  Stack:        0x{:08x} - 0x{:08x} ({} bytes)", stack_bottom, stack_top, stack_top - stack_bottom);
@@ -50,7 +50,7 @@ pub extern "C" fn kmain() -> ! {
 
     // Initialize page allocator — reserve firmware + kernel + stack pages
     unsafe {
-        let kernel_start = mm::addr::PhysAddr::new(0x4008_0000);
+        let kernel_start = mm::addr::PhysAddr::new(arch::aarch64::platform::KERNEL_LOAD_ADDR);
         let stack_top = mm::addr::PhysAddr::new(&__stack_top as *const u8 as u64);
         mm::page_alloc::init(kernel_start, stack_top);
     }
@@ -325,7 +325,7 @@ pub extern "C" fn kmain() -> ! {
 
         // Allocate user stack page
         let stack_page = mm::page_alloc::alloc_page().expect("user stack page");
-        let user_stack_va: u64 = 0x0080_0000; // 8 MB
+        let user_stack_va: u64 = lockjaw_types::constants::USER_STACK_BASE;
         let user_stack_top: u64 = user_stack_va + mm::addr::PAGE_SIZE;
         mappings[mapping_count] = Mapping {
             virt_addr: user_stack_va,

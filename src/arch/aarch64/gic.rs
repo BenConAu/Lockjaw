@@ -6,8 +6,10 @@ use core::ptr;
 // GICv3 MMIO base addresses (QEMU virt machine)
 // ---------------------------------------------------------------------------
 
-const GICD_BASE_PHYS: u64 = 0x0800_0000;
-const GICR_BASE_PHYS: u64 = 0x080A_0000;
+use super::platform;
+
+const GICD_BASE_PHYS: u64 = platform::GICD_BASE_PHYS;
+const GICR_BASE_PHYS: u64 = platform::GICR_BASE_PHYS;
 
 /// Distributor registers (offsets from GICD_BASE)
 const GICD_CTLR: u64 = 0x0000;
@@ -20,9 +22,7 @@ const GICR_SGI_BASE: u64 = 0x10000;
 const GICR_IGROUPR0: u64 = GICR_SGI_BASE + 0x0080;
 const GICR_ISENABLER0: u64 = GICR_SGI_BASE + 0x0100;
 
-/// Virtual timer PPI — INTID 27 on GICv3.
-/// (INTID 30 is the non-secure physical timer; 27 is the virtual timer.)
-const TIMER_PPI_INTID: u32 = 27;
+const TIMER_PPI_INTID: u32 = platform::VIRTUAL_TIMER_INTID;
 
 // ---------------------------------------------------------------------------
 // GICv3 system register helpers (ICC_* accessed via MSR/MRS)

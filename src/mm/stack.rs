@@ -1,7 +1,6 @@
 use core::ptr;
 
-const CANARY_VALUE: u64 = 0xDEAD_BEEF_DEAD_BEEF;
-const FILL_PATTERN: u64 = 0xCCCC_CCCC_CCCC_CCCC;
+use lockjaw_types::constants::{STACK_CANARY, STACK_FILL_PATTERN};
 
 extern "C" {
     static __stack_bottom: u8;
@@ -19,14 +18,14 @@ pub unsafe fn init_canary() {
     let top = &raw const __stack_top as u64;
 
     // Write canary at the very bottom of the stack (first 8 bytes)
-    ptr::write_volatile(bottom as *mut u64, CANARY_VALUE);
+    ptr::write_volatile(bottom as *mut u64, STACK_CANARY);
 
     // Fill remaining stack with pattern.
     // Leave headroom below current SP for this function's own frame.
     let mut addr = bottom + 8;
     let safe_limit = top - 256;
     while addr < safe_limit {
-        ptr::write_volatile(addr as *mut u64, FILL_PATTERN);
+        ptr::write_volatile(addr as *mut u64, STACK_FILL_PATTERN);
         addr += 8;
     }
 }
@@ -37,10 +36,10 @@ pub fn check_canary() {
     unsafe {
         let canary_ptr = &raw const __stack_bottom as *const u64;
         let value = ptr::read_volatile(canary_ptr);
-        if value != CANARY_VALUE {
+        if value != STACK_CANARY {
             panic!(
                 "Stack canary corrupted! Expected {:#018x}, got {:#018x}",
-                CANARY_VALUE, value
+                STACK_CANARY, value
             );
         }
     }
