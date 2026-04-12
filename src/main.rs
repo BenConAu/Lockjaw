@@ -271,7 +271,7 @@ pub extern "C" fn kmain() -> ! {
     static INIT_ELF: &[u8] = include_bytes!("../user/init/target/aarch64-unknown-none/release/lockjaw-init");
 
     unsafe {
-        use arch::aarch64::vmem::{Mapping, create_address_space};
+        use arch::aarch64::vmem::{Mapping, create_address_space, MAX_MAPPINGS};
 
         // Parse the ELF
         let elf_info = elf::parse_elf(INIT_ELF).expect("failed to parse init ELF");
@@ -279,7 +279,7 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("  {} loadable segment(s)", elf_info.segment_count);
 
         // Build mappings: allocate pages for each segment, copy data
-        let mut mappings = [Mapping { virt_addr: 0, phys_addr: mm::addr::PhysAddr::new(0), user_accessible: false, executable: false }; 16];
+        let mut mappings = [Mapping { virt_addr: 0, phys_addr: mm::addr::PhysAddr::new(0), user_accessible: false, executable: false }; MAX_MAPPINGS];
         let mut mapping_count = 0;
 
         for i in 0..elf_info.segment_count {
@@ -291,6 +291,7 @@ pub extern "C" fn kmain() -> ! {
                 if seg.writable { "W" } else { "R" });
 
             for p in 0..num_pages {
+                assert!(mapping_count < MAX_MAPPINGS, "init ELF has too many pages for mapping array");
                 let page = mm::page_alloc::alloc_page().expect("segment page");
                 let page_va = page.start_addr().as_u64() + mm::addr::KERNEL_VA_OFFSET;
 
@@ -334,7 +335,8 @@ pub extern "C" fn kmain() -> ! {
         mapping_count += 1;
 
         // Create the address space (allocate page tables, map everything)
-        let ttbr0 = create_address_space(&mappings[..mapping_count]);
+        let ttbr0 = create_address_space(&mappings[..mapping_count])
+            .expect("failed to create address space");
         kprintln!("  Address space created: TTBR0 = {:#x}", ttbr0.as_u64());
 
         // Flush I-cache (we copied code into pages)

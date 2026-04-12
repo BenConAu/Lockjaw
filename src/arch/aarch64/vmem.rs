@@ -3,6 +3,12 @@ use crate::mm::page_alloc;
 use crate::mm::page_table::*;
 use core::ptr;
 
+/// Maximum number of page mappings per address space.
+/// Limits stack usage in create_address_space. If you need more mappings,
+/// the caller must provide the mapping list from user-allocated pages
+/// instead of building it on the kernel stack.
+pub const MAX_MAPPINGS: usize = 32;
+
 /// A single VA → PA mapping with permissions.
 #[derive(Clone, Copy)]
 pub struct Mapping {
@@ -12,23 +18,38 @@ pub struct Mapping {
     pub executable: bool,
 }
 
+#[derive(Debug)]
+pub enum VmemError {
+    TooManyMappings,
+    TooManyL3Regions,
+    OutOfPages,
+}
+
 /// Allocate a fresh set of page tables and map the given pages.
 /// Returns the physical address of the L0 table (for TTBR0).
+///
+/// Limits:
+///   - At most MAX_MAPPINGS (32) page mappings
+///   - At most MAX_L3_TABLES (8) distinct 2 MB regions containing user pages
+///   - All user VAs must be in the first 1 GB (L1[0] range)
 ///
 /// Automatically includes the kernel identity map (RAM + device MMIO)
 /// so that exception vectors and kernel code remain reachable.
 ///
 /// # Safety
 /// All physical addresses in mappings must be valid allocated pages.
-pub unsafe fn create_address_space(mappings: &[Mapping]) -> PhysAddr {
+pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, VmemError> {
+    if mappings.len() > MAX_MAPPINGS {
+        return Err(VmemError::TooManyMappings);
+    }
     // Allocate L0
-    let l0_page = page_alloc::alloc_page().expect("L0 page");
+    let l0_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
     let l0_va = (l0_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
     ptr::write_bytes(l0_va, 0, 1);
 
     // We need L1 for entry [0] (covers VA 0x00000000-0x3FFFFFFF, where user pages live)
     // and L1 entry [1] for the kernel identity map (0x40000000-0x7FFFFFFF)
-    let l1_page = page_alloc::alloc_page().expect("L1 page");
+    let l1_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
     let l1_va = (l1_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
     ptr::write_bytes(l1_va, 0, 1);
 
@@ -45,7 +66,7 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> PhysAddr {
     );
 
     // We need L2 for user pages in the first 1GB range
-    let l2_page = page_alloc::alloc_page().expect("L2 page");
+    let l2_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
     let l2_va = (l2_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
     ptr::write_bytes(l2_va, 0, 1);
 
@@ -85,8 +106,10 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> PhysAddr {
                 }
             }
             if found.is_null() {
-                assert!(l3_count < MAX_L3_TABLES, "too many L3 tables needed");
-                let l3_page = page_alloc::alloc_page().expect("L3 page");
+                if l3_count >= MAX_L3_TABLES {
+                    return Err(VmemError::TooManyL3Regions);
+                }
+                let l3_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
                 let va = (l3_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
                 ptr::write_bytes(va, 0, 1);
 
@@ -116,5 +139,5 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> PhysAddr {
         (*l3_va).entries[l3_idx] = entry;
     }
 
-    l0_page.start_addr()
+    Ok(l0_page.start_addr())
 }
