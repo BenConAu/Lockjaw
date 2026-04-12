@@ -6,6 +6,7 @@ use core::ptr;
 // Thread state
 // ---------------------------------------------------------------------------
 
+/// Scheduling state of a thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadState {
     Ready,

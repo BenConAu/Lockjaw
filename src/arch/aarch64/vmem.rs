@@ -9,7 +9,7 @@ use core::ptr;
 /// instead of building it on the kernel stack.
 pub const MAX_MAPPINGS: usize = 32;
 
-/// A single VA → PA mapping with permissions.
+/// A single virtual-to-physical page mapping with access permissions.
 #[derive(Clone, Copy)]
 pub struct Mapping {
     pub virt_addr: u64,
@@ -18,6 +18,7 @@ pub struct Mapping {
     pub executable: bool,
 }
 
+/// Errors returned by virtual memory operations.
 #[derive(Debug)]
 pub enum VmemError {
     TooManyMappings,

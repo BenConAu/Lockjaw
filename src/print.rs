@@ -1,6 +1,7 @@
 use crate::arch::aarch64::uart::Uart;
 use core::fmt;
 
+/// Write formatted output to the UART. Used by the `kprint!` and `kprintln!` macros.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;

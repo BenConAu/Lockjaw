@@ -21,9 +21,11 @@ static mut ACTIVE: bool = false;
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Register a thread in the run queue. The first thread registered (index 0)
-/// is the idle thread — its saved_sp will be filled on the first context switch.
-/// Returns false if the run queue is full (MAX_THREADS reached).
+/// Register a thread in the run queue.
+///
+/// The first thread registered (index 0) is the idle/boot thread — its
+/// saved_sp will be filled on the first context switch away from it.
+/// Returns false if the run queue is full (MAX_THREADS = 8 reached).
 pub unsafe fn add_thread(tcb_paddr: PhysAddr) -> bool {
     let idx = THREAD_COUNT;
     if idx >= MAX_THREADS {
@@ -34,13 +36,16 @@ pub unsafe fn add_thread(tcb_paddr: PhysAddr) -> bool {
     true
 }
 
-/// Start the scheduler. Must be called after all initial threads are added.
+/// Activate the scheduler. After this call, timer ticks trigger scheduling.
+/// Must be called after all initial threads are registered via add_thread().
 pub unsafe fn start() {
     ACTIVE = true;
 }
 
-/// Called from the timer tick handler. Picks the next ready thread and
-/// context-switches to it.
+/// Called from the timer tick handler every TIMER_TICK_MS milliseconds.
+/// Uses the round-robin model (from lockjaw-types) to pick the next Ready
+/// thread, swaps TTBR0 if needed, checks the stack canary, and performs
+/// the context switch.
 pub unsafe fn tick() {
     if !ACTIVE || THREAD_COUNT < 2 {
         return;
@@ -50,12 +55,15 @@ pub unsafe fn tick() {
 }
 
 /// Return the physical address of the currently running thread's TCB.
+/// Used by syscall handlers to look up the caller's handle table and TTBR0.
 pub unsafe fn current_tcb_paddr() -> PhysAddr {
     THREADS[CURRENT].unwrap()
 }
 
-/// Block the current thread. Sets state to Blocked and schedules away.
-/// The caller must have already set the TCB's ipc_blocked_on field.
+/// Block the current thread and schedule away to the next Ready thread.
+/// Sets the thread's state to Blocked. The caller must have already set
+/// the TCB's ipc_blocked_on field. This function does not return until
+/// the thread is unblocked by another thread calling unblock_thread().
 pub unsafe fn block_current() {
     let paddr = THREADS[CURRENT].unwrap();
     let tcb = tcb_ptr_mut(paddr);
@@ -64,6 +72,8 @@ pub unsafe fn block_current() {
 }
 
 /// Unblock a thread by setting its state back to Ready.
+/// The thread will be picked up by the next scheduling round.
+/// Typically called from IPC endpoint code when a partner arrives.
 pub unsafe fn unblock_thread(tcb_paddr: PhysAddr) {
     let tcb = tcb_ptr_mut(tcb_paddr);
     (*tcb).state = ThreadState::Ready;

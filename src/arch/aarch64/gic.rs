@@ -103,6 +103,15 @@ unsafe fn mmio_write32(addr: u64, val: u32) {
 ///
 /// # Safety
 /// Must be called after MMU + higher-half mapping is active.
+/// Initialize the GICv3 distributor, redistributor, and CPU interface.
+///
+/// Enables Group 1 interrupts, wakes the redistributor, sets the timer
+/// PPI (INTID from platform::VIRTUAL_TIMER_INTID) to Group 1, enables
+/// system register access, and sets priority mask to allow all priorities.
+///
+/// # Safety
+/// Must be called after MMU + higher-half mapping is active (GIC MMIO
+/// addresses are accessed via KERNEL_VA_OFFSET).
 pub unsafe fn init() {
     // --- Distributor init ---
 
@@ -152,6 +161,14 @@ pub unsafe fn init() {
 ///
 /// # Safety
 /// Must be called from the IRQ exception handler.
+/// Acknowledge a pending IRQ and signal end-of-interrupt.
+///
+/// Reads the interrupt ID from ICC_IAR1_EL1 (which also acknowledges it),
+/// then writes ICC_EOIR1_EL1 to signal completion. Returns the INTID.
+/// INTID 1023 means spurious (no interrupt pending).
+///
+/// # Safety
+/// Must be called from the IRQ exception handler with interrupts masked.
 pub unsafe fn handle_irq() -> u32 {
     // Read INTID from IAR — this acknowledges the interrupt
     let intid = icc_iar1_el1_read();

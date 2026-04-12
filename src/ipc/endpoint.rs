@@ -39,6 +39,8 @@ fn u8_to_ep_state(v: u8) -> EpState {
 // Endpoint object — stored in a donated page
 // ---------------------------------------------------------------------------
 
+/// Kernel-side endpoint object stored in a donated page.
+/// Holds the IPC state machine state, any buffered message, and blocked thread references.
 #[repr(C)]
 pub struct EndpointObject {
     pub header: ObjectHeader,
@@ -48,6 +50,10 @@ pub struct EndpointObject {
     pub caller_tcb_paddr: u64,
 }
 
+/// Initialize an endpoint object in donated memory.
+///
+/// # Safety
+/// `base_paddr` must point to a donated page not mapped by userspace.
 pub unsafe fn create_endpoint(base_paddr: PhysAddr) -> Result<(), CreateError> {
     let ep_va = (base_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut EndpointObject;
     ptr::write(ep_va, EndpointObject {
@@ -67,6 +73,7 @@ pub unsafe fn create_endpoint(base_paddr: PhysAddr) -> Result<(), CreateError> {
 // IPC operations — driven entirely by the state machine model
 // ---------------------------------------------------------------------------
 
+/// Errors returned by IPC operations.
 #[derive(Clone, Copy, Debug)]
 pub enum IpcError {
     EndpointBusy,
@@ -216,6 +223,10 @@ unsafe fn execute_ipc(
 // Public API — thin wrappers over execute_ipc
 // ---------------------------------------------------------------------------
 
+/// Send a message on an endpoint. Blocks the sender if no receiver is waiting.
+///
+/// # Safety
+/// `endpoint_paddr` and `sender_tcb_paddr` must point to valid kernel objects.
 pub unsafe fn ipc_send(
     endpoint_paddr: PhysAddr,
     msg: [u64; 4],
@@ -225,6 +236,11 @@ pub unsafe fn ipc_send(
     Ok(())
 }
 
+/// Receive a message from an endpoint. Blocks if no sender is waiting.
+/// Returns the received 4-word message.
+///
+/// # Safety
+/// `endpoint_paddr` and `receiver_tcb_paddr` must point to valid kernel objects.
 pub unsafe fn ipc_receive(
     endpoint_paddr: PhysAddr,
     receiver_tcb_paddr: PhysAddr,
@@ -233,6 +249,11 @@ pub unsafe fn ipc_receive(
     Ok(result.unwrap_or([0; 4]))
 }
 
+/// Send a message and block waiting for a reply (client call).
+/// Returns the reply message.
+///
+/// # Safety
+/// `endpoint_paddr` and `caller_tcb_paddr` must point to valid kernel objects.
 pub unsafe fn ipc_call(
     endpoint_paddr: PhysAddr,
     msg: [u64; 4],
@@ -242,6 +263,10 @@ pub unsafe fn ipc_call(
     Ok(result.unwrap_or([0; 4]))
 }
 
+/// Reply to a blocked caller on an endpoint, unblocking it.
+///
+/// # Safety
+/// `endpoint_paddr` must point to a valid endpoint with a waiting caller.
 pub unsafe fn ipc_reply(
     endpoint_paddr: PhysAddr,
     reply_msg: [u64; 4],

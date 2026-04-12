@@ -15,7 +15,11 @@ use lockjaw_types::syscall::*;
 /// Called from handle_exception_sync_lower when EC = 0x15 (SVC from AArch64).
 ///
 /// Convention: syscall number in x8, arguments in x0-x5, return in x0.
-/// Returns SYS_OK (0) on success, or an error code from lockjaw_types::syscall.
+/// Dispatch a syscall from userspace.
+///
+/// Called from handle_exception_sync_lower when ESR_EL1.EC = 0x15 (SVC from AArch64).
+/// Reads the syscall number from x8, dispatches to the handler, and writes the
+/// return value (SYS_OK or an error code from lockjaw_types::syscall) to x0.
 pub fn handle_syscall(ctx: &mut ExceptionContext) {
     let syscall_num = ctx.gpr[8]; // x8
 

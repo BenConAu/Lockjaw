@@ -7,8 +7,8 @@ use lockjaw_types::pageset_table::{PageSetTable, PageSetEntry, MAX_PAGES_PER_SET
 /// page allocator for allocation and deallocation.
 static mut TABLE: PageSetTable = PageSetTable::new();
 
-/// Allocate `count` physical pages and return a PageSet ID.
-/// Returns None if out of memory, too many pages requested, or table full.
+/// Allocate `count` physical pages and register them as a PageSet.
+/// Returns the PageSet ID, or `None` if out of memory, too many pages, or table full.
 pub fn alloc_pages(count: usize) -> Option<u64> {
     // Allocate the physical pages
     let mut pages = [PhysAddr::new(0); MAX_PAGES_PER_SET];

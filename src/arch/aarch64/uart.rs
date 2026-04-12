@@ -23,6 +23,7 @@ static mut UART_BASE: usize = UART0_BASE_PHYS;
 pub struct Uart;
 
 impl Uart {
+    /// Create a new UART handle. Zero-sized; all state is in MMIO registers.
     pub const fn new() -> Self {
         Uart
     }

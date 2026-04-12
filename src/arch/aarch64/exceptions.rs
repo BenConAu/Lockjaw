@@ -3,14 +3,23 @@ use core::arch::global_asm;
 /// Exception context saved by the vector entry stub.
 /// Must match the layout in the assembly save/restore macros.
 #[repr(C)]
+/// CPU state saved by the exception vector entry stub.
+///
+/// Created on the kernel stack by the SAVE_REGS assembly macro when an
+/// exception is taken. The Rust handler receives a pointer to this struct.
+/// For syscalls, the handler modifies `gpr[0]` (x0) to set the return value.
+/// RESTORE_REGS loads the (potentially modified) values back before `eret`.
+///
+/// Layout must match the assembly in SAVE_REGS/RESTORE_REGS exactly.
 pub struct ExceptionContext {
     /// General-purpose registers x0–x30.
     pub gpr: [u64; 31],
     /// Exception Link Register — the PC to return to.
     pub elr: u64,
-    /// Saved Program Status Register.
+    /// Saved Program Status Register (PSTATE at time of exception).
     pub spsr: u64,
-    /// Exception Syndrome Register — describes the exception cause.
+    /// Exception Syndrome Register — encodes the exception cause.
+    /// EC field (bits 31:26) identifies the exception class (SVC, data abort, etc).
     pub esr: u64,
 }
 
@@ -249,6 +258,13 @@ __vec_sync_lower:
 );
 
 /// Install the exception vector table by writing VBAR_EL1.
+///
+/// # Safety
+/// Must be called once during boot. The vector table must be in mapped memory.
+/// Install the exception vector table by writing VBAR_EL1.
+///
+/// After this call, all exceptions (synchronous, IRQ, FIQ, SError) from
+/// both EL1 and EL0 are routed through the vector table in `__exception_vectors`.
 ///
 /// # Safety
 /// Must be called once during boot. The vector table must be in mapped memory.
