@@ -15,6 +15,7 @@ const SYS_SEND: u64 = 2;
 const SYS_RECEIVE: u64 = 3;
 const SYS_CALL: u64 = 4;
 const SYS_REPLY: u64 = 5;
+const SYS_ALLOC_PAGES: u64 = 6;
 
 /// Dispatch a syscall from userspace.
 /// Called from handle_exception_sync_lower when EC = 0x15 (SVC from AArch64).
@@ -31,6 +32,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_RECEIVE => sys_receive(ctx),
         SYS_CALL => sys_call(ctx),
         SYS_REPLY => sys_reply(ctx),
+        SYS_ALLOC_PAGES => sys_alloc_pages(ctx),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             u64::MAX
@@ -170,5 +172,17 @@ fn sys_reply(ctx: &mut ExceptionContext) -> u64 {
             Ok(()) => 0,
             Err(_) => u64::MAX,
         }
+    }
+}
+
+/// sys_alloc_pages(count) — allocate physical pages.
+/// x0 = number of pages to allocate.
+/// Returns a PageSet ID on success, u64::MAX on failure.
+fn sys_alloc_pages(ctx: &mut ExceptionContext) -> u64 {
+    let count = ctx.gpr[0] as usize;
+
+    match crate::cap::pageset_table::alloc_pages(count) {
+        Some(id) => id,
+        None => u64::MAX,
     }
 }
