@@ -4,6 +4,7 @@ pub mod addr;
 pub mod constants;
 pub mod elf;
 pub mod ipc_state;
+pub mod notification_state;
 pub mod object;
 pub mod pageset_table;
 pub mod scheduler;

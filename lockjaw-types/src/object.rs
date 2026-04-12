@@ -11,6 +11,7 @@ pub enum ObjectType {
     HandleTable = 0,
     ThreadControlBlock = 1,
     Endpoint = 2,
+    Notification = 3,
 }
 
 /// Header written at the start of every kernel object's donated memory.
@@ -68,6 +69,20 @@ pub struct EndpointCreateInfo;
 
 /// How many pages does an Endpoint need? Always 1.
 pub fn query_endpoint_size(_info: &EndpointCreateInfo) -> ObjectSize {
+    ObjectSize { pages: 1 }
+}
+
+// ---------------------------------------------------------------------------
+// Notification create-info (Vulkan timeline semaphore pattern)
+// ---------------------------------------------------------------------------
+
+/// Describes a Notification to create. Notifications are timeline semaphores
+/// with a monotonically increasing u64 counter.
+#[derive(Clone, Copy, Debug)]
+pub struct NotificationCreateInfo;
+
+/// How many pages does a Notification need? Always 1.
+pub fn query_notification_size(_info: &NotificationCreateInfo) -> ObjectSize {
     ObjectSize { pages: 1 }
 }
 
