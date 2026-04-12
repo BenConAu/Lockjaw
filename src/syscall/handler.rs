@@ -8,22 +8,14 @@ use crate::mm::addr::PhysAddr;
 use crate::sched::scheduler;
 use crate::sched::tcb::Tcb;
 
-/// Syscall numbers.
-const SYS_DEBUG_PUTC: u64 = 0;
-const SYS_YIELD: u64 = 1;
-const SYS_SEND: u64 = 2;
-const SYS_RECEIVE: u64 = 3;
-const SYS_CALL: u64 = 4;
-const SYS_REPLY: u64 = 5;
-const SYS_ALLOC_PAGES: u64 = 6;
-const SYS_MAP_PAGES: u64 = 7;
-const SYS_CREATE_PROCESS: u64 = 8;
+// Syscall numbers and error codes from lockjaw-types (shared with userspace).
+use lockjaw_types::syscall::*;
 
 /// Dispatch a syscall from userspace.
 /// Called from handle_exception_sync_lower when EC = 0x15 (SVC from AArch64).
 ///
 /// Convention: syscall number in x8, arguments in x0-x5, return in x0.
-/// Returns 0 on success, u64::MAX on error.
+/// Returns SYS_OK (0) on success, or an error code from lockjaw_types::syscall.
 pub fn handle_syscall(ctx: &mut ExceptionContext) {
     let syscall_num = ctx.gpr[8]; // x8
 
@@ -39,7 +31,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_CREATE_PROCESS => sys_create_process(ctx),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
-            u64::MAX
+            SYS_ERR_INVALID_PARAMETER
         }
     };
 }
@@ -69,17 +61,17 @@ fn sys_send(ctx: &mut ExceptionContext) -> u64 {
         // Look up the endpoint handle
         let entry = match handle_table::handle_lookup(ht_paddr, handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE)) {
             Ok(e) => e,
-            Err(_) => return u64::MAX,
+            Err(_) => return SYS_ERR_UNKNOWN,
         };
 
         if entry.obj_type != ObjectType::Endpoint {
-            return u64::MAX;
+            return SYS_ERR_INVALID_PARAMETER;
         }
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
         match endpoint::ipc_send(ep_paddr, msg, tcb_paddr) {
-            Ok(()) => 0,
-            Err(_) => u64::MAX,
+            Ok(()) => SYS_OK,
+            Err(_) => SYS_ERR_ENDPOINT_BUSY,
         }
     }
 }
@@ -96,11 +88,11 @@ fn sys_receive(ctx: &mut ExceptionContext) -> u64 {
 
         let entry = match handle_table::handle_lookup(ht_paddr, handle, Rights::from_bits(crate::cap::rights::RIGHT_READ)) {
             Ok(e) => e,
-            Err(_) => return u64::MAX,
+            Err(_) => return SYS_ERR_UNKNOWN,
         };
 
         if entry.obj_type != ObjectType::Endpoint {
-            return u64::MAX;
+            return SYS_ERR_INVALID_PARAMETER;
         }
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
@@ -112,7 +104,7 @@ fn sys_receive(ctx: &mut ExceptionContext) -> u64 {
                 ctx.gpr[3] = msg[3];
                 return msg[0];
             }
-            Err(_) => return u64::MAX,
+            Err(_) => return SYS_ERR_UNKNOWN,
         }
     }
 }
@@ -130,11 +122,11 @@ fn sys_call(ctx: &mut ExceptionContext) -> u64 {
 
         let entry = match handle_table::handle_lookup(ht_paddr, handle, Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE)) {
             Ok(e) => e,
-            Err(_) => return u64::MAX,
+            Err(_) => return SYS_ERR_UNKNOWN,
         };
 
         if entry.obj_type != ObjectType::Endpoint {
-            return u64::MAX;
+            return SYS_ERR_INVALID_PARAMETER;
         }
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
@@ -146,7 +138,7 @@ fn sys_call(ctx: &mut ExceptionContext) -> u64 {
                 ctx.gpr[3] = reply[3];
                 return reply[0];
             }
-            Err(_) => return u64::MAX,
+            Err(_) => return SYS_ERR_UNKNOWN,
         }
     }
 }
@@ -164,37 +156,37 @@ fn sys_reply(ctx: &mut ExceptionContext) -> u64 {
 
         let entry = match handle_table::handle_lookup(ht_paddr, handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE)) {
             Ok(e) => e,
-            Err(_) => return u64::MAX,
+            Err(_) => return SYS_ERR_UNKNOWN,
         };
 
         if entry.obj_type != ObjectType::Endpoint {
-            return u64::MAX;
+            return SYS_ERR_INVALID_PARAMETER;
         }
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
         match endpoint::ipc_reply(ep_paddr, reply_msg) {
             Ok(()) => 0,
-            Err(_) => u64::MAX,
+            Err(_) => SYS_ERR_UNKNOWN,
         }
     }
 }
 
 /// sys_alloc_pages(count) — allocate physical pages.
 /// x0 = number of pages to allocate.
-/// Returns a PageSet ID on success, u64::MAX on failure.
+/// Returns a PageSet ID on success, SYS_ERR_OUT_OF_MEMORY on failure.
 fn sys_alloc_pages(ctx: &mut ExceptionContext) -> u64 {
     let count = ctx.gpr[0] as usize;
 
     match crate::cap::pageset_table::alloc_pages(count) {
         Some(id) => id,
-        None => u64::MAX,
+        None => SYS_ERR_OUT_OF_MEMORY,
     }
 }
 
 /// sys_map_pages(page_set_id, virt_addr) — map a PageSet into the caller's address space.
 /// x0 = PageSet ID (from sys_alloc_pages).
 /// x1 = virtual address to map at (must be page-aligned, in user range).
-/// Returns 0 on success, u64::MAX on failure.
+/// Returns 0 on success, SYS_ERR_UNKNOWN on failure.
 fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
     let pageset_id = ctx.gpr[0];
     let virt_addr = ctx.gpr[1];
@@ -203,7 +195,7 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
         // Look up the PageSet
         let (count, pages) = match crate::cap::pageset_table::get_pageset(pageset_id) {
             Some(ps) => ps,
-            None => return u64::MAX,
+            None => return SYS_ERR_INVALID_HANDLE,
         };
 
         // Get the caller's TTBR0 from their TCB
@@ -212,13 +204,13 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
         let ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
 
         if ttbr0.as_u64() == 0 {
-            return u64::MAX; // kernel threads don't have a user address space
+            return SYS_ERR_INVALID_PARAMETER; // kernel threads don't have a user address space
         }
 
         // Map the pages into the caller's address space
         match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages[..count]) {
             Ok(()) => 0,
-            Err(_) => u64::MAX,
+            Err(_) => SYS_ERR_UNKNOWN,
         }
     }
 }
@@ -228,7 +220,7 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
 /// x1 = number of mappings
 /// x2 = entry point VA for the new process
 /// x3 = PageSet ID for the stack page
-/// Returns 0 on success, u64::MAX on failure.
+/// Returns 0 on success, SYS_ERR_UNKNOWN on failure.
 fn sys_create_process(ctx: &mut ExceptionContext) -> u64 {
     let mappings_ptr = ctx.gpr[0] as *const crate::process::ProcessMapping;
     let mapping_count = ctx.gpr[1] as usize;
@@ -238,7 +230,7 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> u64 {
     unsafe {
         match crate::process::create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id) {
             Ok(()) => 0,
-            Err(_) => u64::MAX,
+            Err(_) => SYS_ERR_UNKNOWN,
         }
     }
 }
