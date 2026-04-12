@@ -177,13 +177,15 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> u64 {
     }
 }
 
-/// sys_map_pages(page_set_id, virt_addr) — map a PageSet into the caller's address space.
+/// sys_map_pages(page_set_id, virt_addr, flags) — map a PageSet into the caller's address space.
 /// x0 = PageSet ID (from sys_alloc_pages).
 /// x1 = virtual address to map at (must be page-aligned, in user range).
+/// x2 = flags (MAP_FLAG_DEVICE for MMIO, 0 for normal memory).
 /// Returns 0 on success, SYS_ERR_UNKNOWN on failure.
 fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
     let pageset_id = ctx.gpr[0];
     let virt_addr = ctx.gpr[1];
+    let flags = ctx.gpr[2];
 
     unsafe {
         // Look up the PageSet
@@ -202,8 +204,8 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
         }
 
         // Map the pages into the caller's address space
-        match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages[..count]) {
-            Ok(()) => 0,
+        match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages[..count], flags) {
+            Ok(()) => SYS_OK,
             Err(_) => SYS_ERR_UNKNOWN,
         }
     }

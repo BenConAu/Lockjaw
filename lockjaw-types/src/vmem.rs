@@ -5,6 +5,11 @@
 
 use crate::addr::PAGE_SIZE;
 
+/// Mapping flags for map_pages_in_existing. Shared between kernel and userspace.
+/// Device memory: use MAIR_DEVICE (strongly ordered, non-cacheable) instead of
+/// MAIR_NORMAL. Required for MMIO regions (UART, GIC, etc).
+pub const MAP_FLAG_DEVICE: u64 = 1 << 0;
+
 /// Extract the 4-level page table indices from a virtual address (4KB granule).
 pub const fn page_table_indices(va: u64) -> (usize, usize, usize, usize) {
     let l0 = ((va >> 39) & 0x1FF) as usize;

@@ -143,13 +143,17 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     Ok(l0_page.start_addr())
 }
 
+// Re-export the flag constant so kernel code can use it without importing lockjaw_types.
+pub use lockjaw_types::vmem::MAP_FLAG_DEVICE;
+
 /// Map pages into an existing address space (identified by its L0 paddr).
 /// Walks L0→L1→L2, allocates an L3 table if the target 2MB region doesn't
 /// have one, and writes page entries for the given physical pages at the
 /// requested virtual address.
 ///
 /// All mapped pages get AP_RW_ALL (user read-write), UXN + PXN (no execute).
-/// This is the mapping for user data/heap pages, not code.
+/// If MAP_FLAG_DEVICE is set, uses MAIR_DEVICE + SH_NON (strongly ordered,
+/// non-cacheable) instead of MAIR_NORMAL + SH_INNER.
 ///
 /// Validation is done by the pure model in lockjaw_types::vmem (tested on host).
 ///
@@ -159,6 +163,7 @@ pub unsafe fn map_pages_in_existing(
     ttbr0_paddr: PhysAddr,
     virt_addr: u64,
     pages: &[PhysAddr],
+    flags: u64,
 ) -> Result<(), VmemError> {
     use lockjaw_types::vmem::{validate_mapping, map_action_for_l2, MapValidation, MapAction, L2SlotState};
 
@@ -210,12 +215,19 @@ pub unsafe fn map_pages_in_existing(
         }
     };
 
+    // Select memory attributes based on flags
+    let (attr, sh) = if flags & MAP_FLAG_DEVICE != 0 {
+        (MAIR_DEVICE, SH_NON)   // Strongly ordered, non-cacheable device memory
+    } else {
+        (MAIR_NORMAL, SH_INNER) // Normal cacheable memory
+    };
+
     // Map each page at the L3 indices computed by the model
     for (i, phys) in pages.iter().enumerate() {
         let l3_idx = l3_start + i;
 
-        // User data page: read-write, no execute
-        let entry = PageTableEntry::new_page(*phys, MAIR_NORMAL, AP_RW_ALL, SH_INNER)
+        // User page: read-write, no execute
+        let entry = PageTableEntry::new_page(*phys, attr, AP_RW_ALL, sh)
             .with_uxn()
             .with_pxn();
 
@@ -232,3 +244,4 @@ pub unsafe fn map_pages_in_existing(
 
     Ok(())
 }
+
