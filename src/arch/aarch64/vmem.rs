@@ -3,11 +3,9 @@ use crate::mm::page_alloc;
 use crate::mm::page_table::*;
 use core::ptr;
 
-/// Maximum number of page mappings per address space.
-/// Limits stack usage in create_address_space. If you need more mappings,
-/// the caller must provide the mapping list from user-allocated pages
-/// instead of building it on the kernel stack.
-pub const MAX_MAPPINGS: usize = 32;
+/// How many Mapping structs fit in a single 4KB page.
+/// Callers allocate a page for the mapping buffer rather than using the stack.
+pub const MAPPINGS_PER_PAGE: usize = PAGE_SIZE as usize / core::mem::size_of::<Mapping>();
 
 /// A single virtual-to-physical page mapping with access permissions.
 #[derive(Clone, Copy)]
@@ -40,7 +38,7 @@ pub enum VmemError {
 /// # Safety
 /// All physical addresses in mappings must be valid allocated pages.
 pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, VmemError> {
-    if mappings.len() > MAX_MAPPINGS {
+    if mappings.len() > MAPPINGS_PER_PAGE {
         return Err(VmemError::TooManyMappings);
     }
     // Allocate L0

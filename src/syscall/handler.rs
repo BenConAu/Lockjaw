@@ -220,20 +220,22 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
     }
 }
 
-/// sys_create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id)
+/// sys_create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id)
 /// x0 = pointer to ProcessMapping array in caller's memory
 /// x1 = number of mappings
 /// x2 = entry point VA for the new process
 /// x3 = PageSet ID for the stack page
+/// x4 = PageSet ID for a scratch page (kernel uses as Mapping buffer, caller keeps)
 /// Returns 0 on success, SYS_ERR_UNKNOWN on failure.
 fn sys_create_process(ctx: &mut ExceptionContext) -> u64 {
     let mappings_ptr = ctx.gpr[0] as *const crate::process::ProcessMapping;
     let mapping_count = ctx.gpr[1] as usize;
     let entry_point = ctx.gpr[2];
     let stack_pageset_id = ctx.gpr[3];
+    let scratch_pageset_id = ctx.gpr[4];
 
     unsafe {
-        match crate::process::create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id) {
+        match crate::process::create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id) {
             Ok(()) => SYS_OK,
             Err(_) => SYS_ERR_UNKNOWN,
         }

@@ -1,4 +1,4 @@
-use crate::arch::aarch64::vmem::{Mapping, create_address_space, VmemError, MAX_MAPPINGS};
+use crate::arch::aarch64::vmem::{Mapping, create_address_space, MAPPINGS_PER_PAGE};
 use crate::cap::object::{HandleTableCreateInfo, create_handle_table};
 use crate::cap::pageset_table;
 use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET, PAGE_SIZE};
@@ -44,18 +44,23 @@ pub unsafe fn create_process(
     mapping_count: usize,
     entry_point: u64,
     stack_pageset_id: u64,
+    scratch_pageset_id: u64,
 ) -> Result<(), &'static str> {
-    if mapping_count == 0 || mapping_count > MAX_MAPPINGS - 1 {
+    // Need room for mapping_count entries + 1 stack page
+    if mapping_count == 0 || mapping_count + 1 > MAPPINGS_PER_PAGE {
         return Err("invalid mapping count");
     }
 
-    // Build the kernel-side Mapping array by reading from userspace one at a time.
-    // This array is small (MAX_MAPPINGS = 32, each 32 bytes = 1024 bytes total)
-    // and fits on the stack safely.
-    let mut mappings = [Mapping {
-        virt_addr: 0, phys_addr: PhysAddr::new(0),
-        user_accessible: false, executable: false,
-    }; MAX_MAPPINGS];
+    // Use the caller-provided scratch page as the Mapping buffer.
+    // This avoids putting a large array on the kernel stack.
+    let (scratch_count, scratch_pages) = pageset_table::get_pageset(scratch_pageset_id)
+        .ok_or("invalid scratch pageset")?;
+    if scratch_count != 1 {
+        return Err("scratch must be 1 page");
+    }
+    let buf_va = (scratch_pages[0].as_u64() + KERNEL_VA_OFFSET) as *mut Mapping;
+    core::ptr::write_bytes(buf_va as *mut u8, 0, PAGE_SIZE as usize);
+    let mappings = core::slice::from_raw_parts_mut(buf_va, MAPPINGS_PER_PAGE);
     let mut count = 0;
 
     for i in 0..mapping_count {
