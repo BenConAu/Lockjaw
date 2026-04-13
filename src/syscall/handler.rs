@@ -33,6 +33,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_ALLOC_PAGES => sys_alloc_pages(ctx),
         SYS_MAP_PAGES => sys_map_pages(ctx),
         SYS_CREATE_PROCESS => sys_create_process(ctx),
+        SYS_CREATE_NOTIFICATION => sys_create_notification(ctx),
         SYS_SIGNAL_NOTIFICATION => sys_signal_notification(ctx),
         SYS_WAIT_NOTIFICATION => sys_wait_notification(ctx),
         SYS_BIND_IRQ => sys_bind_irq(ctx),
@@ -177,36 +178,44 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> u64 {
     }
 }
 
-/// sys_map_pages(page_set_id, virt_addr, flags) — map a PageSet into the caller's address space.
-/// x0 = PageSet ID (from sys_alloc_pages).
+/// sys_map_pages(x0, virt_addr, flags) — map pages into the caller's address space.
+/// When flags == 0 (normal memory): x0 = PageSet ID (from sys_alloc_pages).
+/// When flags & MAP_FLAG_DEVICE: x0 = raw physical MMIO address (page-aligned).
 /// x1 = virtual address to map at (must be page-aligned, in user range).
-/// x2 = flags (MAP_FLAG_DEVICE for MMIO, 0 for normal memory).
-/// Returns 0 on success, SYS_ERR_UNKNOWN on failure.
+/// x2 = flags.
+/// Returns SYS_OK on success.
 fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
-    let pageset_id = ctx.gpr[0];
+    let x0 = ctx.gpr[0];
     let virt_addr = ctx.gpr[1];
     let flags = ctx.gpr[2];
 
     unsafe {
-        // Look up the PageSet
-        let (count, pages) = match crate::cap::pageset_table::get_pageset(pageset_id) {
-            Some(ps) => ps,
-            None => return SYS_ERR_INVALID_HANDLE,
-        };
-
         // Get the caller's TTBR0 from their TCB
         let tcb_paddr = scheduler::current_tcb_paddr();
         let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
         let ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
 
         if ttbr0.as_u64() == 0 {
-            return SYS_ERR_INVALID_PARAMETER; // kernel threads don't have a user address space
+            return SYS_ERR_INVALID_PARAMETER;
         }
 
-        // Map the pages into the caller's address space
-        match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages[..count], flags) {
-            Ok(()) => SYS_OK,
-            Err(_) => SYS_ERR_UNKNOWN,
+        if flags & crate::arch::aarch64::vmem::MAP_FLAG_DEVICE != 0 {
+            // x0 = raw physical address for device MMIO (single page)
+            let pages = [PhysAddr::new(x0)];
+            match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages, flags) {
+                Ok(()) => SYS_OK,
+                Err(_) => SYS_ERR_INVALID_PARAMETER,
+            }
+        } else {
+            // x0 = PageSet ID (normal memory)
+            let (count, pages) = match crate::cap::pageset_table::get_pageset(x0) {
+                Some(ps) => ps,
+                None => return SYS_ERR_INVALID_HANDLE,
+            };
+            match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages[..count], flags) {
+                Ok(()) => SYS_OK,
+                Err(_) => SYS_ERR_UNKNOWN,
+            }
         }
     }
 }
@@ -227,6 +236,44 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> u64 {
         match crate::process::create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id) {
             Ok(()) => SYS_OK,
             Err(_) => SYS_ERR_UNKNOWN,
+        }
+    }
+}
+
+/// sys_create_notification(pageset_id) — create a Notification from a donated page.
+/// x0 = PageSet ID (must be a 1-page PageSet).
+/// Returns the new handle index on success.
+fn sys_create_notification(ctx: &mut ExceptionContext) -> u64 {
+    let pageset_id = ctx.gpr[0];
+
+    unsafe {
+        // Look up the PageSet to get the physical page
+        let (count, pages) = match crate::cap::pageset_table::get_pageset(pageset_id) {
+            Some(ps) => ps,
+            None => return SYS_ERR_INVALID_HANDLE,
+        };
+        if count != 1 {
+            return SYS_ERR_INVALID_PARAMETER;
+        }
+
+        let paddr = pages[0];
+
+        // Initialize the page as a NotificationObject
+        if crate::ipc::notification::create_notification(paddr).is_err() {
+            return SYS_ERR_UNKNOWN;
+        }
+
+        // Insert a handle into the caller's handle table
+        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
+        let ht_paddr = PhysAddr::new((*tcb).handle_table_paddr);
+
+        match handle_table::handle_insert(
+            ht_paddr, paddr, ObjectType::Notification,
+            Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE),
+        ) {
+            Ok(handle) => handle as u64,
+            Err(_) => SYS_ERR_OUT_OF_MEMORY,
         }
     }
 }
@@ -293,6 +340,10 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> u64 {
 
         let notif_paddr = PhysAddr::new(entry.object_paddr);
         if crate::arch::aarch64::irq_bind::bind(intid, notif_paddr) {
+            // Enable SPI in the GIC distributor (PPIs are already enabled in gic::init)
+            if intid >= 32 {
+                crate::arch::aarch64::gic::enable_spi(intid);
+            }
             SYS_OK
         } else {
             SYS_ERR_INVALID_PARAMETER

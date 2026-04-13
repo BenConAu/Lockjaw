@@ -1,11 +1,18 @@
 use crate::mm::addr::PhysAddr;
 use crate::mm::page_alloc;
+use core::cell::UnsafeCell;
 use lockjaw_types::pageset_table::{PageSetTable, PageSetEntry, MAX_PAGES_PER_SET};
 
 /// The kernel's global PageSet tracking table.
 /// Wraps the pure PageSetTable model from lockjaw-types with the actual
 /// page allocator for allocation and deallocation.
-static mut TABLE: PageSetTable = PageSetTable::new();
+///
+/// UnsafeCell instead of static mut to avoid Rust 2024 reference UB warnings.
+/// Safety: single-core kernel, no concurrent access during a syscall.
+struct SyncTable(UnsafeCell<PageSetTable>);
+unsafe impl Sync for SyncTable {}
+
+static TABLE: SyncTable = SyncTable(UnsafeCell::new(PageSetTable::new()));
 
 /// Allocate `count` physical pages and register them as a PageSet.
 /// Returns the PageSet ID, or `None` if out of memory, too many pages, or table full.
@@ -30,13 +37,13 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
     // Insert into the table (pure logic, validated by unit tests)
     let entry = PageSetEntry { count, pages };
     unsafe {
-        TABLE.insert(entry).ok().map(|id| id as u64)
+        (*TABLE.0.get()).insert(entry).ok().map(|id| id as u64)
     }
 }
 
 /// Look up a PageSet by ID. Returns the page count and physical addresses.
 pub fn get_pageset(id: u64) -> Option<(usize, [PhysAddr; MAX_PAGES_PER_SET])> {
     unsafe {
-        TABLE.get(id as usize).ok().map(|entry| (entry.count, entry.pages))
+        (*TABLE.0.get()).get(id as usize).ok().map(|entry| (entry.count, entry.pages))
     }
 }

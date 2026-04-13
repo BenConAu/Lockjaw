@@ -14,6 +14,9 @@ const GICR_BASE_PHYS: u64 = platform::GICR_BASE_PHYS;
 /// Distributor registers (offsets from GICD_BASE)
 const GICD_CTLR: u64 = 0x0000;
 const GICD_TYPER: u64 = 0x0004;
+const GICD_IGROUPR: u64 = 0x0080;      // Interrupt Group Registers (one bit per INTID)
+const GICD_ISENABLER: u64 = 0x0100;    // Interrupt Set-Enable Registers
+const GICD_IPRIORITYR: u64 = 0x0400;   // Interrupt Priority Registers (one byte per INTID)
 
 /// Redistributor registers (offsets from GICR_BASE)
 /// SGI/PPI region is at GICR_BASE + 0x10000 (64KB offset for RD_base, then SGI_base)
@@ -180,4 +183,33 @@ pub unsafe fn handle_irq() -> u32 {
     // INTID 1023 = spurious, no EOI needed
 
     intid
+}
+
+/// Enable a Shared Peripheral Interrupt (SPI) in the GIC distributor.
+/// Configures the INTID as Group 1, sets priority, and enables it.
+///
+/// # Safety
+/// Must be called after `init()`. `intid` must be an SPI (>= 32).
+pub unsafe fn enable_spi(intid: u32) {
+    let reg = (intid / 32) as u64;     // Which 32-bit register
+    let bit = intid % 32;              // Which bit within that register
+
+    // Set to Group 1 (NS) in GICD_IGROUPR
+    let grp_addr = gicd_addr() + GICD_IGROUPR + reg * 4;
+    let grp = mmio_read32(grp_addr);
+    mmio_write32(grp_addr, grp | (1 << bit));
+
+    // Set priority (0xA0 = middle priority, lower than default 0x00)
+    let pri_addr = gicd_addr() + GICD_IPRIORITYR + intid as u64;
+    mmio_write32(pri_addr & !3, {
+        // IPRIORITYR is byte-accessible but we use 32-bit MMIO reads.
+        // Read the 4-byte register, modify the target byte, write back.
+        let byte_offset = (intid % 4) * 8;
+        let cur = mmio_read32(pri_addr & !3);
+        (cur & !(0xFF << byte_offset)) | (0xA0 << byte_offset)
+    });
+
+    // Enable in GICD_ISENABLER (write-1-to-set)
+    let en_addr = gicd_addr() + GICD_ISENABLER + reg * 4;
+    mmio_write32(en_addr, 1 << bit);
 }

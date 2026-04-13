@@ -88,6 +88,18 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ---
 
+## UnsafeCell globals assume single-core
+
+**Where:** `src/cap/pageset_table.rs`, `src/arch/aarch64/irq_bind.rs`
+
+**What:** Kernel globals use `UnsafeCell` with a manual `unsafe impl Sync` to avoid `static mut` UB warnings. The safety argument is "single-core kernel, no concurrent access during a syscall." This is true today but breaks under SMP where multiple cores can execute syscalls concurrently.
+
+**Why bootstrap:** Proper locking (spinlocks, per-CPU data) requires an SMP-aware synchronization primitive that doesn't exist yet. Single-core QEMU virt doesn't need it.
+
+**Fix:** When adding SMP support, replace bare `UnsafeCell` wrappers with a kernel spinlock type (e.g. `SpinMutex<T>` that disables IRQs on lock). Audit every `unsafe impl Sync` for the same pattern. The IRQ binding table (`irq_bind.rs`) still uses `static mut` and needs the same treatment.
+
+---
+
 ## No device manager process
 
 **Where:** Affects `src/arch/aarch64/irq_bind.rs`, `src/syscall/handler.rs` (sys_map_pages with MAP_FLAG_DEVICE, sys_bind_irq)

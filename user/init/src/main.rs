@@ -7,6 +7,10 @@ use core::arch::asm;
 /// Built by: cd user/hello && cargo build --release
 static HELLO_ELF: &[u8] = include_bytes!("../../hello/target/aarch64-unknown-none/release/lockjaw-hello");
 
+/// The UART driver ELF binary, embedded at compile time.
+/// Built by: cd user/uart-driver && cargo build --release
+static UART_ELF: &[u8] = include_bytes!("../../uart-driver/target/aarch64-unknown-none/release/lockjaw-uart-driver");
+
 // ---------------------------------------------------------------------------
 // Syscall wrappers
 // ---------------------------------------------------------------------------
@@ -31,10 +35,10 @@ fn sys_alloc_pages(count: u64) -> u64 {
     result
 }
 
-fn sys_map_pages(pageset_id: u64, virt_addr: u64) -> u64 {
+fn sys_map_pages(pageset_id: u64, virt_addr: u64, flags: u64) -> u64 {
     let result: u64;
     unsafe {
-        asm!("svc #0", in("x0") pageset_id, in("x1") virt_addr, in("x8") 7u64, lateout("x0") result);
+        asm!("svc #0", in("x0") pageset_id, in("x1") virt_addr, in("x2") flags, in("x8") 7u64, lateout("x0") result);
     }
     result
 }
@@ -177,6 +181,117 @@ const FLAG_EXECUTABLE: u64 = 1 << 0;
 const PAGE_SIZE: u64 = 4096;
 
 // ---------------------------------------------------------------------------
+// ELF spawn helper
+// ---------------------------------------------------------------------------
+
+/// Parse an ELF binary, allocate pages, copy segments, and spawn as a new process.
+/// `elf_data` is the raw ELF binary. `name` is used for log messages.
+/// `map_array_va` is a user VA where the mapping array will be mapped (must be free).
+/// `temp_base_va` is a base VA for temporary segment page mappings (must be free).
+/// Returns true on success.
+fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64) -> bool {
+    puts("init: parsing ");
+    puts(name);
+    puts(" ELF...\n");
+
+    let elf_info = match parse_elf(elf_data) {
+        Some(info) => info,
+        None => {
+            puts("init: ELF parse FAILED\n");
+            return false;
+        }
+    };
+
+    // Allocate a page for the mapping array
+    let map_array_ps = sys_alloc_pages(1);
+    sys_map_pages(map_array_ps, map_array_va, 0);
+    let map_array = map_array_va as *mut ProcessMapping;
+    let mut mapping_count: usize = 0;
+
+    // For each ELF segment: allocate pages, map into our space, copy data
+    for i in 0..elf_info.segment_count {
+        let seg = &elf_info.segments[i];
+        let num_pages = ((seg.mem_size + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
+
+        for p in 0..num_pages {
+            let ps_id = sys_alloc_pages(1);
+            if ps_id == u64::MAX {
+                puts("init: alloc for segment FAILED\n");
+                return false;
+            }
+
+            let temp_va: u64 = temp_base_va + (mapping_count as u64) * PAGE_SIZE;
+            if sys_map_pages(ps_id, temp_va, 0) != 0 {
+                puts("init: map for segment FAILED\n");
+                return false;
+            }
+
+            unsafe {
+                core::ptr::write_bytes(temp_va as *mut u8, 0, PAGE_SIZE as usize);
+            }
+
+            let seg_page_offset = (p as u64) * PAGE_SIZE;
+            let file_remaining = if seg.file_size > seg_page_offset {
+                let r = seg.file_size - seg_page_offset;
+                if r > PAGE_SIZE { PAGE_SIZE } else { r }
+            } else {
+                0
+            };
+
+            if file_remaining > 0 {
+                let src_start = (seg.file_offset + seg_page_offset) as usize;
+                let src_end = src_start + file_remaining as usize;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        elf_data[src_start..src_end].as_ptr(),
+                        temp_va as *mut u8,
+                        file_remaining as usize,
+                    );
+                }
+            }
+
+            unsafe {
+                core::ptr::write(map_array.add(mapping_count), ProcessMapping {
+                    virt_addr: seg.vaddr + seg_page_offset,
+                    pageset_id: ps_id,
+                    page_index: 0,
+                    flags: if seg.executable { FLAG_EXECUTABLE } else { 0 },
+                });
+            }
+            mapping_count += 1;
+        }
+    }
+
+    let stack_ps = sys_alloc_pages(1);
+    if stack_ps == u64::MAX {
+        puts("init: alloc stack FAILED\n");
+        return false;
+    }
+
+    puts("init: spawning ");
+    puts(name);
+    puts("...\n");
+    let result = sys_create_process(
+        map_array_va,
+        mapping_count as u64,
+        elf_info.entry_point,
+        stack_ps,
+    );
+
+    if result == 0 {
+        puts("init: ");
+        puts(name);
+        puts(" spawned OK\n");
+        true
+    } else {
+        puts("init: ");
+        puts(name);
+        puts(" spawn FAILED\n");
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -195,7 +310,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     // Test sys_map_pages
-    let map_result = sys_map_pages(test_ps, 0x0060_0000);
+    let map_result = sys_map_pages(test_ps, 0x0060_0000, 0);
     if map_result == 0 {
         puts("init: map_pages OK\n");
         unsafe {
@@ -212,104 +327,10 @@ pub extern "C" fn _start() -> ! {
         puts("init: map_pages FAILED\n");
     }
 
-    // --- Spawn child process from embedded ELF ---
-    puts("init: parsing child ELF...\n");
-
-    let elf_info = match parse_elf(HELLO_ELF) {
-        Some(info) => info,
-        None => {
-            puts("init: ELF parse FAILED\n");
-            loop { sys_yield(); }
-        }
-    };
-
-    // Allocate a page for the mapping array (so it's in our address space)
-    let map_array_ps = sys_alloc_pages(1);
-    let map_array_va: u64 = 0x0070_0000;
-    sys_map_pages(map_array_ps, map_array_va);
-    let map_array = map_array_va as *mut ProcessMapping;
-    let mut mapping_count: usize = 0;
-
-    // For each ELF segment: allocate pages, map into our space, copy data
-    for i in 0..elf_info.segment_count {
-        let seg = &elf_info.segments[i];
-        let num_pages = ((seg.mem_size + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
-
-        for p in 0..num_pages {
-            // Allocate one page
-            let ps_id = sys_alloc_pages(1);
-            if ps_id == u64::MAX {
-                puts("init: alloc for segment FAILED\n");
-                loop { sys_yield(); }
-            }
-
-            // Map it into our space temporarily so we can write ELF data
-            let temp_va: u64 = 0x00A0_0000 + (mapping_count as u64) * PAGE_SIZE;
-            if sys_map_pages(ps_id, temp_va) != 0 {
-                puts("init: map for segment FAILED\n");
-                loop { sys_yield(); }
-            }
-
-            // Zero the page
-            unsafe {
-                core::ptr::write_bytes(temp_va as *mut u8, 0, PAGE_SIZE as usize);
-            }
-
-            // Copy file data into this page if any
-            let seg_page_offset = (p as u64) * PAGE_SIZE;
-            let file_remaining = if seg.file_size > seg_page_offset {
-                let r = seg.file_size - seg_page_offset;
-                if r > PAGE_SIZE { PAGE_SIZE } else { r }
-            } else {
-                0
-            };
-
-            if file_remaining > 0 {
-                let src_start = (seg.file_offset + seg_page_offset) as usize;
-                let src_end = src_start + file_remaining as usize;
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        HELLO_ELF[src_start..src_end].as_ptr(),
-                        temp_va as *mut u8,
-                        file_remaining as usize,
-                    );
-                }
-            }
-
-            // Add to mapping array
-            unsafe {
-                core::ptr::write(map_array.add(mapping_count), ProcessMapping {
-                    virt_addr: seg.vaddr + seg_page_offset,
-                    pageset_id: ps_id,
-                    page_index: 0,
-                    flags: if seg.executable { FLAG_EXECUTABLE } else { 0 },
-                });
-            }
-            mapping_count += 1;
-        }
-    }
-
-    // Allocate stack page for the child
-    let stack_ps = sys_alloc_pages(1);
-    if stack_ps == u64::MAX {
-        puts("init: alloc stack FAILED\n");
-        loop { sys_yield(); }
-    }
-
-    // Call sys_create_process
-    puts("init: spawning child process...\n");
-    let result = sys_create_process(
-        map_array_va,
-        mapping_count as u64,
-        elf_info.entry_point,
-        stack_ps,
-    );
-
-    if result == 0 {
-        puts("init: child spawned successfully!\n");
-    } else {
-        puts("init: child spawn FAILED\n");
-    }
+    // Spawn child processes.
+    // Each gets its own mapping array VA and temp VA region to avoid overlap.
+    spawn_elf(HELLO_ELF, "hello", 0x0070_0000, 0x00A0_0000);
+    spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000);
 
     loop {
         puts("init: alive\n");

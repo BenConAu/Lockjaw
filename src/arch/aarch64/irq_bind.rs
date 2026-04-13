@@ -1,8 +1,9 @@
 use crate::mm::addr::PhysAddr;
 
 /// Maximum number of IRQ-to-Notification bindings.
+/// Must be > 33 to cover UART0 (SPI 1 = INTID 33).
 /// Known limitation: static table, see docs/tech-debt.md.
-const MAX_BINDINGS: usize = 32;
+const MAX_BINDINGS: usize = 64;
 
 /// Static IRQ binding table. Maps hardware INTID → Notification paddr.
 static mut BINDINGS: [Option<PhysAddr>; MAX_BINDINGS] = [None; MAX_BINDINGS];

@@ -10,6 +10,7 @@ INIT_ELF := user/init/target/aarch64-unknown-none/release/lockjaw-init
 
 build-user:
 	cd user/hello && cargo build --release
+	cd user/uart-driver && cargo build --release
 	cd user/init && cargo build --release
 
 build: build-user check-stack
