@@ -160,6 +160,20 @@ pub extern "C" fn _start() -> ! {
         puts("init: map_pages FAILED\n");
     }
 
+    // Test sys_export_handle — verify it reaches the kernel and validates correctly.
+    // Create an endpoint and try to export a handle on it (no caller blocked → should fail).
+    let test_ep_ps = sys_alloc_pages(1);
+    let test_ep = sys_create_endpoint(test_ep_ps);
+    let export_result = sys_export_handle(test_ep, test_ep); // export test_ep to nobody
+    if export_result == 6 {
+        // SYS_ERR_NO_CALLER = 6 — correct, nobody is blocked on this endpoint
+        puts("init: sys_export_handle validation OK (no caller)\n");
+    } else {
+        puts("init: sys_export_handle UNEXPECTED result=");
+        putc(b'0' + export_result as u8);
+        putc(b'\n');
+    }
+
     // Allocate a scratch page for create_process — reused across spawns.
     // The kernel uses it as a temporary Mapping buffer during address space creation.
     let scratch_ps = sys_alloc_pages(1);
