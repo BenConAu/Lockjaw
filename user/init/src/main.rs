@@ -13,6 +13,10 @@ static HELLO_ELF: &[u8] = include_bytes!("../../hello/target/aarch64-unknown-non
 /// Built by: cd user/uart-driver && cargo build --release
 static UART_ELF: &[u8] = include_bytes!("../../uart-driver/target/aarch64-unknown-none/release/lockjaw-uart-driver");
 
+/// The device manager ELF binary, embedded at compile time.
+/// Built by: cd user/device-manager && cargo build --release
+static DEVMGR_ELF: &[u8] = include_bytes!("../../device-manager/target/aarch64-unknown-none/release/lockjaw-device-manager");
+
 // ---------------------------------------------------------------------------
 // ELF spawn helper
 // ---------------------------------------------------------------------------
@@ -22,7 +26,7 @@ static UART_ELF: &[u8] = include_bytes!("../../uart-driver/target/aarch64-unknow
 /// `map_array_va` is a user VA where the mapping array will be mapped (must be free).
 /// `temp_base_va` is a base VA for temporary segment page mappings (must be free).
 /// Returns true on success.
-fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, scratch_ps: u64, handle_to_copy: u64) -> bool {
+fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, scratch_ps: u64, handle_to_copy: u64, stack_pages: u64) -> bool {
     puts("init: parsing ");
     puts(name);
     puts(" ELF...\n");
@@ -93,7 +97,7 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
         }
     }
 
-    let stack_ps = sys_alloc_pages(1);
+    let stack_ps = sys_alloc_pages(stack_pages);
     if stack_ps == u64::MAX {
         puts("init: alloc stack FAILED\n");
         return false;
@@ -208,11 +212,11 @@ pub extern "C" fn _start() -> ! {
     putc(b'\n');
 
     // Spawn child processes.
-    // Hello gets no handle. UART driver gets the endpoint handle (becomes handle 0 in child).
-    spawn_elf(HELLO_ELF, "hello", 0x0070_0000, 0x00A0_0000, scratch_ps, u64::MAX);
-    spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000, scratch_ps, ep_handle);
+    spawn_elf(HELLO_ELF, "hello", 0x0070_0000, 0x00A0_0000, scratch_ps, u64::MAX, 1);
+    spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000, scratch_ps, ep_handle, 1);
+    spawn_elf(DEVMGR_ELF, "device-manager", 0x0072_0000, 0x00E0_0000, scratch_ps, u64::MAX, 4);
 
-    // From here on, print via IPC to the UART server.
+    // Print via IPC to the UART server.
     loop {
         ipc_puts(ep_handle, "init: alive (via IPC)\n");
         sys_yield();

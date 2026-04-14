@@ -374,17 +374,21 @@ pub extern "C" fn kmain() -> ! {
             }
         }
 
-        // Allocate user stack page
-        let stack_page = mm::page_alloc::alloc_page().expect("user stack page");
+        // Allocate user stack (4 pages = 16KB for init, which embeds and spawns
+        // multiple processes including the device manager)
+        let user_stack_pages = 4;
         let user_stack_va: u64 = lockjaw_types::constants::USER_STACK_BASE;
-        let user_stack_top: u64 = user_stack_va + mm::addr::PAGE_SIZE;
-        mappings[mapping_count] = Mapping {
-            virt_addr: user_stack_va,
-            phys_addr: stack_page.start_addr(),
-            user_accessible: true,
-            executable: false,
-        };
-        mapping_count += 1;
+        let user_stack_top: u64 = user_stack_va + (user_stack_pages as u64) * mm::addr::PAGE_SIZE;
+        for s in 0..user_stack_pages {
+            let stack_page = mm::page_alloc::alloc_page().expect("user stack page");
+            mappings[mapping_count] = Mapping {
+                virt_addr: user_stack_va + (s as u64) * mm::addr::PAGE_SIZE,
+                phys_addr: stack_page.start_addr(),
+                user_accessible: true,
+                executable: false,
+            };
+            mapping_count += 1;
+        }
 
         // Create the address space (allocate page tables, map everything)
         let ttbr0 = create_address_space(&mappings[..mapping_count])

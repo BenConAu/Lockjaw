@@ -20,8 +20,9 @@ pub const GICR_BASE_PHYS: u64 = 0x080A_0000;
 /// Physical base address of RAM.
 pub const RAM_BASE: u64 = 0x4000_0000;
 
-/// Device MMIO region base (covers UART and GIC in one 2MB block).
-pub const DEVICE_MMIO_BASE: u64 = 0x0080_0000;
+/// Device MMIO region base (covers GIC at 0x0800_0000 and UART at 0x0900_0000
+/// in one 2MB block). Verified from DTB, not guessed.
+pub const DEVICE_MMIO_BASE: u64 = 0x0800_0000;
 
 /// Virtual timer PPI interrupt ID on GICv3.
 /// Note: INTID 27 is the virtual timer, INTID 30 is the physical timer.

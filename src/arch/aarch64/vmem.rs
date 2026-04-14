@@ -72,9 +72,9 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     // L1[0] → L2
     (*l1_va).entries[0] = PageTableEntry::new_table(l2_page.start_addr());
 
-    // Device MMIO (UART at 0x0900_0000, GIC at 0x0800_0000) — kernel-only
-    // L2[4] covers 0x00800000-0x009FFFFF
-    (*l2_va).entries[4] = PageTableEntry::new_block(
+    // Device MMIO (GIC at 0x0800_0000, UART at 0x0900_0000) — kernel-only
+    let device_l2_idx = (super::platform::DEVICE_MMIO_BASE >> 21) as usize;
+    (*l2_va).entries[device_l2_idx] = PageTableEntry::new_block(
         PhysAddr::new(super::platform::DEVICE_MMIO_BASE),
         MAIR_DEVICE,
         AP_RW_EL1,

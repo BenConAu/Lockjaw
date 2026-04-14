@@ -85,22 +85,24 @@ pub unsafe fn create_process(
         count += 1;
     }
 
-    // Add stack page
+    // Add stack pages (the PageSet may contain multiple pages for larger stacks)
     let (stack_count, stack_pages) = pageset_table::get_pageset(stack_pageset_id)
         .ok_or("invalid stack pageset")?;
     if stack_count == 0 {
         return Err("empty stack pageset");
     }
 
-    // Use a fixed stack VA for new processes
+    // Map all stack pages contiguously at USER_STACK_BASE
     let stack_va: u64 = lockjaw_types::constants::USER_STACK_BASE;
-    mappings[count] = Mapping {
-        virt_addr: stack_va,
-        phys_addr: stack_pages[0],
-        user_accessible: true,
-        executable: false,
-    };
-    count += 1;
+    for s in 0..stack_count {
+        mappings[count] = Mapping {
+            virt_addr: stack_va + (s as u64) * PAGE_SIZE,
+            phys_addr: stack_pages[s],
+            user_accessible: true,
+            executable: false,
+        };
+        count += 1;
+    }
 
     // Create address space
     let ttbr0 = create_address_space(&mappings[..count])
@@ -147,7 +149,7 @@ pub unsafe fn create_process(
             handle_table_paddr: ht_page.start_addr(),
             ttbr0_paddr: ttbr0,
             user_entry_point: entry_point,
-            user_stack_top: stack_va + PAGE_SIZE,
+            user_stack_top: stack_va + (stack_count as u64) * PAGE_SIZE,
         },
         tcb_page.start_addr(),
     ).map_err(|_| "TCB create failed")?;
