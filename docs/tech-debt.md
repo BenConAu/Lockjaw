@@ -64,18 +64,6 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ---
 
-## Duplicated ELF parser (kernel + init)
-
-**Where:** `lockjaw-types/src/elf.rs` and `user/init/src/main.rs`
-
-**What:** Init has its own minimal ELF parser (~80 lines of byte parsing). The kernel has the same parser in lockjaw-types. They are functionally identical but not shared — init is a separate Cargo project that cannot depend on lockjaw-types.
-
-**Why:** Init is not a workspace member (different linker script, different build config). Adding lockjaw-types as a path dependency from init would require careful workspace configuration to avoid conflicting targets.
-
-**Fix:** Create a `lockjaw-userlib` no_std crate that both init and other userspace processes depend on. It would contain the ELF parser, syscall wrappers, and common types. Alternatively, make lockjaw-types publishable and add it as a dependency to each user crate.
-
----
-
 ## ipc_msg field used as scratch in TCB
 
 **Where:** `src/process.rs` (line 129-130)
@@ -155,3 +143,19 @@ The eventual design is a **device manager** process that:
 **Why bootstrap:** The proper solution is bound notifications (seL4-style multiplexed wait): bind a notification to a thread's TCB so that sys_receive wakes on either an IPC message or a notification signal. This lets the driver sleep until work arrives. Implementing bound notifications requires modifying the IPC receive path, the notification signal path, and the TCB — substantial kernel work.
 
 **Fix:** Add bound notifications. TCB gets a `bound_notif_paddr` field. sys_receive checks the bound notification before blocking — if it fired, return immediately with a flag. notification_signal checks if the bound TCB is blocked on an endpoint and wakes it. The driver loop becomes: `sys_receive(endpoint)` → if notification: handle RX; if IPC: handle TX. Zero CPU when idle.
+
+---
+
+## lockjaw-userlib minor cleanup
+
+**Where:** `user/lockjaw-userlib/`
+
+**What:** Several minor issues from the initial extraction:
+- `ProcessMapping` is defined in both userlib and the kernel (`src/process.rs`). Should live in lockjaw-types so both sides share one definition.
+- No module-level doc comment on `lib.rs`.
+- Inconsistent re-export strategy: syscall/print are glob-exported, elf is namespaced. Should be a documented choice.
+- Empty `[lib]` section in Cargo.toml (no effect, just noise).
+
+**Why:** Low-priority cleanup. None of these cause bugs.
+
+**Fix:** Move `ProcessMapping` to lockjaw-types. Add doc comment. Clean up Cargo.toml. Standardize re-exports.

@@ -1,0 +1,11 @@
+[package]
+name = "lockjaw-userlib"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+lockjaw-types = { path = "../../lockjaw-types" }
+
+[lib]

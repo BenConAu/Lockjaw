@@ -3,6 +3,7 @@
 
 use core::arch::asm;
 use core::ptr;
+use lockjaw_userlib::*;
 
 // ---------------------------------------------------------------------------
 // PL011 UART register offsets
@@ -30,106 +31,6 @@ const UART_PHYS: u64 = 0x0904_0000;
 
 /// UART1 SPI interrupt: SPI 8 = INTID 40 on QEMU virt (from DTB: interrupts <0 8 4>).
 const UART_INTID: u64 = 40;
-
-/// MAP_FLAG_DEVICE — must match lockjaw-types::vmem::MAP_FLAG_DEVICE.
-const MAP_FLAG_DEVICE: u64 = 1 << 0;
-
-// ---------------------------------------------------------------------------
-// Syscall wrappers
-// ---------------------------------------------------------------------------
-
-fn putc(c: u8) {
-    unsafe {
-        asm!("svc #0", in("x0") c as u64, in("x8") 0u64);
-    }
-}
-
-fn puts(s: &str) {
-    for b in s.bytes() {
-        putc(b);
-    }
-}
-
-fn sys_alloc_pages(count: u64) -> u64 {
-    let result: u64;
-    unsafe {
-        asm!("svc #0", in("x0") count, in("x8") 6u64, lateout("x0") result);
-    }
-    result
-}
-
-fn sys_map_pages(x0: u64, virt_addr: u64, flags: u64) -> u64 {
-    let result: u64;
-    unsafe {
-        asm!(
-            "svc #0",
-            in("x0") x0,
-            in("x1") virt_addr,
-            in("x2") flags,
-            in("x8") 7u64,
-            lateout("x0") result,
-        );
-    }
-    result
-}
-
-fn sys_create_notification(pageset_id: u64) -> u64 {
-    let result: u64;
-    unsafe {
-        asm!("svc #0", in("x0") pageset_id, in("x8") 9u64, lateout("x0") result);
-    }
-    result
-}
-
-fn sys_bind_irq(intid: u64, notif_handle: u64) -> u64 {
-    let result: u64;
-    unsafe {
-        asm!(
-            "svc #0",
-            in("x0") intid,
-            in("x1") notif_handle,
-            in("x8") 12u64,
-            lateout("x0") result,
-        );
-    }
-    result
-}
-
-/// Non-blocking receive. Returns the first message word, or SYS_ERR_WOULD_BLOCK (10).
-fn sys_recv_nb(handle: u64) -> u64 {
-    let result: u64;
-    unsafe {
-        asm!(
-            "svc #0",
-            in("x0") handle,
-            in("x8") 14u64,
-            lateout("x0") result,
-        );
-    }
-    result
-}
-
-fn sys_reply(handle: u64, msg0: u64, msg1: u64, msg2: u64, msg3: u64) {
-    unsafe {
-        asm!(
-            "svc #0",
-            in("x0") handle,
-            in("x1") msg0,
-            in("x2") msg1,
-            in("x3") msg2,
-            in("x4") msg3,
-            in("x8") 5u64,
-        );
-    }
-}
-
-fn sys_yield() {
-    unsafe {
-        asm!("svc #0", in("x8") 1u64);
-    }
-}
-
-const SYS_ERR_WOULD_BLOCK: u64 = 10;
 
 // ---------------------------------------------------------------------------
 // UART MMIO helpers
@@ -183,7 +84,7 @@ pub extern "C" fn _start() -> ! {
     let notif_handle = sys_create_notification(notif_ps);
     puts("uart-driver: notification created\n");
 
-    // Step 3: Bind UART1 IRQ (INTID 34) to the notification
+    // Step 3: Bind UART1 IRQ (INTID 40) to the notification
     let bind_result = sys_bind_irq(UART_INTID, notif_handle);
     if bind_result != 0 {
         puts("uart-driver: bind IRQ FAILED\n");
@@ -211,7 +112,9 @@ pub extern "C" fn _start() -> ! {
             let mut rx_count = 0;
             while uart_read32(UARTFR) & UARTFR_RXFE == 0 && rx_count < 16 {
                 let ch = (uart_read32(UARTDR) & 0xFF) as u8;
+                // Echo the character back
                 uart_putc(ch);
+                // Echo newline as \r\n
                 if ch == b'\r' {
                     uart_putc(b'\n');
                 }

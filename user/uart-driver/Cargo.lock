@@ -3,5 +3,19 @@
 version = 4
 
 [[package]]
+name = "lockjaw-types"
+version = "0.1.0"
+
+[[package]]
 name = "lockjaw-uart-driver"
 version = "0.1.0"
+dependencies = [
+ "lockjaw-userlib",
+]
+
+[[package]]
+name = "lockjaw-userlib"
+version = "0.1.0"
+dependencies = [
+ "lockjaw-types",
+]
