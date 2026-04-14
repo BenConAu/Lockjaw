@@ -122,6 +122,16 @@ The eventual design is a **device manager** process that:
 
 ---
 
+## SYS_RECV_NB naming inconsistency
+
+**Where:** `lockjaw-types/src/syscall.rs`, `src/syscall/handler.rs`, `user/lockjaw-userlib/src/syscall.rs`
+
+**What:** The syscall is named `SYS_RECV_NB` / `sys_recv_nb` but every other IPC syscall spells out "receive" (`SYS_RECEIVE`, `sys_receive`). Inconsistent abbreviation.
+
+**Fix:** Rename to `SYS_RECEIVE_NB` / `sys_receive_nb` across all three files.
+
+---
+
 ## lockjaw-userlib minor cleanup
 
 **Where:** `user/lockjaw-userlib/`
