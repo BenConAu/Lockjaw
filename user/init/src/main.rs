@@ -43,7 +43,7 @@ fn sys_map_pages(pageset_id: u64, virt_addr: u64, flags: u64) -> u64 {
     result
 }
 
-fn sys_create_process(mappings_ptr: u64, mapping_count: u64, entry_point: u64, stack_pageset_id: u64, scratch_pageset_id: u64) -> u64 {
+fn sys_create_process(mappings_ptr: u64, mapping_count: u64, entry_point: u64, stack_pageset_id: u64, scratch_pageset_id: u64, handle_to_copy: u64) -> u64 {
     let result: u64;
     unsafe {
         asm!(
@@ -53,7 +53,33 @@ fn sys_create_process(mappings_ptr: u64, mapping_count: u64, entry_point: u64, s
             in("x2") entry_point,
             in("x3") stack_pageset_id,
             in("x4") scratch_pageset_id,
+            in("x5") handle_to_copy,
             in("x8") 8u64,
+            lateout("x0") result,
+        );
+    }
+    result
+}
+
+fn sys_create_endpoint(pageset_id: u64) -> u64 {
+    let result: u64;
+    unsafe {
+        asm!("svc #0", in("x0") pageset_id, in("x8") 13u64, lateout("x0") result);
+    }
+    result
+}
+
+fn sys_call(handle: u64, msg0: u64, msg1: u64, msg2: u64, msg3: u64) -> u64 {
+    let result: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x0") handle,
+            in("x1") msg0,
+            in("x2") msg1,
+            in("x3") msg2,
+            in("x4") msg3,
+            in("x8") 4u64,
             lateout("x0") result,
         );
     }
@@ -63,6 +89,13 @@ fn sys_create_process(mappings_ptr: u64, mapping_count: u64, entry_point: u64, s
 fn puts(s: &str) {
     for b in s.bytes() {
         putc(b);
+    }
+}
+
+/// Print via IPC to the UART server. Each character is a sys_call.
+fn ipc_puts(ep: u64, s: &str) {
+    for b in s.bytes() {
+        sys_call(ep, b as u64, 0, 0, 0);
     }
 }
 
@@ -190,7 +223,7 @@ const PAGE_SIZE: u64 = 4096;
 /// `map_array_va` is a user VA where the mapping array will be mapped (must be free).
 /// `temp_base_va` is a base VA for temporary segment page mappings (must be free).
 /// Returns true on success.
-fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, scratch_ps: u64) -> bool {
+fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, scratch_ps: u64, handle_to_copy: u64) -> bool {
     puts("init: parsing ");
     puts(name);
     puts(" ELF...\n");
@@ -278,6 +311,7 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
         elf_info.entry_point,
         stack_ps,
         scratch_ps,
+        handle_to_copy,
     );
 
     if result == 0 {
@@ -337,13 +371,21 @@ pub extern "C" fn _start() -> ! {
         loop { sys_yield(); }
     }
 
-    // Spawn child processes.
-    // Each gets its own mapping array VA and temp VA region to avoid overlap.
-    spawn_elf(HELLO_ELF, "hello", 0x0070_0000, 0x00A0_0000, scratch_ps);
-    spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000, scratch_ps);
+    // Create an endpoint for communicating with the UART server.
+    let ep_ps = sys_alloc_pages(1);
+    let ep_handle = sys_create_endpoint(ep_ps);
+    puts("init: endpoint created, handle=");
+    putc(b'0' + ep_handle as u8);
+    putc(b'\n');
 
+    // Spawn child processes.
+    // Hello gets no handle. UART driver gets the endpoint handle (becomes handle 0 in child).
+    spawn_elf(HELLO_ELF, "hello", 0x0070_0000, 0x00A0_0000, scratch_ps, u64::MAX);
+    spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000, scratch_ps, ep_handle);
+
+    // From here on, print via IPC to the UART server.
     loop {
-        puts("init: alive\n");
+        ipc_puts(ep_handle, "init: alive (via IPC)\n");
         sys_yield();
     }
 }

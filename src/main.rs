@@ -238,9 +238,16 @@ pub extern "C" fn kmain() -> ! {
         create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, handle_table_paddr: ht_b_page, ttbr0_paddr: mm::addr::PhysAddr::new(0) }, tcb_b_page)
             .expect("create tcb b");
 
-        // Register idle thread (index 0 = this boot thread, uses the boot stack)
-        // We create a minimal TCB for it on another page
+        // Register idle thread (index 0 = this boot thread, uses the boot stack).
+        // This thread drops to EL0 and becomes the init process, so it needs
+        // a handle table for init's syscalls (create_endpoint, etc).
         let idle_stack_base = &__stack_bottom as *const u8 as u64 + mm::addr::KERNEL_VA_OFFSET;
+        let idle_ht_page = mm::page_alloc::alloc_page().expect("idle ht alloc").start_addr();
+        create_handle_table(
+            &HandleTableCreateInfo { slot_count: 8 },
+            idle_ht_page,
+        ).expect("idle ht create");
+
         let idle_tcb_page = mm::page_alloc::alloc_page().expect("idle tcb alloc").start_addr();
         let idle_tcb_va = (idle_tcb_page.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut sched::tcb::Tcb;
         core::ptr::write(idle_tcb_va, sched::tcb::Tcb {
@@ -249,7 +256,7 @@ pub extern "C" fn kmain() -> ! {
             state: sched::tcb::ThreadState::Running,
             entry: idle_thread,
             stack_base: idle_stack_base,
-            handle_table_paddr: 0,
+            handle_table_paddr: idle_ht_page.as_u64(),
             ttbr0_paddr: 0,
             ipc_blocked_on: 0,
             ipc_msg: [0; 4],

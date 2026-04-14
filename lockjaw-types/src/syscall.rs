@@ -33,6 +33,9 @@ pub const SYS_ERR_NOT_MONOTONIC: u64 = 8;
 /// A thread is already waiting on this notification (single-waiter limit).
 pub const SYS_ERR_ALREADY_WAITING: u64 = 9;
 
+/// The operation would block but non-blocking was requested.
+pub const SYS_ERR_WOULD_BLOCK: u64 = 10;
+
 /// An unknown or unrecoverable error occurred.
 pub const SYS_ERR_UNKNOWN: u64 = u64::MAX;
 
@@ -50,3 +53,5 @@ pub const SYS_CREATE_NOTIFICATION: u64 = 9;
 pub const SYS_SIGNAL_NOTIFICATION: u64 = 10;
 pub const SYS_WAIT_NOTIFICATION: u64 = 11;
 pub const SYS_BIND_IRQ: u64 = 12;
+pub const SYS_CREATE_ENDPOINT: u64 = 13;
+pub const SYS_RECV_NB: u64 = 14;

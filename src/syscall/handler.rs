@@ -37,6 +37,8 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_SIGNAL_NOTIFICATION => sys_signal_notification(ctx),
         SYS_WAIT_NOTIFICATION => sys_wait_notification(ctx),
         SYS_BIND_IRQ => sys_bind_irq(ctx),
+        SYS_CREATE_ENDPOINT => sys_create_endpoint(ctx),
+        SYS_RECV_NB => sys_recv_nb(ctx),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             SYS_ERR_INVALID_PARAMETER
@@ -233,9 +235,10 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> u64 {
     let entry_point = ctx.gpr[2];
     let stack_pageset_id = ctx.gpr[3];
     let scratch_pageset_id = ctx.gpr[4];
+    let parent_handle_to_copy = ctx.gpr[5];
 
     unsafe {
-        match crate::process::create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id) {
+        match crate::process::create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy) {
             Ok(()) => SYS_OK,
             Err(_) => SYS_ERR_UNKNOWN,
         }
@@ -349,6 +352,73 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> u64 {
             SYS_OK
         } else {
             SYS_ERR_INVALID_PARAMETER
+        }
+    }
+}
+
+/// sys_create_endpoint(pageset_id) — create an Endpoint from a donated page.
+/// x0 = PageSet ID (must be a 1-page PageSet).
+/// Returns the new handle index on success.
+fn sys_create_endpoint(ctx: &mut ExceptionContext) -> u64 {
+    let pageset_id = ctx.gpr[0];
+
+    unsafe {
+        let (count, pages) = match crate::cap::pageset_table::get_pageset(pageset_id) {
+            Some(ps) => ps,
+            None => return SYS_ERR_INVALID_HANDLE,
+        };
+        if count != 1 {
+            return SYS_ERR_INVALID_PARAMETER;
+        }
+
+        let paddr = pages[0];
+
+        if endpoint::create_endpoint(paddr).is_err() {
+            return SYS_ERR_UNKNOWN;
+        }
+
+        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
+        let ht_paddr = PhysAddr::new((*tcb).handle_table_paddr);
+
+        match handle_table::handle_insert(
+            ht_paddr, paddr, ObjectType::Endpoint,
+            Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE),
+        ) {
+            Ok(handle) => handle as u64,
+            Err(_) => SYS_ERR_OUT_OF_MEMORY,
+        }
+    }
+}
+
+/// sys_recv_nb(handle) — non-blocking receive on an endpoint.
+/// x0 = endpoint handle. If a sender is waiting, returns the message in x0-x3.
+/// Otherwise returns SYS_ERR_WOULD_BLOCK immediately.
+fn sys_recv_nb(ctx: &mut ExceptionContext) -> u64 {
+    let handle = ctx.gpr[0] as u32;
+
+    unsafe {
+        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ), ObjectType::Endpoint) {
+            Ok(e) => e,
+            Err(code) => {
+                crate::kprintln!("[recv_nb] handle lookup failed: h={} code={}", handle, code);
+                return code;
+            }
+        };
+
+        let ep_paddr = PhysAddr::new(entry.object_paddr);
+        let tcb_paddr = scheduler::current_tcb_paddr();
+
+        match endpoint::ipc_receive_nb(ep_paddr, tcb_paddr) {
+            Ok(msg) => {
+                ctx.gpr[0] = msg[0];
+                ctx.gpr[1] = msg[1];
+                ctx.gpr[2] = msg[2];
+                ctx.gpr[3] = msg[3];
+                return msg[0];
+            }
+            Err(endpoint::IpcError::WouldBlock) => return SYS_ERR_WOULD_BLOCK,
+            Err(_) => return SYS_ERR_UNKNOWN,
         }
     }
 }

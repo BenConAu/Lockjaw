@@ -2,7 +2,12 @@ KERNEL_ELF := target/aarch64-unknown-none/debug/lockjaw
 KERNEL_ELF_RELEASE := target/aarch64-unknown-none/release/lockjaw
 
 QEMU := qemu-system-aarch64
-QEMU_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -nographic -kernel
+# Two UARTs: UART0 (kernel debug) and UART1 (userspace driver), both to stdio.
+# Ctrl-A C switches between QEMU monitor and serial mux.
+QEMU_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -display none \
+	-chardev stdio,mux=on,id=char0 -mon chardev=char0,mode=readline \
+	-serial chardev:char0 -serial chardev:char0 \
+	-kernel
 
 INIT_ELF := user/init/target/aarch64-unknown-none/release/lockjaw-init
 
@@ -16,7 +21,7 @@ build-user:
 build: build-user check-stack
 	cargo build
 
-build-release: check-stack
+build-release: build-user check-stack
 	cargo build --release
 
 run: build

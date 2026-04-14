@@ -11,7 +11,6 @@ use core::ptr;
 const UARTDR: u64 = 0x00;    // Data register (read = RX, write = TX)
 const UARTFR: u64 = 0x18;    // Flag register
 const UARTIMSC: u64 = 0x38;  // Interrupt mask set/clear
-const UARTICR: u64 = 0x44;   // Interrupt clear register
 
 const UARTFR_TXFF: u32 = 1 << 5;  // TX FIFO full
 const UARTFR_RXFE: u32 = 1 << 4;  // RX FIFO empty
@@ -25,11 +24,12 @@ const UARTIMSC_RXIM: u32 = 1 << 4; // RX interrupt mask
 /// conflict with L2[4] (kernel device MMIO block) and L2[2] (user code).
 const UART_VA: u64 = 0x0020_0000;
 
-/// PL011 UART0 physical address on QEMU virt.
-const UART_PHYS: u64 = 0x0900_0000;
+/// PL011 UART1 physical address on QEMU virt (from DTB: pl011@9040000).
+/// UART0 (0x0900_0000) stays with the kernel for kprintln/debug.
+const UART_PHYS: u64 = 0x0904_0000;
 
-/// UART0 SPI interrupt: SPI 1 = INTID 33 on QEMU virt.
-const UART_INTID: u64 = 33;
+/// UART1 SPI interrupt: SPI 8 = INTID 40 on QEMU virt (from DTB: interrupts <0 8 4>).
+const UART_INTID: u64 = 40;
 
 /// MAP_FLAG_DEVICE — must match lockjaw-types::vmem::MAP_FLAG_DEVICE.
 const MAP_FLAG_DEVICE: u64 = 1 << 0;
@@ -81,20 +81,6 @@ fn sys_create_notification(pageset_id: u64) -> u64 {
     result
 }
 
-fn sys_wait_notification(handle: u64, threshold: u64) -> u64 {
-    let result: u64;
-    unsafe {
-        asm!(
-            "svc #0",
-            in("x0") handle,
-            in("x1") threshold,
-            in("x8") 11u64,
-            lateout("x0") result,
-        );
-    }
-    result
-}
-
 fn sys_bind_irq(intid: u64, notif_handle: u64) -> u64 {
     let result: u64;
     unsafe {
@@ -108,6 +94,42 @@ fn sys_bind_irq(intid: u64, notif_handle: u64) -> u64 {
     }
     result
 }
+
+/// Non-blocking receive. Returns the first message word, or SYS_ERR_WOULD_BLOCK (10).
+fn sys_recv_nb(handle: u64) -> u64 {
+    let result: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x0") handle,
+            in("x8") 14u64,
+            lateout("x0") result,
+        );
+    }
+    result
+}
+
+fn sys_reply(handle: u64, msg0: u64, msg1: u64, msg2: u64, msg3: u64) {
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x0") handle,
+            in("x1") msg0,
+            in("x2") msg1,
+            in("x3") msg2,
+            in("x4") msg3,
+            in("x8") 5u64,
+        );
+    }
+}
+
+fn sys_yield() {
+    unsafe {
+        asm!("svc #0", in("x8") 1u64);
+    }
+}
+
+const SYS_ERR_WOULD_BLOCK: u64 = 10;
 
 // ---------------------------------------------------------------------------
 // UART MMIO helpers
@@ -148,33 +170,26 @@ pub extern "C" fn _start() -> ! {
     // Print early banner via sys_debug_putc (kernel UART, known to work)
     puts("uart-driver: starting\n");
 
-    // Step 1: Map UART MMIO page into our address space
+    // Step 1: Map UART1 MMIO page into our address space
     let map_result = sys_map_pages(UART_PHYS, UART_VA, MAP_FLAG_DEVICE);
     if map_result != 0 {
-        puts("uart-driver: map UART MMIO FAILED\n");
+        puts("uart-driver: map MMIO FAILED\n");
         loop { unsafe { asm!("wfi"); } }
     }
+    puts("uart-driver: MMIO mapped\n");
 
     // Step 2: Create a notification for the UART RX interrupt
     let notif_ps = sys_alloc_pages(1);
-    if notif_ps == u64::MAX {
-        puts("uart-driver: alloc notification page FAILED\n");
-        loop { unsafe { asm!("wfi"); } }
-    }
-
     let notif_handle = sys_create_notification(notif_ps);
-    if notif_handle >= 256 {
-        // Handle indices are small; large values indicate error codes
-        puts("uart-driver: create notification FAILED\n");
-        loop { unsafe { asm!("wfi"); } }
-    }
+    puts("uart-driver: notification created\n");
 
-    // Step 3: Bind UART IRQ (INTID 33) to the notification
+    // Step 3: Bind UART1 IRQ (INTID 34) to the notification
     let bind_result = sys_bind_irq(UART_INTID, notif_handle);
     if bind_result != 0 {
         puts("uart-driver: bind IRQ FAILED\n");
         loop { unsafe { asm!("wfi"); } }
     }
+    puts("uart-driver: IRQ bound\n");
 
     // Step 4: Enable PL011 RX interrupt via mapped MMIO
     unsafe {
@@ -182,30 +197,37 @@ pub extern "C" fn _start() -> ! {
         uart_write32(UARTIMSC, imsc | UARTIMSC_RXIM);
     }
 
-    // Print banner via our own mapped UART
-    unsafe { uart_puts("uart-driver: UART mapped, IRQ bound, RX echo active\n"); }
+    // Print banner via UART1 (our own mapped UART)
+    unsafe { uart_puts("uart-driver: UART1 active\n"); }
+    // Also confirm via kernel UART0
+    puts("uart-driver: server ready\n");
 
-    // Step 5: Main loop — wait for RX interrupt, read and echo characters
-    let mut threshold: u64 = 1;
+    // Step 5: Polling server loop.
+    // Handle 0 = endpoint (copied from parent at process creation).
+    // Check both RX (via MMIO) and TX requests (via non-blocking IPC) each round.
     loop {
-        sys_wait_notification(notif_handle, threshold);
-        threshold += 1;
-
         unsafe {
-            // Drain the RX FIFO
-            while uart_read32(UARTFR) & UARTFR_RXFE == 0 {
+            // Check RX directly via MMIO — drain up to 16 bytes per poll
+            let mut rx_count = 0;
+            while uart_read32(UARTFR) & UARTFR_RXFE == 0 && rx_count < 16 {
                 let ch = (uart_read32(UARTDR) & 0xFF) as u8;
-                // Echo the character back
                 uart_putc(ch);
-                // Echo newline as \r\n
                 if ch == b'\r' {
                     uart_putc(b'\n');
                 }
+                rx_count += 1;
             }
-
-            // Clear the RX interrupt
-            uart_write32(UARTICR, UARTIMSC_RXIM);
         }
+
+        // Check for TX requests (non-blocking IPC receive on handle 0)
+        let result = sys_recv_nb(0);
+        if result != SYS_ERR_WOULD_BLOCK {
+            // Got a message — first word is the character to print
+            unsafe { uart_putc(result as u8); }
+            sys_reply(0, 0, 0, 0, 0);
+        }
+
+        sys_yield();
     }
 }
 

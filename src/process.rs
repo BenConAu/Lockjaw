@@ -45,6 +45,7 @@ pub unsafe fn create_process(
     entry_point: u64,
     stack_pageset_id: u64,
     scratch_pageset_id: u64,
+    parent_handle_to_copy: u64,
 ) -> Result<(), &'static str> {
     // Need room for mapping_count entries + 1 stack page
     if mapping_count == 0 || mapping_count + 1 > MAPPINGS_PER_PAGE {
@@ -114,6 +115,26 @@ pub unsafe fn create_process(
         &HandleTableCreateInfo { slot_count: 8 },
         ht_page.start_addr(),
     ).map_err(|_| "handle table create failed")?;
+
+    // Copy a handle from the parent's table into the child's table.
+    // This is the simplest form of capability transfer at process creation.
+    if parent_handle_to_copy != u64::MAX {
+        let parent_tcb_paddr = scheduler::current_tcb_paddr();
+        let parent_tcb = (parent_tcb_paddr.as_u64() + KERNEL_VA_OFFSET) as *const crate::sched::tcb::Tcb;
+        let parent_ht = PhysAddr::new((*parent_tcb).handle_table_paddr);
+
+        let entry = crate::cap::handle_table::handle_lookup(
+            parent_ht, parent_handle_to_copy as u32,
+            crate::cap::rights::Rights::none(), // no rights check — just copy the entry
+        ).map_err(|_| "parent handle lookup failed")?;
+
+        crate::cap::handle_table::handle_insert(
+            ht_page.start_addr(),
+            PhysAddr::new(entry.object_paddr),
+            entry.obj_type,
+            entry.rights,
+        ).map_err(|_| "child handle insert failed")?;
+    }
 
     // Create TCB
     let tcb_stack = page_alloc::alloc_page().ok_or("out of pages for TCB stack")?;

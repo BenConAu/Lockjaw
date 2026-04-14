@@ -79,6 +79,7 @@ pub enum IpcError {
     EndpointBusy,
     NoCaller,
     InvalidTransition,
+    WouldBlock,
 }
 
 impl From<lockjaw_types::ipc_state::TransitionError> for IpcError {
@@ -276,6 +277,28 @@ pub unsafe fn ipc_reply(
     // block the acting thread.
     execute_ipc(endpoint_paddr, IpcOp::Reply, PhysAddr::new(0), Some(reply_msg))?;
     Ok(())
+}
+
+/// Non-blocking receive: if a sender is waiting, take the message.
+/// Otherwise return WouldBlock immediately instead of blocking.
+///
+/// # Safety
+/// `endpoint_paddr` and `receiver_tcb_paddr` must point to valid kernel objects.
+pub unsafe fn ipc_receive_nb(
+    endpoint_paddr: PhysAddr,
+    receiver_tcb_paddr: PhysAddr,
+) -> Result<[u64; 4], IpcError> {
+    let ep = ep_ptr_mut(endpoint_paddr);
+
+    // Fast check: if no sender/caller is waiting, return immediately.
+    // HasSender = a Send is pending. HasCaller = a Call is pending (sender waiting for reply).
+    if (*ep).state != EP_HAS_SENDER && (*ep).state != EP_HAS_CALLER {
+        return Err(IpcError::WouldBlock);
+    }
+
+    // A sender is waiting — proceed with the normal receive (will not block)
+    let result = execute_ipc(endpoint_paddr, IpcOp::Receive, receiver_tcb_paddr, None)?;
+    Ok(result.unwrap_or([0; 4]))
 }
 
 // ---------------------------------------------------------------------------
