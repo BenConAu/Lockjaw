@@ -64,18 +64,6 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ---
 
-## ipc_msg field used as scratch in TCB
-
-**Where:** `src/process.rs` (line 129-130)
-
-**What:** New processes store their ELF entry point and user stack top in the TCB's `ipc_msg[0]` and `ipc_msg[1]` fields. These are IPC message registers repurposed as temporary storage because the thread hasn't started IPC yet.
-
-**Why:** Adding dedicated fields to the TCB would increase its size. The ipc_msg fields are unused until the thread starts IPC operations.
-
-**Fix:** Add `user_entry_point: u64` and `user_stack_top: u64` fields to the TCB struct. The ipc_msg field should only be used for IPC.
-
----
-
 ## UnsafeCell globals assume single-core
 
 **Where:** `src/cap/pageset_table.rs`, `src/arch/aarch64/irq_bind.rs`

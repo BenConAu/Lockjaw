@@ -29,7 +29,14 @@ pub struct Tcb {
     pub handle_table_paddr: u64,
     pub ttbr0_paddr: u64,
     pub ipc_blocked_on: u64,
+    /// Kernel-internal IPC mailbox. The IPC state machine writes received
+    /// messages here; the syscall handler copies them to the exception
+    /// context (x0-x3) for userspace. Do not use for other purposes.
     pub ipc_msg: [u64; 4],
+    /// ELF entry point VA for user processes (0 for kernel threads).
+    pub user_entry_point: u64,
+    /// User stack top VA for user processes (0 for kernel threads).
+    pub user_stack_top: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -42,6 +49,8 @@ pub struct TcbCreateInfo {
     pub stack_paddr: PhysAddr,
     pub handle_table_paddr: PhysAddr,
     pub ttbr0_paddr: PhysAddr,
+    pub user_entry_point: u64,
+    pub user_stack_top: u64,
 }
 
 /// Initialize a TCB in donated memory and set up its stack with a
@@ -95,6 +104,8 @@ pub unsafe fn create_tcb(
         ttbr0_paddr: info.ttbr0_paddr.as_u64(),
         ipc_blocked_on: 0,
         ipc_msg: [0; 4],
+        user_entry_point: info.user_entry_point,
+        user_stack_top: info.user_stack_top,
     });
 
     Ok(())

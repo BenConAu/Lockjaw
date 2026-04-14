@@ -229,13 +229,13 @@ pub extern "C" fn kmain() -> ! {
         // Thread A (sender) — sends messages on the endpoint
         let stack_a = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
         let tcb_a_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
-        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, handle_table_paddr: ht_a_page, ttbr0_paddr: mm::addr::PhysAddr::new(0) }, tcb_a_page)
+        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, handle_table_paddr: ht_a_page, ttbr0_paddr: mm::addr::PhysAddr::new(0), user_entry_point: 0, user_stack_top: 0 }, tcb_a_page)
             .expect("create tcb a");
 
         // Thread B (receiver) — receives and prints messages
         let stack_b = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
         let tcb_b_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
-        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, handle_table_paddr: ht_b_page, ttbr0_paddr: mm::addr::PhysAddr::new(0) }, tcb_b_page)
+        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, handle_table_paddr: ht_b_page, ttbr0_paddr: mm::addr::PhysAddr::new(0), user_entry_point: 0, user_stack_top: 0 }, tcb_b_page)
             .expect("create tcb b");
 
         // Register idle thread (index 0 = this boot thread, uses the boot stack).
@@ -260,6 +260,8 @@ pub extern "C" fn kmain() -> ! {
             ttbr0_paddr: 0,
             ipc_blocked_on: 0,
             ipc_msg: [0; 4],
+            user_entry_point: 0,
+            user_stack_top: 0,
         });
 
         sched::scheduler::add_thread(idle_tcb_page);  // index 0: idle/boot

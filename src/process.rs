@@ -146,14 +146,11 @@ pub unsafe fn create_process(
             stack_paddr: tcb_stack.start_addr(),
             handle_table_paddr: ht_page.start_addr(),
             ttbr0_paddr: ttbr0,
+            user_entry_point: entry_point,
+            user_stack_top: stack_va + PAGE_SIZE,
         },
         tcb_page.start_addr(),
     ).map_err(|_| "TCB create failed")?;
-
-    // Store entry point and stack top in TCB's ipc_msg scratch
-    let tcb_va = (tcb_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut Tcb;
-    (*tcb_va).ipc_msg[0] = entry_point;
-    (*tcb_va).ipc_msg[1] = stack_va + PAGE_SIZE;
 
     if !scheduler::add_thread(tcb_page.start_addr()) {
         return Err("scheduler run queue full");
@@ -168,8 +165,8 @@ fn process_entry() -> ! {
     unsafe {
         let tcb_paddr = scheduler::current_tcb_paddr();
         let tcb = (tcb_paddr.as_u64() + KERNEL_VA_OFFSET) as *const Tcb;
-        let entry = (*tcb).ipc_msg[0];
-        let stack_top = (*tcb).ipc_msg[1];
+        let entry = (*tcb).user_entry_point;
+        let stack_top = (*tcb).user_stack_top;
         let ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
 
         crate::arch::aarch64::mmu::drop_to_el0_with_ttbr0(ttbr0, entry, stack_top);
