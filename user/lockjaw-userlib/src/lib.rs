@@ -15,3 +15,9 @@ pub use lockjaw_types::syscall::SYS_ERR_WOULD_BLOCK;
 pub use syscall::*;
 pub use print::*;
 pub use process::{ProcessMapping, FLAG_EXECUTABLE};
+
+/// Zero a page at the given virtual address.
+/// Unsafe: caller must ensure the VA points to a valid mapped page.
+pub unsafe fn zero_page_at_va(va: u64) {
+    core::ptr::write_bytes(va as *mut u8, 0, PAGE_SIZE as usize);
+}

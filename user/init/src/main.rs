@@ -59,9 +59,7 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
                 return false;
             }
 
-            unsafe {
-                core::ptr::write_bytes(temp_va as *mut u8, 0, PAGE_SIZE as usize);
-            }
+            unsafe { zero_page_at_va(temp_va); }
 
             let seg_page_offset = (p as u64) * PAGE_SIZE;
             let file_remaining = if seg.file_size > seg_page_offset {

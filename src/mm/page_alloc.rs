@@ -1,4 +1,4 @@
-use crate::mm::addr::{PhysAddr, PhysPage, RAM_START, TOTAL_PAGES, PAGE_SIZE};
+use crate::mm::addr::{PhysAddr, PhysPage, RAM_START, TOTAL_PAGES, PAGE_SIZE, KERNEL_VA_OFFSET};
 
 /// Bitmap size in bytes: 32768 pages / 8 bits per byte = 4096 bytes.
 const BITMAP_SIZE: usize = (TOTAL_PAGES + 7) / 8;
@@ -95,6 +95,15 @@ pub fn dealloc_page(page: PhysPage) -> bool {
             NEXT_FREE_HINT = idx;
         }
         true
+    }
+}
+
+/// Zero a single 4KB page at the given physical address.
+/// Safe because the kernel higher-half mapping covers all RAM.
+pub fn zero_page(paddr: PhysAddr) {
+    unsafe {
+        let va = (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut u8;
+        core::ptr::write_bytes(va, 0, PAGE_SIZE as usize);
     }
 }
 

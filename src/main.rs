@@ -288,8 +288,8 @@ pub extern "C" fn kmain() -> ! {
 
         // Allocate a page for the mapping buffer (avoids large array on the kernel stack)
         let map_buf = mm::page_alloc::alloc_page().expect("mapping buffer page");
+        mm::page_alloc::zero_page(map_buf.start_addr());
         let map_buf_va = (map_buf.start_addr().as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut Mapping;
-        core::ptr::write_bytes(map_buf_va as *mut u8, 0, mm::addr::PAGE_SIZE as usize);
         let mappings = core::slice::from_raw_parts_mut(map_buf_va, MAPPINGS_PER_PAGE);
         let mut mapping_count = 0;
 
@@ -316,7 +316,7 @@ pub extern "C" fn kmain() -> ! {
                 };
 
                 // Zero the page first (for BSS-style segments where mem_size > file_size)
-                core::ptr::write_bytes(page_va as *mut u8, 0, mm::addr::PAGE_SIZE as usize);
+                mm::page_alloc::zero_page(page.start_addr());
 
                 if file_remaining > 0 {
                     let src = &INIT_ELF[file_start as usize..(file_start + file_remaining) as usize];

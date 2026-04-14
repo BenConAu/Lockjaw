@@ -88,15 +88,15 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ---
 
-## No zero_page helper for page zeroing
+## No safe page abstraction in userspace
 
-**Where:** `src/main.rs`, `src/process.rs`, `src/arch/aarch64/vmem.rs`
+**Where:** `user/lockjaw-userlib/src/lib.rs` (`zero_page_at_va`)
 
-**What:** Multiple call sites zero a page with `core::ptr::write_bytes(va as *mut u8, 0, PAGE_SIZE)`. The `as *mut u8` cast is critical — `write_bytes` on a typed pointer multiplies count by `size_of::<T>()`, so passing `PAGE_SIZE` to a `*mut Mapping` pointer zeroes 24× past the page boundary. This already caused a memory corruption bug (zeroed 98KB instead of 4KB).
+**What:** The kernel's `zero_page(PhysAddr)` is safe because `PhysAddr` is a trusted type from the page allocator. The userspace equivalent `zero_page_at_va(u64)` is unsafe because user virtual addresses are raw `u64` values with no type-level proof that they're mapped.
 
-**Why bootstrap:** The pattern appeared in only two places initially and the bug was caught during testing.
+**Why bootstrap:** Userspace has no validated address types. Adding a `MappedPage` type returned by `sys_map_pages` would make page operations safe, but requires designing the userspace memory management API.
 
-**Fix:** Add `unsafe fn zero_page(paddr: PhysAddr)` in `mm/page_alloc.rs` (or similar) that always casts to `*mut u8` internally. Replace all manual page-zeroing call sites. One function, impossible to get wrong.
+**Fix:** Introduce a `MappedPage` type in lockjaw-userlib that wraps a VA returned by a successful `sys_map_pages`. `zero_page_at_va` and other page operations would take `MappedPage` instead of raw `u64`, making them safe.
 
 ---
 

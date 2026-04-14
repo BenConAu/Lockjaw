@@ -59,8 +59,8 @@ pub unsafe fn create_process(
     if scratch_count != 1 {
         return Err("scratch must be 1 page");
     }
+    page_alloc::zero_page(scratch_pages[0]);
     let buf_va = (scratch_pages[0].as_u64() + KERNEL_VA_OFFSET) as *mut Mapping;
-    core::ptr::write_bytes(buf_va as *mut u8, 0, PAGE_SIZE as usize);
     let mappings = core::slice::from_raw_parts_mut(buf_va, MAPPINGS_PER_PAGE);
     let mut count = 0;
 
