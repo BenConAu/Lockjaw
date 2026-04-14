@@ -59,6 +59,12 @@ pub fn is_notification_ready(current_value: u64, threshold: u64) -> bool {
     current_value >= threshold
 }
 
+/// Check whether an endpoint has a blocked caller (required for sys_export_handle).
+/// The exporter can only export a handle into a caller that is waiting for a reply.
+pub fn can_export_to_caller(state: EpState) -> bool {
+    state == EpState::HasCaller
+}
+
 // ---------------------------------------------------------------------------
 // Bitmask computation
 // ---------------------------------------------------------------------------
@@ -146,6 +152,28 @@ mod tests {
     fn user_buffer_zero_size_invalid_kernel_ptr() {
         // Even zero-size buffer at kernel address is invalid
         assert!(!validate_user_buffer(0xFFFF_0000_0000_0000, 0));
+    }
+
+    // --- can_export_to_caller ---
+
+    #[test]
+    fn export_allowed_when_has_caller() {
+        assert!(can_export_to_caller(EpState::HasCaller));
+    }
+
+    #[test]
+    fn export_denied_when_idle() {
+        assert!(!can_export_to_caller(EpState::Idle));
+    }
+
+    #[test]
+    fn export_denied_when_has_sender() {
+        assert!(!can_export_to_caller(EpState::HasSender));
+    }
+
+    #[test]
+    fn export_denied_when_has_receiver() {
+        assert!(!can_export_to_caller(EpState::HasReceiver));
     }
 
     // --- validate_wait_count ---

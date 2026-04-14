@@ -330,6 +330,15 @@ pub fn read_state(ep_paddr: PhysAddr) -> EpState {
     }
 }
 
+/// Read the caller TCB paddr from this endpoint (for sys_export_handle).
+/// Returns 0 if no caller is blocked.
+pub fn read_caller_tcb(ep_paddr: PhysAddr) -> u64 {
+    unsafe {
+        let ep = ep_ptr(ep_paddr);
+        (*ep).caller_tcb_paddr
+    }
+}
+
 /// Register a thread as a readiness waiter on this endpoint.
 /// The thread will be woken (without consuming) when a sender/caller arrives.
 pub unsafe fn set_readiness_waiter(ep_paddr: PhysAddr, waiter_paddr: PhysAddr) {

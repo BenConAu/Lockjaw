@@ -36,6 +36,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_CREATE_ENDPOINT => sys_create_endpoint(ctx),
         SYS_RECV_NB => sys_recv_nb(ctx),
         SYS_WAIT_ANY => sys_wait_any(ctx),
+        SYS_EXPORT_HANDLE => sys_export_handle(ctx),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             SYS_ERR_INVALID_PARAMETER
@@ -514,6 +515,59 @@ fn check_readiness(
         };
     }
     compute_ready_mask(&objects[..count])
+}
+
+/// sys_export_handle(endpoint_handle, handle_to_export) — duplicate a handle
+/// into a blocked caller's handle table.
+/// x0 = endpoint handle (must have a caller blocked via sys_call).
+/// x1 = handle index in the exporter's table to duplicate.
+/// Returns the new handle index in the caller's table, or an error.
+fn sys_export_handle(ctx: &mut ExceptionContext) -> u64 {
+    use lockjaw_types::wait::can_export_to_caller;
+
+    let ep_handle = ctx.gpr[0] as u32;
+    let handle_to_export = ctx.gpr[1] as u32;
+
+    unsafe {
+        // Look up the endpoint — exporter needs WRITE rights
+        let ep_entry = match lookup_handle(ep_handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Endpoint) {
+            Ok(e) => e,
+            Err(code) => return code,
+        };
+
+        let ep_paddr = PhysAddr::new(ep_entry.object_paddr);
+
+        // Verify a caller is blocked (pure check from lockjaw-types)
+        let ep_state = endpoint::read_state(ep_paddr);
+        if !can_export_to_caller(ep_state) {
+            return SYS_ERR_NO_CALLER;
+        }
+
+        // Look up the handle to export in the exporter's own table
+        let ht_paddr = caller_handle_table();
+        let export_entry = match handle_table::handle_lookup(
+            ht_paddr, handle_to_export, Rights::none(),
+        ) {
+            Ok(e) => e,
+            Err(_) => return SYS_ERR_INVALID_HANDLE,
+        };
+
+        // Find the blocked caller's handle table
+        let caller_tcb_paddr = endpoint::read_caller_tcb(ep_paddr);
+        let caller_tcb = (caller_tcb_paddr + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
+        let caller_ht = PhysAddr::new((*caller_tcb).handle_table_paddr);
+
+        // Insert a copy into the caller's table
+        match handle_table::handle_insert(
+            caller_ht,
+            PhysAddr::new(export_entry.object_paddr),
+            export_entry.obj_type,
+            export_entry.rights,
+        ) {
+            Ok(new_index) => new_index as u64,
+            Err(_) => SYS_ERR_OUT_OF_MEMORY,
+        }
+    }
 }
 
 fn obj_type_from_u8(v: u8) -> ObjectType {

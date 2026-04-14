@@ -132,6 +132,23 @@ pub fn sys_bind_irq(intid: u64, notif_handle: u64) -> u64 {
     result
 }
 
+/// Export a handle from the caller's table into a blocked caller's table.
+/// The endpoint must have a caller blocked via sys_call.
+/// Returns the new handle index in the caller's table.
+pub fn sys_export_handle(endpoint_handle: u64, handle_to_export: u64) -> u64 {
+    let result: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x0") endpoint_handle,
+            in("x1") handle_to_export,
+            in("x8") SYS_EXPORT_HANDLE,
+            lateout("x0") result,
+        );
+    }
+    result
+}
+
 /// Wait until any of the given objects is ready.
 /// entries = array of WaitEntry (handle + threshold pairs).
 /// Returns a bitmask: bit N set = entry N is ready.
