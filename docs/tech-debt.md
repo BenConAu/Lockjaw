@@ -122,18 +122,6 @@ The eventual design is a **device manager** process that:
 
 ---
 
-## Polling UART server
-
-**Where:** `user/uart-driver/src/main.rs`
-
-**What:** The UART driver polls both RX (via UARTFR MMIO read) and TX (via sys_recv_nb) in a loop with sys_yield between iterations. It burns a scheduler slot every tick even when idle.
-
-**Why bootstrap:** The proper solution is bound notifications (seL4-style multiplexed wait): bind a notification to a thread's TCB so that sys_receive wakes on either an IPC message or a notification signal. This lets the driver sleep until work arrives. Implementing bound notifications requires modifying the IPC receive path, the notification signal path, and the TCB — substantial kernel work.
-
-**Fix:** Add bound notifications. TCB gets a `bound_notif_paddr` field. sys_receive checks the bound notification before blocking — if it fired, return immediately with a flag. notification_signal checks if the bound TCB is blocked on an endpoint and wakes it. The driver loop becomes: `sys_receive(endpoint)` → if notification: handle RX; if IPC: handle TX. Zero CPU when idle.
-
----
-
 ## lockjaw-userlib minor cleanup
 
 **Where:** `user/lockjaw-userlib/`
