@@ -131,3 +131,27 @@ The eventual design is a **device manager** process that:
 **Why bootstrap:** Phase 9 only needs one UART driver with one known MMIO address and one IRQ. Hardcoding works. The DTB parser and resource arbitration are substantial — worth their own phase.
 
 **Fix:** Dedicated phase. The kernel's sys_bind_irq and sys_map_pages syscalls stay as-is (simple, low-level primitives). The device manager sits on top as the userspace authority that decides who gets to call them and with what arguments.
+
+---
+
+## Single-handle copy at process creation
+
+**Where:** `src/process.rs`, `src/syscall/handler.rs` (sys_create_process x5 parameter)
+
+**What:** sys_create_process copies at most one handle from the parent's handle table into the child's. x5 = handle index to copy, or u64::MAX for none. This is the only mechanism for capability transfer between processes.
+
+**Why bootstrap:** The UART driver needs exactly one handle (the IPC endpoint from init). One handle is enough for Phase 9.
+
+**Fix:** Either extend to an array of handles (x5 = pointer to handle index array, x6 = count), or implement IPC-based capability transfer where handles can be sent in IPC messages (like seL4's CNode mint/copy operations). The latter is the proper microkernel approach — capabilities flow through IPC, not just at creation time.
+
+---
+
+## Polling UART server
+
+**Where:** `user/uart-driver/src/main.rs`
+
+**What:** The UART driver polls both RX (via UARTFR MMIO read) and TX (via sys_recv_nb) in a loop with sys_yield between iterations. It burns a scheduler slot every tick even when idle.
+
+**Why bootstrap:** The proper solution is bound notifications (seL4-style multiplexed wait): bind a notification to a thread's TCB so that sys_receive wakes on either an IPC message or a notification signal. This lets the driver sleep until work arrives. Implementing bound notifications requires modifying the IPC receive path, the notification signal path, and the TCB — substantial kernel work.
+
+**Fix:** Add bound notifications. TCB gets a `bound_notif_paddr` field. sys_receive checks the bound notification before blocking — if it fired, return immediately with a flag. notification_signal checks if the bound TCB is blocked on an endpoint and wakes it. The driver loop becomes: `sys_receive(endpoint)` → if notification: handle RX; if IPC: handle TX. Zero CPU when idle.
