@@ -97,6 +97,16 @@ pub fn sys_reply(handle: u64, msg0: u64, msg1: u64, msg2: u64, msg3: u64) {
     }
 }
 
+/// Blocking receive on an endpoint.
+/// Returns the first message word. Blocks until a sender is waiting.
+pub fn sys_receive(handle: u64) -> u64 {
+    let result: u64;
+    unsafe {
+        asm!("svc #0", in("x0") handle, in("x8") SYS_RECEIVE, lateout("x0") result);
+    }
+    result
+}
+
 /// Non-blocking receive on an endpoint.
 /// Returns the first message word if a sender is waiting,
 /// or SYS_ERR_WOULD_BLOCK if no message is pending.
@@ -116,6 +126,23 @@ pub fn sys_bind_irq(intid: u64, notif_handle: u64) -> u64 {
             in("x0") intid,
             in("x1") notif_handle,
             in("x8") SYS_BIND_IRQ,
+            lateout("x0") result,
+        );
+    }
+    result
+}
+
+/// Wait until any of the given objects is ready.
+/// entries = array of WaitEntry (handle + threshold pairs).
+/// Returns a bitmask: bit N set = entry N is ready.
+pub fn sys_wait_any(entries: &[crate::WaitEntry]) -> u64 {
+    let result: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x0") entries.as_ptr(),
+            in("x1") entries.len(),
+            in("x8") SYS_WAIT_ANY,
             lateout("x0") result,
         );
     }

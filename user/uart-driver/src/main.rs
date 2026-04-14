@@ -103,34 +103,44 @@ pub extern "C" fn _start() -> ! {
     // Also confirm via kernel UART0
     puts("uart-driver: server ready\n");
 
-    // Step 5: Polling server loop.
+    // Step 5: Event-driven server loop using sys_wait_any.
     // Handle 0 = endpoint (copied from parent at process creation).
-    // Check both RX (via MMIO) and TX requests (via non-blocking IPC) each round.
-    loop {
-        unsafe {
-            // Check RX directly via MMIO — drain up to 16 bytes per poll
-            let mut rx_count = 0;
-            while uart_read32(UARTFR) & UARTFR_RXFE == 0 && rx_count < 16 {
-                let ch = (uart_read32(UARTDR) & 0xFF) as u8;
-                // Echo the character back
-                uart_putc(ch);
-                // Echo newline as \r\n
-                if ch == b'\r' {
-                    uart_putc(b'\n');
-                }
-                rx_count += 1;
-            }
-        }
+    // Handle at notif_handle = notification (created above, bound to UART1 IRQ).
+    // The thread sleeps until either an IPC message or an IRQ arrives.
+    let mut irq_threshold: u64 = 1;
+    let mut entries = [
+        WaitEntry { handle: 0, threshold: 0 },                       // endpoint
+        WaitEntry { handle: notif_handle, threshold: irq_threshold }, // notification
+    ];
 
-        // Check for TX requests (non-blocking IPC receive on handle 0)
-        let result = sys_recv_nb(0);
-        if result != SYS_ERR_WOULD_BLOCK {
-            // Got a message — first word is the character to print
-            unsafe { uart_putc(result as u8); }
+    loop {
+        let mask = sys_wait_any(&entries);
+
+        // Bit 0: endpoint ready — IPC TX request
+        if mask & 1 != 0 {
+            let ch = sys_receive(0);
+            unsafe { uart_putc(ch as u8); }
             sys_reply(0, 0, 0, 0, 0);
         }
 
-        sys_yield();
+        // Bit 1: notification ready — UART RX interrupt fired
+        if mask & 2 != 0 {
+            unsafe {
+                // Drain the RX FIFO
+                while uart_read32(UARTFR) & UARTFR_RXFE == 0 {
+                    let ch = (uart_read32(UARTDR) & 0xFF) as u8;
+                    // Echo the character back
+                    uart_putc(ch);
+                    // Echo newline as \r\n
+                    if ch == b'\r' {
+                        uart_putc(b'\n');
+                    }
+                }
+            }
+            // Advance threshold for the next IRQ
+            irq_threshold += 1;
+            entries[1].threshold = irq_threshold;
+        }
     }
 }
 
