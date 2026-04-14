@@ -12,10 +12,6 @@ use crate::sched::tcb::Tcb;
 use lockjaw_types::syscall::*;
 
 /// Dispatch a syscall from userspace.
-/// Called from handle_exception_sync_lower when EC = 0x15 (SVC from AArch64).
-///
-/// Convention: syscall number in x8, arguments in x0-x5, return in x0.
-/// Dispatch a syscall from userspace.
 ///
 /// Called from handle_exception_sync_lower when ESR_EL1.EC = 0x15 (SVC from AArch64).
 /// Reads the syscall number from x8, dispatches to the handler, and writes the
@@ -46,12 +42,17 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
     };
 }
 
+/// Get the current thread's handle table physical address.
+unsafe fn caller_handle_table() -> PhysAddr {
+    let tcb_paddr = scheduler::current_tcb_paddr();
+    let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
+    PhysAddr::new((*tcb).handle_table_paddr)
+}
+
 /// Look up a handle in the current thread's handle table with type checking.
 /// Returns the HandleEntry on success, or a syscall error code on failure.
 unsafe fn lookup_handle(handle: u32, required_rights: Rights, expected_type: ObjectType) -> Result<handle_table::HandleEntry, u64> {
-    let tcb_paddr = scheduler::current_tcb_paddr();
-    let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
-    let ht_paddr = PhysAddr::new((*tcb).handle_table_paddr);
+    let ht_paddr = caller_handle_table();
 
     let entry = handle_table::handle_lookup(ht_paddr, handle, required_rights)
         .map_err(|_| SYS_ERR_INVALID_HANDLE)?;
@@ -61,6 +62,35 @@ unsafe fn lookup_handle(handle: u32, required_rights: Rights, expected_type: Obj
     }
 
     Ok(entry)
+}
+
+/// Common logic for sys_create_notification and sys_create_endpoint.
+/// Looks up the PageSet, validates it's 1 page, calls the init function,
+/// and inserts a handle into the caller's table.
+unsafe fn create_kernel_object(
+    pageset_id: u64,
+    obj_type: ObjectType,
+    init_fn: unsafe fn(PhysAddr) -> Result<(), crate::cap::object::CreateError>,
+) -> u64 {
+    let (count, pages) = match crate::cap::pageset_table::get_pageset(pageset_id) {
+        Some(ps) => ps,
+        None => return SYS_ERR_INVALID_HANDLE,
+    };
+    if count != 1 {
+        return SYS_ERR_INVALID_PARAMETER;
+    }
+    let paddr = pages[0];
+    if init_fn(paddr).is_err() {
+        return SYS_ERR_UNKNOWN;
+    }
+    let ht_paddr = caller_handle_table();
+    match handle_table::handle_insert(
+        ht_paddr, paddr, obj_type,
+        Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE),
+    ) {
+        Ok(handle) => handle as u64,
+        Err(_) => SYS_ERR_OUT_OF_MEMORY,
+    }
 }
 
 fn sys_debug_putc(char_val: u64) -> u64 {
@@ -249,38 +279,7 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> u64 {
 /// x0 = PageSet ID (must be a 1-page PageSet).
 /// Returns the new handle index on success.
 fn sys_create_notification(ctx: &mut ExceptionContext) -> u64 {
-    let pageset_id = ctx.gpr[0];
-
-    unsafe {
-        // Look up the PageSet to get the physical page
-        let (count, pages) = match crate::cap::pageset_table::get_pageset(pageset_id) {
-            Some(ps) => ps,
-            None => return SYS_ERR_INVALID_HANDLE,
-        };
-        if count != 1 {
-            return SYS_ERR_INVALID_PARAMETER;
-        }
-
-        let paddr = pages[0];
-
-        // Initialize the page as a NotificationObject
-        if crate::ipc::notification::create_notification(paddr).is_err() {
-            return SYS_ERR_UNKNOWN;
-        }
-
-        // Insert a handle into the caller's handle table
-        let tcb_paddr = scheduler::current_tcb_paddr();
-        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
-        let ht_paddr = PhysAddr::new((*tcb).handle_table_paddr);
-
-        match handle_table::handle_insert(
-            ht_paddr, paddr, ObjectType::Notification,
-            Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE),
-        ) {
-            Ok(handle) => handle as u64,
-            Err(_) => SYS_ERR_OUT_OF_MEMORY,
-        }
-    }
+    unsafe { create_kernel_object(ctx.gpr[0], ObjectType::Notification, crate::ipc::notification::create_notification) }
 }
 
 /// sys_signal_notification(handle, value) — signal a notification.
@@ -360,35 +359,7 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> u64 {
 /// x0 = PageSet ID (must be a 1-page PageSet).
 /// Returns the new handle index on success.
 fn sys_create_endpoint(ctx: &mut ExceptionContext) -> u64 {
-    let pageset_id = ctx.gpr[0];
-
-    unsafe {
-        let (count, pages) = match crate::cap::pageset_table::get_pageset(pageset_id) {
-            Some(ps) => ps,
-            None => return SYS_ERR_INVALID_HANDLE,
-        };
-        if count != 1 {
-            return SYS_ERR_INVALID_PARAMETER;
-        }
-
-        let paddr = pages[0];
-
-        if endpoint::create_endpoint(paddr).is_err() {
-            return SYS_ERR_UNKNOWN;
-        }
-
-        let tcb_paddr = scheduler::current_tcb_paddr();
-        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
-        let ht_paddr = PhysAddr::new((*tcb).handle_table_paddr);
-
-        match handle_table::handle_insert(
-            ht_paddr, paddr, ObjectType::Endpoint,
-            Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE),
-        ) {
-            Ok(handle) => handle as u64,
-            Err(_) => SYS_ERR_OUT_OF_MEMORY,
-        }
-    }
+    unsafe { create_kernel_object(ctx.gpr[0], ObjectType::Endpoint, endpoint::create_endpoint) }
 }
 
 /// sys_recv_nb(handle) — non-blocking receive on an endpoint.
@@ -400,10 +371,7 @@ fn sys_recv_nb(ctx: &mut ExceptionContext) -> u64 {
     unsafe {
         let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ), ObjectType::Endpoint) {
             Ok(e) => e,
-            Err(code) => {
-                crate::kprintln!("[recv_nb] handle lookup failed: h={} code={}", handle, code);
-                return code;
-            }
+            Err(code) => return code,
         };
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
