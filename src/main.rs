@@ -262,6 +262,10 @@ pub extern "C" fn kmain() -> ! {
             ipc_msg: [0; 4],
             user_entry_point: 0,
             user_stack_top: 0,
+            wait_objects: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+            wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+            wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+            wait_count: 0,
         });
 
         sched::scheduler::add_thread(idle_tcb_page);  // index 0: idle/boot

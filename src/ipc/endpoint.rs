@@ -318,8 +318,38 @@ pub unsafe fn ipc_receive_nb(
 }
 
 // ---------------------------------------------------------------------------
+// Readiness helpers for sys_wait_any
+// ---------------------------------------------------------------------------
+
+/// Read the current EpState from this endpoint.
+/// Safe because PhysAddr is a trusted kernel address.
+pub fn read_state(ep_paddr: PhysAddr) -> EpState {
+    unsafe {
+        let ep = ep_ptr(ep_paddr);
+        u8_to_ep_state((*ep).state)
+    }
+}
+
+/// Register a thread as a readiness waiter on this endpoint.
+/// The thread will be woken (without consuming) when a sender/caller arrives.
+pub unsafe fn set_readiness_waiter(ep_paddr: PhysAddr, waiter_paddr: PhysAddr) {
+    let ep = ep_ptr_mut(ep_paddr);
+    (*ep).readiness_waiter_paddr = waiter_paddr.as_u64();
+}
+
+/// Clear the readiness waiter registration on this endpoint.
+pub unsafe fn clear_readiness_waiter(ep_paddr: PhysAddr) {
+    let ep = ep_ptr_mut(ep_paddr);
+    (*ep).readiness_waiter_paddr = 0;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+unsafe fn ep_ptr(paddr: PhysAddr) -> *const EndpointObject {
+    (paddr.as_u64() + KERNEL_VA_OFFSET) as *const EndpointObject
+}
 
 unsafe fn ep_ptr_mut(paddr: PhysAddr) -> *mut EndpointObject {
     (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut EndpointObject

@@ -35,6 +35,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_BIND_IRQ => sys_bind_irq(ctx),
         SYS_CREATE_ENDPOINT => sys_create_endpoint(ctx),
         SYS_RECV_NB => sys_recv_nb(ctx),
+        SYS_WAIT_ANY => sys_wait_any(ctx),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             SYS_ERR_INVALID_PARAMETER
@@ -267,6 +268,12 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> u64 {
     let scratch_pageset_id = ctx.gpr[4];
     let parent_handle_to_copy = ctx.gpr[5];
 
+    // Validate the userspace mappings pointer
+    let byte_count = (mapping_count * core::mem::size_of::<crate::process::ProcessMapping>()) as u64;
+    if !lockjaw_types::wait::validate_user_buffer(ctx.gpr[0], byte_count) {
+        return SYS_ERR_INVALID_PARAMETER;
+    }
+
     unsafe {
         match crate::process::create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy) {
             Ok(()) => SYS_OK,
@@ -388,5 +395,131 @@ fn sys_recv_nb(ctx: &mut ExceptionContext) -> u64 {
             Err(endpoint::IpcError::WouldBlock) => return SYS_ERR_WOULD_BLOCK,
             Err(_) => return SYS_ERR_UNKNOWN,
         }
+    }
+}
+
+/// sys_wait_any(entries_ptr, count) — wait until any of N objects is ready.
+/// x0 = pointer to WaitEntry array in caller memory.
+/// x1 = count (1..MAX_WAIT_OBJECTS).
+/// Returns bitmask of ready objects in x0 (bit N = entry N is ready).
+fn sys_wait_any(ctx: &mut ExceptionContext) -> u64 {
+    use lockjaw_types::wait::{WaitEntry, MAX_WAIT_OBJECTS, validate_user_buffer, validate_wait_count};
+    use crate::ipc::notification;
+
+    let entries_ptr = ctx.gpr[0] as *const WaitEntry;
+    let count = ctx.gpr[1] as usize;
+
+    if !validate_wait_count(count) {
+        return SYS_ERR_INVALID_PARAMETER;
+    }
+
+    // Validate the userspace pointer is within the user VA range
+    let byte_count = (count * core::mem::size_of::<WaitEntry>()) as u64;
+    if !validate_user_buffer(ctx.gpr[0], byte_count) {
+        return SYS_ERR_INVALID_PARAMETER;
+    }
+
+    unsafe {
+        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *mut Tcb;
+        let ht_paddr = caller_handle_table();
+
+        // Resolve handles to paddrs and types
+        let mut paddrs = [PhysAddr::new(0); MAX_WAIT_OBJECTS];
+        let mut types = [ObjectType::HandleTable; MAX_WAIT_OBJECTS];
+        let mut thresholds = [0u64; MAX_WAIT_OBJECTS];
+
+        for i in 0..count {
+            let entry = core::ptr::read(entries_ptr.add(i));
+            let he = match handle_table::handle_lookup(
+                ht_paddr, entry.handle as u32,
+                Rights::from_bits(crate::cap::rights::RIGHT_READ),
+            ) {
+                Ok(e) => e,
+                Err(_) => return SYS_ERR_INVALID_HANDLE,
+            };
+            if he.obj_type != ObjectType::Endpoint && he.obj_type != ObjectType::Notification {
+                return SYS_ERR_INVALID_PARAMETER;
+            }
+            paddrs[i] = PhysAddr::new(he.object_paddr);
+            types[i] = he.obj_type;
+            thresholds[i] = entry.threshold;
+        }
+
+        // Fast path: check if any object is already ready
+        let mask = check_readiness(&paddrs, &types, &thresholds, count);
+        if mask != 0 {
+            return mask;
+        }
+
+        // Slow path: register as readiness waiter on each object, then block
+        for i in 0..count {
+            match types[i] {
+                ObjectType::Endpoint => endpoint::set_readiness_waiter(paddrs[i], tcb_paddr),
+                ObjectType::Notification => notification::set_readiness_waiter(paddrs[i], tcb_paddr, thresholds[i]),
+                _ => {}
+            }
+        }
+
+        // Store wait state in TCB for post-wake cleanup
+        for i in 0..count {
+            (*tcb).wait_objects[i] = paddrs[i].as_u64();
+            (*tcb).wait_thresholds[i] = thresholds[i];
+            (*tcb).wait_types[i] = types[i] as u8;
+        }
+        (*tcb).wait_count = count as u8;
+
+        scheduler::block_current();
+
+        // Woke up — unregister from all objects
+        let wc = (*tcb).wait_count as usize;
+        for i in 0..wc {
+            let p = PhysAddr::new((*tcb).wait_objects[i]);
+            match obj_type_from_u8((*tcb).wait_types[i]) {
+                ObjectType::Endpoint => endpoint::clear_readiness_waiter(p),
+                ObjectType::Notification => notification::clear_readiness_waiter(p),
+                _ => {}
+            }
+        }
+        (*tcb).wait_count = 0;
+
+        // Re-check all objects (others may have become ready while blocked)
+        check_readiness(&paddrs, &types, &thresholds, wc)
+    }
+}
+
+/// Build ObjectReadiness snapshots from live objects and compute the ready bitmask.
+/// The readiness logic is in lockjaw_types::wait::compute_ready_mask (tested on host).
+fn check_readiness(
+    paddrs: &[PhysAddr],
+    types: &[ObjectType],
+    thresholds: &[u64],
+    count: usize,
+) -> u64 {
+    use lockjaw_types::wait::{ObjectReadiness, compute_ready_mask, MAX_WAIT_OBJECTS};
+    use lockjaw_types::ipc_state::EpState;
+
+    let mut objects = [ObjectReadiness::Endpoint(EpState::Idle); MAX_WAIT_OBJECTS];
+    for i in 0..count {
+        objects[i] = match types[i] {
+            ObjectType::Endpoint => {
+                let state = endpoint::read_state(paddrs[i]);
+                ObjectReadiness::Endpoint(state)
+            }
+            ObjectType::Notification => {
+                let value = crate::ipc::notification::read_value(paddrs[i]);
+                ObjectReadiness::Notification { value, threshold: thresholds[i] }
+            }
+            _ => ObjectReadiness::Endpoint(EpState::Idle), // not waitable, never ready
+        };
+    }
+    compute_ready_mask(&objects[..count])
+}
+
+fn obj_type_from_u8(v: u8) -> ObjectType {
+    match v {
+        2 => ObjectType::Endpoint,
+        3 => ObjectType::Notification,
+        _ => ObjectType::HandleTable,
     }
 }

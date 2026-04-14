@@ -109,6 +109,34 @@ pub unsafe fn notification_wait(
 }
 
 // ---------------------------------------------------------------------------
+// Readiness helpers for sys_wait_any
+// ---------------------------------------------------------------------------
+
+/// Read the current timeline value from this notification.
+/// Safe because PhysAddr is a trusted kernel address.
+pub fn read_value(notif_paddr: PhysAddr) -> u64 {
+    unsafe {
+        let obj = obj_ptr(notif_paddr);
+        (*obj).state.value
+    }
+}
+
+/// Register a thread as a readiness waiter on this notification.
+/// The thread will be woken when the value reaches the threshold.
+pub unsafe fn set_readiness_waiter(notif_paddr: PhysAddr, waiter_paddr: PhysAddr, threshold: u64) {
+    let obj = obj_ptr_mut(notif_paddr);
+    (*obj).readiness_waiter_paddr = waiter_paddr.as_u64();
+    (*obj).readiness_threshold = threshold;
+}
+
+/// Clear the readiness waiter registration on this notification.
+pub unsafe fn clear_readiness_waiter(notif_paddr: PhysAddr) {
+    let obj = obj_ptr_mut(notif_paddr);
+    (*obj).readiness_waiter_paddr = 0;
+    (*obj).readiness_threshold = 0;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

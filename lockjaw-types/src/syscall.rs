@@ -55,3 +55,4 @@ pub const SYS_WAIT_NOTIFICATION: u64 = 11;
 pub const SYS_BIND_IRQ: u64 = 12;
 pub const SYS_CREATE_ENDPOINT: u64 = 13;
 pub const SYS_RECV_NB: u64 = 14;
+pub const SYS_WAIT_ANY: u64 = 15;

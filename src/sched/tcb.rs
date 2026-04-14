@@ -37,6 +37,14 @@ pub struct Tcb {
     pub user_entry_point: u64,
     /// User stack top VA for user processes (0 for kernel threads).
     pub user_stack_top: u64,
+    /// Objects this thread is waiting on via sys_wait_any (paddrs, 0 = unused).
+    pub wait_objects: [u64; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+    /// Per-object thresholds for the wait (notification target values).
+    pub wait_thresholds: [u64; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+    /// Object types for each wait entry (ObjectType as u8).
+    pub wait_types: [u8; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+    /// Number of valid entries in wait_objects (0 = not in a sys_wait_any).
+    pub wait_count: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +114,10 @@ pub unsafe fn create_tcb(
         ipc_msg: [0; 4],
         user_entry_point: info.user_entry_point,
         user_stack_top: info.user_stack_top,
+        wait_objects: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+        wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+        wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+        wait_count: 0,
     });
 
     Ok(())
