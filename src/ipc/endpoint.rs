@@ -44,10 +44,17 @@ fn u8_to_ep_state(v: u8) -> EpState {
 #[repr(C)]
 pub struct EndpointObject {
     pub header: ObjectHeader,
+    /// IPC state machine state (EP_IDLE, EP_HAS_SENDER, EP_HAS_RECEIVER, EP_HAS_CALLER).
     pub state: u8,
+    /// TCB paddr of the thread blocked on this endpoint via send/receive (0 = none).
     pub blocked_tcb_paddr: u64,
+    /// Buffered IPC message (4 words). Written by sender, read by receiver.
     pub msg: [u64; 4],
+    /// TCB paddr of the thread that issued a Call and is waiting for Reply (0 = none).
     pub caller_tcb_paddr: u64,
+    /// TCB paddr of a thread waiting via sys_wait_any for readiness (0 = none).
+    /// Woken (without consuming) when a sender/caller arrives.
+    pub readiness_waiter_paddr: u64,
 }
 
 /// Initialize an endpoint object in donated memory.
@@ -65,6 +72,7 @@ pub unsafe fn create_endpoint(base_paddr: PhysAddr) -> Result<(), CreateError> {
         blocked_tcb_paddr: 0,
         msg: [0; 4],
         caller_tcb_paddr: 0,
+        readiness_waiter_paddr: 0,
     });
     Ok(())
 }
@@ -144,6 +152,14 @@ unsafe fn execute_ipc(
             }
             IpcEffect::SetEndpointState(new_state) => {
                 (*ep).state = ep_state_to_u8(new_state);
+                // If transitioning to HasSender/HasCaller and a readiness waiter
+                // is registered (via sys_wait_any), wake it without consuming.
+                if (new_state == EpState::HasSender || new_state == EpState::HasCaller)
+                    && (*ep).readiness_waiter_paddr != 0
+                {
+                    scheduler::unblock_thread(PhysAddr::new((*ep).readiness_waiter_paddr));
+                    (*ep).readiness_waiter_paddr = 0;
+                }
             }
             IpcEffect::StoreMessage => {
                 (*ep).msg = msg.unwrap();

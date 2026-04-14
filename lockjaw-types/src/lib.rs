@@ -10,5 +10,6 @@ pub mod pageset_table;
 pub mod scheduler;
 pub mod syscall;
 pub mod vmem;
+pub mod wait;
 pub mod page_table;
 pub mod rights;

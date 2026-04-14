@@ -10,8 +10,14 @@ use core::ptr;
 #[repr(C)]
 pub struct NotificationObject {
     pub header: ObjectHeader,
+    /// Timeline semaphore state (value, has_waiter, threshold). Pure logic in lockjaw-types.
     pub state: NotificationState,
+    /// TCB paddr of the thread blocked via sys_wait_notification (0 = none).
     pub blocked_tcb_paddr: u64,
+    /// TCB paddr of a thread waiting via sys_wait_any for readiness (0 = none).
+    pub readiness_waiter_paddr: u64,
+    /// Threshold the readiness waiter is waiting for (value >= this means ready).
+    pub readiness_threshold: u64,
 }
 
 /// Initialize a Notification in donated physical memory.
@@ -27,6 +33,8 @@ pub unsafe fn create_notification(base_paddr: PhysAddr) -> Result<(), CreateErro
         },
         state: NotificationState::new(),
         blocked_tcb_paddr: 0,
+        readiness_waiter_paddr: 0,
+        readiness_threshold: 0,
     });
     Ok(())
 }
