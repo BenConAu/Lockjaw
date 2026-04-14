@@ -26,6 +26,11 @@ extern "C" {
 pub extern "C" fn kmain() -> ! {
     kprintln!("=== Lockjaw Microkernel v{} ===", env!("CARGO_PKG_VERSION"));
     kprintln!("Target: AArch64 (ARMv8-A), QEMU virt");
+
+    // QEMU bare-metal boot places the DTB at the start of RAM.
+    // Ref: https://wiki.osdev.org/QEMU_AArch64_Virt_Bare_Bones
+    let dtb_paddr = arch::aarch64::platform::RAM_BASE;
+    kprintln!("DTB: paddr {:#x}", dtb_paddr);
     kprintln!();
 
     unsafe {
@@ -72,6 +77,16 @@ pub extern "C" fn kmain() -> ! {
         Uart::use_high_addresses();
     }
     kprintln!("Higher-half active — UART at {:#x}", 0xFFFF_0000_0900_0000u64);
+
+    // Verify DTB at RAM_BASE (placed there by QEMU bare-metal boot)
+    unsafe {
+        let dtb_va = (dtb_paddr + mm::addr::KERNEL_VA_OFFSET) as *const u8;
+        let magic = u32::from_be_bytes([
+            *dtb_va, *dtb_va.add(1), *dtb_va.add(2), *dtb_va.add(3),
+        ]);
+        kprintln!("DTB: {:#x}, magic={:#010x} ({})", dtb_paddr, magic,
+            if magic == 0xd00dfeed { "valid" } else { "INVALID" });
+    }
 
     // Set up guard page (unmapped) and stack canary
     kprintln!();

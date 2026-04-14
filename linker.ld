@@ -1,20 +1,21 @@
 /*
  * Lockjaw Microkernel — AArch64 Linker Script
  *
- * QEMU virt machine loads the kernel at 0x4008_0000 via -kernel flag.
- * RAM starts at 0x4000_0000 (128 MB default), first 512 KB reserved by QEMU firmware/DTB.
+ * QEMU virt machine loads the kernel via -kernel flag.
+ * RAM starts at 0x4000_0000 (128 MB default). First 2 MB reserved for the
+ * 1 MB DTB that QEMU places at RAM_BASE during bare-metal ELF boot.
  */
 
 ENTRY(_start)
 
 MEMORY
 {
-    RAM (rwx) : ORIGIN = 0x40080000, LENGTH = 128M - 512K
+    RAM (rwx) : ORIGIN = 0x40200000, LENGTH = 128M - 2M
 }
 
 SECTIONS
 {
-    . = 0x40080000;
+    . = 0x40200000;
 
     /* Kernel code — _start entry point placed first */
     .text : {

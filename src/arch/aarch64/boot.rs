@@ -46,6 +46,7 @@ _start:
     b       .Lbss_loop               // Repeat
 
 .Lbss_done:
+    // Store DTB paddr to global (after BSS zeroing so we don't clobber it).
     bl      kmain                    // Call Rust entry point
 
     // --- Halt if kmain ever returns ---

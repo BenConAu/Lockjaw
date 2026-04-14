@@ -4,7 +4,9 @@
 /// these would be read from the device tree at boot.
 
 /// Kernel load address. QEMU's -kernel flag loads the ELF at this physical address.
-pub const KERNEL_LOAD_ADDR: u64 = 0x4008_0000;
+/// Kernel load address. Offset 2MB from RAM_BASE to leave room for the
+/// 1MB DTB that QEMU places at RAM_BASE during bare-metal ELF boot.
+pub const KERNEL_LOAD_ADDR: u64 = 0x4020_0000;
 
 /// PL011 UART0 physical base address.
 pub const UART0_BASE_PHYS: u64 = 0x0900_0000;
