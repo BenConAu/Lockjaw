@@ -51,14 +51,25 @@ pub unsafe fn notification_signal(
     let obj = obj_ptr_mut(notif_paddr);
 
     match (*obj).state.signal(new_value)? {
-        SignalResult::Updated => Ok(()),
+        SignalResult::Updated => {}
         SignalResult::WakeWaiter => {
             let waiter = PhysAddr::new((*obj).blocked_tcb_paddr);
             (*obj).blocked_tcb_paddr = 0;
             scheduler::unblock_thread(waiter);
-            Ok(())
         }
     }
+
+    // Check readiness waiter (registered via sys_wait_any).
+    // Wake if the new value meets the readiness threshold.
+    if (*obj).readiness_waiter_paddr != 0
+        && lockjaw_types::wait::is_notification_ready(new_value, (*obj).readiness_threshold)
+    {
+        scheduler::unblock_thread(PhysAddr::new((*obj).readiness_waiter_paddr));
+        (*obj).readiness_waiter_paddr = 0;
+        (*obj).readiness_threshold = 0;
+    }
+
+    Ok(())
 }
 
 /// Wait on a notification until the timeline value reaches the threshold.
