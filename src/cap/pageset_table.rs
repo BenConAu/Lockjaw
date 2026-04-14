@@ -41,6 +41,15 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
     }
 }
 
+/// Register a PageSet for existing physical pages (not from the allocator).
+/// Used at boot to wrap the DTB pages placed by QEMU firmware.
+pub fn register_existing(count: usize, pages: [PhysAddr; MAX_PAGES_PER_SET]) -> Option<u64> {
+    let entry = PageSetEntry { count, pages };
+    unsafe {
+        (*TABLE.0.get()).insert(entry).ok().map(|id| id as u64)
+    }
+}
+
 /// Look up a PageSet by ID. Returns the page count and physical addresses.
 pub fn get_pageset(id: u64) -> Option<(usize, [PhysAddr; MAX_PAGES_PER_SET])> {
     unsafe {

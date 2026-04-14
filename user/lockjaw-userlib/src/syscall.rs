@@ -165,3 +165,13 @@ pub fn sys_wait_any(entries: &[crate::WaitEntry]) -> u64 {
     }
     result
 }
+
+/// Get boot information from the kernel.
+/// Returns the DTB PageSet ID in x0.
+pub fn sys_get_boot_info() -> u64 {
+    let result: u64;
+    unsafe {
+        asm!("svc #0", in("x8") SYS_GET_BOOT_INFO, lateout("x0") result);
+    }
+    result
+}

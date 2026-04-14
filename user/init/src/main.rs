@@ -174,6 +174,24 @@ pub extern "C" fn _start() -> ! {
         putc(b'\n');
     }
 
+    // Test sys_get_boot_info — map the DTB PageSet and verify the magic.
+    let dtb_ps = sys_get_boot_info();
+    let dtb_va: u64 = 0x0010_0000;
+    let dtb_map = sys_map_pages(dtb_ps, dtb_va, 0);
+    if dtb_map == 0 {
+        let magic = unsafe {
+            let p = dtb_va as *const u8;
+            u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
+        };
+        if magic == 0xd00dfeed {
+            puts("init: DTB PageSet OK, magic valid\n");
+        } else {
+            puts("init: DTB PageSet BAD magic\n");
+        }
+    } else {
+        puts("init: DTB map FAILED\n");
+    }
+
     // Allocate a scratch page for create_process — reused across spawns.
     // The kernel uses it as a temporary Mapping buffer during address space creation.
     let scratch_ps = sys_alloc_pages(1);

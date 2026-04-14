@@ -37,6 +37,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_RECV_NB => sys_recv_nb(ctx),
         SYS_WAIT_ANY => sys_wait_any(ctx),
         SYS_EXPORT_HANDLE => sys_export_handle(ctx),
+        SYS_GET_BOOT_INFO => sys_get_boot_info(),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             SYS_ERR_INVALID_PARAMETER
@@ -568,6 +569,12 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> u64 {
             Err(_) => SYS_ERR_OUT_OF_MEMORY,
         }
     }
+}
+
+/// sys_get_boot_info() — returns boot information.
+/// x0 = DTB PageSet ID.
+fn sys_get_boot_info() -> u64 {
+    crate::dtb_pageset_id()
 }
 
 fn obj_type_from_u8(v: u8) -> ObjectType {

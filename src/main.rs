@@ -22,6 +22,14 @@ extern "C" {
     static __stack_top: u8;
 }
 
+/// DTB PageSet ID, set at boot. Returned by sys_get_boot_info.
+static mut DTB_PAGESET_ID: u64 = 0;
+
+/// Get the DTB PageSet ID (called by sys_get_boot_info handler).
+pub fn dtb_pageset_id() -> u64 {
+    unsafe { DTB_PAGESET_ID }
+}
+
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
     kprintln!("=== Lockjaw Microkernel v{} ===", env!("CARGO_PKG_VERSION"));
@@ -86,6 +94,18 @@ pub extern "C" fn kmain() -> ! {
         ]);
         kprintln!("DTB: {:#x}, magic={:#010x} ({})", dtb_paddr, magic,
             if magic == 0xd00dfeed { "valid" } else { "INVALID" });
+    }
+
+    // Register DTB pages as a PageSet so userspace can map them normally.
+    // This avoids the MAIR_DEVICE aliasing problem (DTB is normal RAM, not MMIO).
+    unsafe {
+        let mut dtb_pages = [mm::addr::PhysAddr::new(0); lockjaw_types::pageset_table::MAX_PAGES_PER_SET];
+        dtb_pages[0] = mm::addr::PhysAddr::new(dtb_paddr);
+        dtb_pages[1] = mm::addr::PhysAddr::new(dtb_paddr + mm::addr::PAGE_SIZE);
+        let dtb_ps_id = cap::pageset_table::register_existing(2, dtb_pages)
+            .expect("DTB PageSet registration failed");
+        DTB_PAGESET_ID = dtb_ps_id;
+        kprintln!("DTB PageSet registered: id={}", dtb_ps_id);
     }
 
     // Set up guard page (unmapped) and stack canary
