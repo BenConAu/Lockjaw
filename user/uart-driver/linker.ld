@@ -26,6 +26,10 @@ SECTIONS
         *(.bss .bss.*)
     }
 
+    .lockjaw_hash : ALIGN(8) {
+        *(.lockjaw_hash)
+    }
+
     /DISCARD/ : {
         *(.comment)
         *(.ARM.*)

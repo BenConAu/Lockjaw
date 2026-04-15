@@ -1,6 +1,11 @@
 #![no_std]
 #![no_main]
 
+const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash.rs"));
+
+#[used]
+#[link_section = ".lockjaw_hash"]
+static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
 use lockjaw_userlib::*;
 use lockjaw_types::fdt::parse_fdt;

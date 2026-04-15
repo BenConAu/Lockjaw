@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash.rs"));
+
 mod arch;
 mod cap;
 pub mod crash;
@@ -335,6 +337,25 @@ pub extern "C" fn kmain() -> ! {
 
     // The init ELF binary, built separately and embedded at compile time
     static INIT_ELF: &[u8] = include_bytes!("../user/init/target/aarch64-unknown-none/release/lockjaw-init");
+
+    // Verify the init binary was built from the same source as the kernel
+    kprintln!("Build hash: {:#018x}", LOCKJAW_SOURCE_HASH);
+    match lockjaw_types::elf::find_section_u64(INIT_ELF, ".lockjaw_hash") {
+        Some(init_hash) if init_hash == LOCKJAW_SOURCE_HASH => {
+            kprintln!("Init hash:  {:#018x} (match)", init_hash);
+        }
+        Some(init_hash) => {
+            kprintln!("FATAL: init binary build hash mismatch!");
+            kprintln!("  kernel: {:#018x}", LOCKJAW_SOURCE_HASH);
+            kprintln!("  init:   {:#018x}", init_hash);
+            kprintln!("  Run 'make build' to rebuild all binaries.");
+            panic!("stale init binary");
+        }
+        None => {
+            kprintln!("WARNING: init binary has no .lockjaw_hash section");
+            kprintln!("  Cannot verify build coherence. Run 'make build'.");
+        }
+    }
 
     unsafe {
         use arch::aarch64::vmem::{Mapping, create_address_space, MAPPINGS_PER_PAGE};

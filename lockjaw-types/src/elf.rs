@@ -155,6 +155,61 @@ pub fn parse_elf(data: &[u8]) -> Result<ElfInfo, ElfError> {
     Ok(info)
 }
 
+/// Find a named section in an ELF64 binary and read a u64 from it.
+/// Used to extract the .lockjaw_hash section for build hash verification.
+/// Returns None if the section is not found or the ELF is malformed.
+pub fn find_section_u64(data: &[u8], name: &str) -> Option<u64> {
+    if data.len() < 64 || data[0..4] != ELF_MAGIC {
+        return None;
+    }
+
+    let shoff = read_u64(data, 40) as usize;     // e_shoff
+    let shentsize = read_u16(data, 58) as usize;  // e_shentsize
+    let shnum = read_u16(data, 60) as usize;       // e_shnum
+    let shstrndx = read_u16(data, 62) as usize;    // e_shstrndx
+
+    if shoff == 0 || shnum == 0 || shentsize < 64 {
+        return None;
+    }
+
+    // Find the section string table
+    let strtab_off = shoff + shstrndx * shentsize;
+    if strtab_off + shentsize > data.len() {
+        return None;
+    }
+    let strtab_addr = read_u64(data, strtab_off + 24) as usize; // sh_offset
+    let strtab_size = read_u64(data, strtab_off + 32) as usize; // sh_size
+
+    if strtab_addr + strtab_size > data.len() {
+        return None;
+    }
+
+    // Search each section header for the named section
+    for i in 0..shnum {
+        let sh_off = shoff + i * shentsize;
+        if sh_off + shentsize > data.len() {
+            break;
+        }
+        let name_idx = read_u32(data, sh_off) as usize; // sh_name
+        let sec_offset = read_u64(data, sh_off + 24) as usize; // sh_offset
+        let sec_size = read_u64(data, sh_off + 32) as usize; // sh_size
+
+        // Compare section name from string table
+        if strtab_addr + name_idx < data.len() {
+            let name_start = strtab_addr + name_idx;
+            let name_end = data[name_start..].iter().position(|&b| b == 0)
+                .map(|p| name_start + p)
+                .unwrap_or(data.len());
+            let sec_name = &data[name_start..name_end];
+            if sec_name == name.as_bytes() && sec_size >= 8 && sec_offset + 8 <= data.len() {
+                return Some(read_u64(data, sec_offset));
+            }
+        }
+    }
+
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

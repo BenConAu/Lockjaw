@@ -1,6 +1,11 @@
 #![no_std]
 #![no_main]
 
+const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash.rs"));
+
+#[used]
+#[link_section = ".lockjaw_hash"]
+static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
 use lockjaw_userlib::*;
 use lockjaw_userlib::elf::parse_elf;
@@ -38,6 +43,22 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
             return false;
         }
     };
+
+    // Verify child ELF build hash matches ours
+    match lockjaw_userlib::elf::find_section_u64(elf_data, ".lockjaw_hash") {
+        Some(child_hash) if child_hash == LOCKJAW_SOURCE_HASH => {}
+        Some(_) => {
+            puts("init: BUILD HASH MISMATCH for ");
+            puts(name);
+            puts(" — run 'make build'\n");
+            return false;
+        }
+        None => {
+            puts("init: WARNING: no .lockjaw_hash in ");
+            puts(name);
+            putc(b'\n');
+        }
+    }
 
     // Allocate a page for the mapping array
     let map_array_ps = match sys_alloc_pages(1) {

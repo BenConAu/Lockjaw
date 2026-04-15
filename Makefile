@@ -11,9 +11,15 @@ QEMU_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -display none \
 
 INIT_ELF := user/init/target/aarch64-unknown-none/release/lockjaw-init
 
-.PHONY: build build-release build-user run run-release objdump nm check-stack check-pointers test test-unit test-qemu clean
+.PHONY: build build-release build-user build-hash run run-release objdump nm check-stack check-pointers test test-unit test-qemu clean
 
-build-user:
+build-hash:
+	@mkdir -p target
+	@find src/ lockjaw-types/src/ user/*/src/ -name '*.rs' 2>/dev/null | sort | xargs cat | shasum -a 256 | cut -c1-16 > target/source-hash.txt.tmp
+	@cmp -s target/source-hash.txt.tmp target/source-hash.txt 2>/dev/null || mv target/source-hash.txt.tmp target/source-hash.txt
+	@rm -f target/source-hash.txt.tmp
+
+build-user: build-hash
 	cd user/hello && cargo build --release
 	cd user/uart-driver && cargo build --release
 	cd user/device-manager && cargo build --release
