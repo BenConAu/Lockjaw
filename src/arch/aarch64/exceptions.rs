@@ -21,7 +21,29 @@ pub struct ExceptionContext {
     /// Exception Syndrome Register — encodes the exception cause.
     /// EC field (bits 31:26) identifies the exception class (SVC, data abort, etc).
     pub esr: u64,
+    /// User stack pointer (SP_EL0). Must be saved/restored so that context
+    /// switches during IRQs or syscalls don't lose the interrupted thread's
+    /// user SP.
+    pub sp_el0: u64,
+    /// Padding to keep the frame 16-byte aligned (AArch64 ABI requirement).
+    pub _pad: u64,
 }
+
+/// Frame size must be 16-byte aligned for AArch64 ABI stack alignment.
+const _: () = assert!(
+    core::mem::size_of::<ExceptionContext>() % 16 == 0,
+    "ExceptionContext size must be 16-byte aligned"
+);
+
+/// Frame size in bytes, used by the assembly save/restore macros.
+pub const EXCEPTION_FRAME_SIZE: usize = core::mem::size_of::<ExceptionContext>();
+
+// Field offsets for assembly. Using core::mem::offset_of! so these stay
+// correct if fields are reordered or padding changes.
+pub const OFF_ELR: usize = core::mem::offset_of!(ExceptionContext, elr);
+pub const OFF_SPSR: usize = core::mem::offset_of!(ExceptionContext, spsr);
+pub const OFF_ESR: usize = core::mem::offset_of!(ExceptionContext, esr);
+pub const OFF_SP_EL0: usize = core::mem::offset_of!(ExceptionContext, sp_el0);
 
 // ---------------------------------------------------------------------------
 // Rust exception handlers (called from assembly stubs)
@@ -128,9 +150,7 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
     crate::kprintln!("{}  FAR:  {:#018x} [{}]", prefix, far, classify_address(far));
     crate::kprintln!("{}  SPSR: {:#018x}", prefix, ctx.spsr);
     if is_user {
-        let sp_el0: u64;
-        unsafe { core::arch::asm!("mrs {}, SP_EL0", out(reg) sp_el0) };
-        crate::kprintln!("{}  SP_EL0: {:#018x}", prefix, sp_el0);
+        crate::kprintln!("{}  SP_EL0: {:#018x}", prefix, ctx.sp_el0);
     }
 
     // User stack overflow detection
@@ -174,6 +194,30 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
 // ---------------------------------------------------------------------------
 // Rust exception handlers (called from assembly stubs)
 // ---------------------------------------------------------------------------
+
+/// Detected ELR=0 in the exception context after a syscall handler returned.
+/// This means something in the kernel corrupted the saved return address.
+/// Print diagnostics and halt — this is a kernel bug, not a user fault.
+#[no_mangle]
+extern "C" fn handle_elr_corruption(ctx: &ExceptionContext) {
+    crate::kprintln!("========================================");
+    crate::kprintln!("[BUG:KERN]  ELR CORRUPTED TO ZERO DURING SYSCALL");
+    crate::crash::print_thread_context("[BUG:KERN]");
+    crate::mm::stack::check_canary_report("[BUG:KERN]");
+    // Print SP to see how much kernel stack was used
+    let sp: u64;
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp); }
+    crate::kprintln!("[BUG:KERN]  Kernel SP: {:#018x}", sp);
+    // SAFETY: printing address of exception context on kernel stack
+    crate::kprintln!("[BUG:KERN]  Exception frame at: {:#018x}", ctx as *const _ as u64);
+    // Print the GPRs from the exception context
+    for i in 0..16 {
+        crate::kprintln!("[BUG:KERN]  x{:02}={:#018x}  x{:02}={:#018x}",
+            i*2, ctx.gpr[i*2], i*2+1, ctx.gpr[i*2+1]);
+    }
+    crate::kprintln!("========================================");
+    loop { unsafe { core::arch::asm!("wfi"); } }
+}
 
 /// Synchronous exception from same EL (kernel fault).
 #[no_mangle]
@@ -229,12 +273,20 @@ global_asm!(
 // ---------------------------------------------------------------------------
 // Register save/restore macros
 // ---------------------------------------------------------------------------
+// Frame layout offsets and size are set by .equ from Rust consts below.
+// This ensures the assembly always matches the ExceptionContext struct.
 
-// Save all caller-saved registers + ELR/SPSR/ESR onto the stack.
+.equ FRAME_SIZE, {frame_size}
+.equ OFF_ELR,    {off_elr}
+.equ OFF_SPSR,   {off_spsr}
+.equ OFF_ESR,    {off_esr}
+.equ OFF_SP_EL0, {off_sp_el0}
+
+// Save all registers + ELR/SPSR/ESR/SP_EL0 onto the stack.
 // Creates an ExceptionContext struct on the stack and passes its
 // address in x0 to the Rust handler.
 .macro SAVE_REGS
-    sub     sp, sp, #(34 * 8)            // Allocate stack frame: 31 GPR + ELR + SPSR + ESR
+    sub     sp, sp, #FRAME_SIZE
 
     stp     x0,  x1,  [sp, #(0  * 8)]   // Save x0, x1
     stp     x2,  x3,  [sp, #(2  * 8)]   // Save x2, x3
@@ -256,9 +308,10 @@ global_asm!(
     mrs     x0, ELR_EL1                  // Read Exception Link Register
     mrs     x1, SPSR_EL1                 // Read Saved Program Status Register
     mrs     x2, ESR_EL1                  // Read Exception Syndrome Register
+    mrs     x3, SP_EL0                   // Read user stack pointer
 
-    stp     x0, x1,   [sp, #(31 * 8)]   // Save ELR, SPSR
-    str     x2,       [sp, #(33 * 8)]   // Save ESR
+    stp     x0, x1,   [sp, #OFF_ELR]    // Save ELR, SPSR
+    stp     x2, x3,   [sp, #OFF_ESR]    // Save ESR, SP_EL0
 
     mov     x0, sp                       // x0 = pointer to ExceptionContext (arg for handler)
 .endm
@@ -266,9 +319,12 @@ global_asm!(
 // Restore all registers from the ExceptionContext on the stack
 // and return from exception.
 .macro RESTORE_REGS
-    ldp     x0, x1,   [sp, #(31 * 8)]   // Load saved ELR, SPSR
+    ldp     x0, x1,   [sp, #OFF_ELR]    // Load saved ELR, SPSR
     msr     ELR_EL1, x0                  // Restore Exception Link Register
     msr     SPSR_EL1, x1                 // Restore Saved Program Status Register
+
+    ldp     x2, x3,   [sp, #OFF_ESR]    // Load saved ESR (unused), SP_EL0
+    msr     SP_EL0, x3                   // Restore user stack pointer
 
     ldp     x0,  x1,  [sp, #(0  * 8)]   // Restore x0, x1
     ldp     x2,  x3,  [sp, #(2  * 8)]   // Restore x2, x3
@@ -287,7 +343,7 @@ global_asm!(
     ldp     x28, x29, [sp, #(28 * 8)]   // Restore x28, x29
     ldr     x30,      [sp, #(30 * 8)]   // Restore x30
 
-    add     sp, sp, #(34 * 8)            // Free the stack frame
+    add     sp, sp, #FRAME_SIZE          // Free the stack frame
 
     eret                                  // Return from exception
 .endm
@@ -362,8 +418,20 @@ __vec_serror:
 __vec_sync_lower:
     SAVE_REGS                            // Save all registers, x0 = &mut ExceptionContext
     bl      handle_exception_sync_lower  // Call lower-EL sync handler (syscall dispatch)
+    // Check if ELR was corrupted to 0 during the handler
+    ldr     x1, [sp, #OFF_ELR]          // Load saved ELR from exception context
+    cbnz    x1, 1f                       // If nonzero, proceed to normal restore
+    // ELR is 0 — something corrupted it during the syscall
+    mov     x0, sp                       // x0 = &ExceptionContext for the fault handler
+    bl      handle_elr_corruption        // Call diagnostic (does not return)
+1:
     RESTORE_REGS                         // Restore and eret back to EL0
-"#
+"#,
+    frame_size = const EXCEPTION_FRAME_SIZE,
+    off_elr = const OFF_ELR,
+    off_spsr = const OFF_SPSR,
+    off_esr = const OFF_ESR,
+    off_sp_el0 = const OFF_SP_EL0,
 );
 
 /// Install the exception vector table by writing VBAR_EL1.

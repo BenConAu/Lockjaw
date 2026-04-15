@@ -50,14 +50,10 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
         Some(_) => {
             puts("init: BUILD HASH MISMATCH for ");
             puts(name);
-            puts(" — run 'make build'\n");
+            puts("\n");
             return false;
         }
-        None => {
-            puts("init: WARNING: no .lockjaw_hash in ");
-            puts(name);
-            putc(b'\n');
-        }
+        None => {}
     }
 
     // Allocate a page for the mapping array
