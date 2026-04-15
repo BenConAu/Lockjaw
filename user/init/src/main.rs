@@ -107,6 +107,12 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
         Err(_) => { puts("init: alloc stack FAILED\n"); return false; }
     };
 
+    // Build a 16-byte NUL-padded name for the kernel TCB
+    let mut name_buf = [0u8; 16];
+    let name_bytes = name.as_bytes();
+    let copy_len = if name_bytes.len() < 15 { name_bytes.len() } else { 15 };
+    name_buf[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
     puts("init: spawning ");
     puts(name);
     puts("...\n");
@@ -117,6 +123,7 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
         stack_ps,
         scratch_ps,
         handle_to_copy,
+        name_buf.as_ptr() as u64,
     );
 
     if result.is_ok() {

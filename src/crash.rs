@@ -44,17 +44,29 @@ pub fn print_thread_context(prefix: &str) {
 
     unsafe {
         let thread_idx = crate::sched::scheduler::current_thread_index();
-        let _ = writeln!(uart, "{}  Thread: #{}", prefix, thread_idx);
 
         if let Some(tcb_paddr) = crate::sched::scheduler::try_current_tcb_paddr() {
             // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
             let tcb = (tcb_paddr.as_u64() + KERNEL_VA_OFFSET) as *const Tcb;
+
+            // Print thread index and process name
+            let name_bytes = core::ptr::read_volatile(&(*tcb).name);
+            let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
+            let name = core::str::from_utf8_unchecked(&name_bytes[..name_len]);
+            if name_len > 0 {
+                let _ = writeln!(uart, "{}  Thread: #{} ({})", prefix, thread_idx, name);
+            } else {
+                let _ = writeln!(uart, "{}  Thread: #{}", prefix, thread_idx);
+            }
+
             let sc = core::ptr::read_volatile(&(*tcb).current_syscall);
             if sc != u64::MAX {
                 let [a0, a1, a2, a3] = core::ptr::read_volatile(&(*tcb).current_syscall_args);
                 let _ = writeln!(uart, "{}  During syscall: {} (x0={:#x}, x1={:#x}, x2={:#x}, x3={:#x})",
                     prefix, syscall_name(sc), a0, a1, a2, a3);
             }
+        } else {
+            let _ = writeln!(uart, "{}  Thread: #{}", prefix, thread_idx);
         }
     }
 }

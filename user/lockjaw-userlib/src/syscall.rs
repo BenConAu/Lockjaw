@@ -54,7 +54,7 @@ pub fn sys_map_pages(pageset_id_or_phys: u64, virt_addr: u64, flags: u64) -> Sys
     SyscallError(err)
 }
 
-pub fn sys_create_process(mappings_ptr: u64, mapping_count: u64, entry_point: u64, stack_pageset_id: u64, scratch_pageset_id: u64, handle_to_copy: u64) -> SyscallError {
+pub fn sys_create_process(mappings_ptr: u64, mapping_count: u64, entry_point: u64, stack_pageset_id: u64, scratch_pageset_id: u64, handle_to_copy: u64, name_ptr: u64) -> SyscallError {
     let err: u64;
     unsafe {
         asm!(
@@ -65,6 +65,7 @@ pub fn sys_create_process(mappings_ptr: u64, mapping_count: u64, entry_point: u6
             in("x3") stack_pageset_id,
             in("x4") scratch_pageset_id,
             in("x5") handle_to_copy,
+            in("x6") name_ptr,
             in("x8") SYS_CREATE_PROCESS,
         );
     }

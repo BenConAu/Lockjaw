@@ -52,6 +52,8 @@ pub struct Tcb {
     pub current_syscall: u64,
     /// Arguments to the current syscall (x0-x3).
     pub current_syscall_args: [u64; 4],
+    /// Process name for diagnostics. NUL-terminated, max 15 chars + NUL.
+    pub name: [u8; 16],
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +69,7 @@ pub struct TcbCreateInfo {
     pub user_entry_point: u64,
     pub user_stack_base: u64,
     pub user_stack_top: u64,
+    pub name: [u8; 16],
 }
 
 /// Initialize a TCB in donated memory and set up its stack with a
@@ -133,6 +136,7 @@ pub unsafe fn create_tcb(
         wait_count: 0,
         current_syscall: u64::MAX,
         current_syscall_args: [0; 4],
+        name: info.name,
     });
 
     Ok(())

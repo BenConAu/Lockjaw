@@ -319,6 +319,7 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
     let stack_pageset_id = ctx.gpr[3];
     let scratch_pageset_id = ctx.gpr[4];
     let parent_handle_to_copy = ctx.gpr[5];
+    let name_va = ctx.gpr[6];
 
     unsafe {
         // Get caller's TTBR0 for safe user memory access
@@ -327,7 +328,11 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
         let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
         let caller_ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
 
-        match crate::process::create_process(mappings_va, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy, caller_ttbr0) {
+        // Read process name from user memory (16 bytes, NUL-padded)
+        let name: [u8; 16] = crate::mm::user_access::copy_from_user(caller_ttbr0, name_va)
+            .unwrap_or([0u8; 16]);
+
+        match crate::process::create_process(mappings_va, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy, caller_ttbr0, name) {
             Ok(()) => SyscallError::OK,
             Err(_) => SyscallError::UNKNOWN,
         }

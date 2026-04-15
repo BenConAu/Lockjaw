@@ -47,6 +47,7 @@ pub unsafe fn create_process(
     scratch_pageset_id: u64,
     parent_handle_to_copy: u64,
     caller_ttbr0: PhysAddr,
+    name: [u8; 16],
 ) -> Result<(), &'static str> {
     // Look up stack PageSet early so we can validate total mapping count
     let (stack_count, stack_header_paddr) = pageset_table::get_pageset(stack_pageset_id)
@@ -157,6 +158,7 @@ pub unsafe fn create_process(
             user_entry_point: entry_point,
             user_stack_top: stack_va + (stack_count as u64) * PAGE_SIZE,
             user_stack_base: stack_va,
+            name,
         },
         tcb_page.start_addr(),
     ).map_err(|_| "TCB create failed")?;
