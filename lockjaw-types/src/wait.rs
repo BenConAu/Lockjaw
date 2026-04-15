@@ -99,6 +99,56 @@ pub fn compute_ready_mask(objects: &[ObjectReadiness]) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Readiness waiter tracking
+// ---------------------------------------------------------------------------
+
+/// Error from readiness waiter operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaiterError {
+    /// A waiter is already registered on this object.
+    AlreadyRegistered,
+}
+
+/// Tracks a single readiness waiter on an IPC object (endpoint or notification).
+/// Enforces identity-checked clearing: only the thread that registered
+/// can clear itself. Prevents waiter slot clobbering between threads.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadinessWaiter {
+    pub paddr: u64,
+}
+
+impl ReadinessWaiter {
+    pub const fn empty() -> Self {
+        Self { paddr: 0 }
+    }
+
+    /// Register a waiter. Fails if another waiter is already registered.
+    pub fn register(&mut self, tcb_paddr: u64) -> Result<(), WaiterError> {
+        if self.paddr != 0 {
+            return Err(WaiterError::AlreadyRegistered);
+        }
+        self.paddr = tcb_paddr;
+        Ok(())
+    }
+
+    /// Clear the waiter only if it matches the expected identity.
+    /// Returns true if cleared, false if the waiter is someone else (or empty).
+    pub fn clear_if_match(&mut self, expected: u64) -> bool {
+        if self.paddr == expected && expected != 0 {
+            self.paddr = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether a waiter is currently registered.
+    pub fn is_registered(&self) -> bool {
+        self.paddr != 0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -331,5 +381,55 @@ mod tests {
     #[test]
     fn empty_returns_zero() {
         assert_eq!(compute_ready_mask(&[]), 0);
+    }
+
+    // --- ReadinessWaiter tests ---
+
+    #[test]
+    fn waiter_register_empty_succeeds() {
+        let mut w = ReadinessWaiter::empty();
+        assert!(w.register(0x1000).is_ok());
+        assert!(w.is_registered());
+        assert_eq!(w.paddr, 0x1000);
+    }
+
+    #[test]
+    fn waiter_register_occupied_fails() {
+        let mut w = ReadinessWaiter::empty();
+        w.register(0x1000).unwrap();
+        assert_eq!(w.register(0x2000), Err(WaiterError::AlreadyRegistered));
+        assert_eq!(w.paddr, 0x1000);
+    }
+
+    #[test]
+    fn waiter_clear_matching_succeeds() {
+        let mut w = ReadinessWaiter::empty();
+        w.register(0x1000).unwrap();
+        assert!(w.clear_if_match(0x1000));
+        assert!(!w.is_registered());
+    }
+
+    #[test]
+    fn waiter_clear_wrong_identity_preserves() {
+        let mut w = ReadinessWaiter::empty();
+        w.register(0x1000).unwrap();
+        assert!(!w.clear_if_match(0x2000));
+        assert!(w.is_registered());
+        assert_eq!(w.paddr, 0x1000);
+    }
+
+    #[test]
+    fn waiter_clear_empty_returns_false() {
+        let mut w = ReadinessWaiter::empty();
+        assert!(!w.clear_if_match(0x1000));
+    }
+
+    #[test]
+    fn waiter_reusable_after_clear() {
+        let mut w = ReadinessWaiter::empty();
+        w.register(0x1000).unwrap();
+        w.clear_if_match(0x1000);
+        assert!(w.register(0x2000).is_ok());
+        assert_eq!(w.paddr, 0x2000);
     }
 }

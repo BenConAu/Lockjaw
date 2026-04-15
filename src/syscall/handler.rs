@@ -530,13 +530,13 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 
         scheduler::block_current();
 
-        // Woke up — unregister from all objects
+        // Woke up — unregister from all objects (only clear our own registration)
         let wc = (*tcb).wait_count as usize;
         for i in 0..wc {
             let p = PhysAddr::new((*tcb).wait_objects[i]);
             match obj_type_from_u8((*tcb).wait_types[i]) {
-                ObjectType::Endpoint => endpoint::clear_readiness_waiter(p),
-                ObjectType::Notification => notification::clear_readiness_waiter(p),
+                ObjectType::Endpoint => endpoint::clear_readiness_waiter(p, tcb_paddr),
+                ObjectType::Notification => notification::clear_readiness_waiter(p, tcb_paddr),
                 _ => {}
             }
         }

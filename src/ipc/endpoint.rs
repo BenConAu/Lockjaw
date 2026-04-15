@@ -52,9 +52,9 @@ pub struct EndpointObject {
     pub msg: [u64; 4],
     /// TCB paddr of the thread that issued a Call and is waiting for Reply (0 = none).
     pub caller_tcb_paddr: u64,
-    /// TCB paddr of a thread waiting via sys_wait_any for readiness (0 = none).
+    /// Thread waiting via sys_wait_any for readiness.
     /// Woken (without consuming) when a sender/caller arrives.
-    pub readiness_waiter_paddr: u64,
+    pub readiness_waiter: lockjaw_types::wait::ReadinessWaiter,
 }
 
 /// Initialize an endpoint object in donated memory.
@@ -73,7 +73,7 @@ pub unsafe fn create_endpoint(base_paddr: PhysAddr) -> Result<(), CreateError> {
         blocked_tcb_paddr: 0,
         msg: [0; 4],
         caller_tcb_paddr: 0,
-        readiness_waiter_paddr: 0,
+        readiness_waiter: lockjaw_types::wait::ReadinessWaiter::empty(),
     });
     Ok(())
 }
@@ -156,10 +156,10 @@ unsafe fn execute_ipc(
                 // If transitioning to HasSender/HasCaller and a readiness waiter
                 // is registered (via sys_wait_any), wake it without consuming.
                 if (new_state == EpState::HasSender || new_state == EpState::HasCaller)
-                    && (*ep).readiness_waiter_paddr != 0
+                    && (*ep).readiness_waiter.is_registered()
                 {
-                    scheduler::unblock_thread(PhysAddr::new((*ep).readiness_waiter_paddr));
-                    (*ep).readiness_waiter_paddr = 0;
+                    scheduler::unblock_thread(PhysAddr::new((*ep).readiness_waiter.paddr));
+                    (*ep).readiness_waiter.paddr = 0;
                 }
             }
             IpcEffect::StoreMessage => {
@@ -344,13 +344,14 @@ pub fn read_caller_tcb(ep_paddr: PhysAddr) -> u64 {
 /// The thread will be woken (without consuming) when a sender/caller arrives.
 pub unsafe fn set_readiness_waiter(ep_paddr: PhysAddr, waiter_paddr: PhysAddr) {
     let ep = ep_ptr_mut(ep_paddr);
-    (*ep).readiness_waiter_paddr = waiter_paddr.as_u64();
+    let _ = (*ep).readiness_waiter.register(waiter_paddr.as_u64());
 }
 
-/// Clear the readiness waiter registration on this endpoint.
-pub unsafe fn clear_readiness_waiter(ep_paddr: PhysAddr) {
+/// Clear the readiness waiter if it matches the expected thread.
+/// Only clears if the stored waiter is the one that registered.
+pub unsafe fn clear_readiness_waiter(ep_paddr: PhysAddr, expected: PhysAddr) {
     let ep = ep_ptr_mut(ep_paddr);
-    (*ep).readiness_waiter_paddr = 0;
+    (*ep).readiness_waiter.clear_if_match(expected.as_u64());
 }
 
 // ---------------------------------------------------------------------------

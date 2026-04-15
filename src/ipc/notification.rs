@@ -14,8 +14,8 @@ pub struct NotificationObject {
     pub state: NotificationState,
     /// TCB paddr of the thread blocked via sys_wait_notification (0 = none).
     pub blocked_tcb_paddr: u64,
-    /// TCB paddr of a thread waiting via sys_wait_any for readiness (0 = none).
-    pub readiness_waiter_paddr: u64,
+    /// Thread waiting via sys_wait_any for readiness.
+    pub readiness_waiter: lockjaw_types::wait::ReadinessWaiter,
     /// Threshold the readiness waiter is waiting for (value >= this means ready).
     pub readiness_threshold: u64,
 }
@@ -34,7 +34,7 @@ pub unsafe fn create_notification(base_paddr: PhysAddr) -> Result<(), CreateErro
         },
         state: NotificationState::new(),
         blocked_tcb_paddr: 0,
-        readiness_waiter_paddr: 0,
+        readiness_waiter: lockjaw_types::wait::ReadinessWaiter::empty(),
         readiness_threshold: 0,
     });
     Ok(())
@@ -62,11 +62,11 @@ pub unsafe fn notification_signal(
 
     // Check readiness waiter (registered via sys_wait_any).
     // Wake if the new value meets the readiness threshold.
-    if (*obj).readiness_waiter_paddr != 0
+    if (*obj).readiness_waiter.is_registered()
         && lockjaw_types::wait::is_notification_ready(new_value, (*obj).readiness_threshold)
     {
-        scheduler::unblock_thread(PhysAddr::new((*obj).readiness_waiter_paddr));
-        (*obj).readiness_waiter_paddr = 0;
+        scheduler::unblock_thread(PhysAddr::new((*obj).readiness_waiter.paddr));
+        (*obj).readiness_waiter.paddr = 0;
         (*obj).readiness_threshold = 0;
     }
 
@@ -127,15 +127,16 @@ pub fn read_value(notif_paddr: PhysAddr) -> u64 {
 /// The thread will be woken when the value reaches the threshold.
 pub unsafe fn set_readiness_waiter(notif_paddr: PhysAddr, waiter_paddr: PhysAddr, threshold: u64) {
     let obj = obj_ptr_mut(notif_paddr);
-    (*obj).readiness_waiter_paddr = waiter_paddr.as_u64();
+    let _ = (*obj).readiness_waiter.register(waiter_paddr.as_u64());
     (*obj).readiness_threshold = threshold;
 }
 
-/// Clear the readiness waiter registration on this notification.
-pub unsafe fn clear_readiness_waiter(notif_paddr: PhysAddr) {
+/// Clear the readiness waiter if it matches the expected thread.
+pub unsafe fn clear_readiness_waiter(notif_paddr: PhysAddr, expected: PhysAddr) {
     let obj = obj_ptr_mut(notif_paddr);
-    (*obj).readiness_waiter_paddr = 0;
-    (*obj).readiness_threshold = 0;
+    if (*obj).readiness_waiter.clear_if_match(expected.as_u64()) {
+        (*obj).readiness_threshold = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
