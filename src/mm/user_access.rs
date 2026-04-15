@@ -20,9 +20,14 @@ use core::mem;
 /// `ttbr0_paddr` must be a valid L0 page table.
 /// T must be safe to read from arbitrary bytes (no references, no padding invariants).
 pub unsafe fn copy_from_user<T: Copy>(ttbr0_paddr: PhysAddr, user_va: u64) -> Option<T> {
-    // Validate the user VA is in the user range
+    // Validate the user VA is in the user range and doesn't cross a page boundary.
+    // A cross-page read would continue into whatever physical page is adjacent
+    // in kernel VA space, not the user's next page.
     let size = mem::size_of::<T>() as u64;
     if !lockjaw_types::wait::validate_user_buffer(user_va, size) {
+        return None;
+    }
+    if !lockjaw_types::vmem::validate_intra_page(user_va, size) {
         return None;
     }
 

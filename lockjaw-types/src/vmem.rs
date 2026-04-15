@@ -89,6 +89,13 @@ pub fn validate_mapping(virt_addr: u64, page_count: usize) -> MapValidation {
     }
 }
 
+/// Validate that a copy_from_user read doesn't straddle a page boundary.
+/// Returns true if the entire object fits within a single 4KB page.
+pub fn validate_intra_page(user_va: u64, size: u64) -> bool {
+    let offset = user_va & (PAGE_SIZE - 1);
+    offset + size <= PAGE_SIZE
+}
+
 /// Validate that user mappings + stack pages fit in the mapping buffer.
 /// Returns true if the combined count fits within `capacity` entries
 /// and both counts are nonzero.
@@ -311,5 +318,37 @@ mod tests {
     #[test]
     fn process_mappings_no_room_for_stack() {
         assert!(!validate_process_mappings(32, 1, 32));
+    }
+
+    // --- validate_intra_page tests ---
+
+    #[test]
+    fn intra_page_aligned_start() {
+        assert!(validate_intra_page(0x1000, 16));
+    }
+
+    #[test]
+    fn intra_page_fits_end() {
+        assert!(validate_intra_page(0x1FF0, 16));
+    }
+
+    #[test]
+    fn intra_page_straddles() {
+        assert!(!validate_intra_page(0x1FF8, 16));
+    }
+
+    #[test]
+    fn intra_page_last_byte() {
+        assert!(validate_intra_page(0x1FFF, 1));
+    }
+
+    #[test]
+    fn intra_page_crosses_by_one() {
+        assert!(!validate_intra_page(0x1FFF, 2));
+    }
+
+    #[test]
+    fn intra_page_zero_size() {
+        assert!(validate_intra_page(0x1FFF, 0));
     }
 }
