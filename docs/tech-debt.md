@@ -122,6 +122,18 @@ The eventual design is a **device manager** process that:
 
 ---
 
+## Mapping functions still walk page tables inline
+
+**Where:** `src/arch/aarch64/vmem.rs` (`create_address_space`, `map_pages_in_existing`)
+
+**What:** The read-only page table walk (`translate_user_va`) was extracted to a testable state machine in `lockjaw-types::page_table::PageTableWalk`. The mapping functions still walk L0→L1→L2 with raw pointer arithmetic to find or allocate L3 tables. The traversal decisions (is this L2 slot empty, a block, or a table?) are pure PTE interpretation mixed in with unsafe page allocation and PTE installation.
+
+**Why:** The mapping write path is inherently tied to the kernel's page allocator — it allocates L3 tables and installs PTEs. Extracting the read portions requires separating "what does this slot contain?" from "allocate and install." `map_pages_in_existing` already uses `lockjaw_types::vmem::validate_mapping` and `map_action_for_l2` for some decisions, but the L0→L1→L2 traversal to reach the target slot is still inline.
+
+**Fix:** Extract the traversal decisions into a state machine similar to `PageTableWalk` — the kernel feeds PTE values, lockjaw-types returns "this slot is empty, allocate" or "this slot has an L3 table, use it" or "this is a block, error." The page allocation and PTE writes stay in the kernel.
+
+---
+
 ## SYS_RECV_NB naming inconsistency
 
 **Where:** `lockjaw-types/src/syscall.rs`, `src/syscall/handler.rs`, `user/lockjaw-userlib/src/syscall.rs`

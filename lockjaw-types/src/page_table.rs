@@ -64,6 +64,10 @@ impl PageTableEntry {
         Self(0)
     }
 
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -173,6 +177,102 @@ impl PageTable {
 }
 
 // ---------------------------------------------------------------------------
+// Page table walk state machine
+// ---------------------------------------------------------------------------
+
+/// Result of each step in a page table walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkResult {
+    /// Read the u64 at this physical address and pass it to step().
+    Continue(u64),
+    /// Walk complete: the VA maps to this physical address.
+    Done(u64),
+    /// Walk faulted: the VA is unmapped at some level.
+    Fault,
+}
+
+/// Pure page table walk state machine. The kernel feeds raw PTE values
+/// read from memory; this module handles all PTE interpretation.
+///
+/// Usage:
+/// ```ignore
+/// let (mut walk, mut result) = PageTableWalk::start(ttbr0_paddr, user_va);
+/// loop {
+///     match result {
+///         WalkResult::Continue(pte_paddr) => {
+///             let pte_raw = read_phys(pte_paddr); // kernel reads via TTBR1
+///             result = walk.step(pte_raw);
+///         }
+///         WalkResult::Done(phys_addr) => return Some(phys_addr),
+///         WalkResult::Fault => return None,
+///     }
+/// }
+/// ```
+pub struct PageTableWalk {
+    level: u8,
+    va: u64,
+    indices: [usize; 4],
+}
+
+impl PageTableWalk {
+    /// Begin a walk. Returns the walker and the first physical address to read.
+    pub fn start(ttbr0_paddr: u64, va: u64) -> (Self, WalkResult) {
+        let (l0, l1, l2, l3) = crate::vmem::page_table_indices(va);
+        let walk = Self {
+            level: 0,
+            va,
+            indices: [l0, l1, l2, l3],
+        };
+        let pte_paddr = ttbr0_paddr + (l0 as u64) * 8;
+        (walk, WalkResult::Continue(pte_paddr))
+    }
+
+    /// Feed a raw PTE value read from the address returned by the previous step.
+    pub fn step(&mut self, pte_raw: u64) -> WalkResult {
+        let pte = PageTableEntry::from_raw(pte_raw);
+
+        match self.level {
+            0 => {
+                // L0 must be a table descriptor
+                if !pte.is_table() { return WalkResult::Fault; }
+                let next_table = pte.output_addr().as_u64();
+                self.level = 1;
+                WalkResult::Continue(next_table + (self.indices[1] as u64) * 8)
+            }
+            1 => {
+                // L1: 1GB block or table
+                if pte.is_block() {
+                    let offset = self.va & 0x3FFF_FFFF;
+                    return WalkResult::Done(pte.output_addr().as_u64() + offset);
+                }
+                if !pte.is_table() { return WalkResult::Fault; }
+                let next_table = pte.output_addr().as_u64();
+                self.level = 2;
+                WalkResult::Continue(next_table + (self.indices[2] as u64) * 8)
+            }
+            2 => {
+                // L2: 2MB block or table
+                if pte.is_block() {
+                    let offset = self.va & 0x1F_FFFF;
+                    return WalkResult::Done(pte.output_addr().as_u64() + offset);
+                }
+                if !pte.is_table() { return WalkResult::Fault; }
+                let next_table = pte.output_addr().as_u64();
+                self.level = 3;
+                WalkResult::Continue(next_table + (self.indices[3] as u64) * 8)
+            }
+            3 => {
+                // L3 must be a valid page entry
+                if !pte.is_valid() { return WalkResult::Fault; }
+                let offset = self.va & 0xFFF;
+                WalkResult::Done(pte.output_addr().as_u64() + offset)
+            }
+            _ => WalkResult::Fault,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -276,5 +376,121 @@ mod tests {
     fn mair_el1_value_correct() {
         // Attr[0] = 0x00 (device), Attr[1] = 0xFF (normal WB)
         assert_eq!(MAIR_EL1_VALUE, 0xFF00);
+    }
+
+    // --- Page table walk tests ---
+
+    #[test]
+    fn walk_4_level_resolves() {
+        // VA 0x0040_1234: L0=0, L1=0, L2=2, L3=1, offset=0x234
+        let va = 0x0040_1234;
+        let (mut w, r) = PageTableWalk::start(0x1_0000, va);
+
+        // Should read L0 entry at table + L0_idx*8 = 0x1_0000 + 0*8
+        assert_eq!(r, WalkResult::Continue(0x1_0000));
+
+        // L0 → table at 0x2_0000
+        let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        assert_eq!(r, WalkResult::Continue(0x2_0000)); // L1[0]
+
+        // L1 → table at 0x3_0000
+        let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
+        assert_eq!(r, WalkResult::Continue(0x3_0000 + 2 * 8)); // L2[2]
+
+        // L2 → table at 0x4_0000
+        let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x4_0000)).raw());
+        assert_eq!(r, WalkResult::Continue(0x4_0000 + 1 * 8)); // L3[1]
+
+        // L3 → page at 0x5_0000
+        let r = w.step(PageTableEntry::new_page(
+            PhysAddr::new(0x5_0000), MAIR_NORMAL, AP_RW_ALL, SH_INNER,
+        ).raw());
+        assert_eq!(r, WalkResult::Done(0x5_0000 + 0x234));
+    }
+
+    #[test]
+    fn walk_1gb_block_at_l1() {
+        // VA 0x4000_1234: L0=0, L1=1, offset within 1GB = 0x1234
+        let va = 0x4000_1234;
+        let (mut w, r) = PageTableWalk::start(0x1_0000, va);
+
+        // L0 table
+        let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        // Should read L1[1]
+        assert_eq!(r, WalkResult::Continue(0x2_0000 + 1 * 8));
+
+        // L1 → 1GB block at 0x8000_0000
+        let r = w.step(PageTableEntry::new_block(
+            PhysAddr::new(0x8000_0000), MAIR_NORMAL, AP_RW_ALL, SH_INNER,
+        ).raw());
+        // offset = 0x4000_1234 & 0x3FFF_FFFF = 0x1234
+        assert_eq!(r, WalkResult::Done(0x8000_0000 + 0x1234));
+    }
+
+    #[test]
+    fn walk_2mb_block_at_l2() {
+        // VA 0x0060_5678: L0=0, L1=0, L2=3, offset within 2MB = 0x5678
+        let va = 0x0060_5678;
+        let (mut w, _) = PageTableWalk::start(0x1_0000, va);
+
+        let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
+        // Should read L2[3]
+        assert_eq!(r, WalkResult::Continue(0x3_0000 + 3 * 8));
+
+        // L2 → 2MB block at 0xA00_0000
+        let r = w.step(PageTableEntry::new_block(
+            PhysAddr::new(0xA00_0000), MAIR_NORMAL, AP_RW_ALL, SH_INNER,
+        ).raw());
+        // offset = 0x0060_5678 & 0x1F_FFFF = 0x5678
+        assert_eq!(r, WalkResult::Done(0xA00_0000 + 0x5678));
+    }
+
+    #[test]
+    fn walk_fault_invalid_l0() {
+        let (mut w, _) = PageTableWalk::start(0x1_0000, 0x0040_0000);
+        let r = w.step(PageTableEntry::empty().raw());
+        assert_eq!(r, WalkResult::Fault);
+    }
+
+    #[test]
+    fn walk_fault_invalid_l1() {
+        let (mut w, _) = PageTableWalk::start(0x1_0000, 0x0040_0000);
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        let r = w.step(PageTableEntry::empty().raw());
+        assert_eq!(r, WalkResult::Fault);
+    }
+
+    #[test]
+    fn walk_fault_invalid_l2() {
+        let (mut w, _) = PageTableWalk::start(0x1_0000, 0x0040_0000);
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
+        let r = w.step(PageTableEntry::empty().raw());
+        assert_eq!(r, WalkResult::Fault);
+    }
+
+    #[test]
+    fn walk_fault_invalid_l3() {
+        let (mut w, _) = PageTableWalk::start(0x1_0000, 0x0040_0000);
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x4_0000)).raw());
+        let r = w.step(PageTableEntry::empty().raw());
+        assert_eq!(r, WalkResult::Fault);
+    }
+
+    #[test]
+    fn walk_page_offset_preserved() {
+        // VA with offset 0xABC within the page
+        let va = 0x0040_0ABC;
+        let (mut w, _) = PageTableWalk::start(0x1_0000, va);
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x4_0000)).raw());
+        let r = w.step(PageTableEntry::new_page(
+            PhysAddr::new(0xFF_0000), MAIR_NORMAL, AP_RW_ALL, SH_INNER,
+        ).raw());
+        assert_eq!(r, WalkResult::Done(0xFF_0000 + 0xABC));
     }
 }

@@ -147,50 +147,27 @@ pub use lockjaw_types::vmem::MAP_FLAG_DEVICE;
 /// Translate a user virtual address to a kernel-accessible VA by walking
 /// the given page table. Returns None if any level is unmapped.
 ///
-/// All reads go through TTBR1 (kernel higher-half) — this function is
-/// immune to TTBR0 changes from context switches.
+/// Walk logic is in lockjaw_types::page_table::PageTableWalk (tested on host).
+/// This function only does the physical memory reads via TTBR1.
 ///
 /// # Safety
 /// `ttbr0_paddr` must be a valid L0 page table base.
 pub unsafe fn translate_user_va(ttbr0_paddr: PhysAddr, user_va: u64) -> Option<u64> {
-    let (l0_idx, l1_idx, l2_idx, l3_idx) = lockjaw_types::vmem::page_table_indices(user_va);
+    use lockjaw_types::page_table::{PageTableWalk, WalkResult};
 
-    // Walk L0 → L1
-    let l0_va = (ttbr0_paddr.as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
-    let l0_entry = (*l0_va).entries[l0_idx];
-    if !l0_entry.is_table() { return None; }
-
-    // Walk L1
-    let l1_va = (l0_entry.output_addr().as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
-    let l1_entry = (*l1_va).entries[l1_idx];
-    if l1_entry.is_block() {
-        // 1GB block mapping — compute physical address from block base + offset
-        let block_phys = l1_entry.output_addr().as_u64();
-        let offset = user_va & 0x3FFF_FFFF; // offset within 1GB block
-        return Some(block_phys + offset + KERNEL_VA_OFFSET);
+    let (mut walk, mut result) = PageTableWalk::start(ttbr0_paddr.as_u64(), user_va);
+    loop {
+        match result {
+            WalkResult::Continue(pte_paddr) => {
+                // SAFETY: kernel VA via KERNEL_VA_OFFSET — reads PTE through TTBR1
+                let pte_va = pte_paddr + KERNEL_VA_OFFSET;
+                let pte_raw = core::ptr::read_volatile(pte_va as *const u64);
+                result = walk.step(pte_raw);
+            }
+            WalkResult::Done(phys_addr) => return Some(phys_addr + KERNEL_VA_OFFSET),
+            WalkResult::Fault => return None,
+        }
     }
-    if !l1_entry.is_table() { return None; }
-
-    // Walk L2
-    let l2_va = (l1_entry.output_addr().as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
-    let l2_entry = (*l2_va).entries[l2_idx];
-    if l2_entry.is_block() {
-        // 2MB block mapping
-        let block_phys = l2_entry.output_addr().as_u64();
-        let offset = user_va & 0x1F_FFFF; // offset within 2MB block
-        return Some(block_phys + offset + KERNEL_VA_OFFSET);
-    }
-    if !l2_entry.is_table() { return None; }
-
-    // Walk L3
-    let l3_va = (l2_entry.output_addr().as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
-    let l3_entry = (*l3_va).entries[l3_idx];
-    if !l3_entry.is_valid() { return None; }
-
-    // L3 page entry — compute physical address from page base + page offset
-    let page_phys = l3_entry.output_addr().as_u64();
-    let offset = user_va & 0xFFF; // offset within 4KB page
-    Some(page_phys + offset + KERNEL_VA_OFFSET)
 }
 
 /// Map pages into an existing address space (identified by its L0 paddr).
