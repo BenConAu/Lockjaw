@@ -90,10 +90,12 @@ fn gicr_addr() -> u64 {
 }
 
 unsafe fn mmio_read32(addr: u64) -> u32 {
+    // SAFETY: MMIO address
     ptr::read_volatile(addr as *const u32)
 }
 
 unsafe fn mmio_write32(addr: u64, val: u32) {
+    // SAFETY: MMIO address
     ptr::write_volatile(addr as *mut u32, val);
 }
 

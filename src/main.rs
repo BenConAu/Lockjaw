@@ -43,10 +43,15 @@ pub extern "C" fn kmain() -> ! {
     kprintln!();
 
     unsafe {
+        // SAFETY: linker symbol
         let bss_start = &__bss_start as *const u8 as usize;
+        // SAFETY: linker symbol
         let bss_end = &__bss_end as *const u8 as usize;
+        // SAFETY: linker symbol
         let kernel_end = &__kernel_end as *const u8 as usize;
+        // SAFETY: linker symbol
         let stack_bottom = &__stack_bottom as *const u8 as usize;
+        // SAFETY: linker symbol
         let stack_top = &__stack_top as *const u8 as usize;
 
         kprintln!("Memory layout:");
@@ -65,6 +70,7 @@ pub extern "C" fn kmain() -> ! {
     // Initialize page allocator — reserve firmware + kernel + stack pages
     unsafe {
         let kernel_start = mm::addr::PhysAddr::new(arch::aarch64::platform::KERNEL_LOAD_ADDR);
+        // SAFETY: linker symbol
         let stack_top = mm::addr::PhysAddr::new(&__stack_top as *const u8 as u64);
         mm::page_alloc::init(kernel_start, stack_top);
     }
@@ -89,6 +95,7 @@ pub extern "C" fn kmain() -> ! {
 
     // Verify DTB at RAM_BASE (placed there by QEMU bare-metal boot)
     unsafe {
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let dtb_va = (dtb_paddr + mm::addr::KERNEL_VA_OFFSET) as *const u8;
         let magic = u32::from_be_bytes([
             *dtb_va, *dtb_va.add(1), *dtb_va.add(2), *dtb_va.add(3),
@@ -112,6 +119,7 @@ pub extern "C" fn kmain() -> ! {
     // Set up guard page (unmapped) and stack canary
     kprintln!();
     unsafe {
+        // SAFETY: linker symbol
         let guard_phys = mm::addr::PhysAddr::new(&__guard_page as *const u8 as u64);
         kprintln!("Setting up guard page at phys {:#x}...", guard_phys.as_u64());
         arch::aarch64::mmu::setup_guard_page(guard_phys);
@@ -208,6 +216,7 @@ pub extern "C" fn kmain() -> ! {
 
     // Read back the header to verify
     let header_va = ht_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET;
+    // SAFETY: kernel object at known VA
     let header = unsafe { &*(header_va as *const HandleTableHeader) };
     kprintln!("  Created: type={:?}, pages={}, slots={}",
         header.header.obj_type, header.header.page_count, header.slot_count);
@@ -277,6 +286,7 @@ pub extern "C" fn kmain() -> ! {
         // Register idle thread (index 0 = this boot thread, uses the boot stack).
         // This thread drops to EL0 and becomes the init process, so it needs
         // a handle table for init's syscalls (create_endpoint, etc).
+        // SAFETY: linker symbol
         let idle_stack_base = &__stack_bottom as *const u8 as u64 + mm::addr::KERNEL_VA_OFFSET;
         let idle_ht_page = mm::page_alloc::alloc_page().expect("idle ht alloc").start_addr();
         create_handle_table(
@@ -285,6 +295,7 @@ pub extern "C" fn kmain() -> ! {
         ).expect("idle ht create");
 
         let idle_tcb_page = mm::page_alloc::alloc_page().expect("idle tcb alloc").start_addr();
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let idle_tcb_va = (idle_tcb_page.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut sched::tcb::Tcb;
         core::ptr::write(idle_tcb_va, sched::tcb::Tcb {
             header: ObjectHeader { obj_type: ObjectType::ThreadControlBlock, page_count: 1 },
@@ -334,6 +345,7 @@ pub extern "C" fn kmain() -> ! {
         // Allocate a page for the mapping buffer (avoids large array on the kernel stack)
         let map_buf = mm::page_alloc::alloc_page().expect("mapping buffer page");
         mm::page_alloc::zero_page(map_buf.start_addr());
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let map_buf_va = (map_buf.start_addr().as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut Mapping;
         let mappings = core::slice::from_raw_parts_mut(map_buf_va, MAPPINGS_PER_PAGE);
         let mut mapping_count = 0;
@@ -365,6 +377,7 @@ pub extern "C" fn kmain() -> ! {
 
                 if file_remaining > 0 {
                     let src = &INIT_ELF[file_start as usize..(file_start + file_remaining) as usize];
+                    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
                     core::ptr::copy_nonoverlapping(src.as_ptr(), page_va as *mut u8, file_remaining as usize);
                 }
 
@@ -402,6 +415,7 @@ pub extern "C" fn kmain() -> ! {
         // Store the TTBR0 in the boot/idle thread's TCB so that syscalls
         // from the init process can find the caller's address space.
         let current_tcb_paddr = sched::scheduler::current_tcb_paddr();
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let current_tcb = (current_tcb_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut sched::tcb::Tcb;
         (*current_tcb).ttbr0_paddr = ttbr0.as_u64();
 
@@ -428,6 +442,7 @@ pub extern "C" fn kmain() -> ! {
 /// Helper: look up endpoint at handle 0 for the current thread.
 unsafe fn lookup_endpoint() -> (mm::addr::PhysAddr, mm::addr::PhysAddr) {
     let tcb_paddr = sched::scheduler::current_tcb_paddr();
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let tcb = (tcb_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *const sched::tcb::Tcb;
     let ht_paddr = mm::addr::PhysAddr::new((*tcb).handle_table_paddr);
     let entry = cap::handle_table::handle_lookup(

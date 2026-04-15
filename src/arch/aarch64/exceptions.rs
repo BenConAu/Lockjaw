@@ -138,6 +138,7 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
         // Data abort from lower EL with translation fault — check if near stack
         unsafe {
             let tcb_paddr = crate::sched::scheduler::current_tcb_paddr();
+            // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
             let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET)
                 as *const crate::sched::tcb::Tcb;
             let stack_base = (*tcb).user_stack_base;
@@ -380,6 +381,7 @@ pub unsafe fn init() {
     extern "C" {
         static __exception_vectors: u8;
     }
+    // SAFETY: linker symbol
     let vbar = &raw const __exception_vectors as u64;
     core::arch::asm!(
         "msr VBAR_EL1, {addr}",             // Set Vector Base Address Register

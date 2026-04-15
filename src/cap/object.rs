@@ -25,6 +25,7 @@ pub unsafe fn create_handle_table(
     let base_va = base_paddr.as_u64() + KERNEL_VA_OFFSET;
 
     // Write the handle table header
+    // SAFETY: kernel object at known VA
     let header = base_va as *mut HandleTableHeader;
     ptr::write(
         header,
@@ -41,6 +42,7 @@ pub unsafe fn create_handle_table(
     let slots_base = base_va + core::mem::size_of::<HandleTableHeader>() as u64;
     let slot_size = core::mem::size_of::<crate::cap::handle_table::HandleEntry>();
     for i in 0..info.slot_count as usize {
+        // SAFETY: kernel object at known VA
         let slot_ptr = (slots_base + (i * slot_size) as u64) as *mut u8;
         ptr::write_bytes(slot_ptr, 0, slot_size);
     }

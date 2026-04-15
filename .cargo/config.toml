@@ -8,4 +8,4 @@ rustflags = [
 ]
 
 [alias]
-xtask = "run --package xtask --target x86_64-apple-darwin --"
+xtask = "run --package xtask --target aarch64-apple-darwin --"

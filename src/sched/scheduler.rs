@@ -72,6 +72,7 @@ pub unsafe fn current_thread_index() -> usize {
 pub unsafe fn try_current_tcb_paddr() -> Option<PhysAddr> {
     let idx = CURRENT;
     if idx >= MAX_THREADS { return None; }
+    // SAFETY: raw pointer to static
     let ptr = (&raw const THREADS as *const Option<PhysAddr>).add(idx);
     core::ptr::read_volatile(ptr)
 }
@@ -156,21 +157,26 @@ unsafe fn schedule() {
     }
 
     // Context switch: save old SP, load new SP, swap callee-saved regs
+    // SAFETY: context switch register pointers
     let old_sp_ptr = &mut (*old_tcb).saved_sp as *mut u64;
+    // SAFETY: context switch register pointers
     let new_sp_ptr = &(*new_tcb).saved_sp as *const u64;
     context_switch(old_sp_ptr, new_sp_ptr);
 }
 
 unsafe fn tcb_ptr(paddr: PhysAddr) -> *const Tcb {
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     (paddr.as_u64() + KERNEL_VA_OFFSET) as *const Tcb
 }
 
 unsafe fn tcb_ptr_mut(paddr: PhysAddr) -> *mut Tcb {
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut Tcb
 }
 
 /// Check the stack canary for a thread.
 unsafe fn check_thread_canary(tcb: *const Tcb) {
+    // SAFETY: kernel stack address
     let canary_ptr = (*tcb).stack_base as *const u64;
     let value = ptr::read_volatile(canary_ptr);
     if value != lockjaw_types::constants::STACK_CANARY {

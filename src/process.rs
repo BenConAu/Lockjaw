@@ -60,6 +60,7 @@ pub unsafe fn create_process(
         return Err("scratch must be 1 page");
     }
     page_alloc::zero_page(scratch_pages[0]);
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let buf_va = (scratch_pages[0].as_u64() + KERNEL_VA_OFFSET) as *mut Mapping;
     let mappings = core::slice::from_raw_parts_mut(buf_va, MAPPINGS_PER_PAGE);
     let mut count = 0;
@@ -125,6 +126,7 @@ pub unsafe fn create_process(
     // This is the simplest form of capability transfer at process creation.
     if parent_handle_to_copy != u64::MAX {
         let parent_tcb_paddr = scheduler::current_tcb_paddr();
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let parent_tcb = (parent_tcb_paddr.as_u64() + KERNEL_VA_OFFSET) as *const crate::sched::tcb::Tcb;
         let parent_ht = PhysAddr::new((*parent_tcb).handle_table_paddr);
 
@@ -170,6 +172,7 @@ pub unsafe fn create_process(
 fn process_entry() -> ! {
     unsafe {
         let tcb_paddr = scheduler::current_tcb_paddr();
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let tcb = (tcb_paddr.as_u64() + KERNEL_VA_OFFSET) as *const Tcb;
         let entry = (*tcb).user_entry_point;
         let stack_top = (*tcb).user_stack_top;

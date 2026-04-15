@@ -30,5 +30,6 @@ pub unsafe fn copy_from_user<T: Copy>(ttbr0_paddr: PhysAddr, user_va: u64) -> Op
     let kernel_va = translate_user_va(ttbr0_paddr, user_va)?;
 
     // Read through TTBR1 — immune to TTBR0 changes
+    // SAFETY: translated via page table walk (TTBR1)
     Some(core::ptr::read(kernel_va as *const T))
 }

@@ -97,6 +97,7 @@ pub unsafe fn handle_remove(
     }
 
     let removed = *slot;
+    // SAFETY: kernel object at known VA
     ptr::write_bytes(slot as *mut HandleEntry, 0, 1);
     Ok(removed)
 }
@@ -107,6 +108,7 @@ pub unsafe fn handle_remove(
 
 unsafe fn table_ptrs(table_paddr: PhysAddr) -> (*const HandleTableHeader, u64) {
     let base_va = table_paddr.as_u64() + KERNEL_VA_OFFSET;
+    // SAFETY: kernel object at known VA
     let header = base_va as *const HandleTableHeader;
     let slots_base = base_va + core::mem::size_of::<HandleTableHeader>() as u64;
     (header, slots_base)
@@ -114,5 +116,6 @@ unsafe fn table_ptrs(table_paddr: PhysAddr) -> (*const HandleTableHeader, u64) {
 
 unsafe fn slot_ptr(slots_base: u64, index: usize) -> *mut HandleEntry {
     let slot_size = core::mem::size_of::<HandleEntry>();
+    // SAFETY: kernel object at known VA
     (slots_base + (index * slot_size) as u64) as *mut HandleEntry
 }

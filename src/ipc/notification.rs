@@ -25,6 +25,7 @@ pub struct NotificationObject {
 /// # Safety
 /// `base_paddr` must be a donated page.
 pub unsafe fn create_notification(base_paddr: PhysAddr) -> Result<(), CreateError> {
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let obj_va = (base_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut NotificationObject;
     ptr::write(obj_va, NotificationObject {
         header: ObjectHeader {
@@ -95,6 +96,7 @@ pub unsafe fn notification_wait(
             // Block until signaled
             (*obj).blocked_tcb_paddr = caller_tcb_paddr.as_u64();
 
+            // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
             let tcb = (caller_tcb_paddr.as_u64() + KERNEL_VA_OFFSET)
                 as *mut crate::sched::tcb::Tcb;
             (*tcb).ipc_blocked_on = notif_paddr.as_u64();
@@ -141,9 +143,11 @@ pub unsafe fn clear_readiness_waiter(notif_paddr: PhysAddr) {
 // ---------------------------------------------------------------------------
 
 unsafe fn obj_ptr(paddr: PhysAddr) -> *const NotificationObject {
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     (paddr.as_u64() + KERNEL_VA_OFFSET) as *const NotificationObject
 }
 
 unsafe fn obj_ptr_mut(paddr: PhysAddr) -> *mut NotificationObject {
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut NotificationObject
 }

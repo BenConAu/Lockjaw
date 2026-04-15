@@ -79,17 +79,20 @@ pub unsafe fn create_tcb(
     info: &TcbCreateInfo,
     base_paddr: PhysAddr,
 ) -> Result<(), CreateError> {
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let tcb_va = (base_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut Tcb;
     let stack_va = info.stack_paddr.as_u64() + KERNEL_VA_OFFSET;
     let stack_top = stack_va + PAGE_SIZE;
 
     // Write canary at stack bottom
+    // SAFETY: kernel stack address
     let canary_ptr = stack_va as *mut u64;
     ptr::write_volatile(canary_ptr, lockjaw_types::constants::STACK_CANARY);
 
     // Set up synthetic SavedContext at top of stack so context_switch
     // can "return" into this thread. SavedContext is 12 x u64 = 96 bytes.
     let saved_ctx_sp = stack_top - 96;
+    // SAFETY: kernel stack address
     let ctx = saved_ctx_sp as *mut u64;
 
     // Zero all callee-saved regs
@@ -104,6 +107,7 @@ pub unsafe fn create_tcb(
     extern "C" {
         fn thread_entry();
     }
+    // SAFETY: function pointer to kernel code
     ptr::write(ctx.add(11), thread_entry as *const () as u64);
 
     // Write the TCB

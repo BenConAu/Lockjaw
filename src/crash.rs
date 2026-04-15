@@ -45,6 +45,7 @@ pub fn print_thread_context(prefix: &str) {
         let _ = writeln!(uart, "{}  Thread: #{}", prefix, thread_idx);
 
         if let Some(tcb_paddr) = crate::sched::scheduler::try_current_tcb_paddr() {
+            // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
             let tcb = (tcb_paddr.as_u64() + KERNEL_VA_OFFSET) as *const Tcb;
             let sc = core::ptr::read_volatile(&(*tcb).current_syscall);
             if sc != u64::MAX {

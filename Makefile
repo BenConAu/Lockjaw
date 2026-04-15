@@ -11,7 +11,7 @@ QEMU_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -display none \
 
 INIT_ELF := user/init/target/aarch64-unknown-none/release/lockjaw-init
 
-.PHONY: build build-release build-user run run-release objdump nm check-stack test test-unit test-qemu clean
+.PHONY: build build-release build-user run run-release objdump nm check-stack check-pointers test test-unit test-qemu clean
 
 build-user:
 	cd user/hello && cargo build --release
@@ -19,7 +19,7 @@ build-user:
 	cd user/device-manager && cargo build --release
 	cd user/init && cargo build --release
 
-build: build-user check-stack
+build: build-user check-stack check-pointers
 	cargo build
 
 build-release: build-user check-stack
@@ -40,10 +40,13 @@ nm: build
 check-stack:
 	cargo xtask check-stack
 
+check-pointers:
+	cargo xtask check-pointers
+
 test: test-unit test-qemu
 
 test-unit:
-	cargo test -p lockjaw-types --target x86_64-apple-darwin
+	cargo test -p lockjaw-types --target aarch64-apple-darwin
 
 test-qemu: build
 	bash tests/qemu_integration.sh

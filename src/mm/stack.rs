@@ -14,10 +14,13 @@ extern "C" {
 /// Must be called after MMU and guard page are set up, but before any deep
 /// call chains. The stack must not have grown past `__stack_bottom + 8`.
 pub unsafe fn init_canary() {
+    // SAFETY: linker symbol
     let bottom = &raw const __stack_bottom as u64;
+    // SAFETY: linker symbol
     let top = &raw const __stack_top as u64;
 
     // Write canary at the very bottom of the stack (first 8 bytes)
+    // SAFETY: kernel stack address
     ptr::write_volatile(bottom as *mut u64, STACK_CANARY);
 
     // Fill remaining stack with pattern.
@@ -25,6 +28,7 @@ pub unsafe fn init_canary() {
     let mut addr = bottom + 8;
     let safe_limit = top - 256;
     while addr < safe_limit {
+        // SAFETY: kernel stack address
         ptr::write_volatile(addr as *mut u64, STACK_FILL_PATTERN);
         addr += 8;
     }
@@ -34,6 +38,7 @@ pub unsafe fn init_canary() {
 /// Intended to be called periodically (e.g. on every context switch in Phase 5).
 pub fn check_canary() {
     unsafe {
+        // SAFETY: linker symbol
         let canary_ptr = &raw const __stack_bottom as *const u64;
         let value = ptr::read_volatile(canary_ptr);
         if value != STACK_CANARY {
@@ -53,6 +58,7 @@ pub fn check_canary_report(prefix: &str) {
     use core::fmt::Write;
     let mut uart = crate::arch::aarch64::uart::Uart::new();
     unsafe {
+        // SAFETY: linker symbol
         let canary_ptr = &raw const __stack_bottom as *const u64;
         let value = ptr::read_volatile(canary_ptr);
         if value == STACK_CANARY {

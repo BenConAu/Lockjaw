@@ -20,6 +20,7 @@ pub fn irq_dispatch() {
         // The notification_signal function handles waking any waiting thread
         unsafe {
             use crate::ipc::notification;
+            // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
             let obj = (notif_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET)
                 as *const notification::NotificationObject;
             let new_value = (*obj).state.value + 1;

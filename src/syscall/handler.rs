@@ -37,6 +37,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
     // Record syscall breadcrumb for crash diagnostics
     unsafe {
         let tcb_paddr = scheduler::current_tcb_paddr();
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *mut Tcb;
         (*tcb).current_syscall = syscall_num;
         (*tcb).current_syscall_args = [ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]];
@@ -92,6 +93,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
     // Clear syscall breadcrumb
     unsafe {
         let tcb_paddr = scheduler::current_tcb_paddr();
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *mut Tcb;
         (*tcb).current_syscall = u64::MAX;
     }
@@ -100,6 +102,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
 /// Get the current thread's handle table physical address.
 unsafe fn caller_handle_table() -> PhysAddr {
     let tcb_paddr = scheduler::current_tcb_paddr();
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
     PhysAddr::new((*tcb).handle_table_paddr)
 }
@@ -278,6 +281,7 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     unsafe {
         // Get the caller's TTBR0 from their TCB
         let tcb_paddr = scheduler::current_tcb_paddr();
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
         let ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
 
@@ -323,6 +327,7 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
     unsafe {
         // Get caller's TTBR0 for safe user memory access
         let tcb_paddr = scheduler::current_tcb_paddr();
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
         let caller_ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
 
@@ -466,6 +471,7 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 
     unsafe {
         let tcb_paddr = scheduler::current_tcb_paddr();
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *mut Tcb;
         let ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
         let ht_paddr = caller_handle_table();
@@ -603,6 +609,7 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         // Find the blocked caller's handle table
         let caller_tcb_paddr = endpoint::read_caller_tcb(ep_paddr);
         crate::kprintln!("[export] caller_tcb={:#x}", caller_tcb_paddr);
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let caller_tcb = (caller_tcb_paddr + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
         let caller_ht = PhysAddr::new((*caller_tcb).handle_table_paddr);
         crate::kprintln!("[export] caller_ht={:#x}", caller_ht.as_u64());

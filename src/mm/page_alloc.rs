@@ -102,6 +102,7 @@ pub fn dealloc_page(page: PhysPage) -> bool {
 /// Safe because the kernel higher-half mapping covers all RAM.
 pub fn zero_page(paddr: PhysAddr) {
     unsafe {
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let va = (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut u8;
         core::ptr::write_bytes(va, 0, PAGE_SIZE as usize);
     }

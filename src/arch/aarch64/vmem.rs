@@ -43,12 +43,14 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     }
     // Allocate L0
     let l0_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let l0_va = (l0_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
     ptr::write_bytes(l0_va, 0, 1);
 
     // We need L1 for entry [0] (covers VA 0x00000000-0x3FFFFFFF, where user pages live)
     // and L1 entry [1] for the kernel identity map (0x40000000-0x7FFFFFFF)
     let l1_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let l1_va = (l1_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
     ptr::write_bytes(l1_va, 0, 1);
 
@@ -66,6 +68,7 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
 
     // We need L2 for user pages in the first 1GB range
     let l2_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let l2_va = (l2_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
     ptr::write_bytes(l2_va, 0, 1);
 
@@ -109,6 +112,7 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
                     return Err(VmemError::TooManyL3Regions);
                 }
                 let l3_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
+                // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
                 let va = (l3_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
                 ptr::write_bytes(va, 0, 1);
 
@@ -161,6 +165,7 @@ pub unsafe fn translate_user_va(ttbr0_paddr: PhysAddr, user_va: u64) -> Option<u
             WalkResult::Continue(pte_paddr) => {
                 // SAFETY: kernel VA via KERNEL_VA_OFFSET — reads PTE through TTBR1
                 let pte_va = pte_paddr + KERNEL_VA_OFFSET;
+                // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
                 let pte_raw = core::ptr::read_volatile(pte_va as *const u64);
                 result = walk.step(pte_raw);
             }
@@ -198,18 +203,21 @@ pub unsafe fn map_pages_in_existing(
     };
 
     // Walk L0 → L1 → L2 (read existing page table pointers)
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let l0_va = (ttbr0_paddr.as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
     let l0_entry = (*l0_va).entries[0];
     if !l0_entry.is_table() {
         return Err(VmemError::OutOfPages);
     }
 
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let l1_va = (l0_entry.output_addr().as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
     let l1_entry = (*l1_va).entries[0];
     if !l1_entry.is_table() {
         return Err(VmemError::OutOfPages);
     }
 
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let l2_va = (l1_entry.output_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
 
     // Determine L2 slot state and ask the model what to do
@@ -225,10 +233,12 @@ pub unsafe fn map_pages_in_existing(
     let l3_va = match map_action_for_l2(l2_state) {
         MapAction::UseExistingL3 => {
             let l3_paddr = l2_entry.output_addr();
+            // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
             (l3_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut PageTable
         }
         MapAction::AllocateL3 => {
             let l3_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
+            // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
             let va = (l3_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
             ptr::write_bytes(va, 0, 1);
             (*l2_va).entries[l2_idx] = PageTableEntry::new_table(l3_page.start_addr());

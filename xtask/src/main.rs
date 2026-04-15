@@ -16,10 +16,12 @@ const NORMAL_ENTRY: &str = "_start";
 fn main() {
     match env::args().nth(1).as_deref() {
         Some("check-stack") => check_stack(),
+        Some("check-pointers") => check_pointers(),
         _ => {
             eprintln!("Usage: cargo xtask <command>");
             eprintln!("Commands:");
-            eprintln!("  check-stack    Verify stack depth budgets and no recursion");
+            eprintln!("  check-stack      Verify stack depth budgets and no recursion");
+            eprintln!("  check-pointers   Verify all pointer casts have SAFETY comments");
             process::exit(1);
         }
     }
@@ -437,6 +439,109 @@ fn parse_hex_or_dec(s: &str) -> Result<u64, std::num::ParseIntError> {
         s.parse()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pointer cast safety lint
+// ---------------------------------------------------------------------------
+
+/// Verify every `as *const` / `as *mut` cast in kernel source has a
+/// `// SAFETY:` comment on the same line or the line immediately before.
+///
+/// This prevents the TTBR0 race class of bugs: any code that casts a user
+/// VA to a pointer and dereferences it is vulnerable to context switches
+/// changing TTBR0. The SAFETY comment forces the author to justify why the
+/// address is safe (kernel VA via KERNEL_VA_OFFSET, MMIO address, linker
+/// symbol, etc). User memory must go through copy_from_user.
+fn check_pointers() {
+    use std::path::Path;
+
+    println!("=== Pointer Cast Safety Check ===");
+    println!("  Every `as *const` / `as *mut` in src/ must have a // SAFETY: comment.");
+    println!();
+
+    let src_dir = Path::new("src");
+    if !src_dir.exists() {
+        eprintln!("ERROR: src/ directory not found (run from project root)");
+        process::exit(1);
+    }
+
+    let mut violations: Vec<(String, usize, String)> = Vec::new();
+    let mut total_casts = 0;
+
+    visit_rs_files(src_dir, &mut |path| {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let rel_path = path.to_string_lossy().to_string();
+
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            // Skip comment-only lines and lines in test modules
+            if trimmed.starts_with("//") || trimmed.starts_with("*") {
+                continue;
+            }
+            if !has_pointer_cast(trimmed) {
+                continue;
+            }
+            total_casts += 1;
+
+            // Check this line or up to 2 lines above for // SAFETY:
+            // (multi-line expressions may split the cast onto a continuation line)
+            let has_safety = trimmed.contains("// SAFETY:")
+                || (i > 0 && lines[i - 1].trim().contains("// SAFETY:"))
+                || (i > 1 && lines[i - 2].trim().contains("// SAFETY:"));
+
+            if !has_safety {
+                violations.push((rel_path.clone(), i + 1, trimmed.to_string()));
+            }
+        }
+    });
+
+    println!("  {} pointer casts found in src/", total_casts);
+    println!("  {} without SAFETY annotation", violations.len());
+    println!();
+
+    if violations.is_empty() {
+        println!("=== Pointer cast check PASSED ===");
+    } else {
+        eprintln!("=== Pointer cast check FAILED ===");
+        eprintln!();
+        for (file, line, text) in &violations {
+            eprintln!("  {}:{}: {}", file, line, text);
+        }
+        eprintln!();
+        eprintln!("Add `// SAFETY: <reason>` on the same line or line above each cast.");
+        eprintln!("User memory must use copy_from_user, never raw pointer casts.");
+        process::exit(1);
+    }
+}
+
+/// Check if a line contains `as *const` or `as *mut` (pointer cast).
+fn has_pointer_cast(line: &str) -> bool {
+    line.contains("as *const") || line.contains("as *mut")
+}
+
+/// Recursively visit all .rs files under a directory.
+fn visit_rs_files(dir: &std::path::Path, cb: &mut dyn FnMut(&std::path::Path)) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            visit_rs_files(&path, cb);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            cb(&path);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
 
 /// Pipe text through `rustfilt` to demangle Rust symbols.
 /// Returns the original text unchanged if rustfilt is not installed.

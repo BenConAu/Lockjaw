@@ -33,10 +33,12 @@ impl Uart {
         unsafe {
             let base = UART_BASE;
             // Spin while TX FIFO is full
+            // SAFETY: MMIO address
             while (ptr::read_volatile((base + FR_OFFSET) as *const u32) & UARTFR_TXFF) != 0 {
                 core::hint::spin_loop();
             }
             // Write the byte to the data register
+            // SAFETY: MMIO address
             ptr::write_volatile((base + DR_OFFSET) as *mut u32, c as u32);
         }
     }

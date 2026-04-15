@@ -62,6 +62,7 @@ pub struct EndpointObject {
 /// # Safety
 /// `base_paddr` must point to a donated page not mapped by userspace.
 pub unsafe fn create_endpoint(base_paddr: PhysAddr) -> Result<(), CreateError> {
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let ep_va = (base_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut EndpointObject;
     ptr::write(ep_va, EndpointObject {
         header: ObjectHeader {
@@ -357,17 +358,21 @@ pub unsafe fn clear_readiness_waiter(ep_paddr: PhysAddr) {
 // ---------------------------------------------------------------------------
 
 unsafe fn ep_ptr(paddr: PhysAddr) -> *const EndpointObject {
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     (paddr.as_u64() + KERNEL_VA_OFFSET) as *const EndpointObject
 }
 
 unsafe fn ep_ptr_mut(paddr: PhysAddr) -> *mut EndpointObject {
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut EndpointObject
 }
 
 unsafe fn tcb_ptr(paddr: PhysAddr) -> *const Tcb {
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     (paddr.as_u64() + KERNEL_VA_OFFSET) as *const Tcb
 }
 
 unsafe fn tcb_ptr_mut(paddr: PhysAddr) -> *mut Tcb {
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut Tcb
 }
