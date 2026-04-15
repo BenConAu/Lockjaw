@@ -3,6 +3,7 @@
 
 mod arch;
 mod cap;
+pub mod crash;
 mod elf;
 mod ipc;
 mod mm;
@@ -302,6 +303,8 @@ pub extern "C" fn kmain() -> ! {
             wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
             wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
             wait_count: 0,
+            current_syscall: u64::MAX,
+            current_syscall_args: [0; 4],
         });
 
         sched::scheduler::add_thread(idle_tcb_page);  // index 0: idle/boot
@@ -505,6 +508,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
     let _ = writeln!(uart, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     let _ = writeln!(uart, "[PANIC:KERN]  KERNEL PANIC");
+    mm::stack::check_canary_report("[PANIC:KERN]");
+    crash::print_thread_context("[PANIC:KERN]");
     if let Some(location) = info.location() {
         let _ = writeln!(uart, "[PANIC:KERN]  {}:{}", location.file(), location.line());
     }

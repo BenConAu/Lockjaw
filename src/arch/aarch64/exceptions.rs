@@ -119,11 +119,8 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
     // Kernel stack canary check — if corrupted, register dump is unreliable
     crate::mm::stack::check_canary_report(prefix);
 
-    // Thread identification
-    unsafe {
-        let thread_idx = crate::sched::scheduler::current_thread_index();
-        crate::kprintln!("{}  Thread: #{}", prefix, thread_idx);
-    }
+    // Thread identification and syscall breadcrumb
+    crate::crash::print_thread_context(prefix);
 
     crate::kprintln!("{}  ESR:  {:#010x} — {} — {}", prefix, esr,
         exception_class_str(ec), data_fault_str(esr));

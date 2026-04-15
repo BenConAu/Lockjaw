@@ -66,6 +66,16 @@ pub unsafe fn current_thread_index() -> usize {
     CURRENT
 }
 
+/// Like current_tcb_paddr but returns None instead of panicking.
+/// Safe to call from the panic handler without risk of re-entrant panic.
+/// Uses raw pointer read to avoid bounds-check panics and static-mut-ref warnings.
+pub unsafe fn try_current_tcb_paddr() -> Option<PhysAddr> {
+    let idx = CURRENT;
+    if idx >= MAX_THREADS { return None; }
+    let ptr = (&raw const THREADS as *const Option<PhysAddr>).add(idx);
+    core::ptr::read_volatile(ptr)
+}
+
 /// Block the current thread and schedule away to the next Ready thread.
 /// Sets the thread's state to Blocked. The caller must have already set
 /// the TCB's ipc_blocked_on field. This function does not return until

@@ -48,14 +48,17 @@ pub fn check_canary() {
 /// Check the kernel stack canary and report status without panicking.
 /// Used by crash diagnostics — if the canary is corrupted during a crash,
 /// we want to print that fact, not trigger a second panic.
+/// Writes directly to UART (not kprintln) to avoid re-entrant panics.
 pub fn check_canary_report(prefix: &str) {
+    use core::fmt::Write;
+    let mut uart = crate::arch::aarch64::uart::Uart::new();
     unsafe {
         let canary_ptr = &raw const __stack_bottom as *const u64;
         let value = ptr::read_volatile(canary_ptr);
         if value == STACK_CANARY {
-            crate::kprintln!("{}  Kernel stack canary: INTACT", prefix);
+            let _ = writeln!(uart, "{}  Kernel stack canary: INTACT", prefix);
         } else {
-            crate::kprintln!("{}  Kernel stack canary: *** CORRUPTED *** — register dump may be unreliable", prefix);
+            let _ = writeln!(uart, "{}  Kernel stack canary: *** CORRUPTED *** — register dump may be unreliable", prefix);
         }
     }
 }

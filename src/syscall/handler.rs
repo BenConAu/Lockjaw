@@ -19,6 +19,14 @@ use lockjaw_types::syscall::*;
 pub fn handle_syscall(ctx: &mut ExceptionContext) {
     let syscall_num = ctx.gpr[8]; // x8
 
+    // Record syscall breadcrumb for crash diagnostics
+    unsafe {
+        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *mut Tcb;
+        (*tcb).current_syscall = syscall_num;
+        (*tcb).current_syscall_args = [ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]];
+    }
+
     ctx.gpr[0] = match syscall_num {
         SYS_DEBUG_PUTC => sys_debug_putc(ctx.gpr[0]),
         SYS_YIELD => sys_yield(),
@@ -43,6 +51,13 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
             SYS_ERR_INVALID_PARAMETER
         }
     };
+
+    // Clear syscall breadcrumb
+    unsafe {
+        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *mut Tcb;
+        (*tcb).current_syscall = u64::MAX;
+    }
 }
 
 /// Get the current thread's handle table physical address.

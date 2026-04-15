@@ -47,6 +47,11 @@ pub struct Tcb {
     pub wait_types: [u8; lockjaw_types::wait::MAX_WAIT_OBJECTS],
     /// Number of valid entries in wait_objects (0 = not in a sys_wait_any).
     pub wait_count: u8,
+    /// Currently executing syscall number (u64::MAX = not in a syscall).
+    /// Set at syscall entry, cleared at exit. Printed on crash.
+    pub current_syscall: u64,
+    /// Arguments to the current syscall (x0-x3).
+    pub current_syscall_args: [u64; 4],
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +127,8 @@ pub unsafe fn create_tcb(
         wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
         wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
         wait_count: 0,
+        current_syscall: u64::MAX,
+        current_syscall_args: [0; 4],
     });
 
     Ok(())
