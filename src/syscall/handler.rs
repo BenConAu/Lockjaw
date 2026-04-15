@@ -66,6 +66,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_WAIT_ANY => SyscallReturn::Value(sys_wait_any(ctx)),
         SYS_EXPORT_HANDLE => SyscallReturn::Value(sys_export_handle(ctx)),
         SYS_GET_BOOT_INFO => SyscallReturn::Value(Ok(sys_get_boot_info())),
+        SYS_REGISTER_DEVICE_PAGE => SyscallReturn::Value(sys_register_device_page(ctx)),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             SyscallReturn::Void(SyscallError::INVALID_PARAMETER)
@@ -270,13 +271,12 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     }
 }
 
-/// sys_map_pages(x0, virt_addr, flags) — map pages into the caller's address space.
-/// When flags == 0 (normal memory): x0 = PageSet ID (from sys_alloc_pages).
-/// When flags & MAP_FLAG_DEVICE: x0 = raw physical MMIO address (page-aligned).
+/// sys_map_pages(pageset_id, virt_addr, flags) — map pages into the caller's address space.
+/// x0 = PageSet ID (from sys_alloc_pages or sys_register_device_page).
 /// x1 = virtual address to map at (must be page-aligned, in user range).
-/// x2 = flags.
+/// x2 = flags (MAP_FLAG_DEVICE for MMIO memory attributes).
 fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
-    let x0 = ctx.gpr[0];
+    let pageset_id = ctx.gpr[0];
     let virt_addr = ctx.gpr[1];
     let flags = ctx.gpr[2];
 
@@ -291,23 +291,14 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
             return SyscallError::INVALID_PARAMETER;
         }
 
-        if flags & crate::arch::aarch64::vmem::MAP_FLAG_DEVICE != 0 {
-            // x0 = raw physical address for device MMIO (single page)
-            let pages = [PhysAddr::new(x0)];
-            match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages, flags) {
-                Ok(()) => SyscallError::OK,
-                Err(_) => SyscallError::INVALID_PARAMETER,
-            }
-        } else {
-            // x0 = PageSet ID (normal memory)
-            let (count, pages) = match crate::cap::pageset_table::get_pageset(x0) {
-                Some(ps) => ps,
-                None => return SyscallError::INVALID_HANDLE,
-            };
-            match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages[..count], flags) {
-                Ok(()) => SyscallError::OK,
-                Err(_) => SyscallError::UNKNOWN,
-            }
+        // All mappings go through PageSets — no raw physical addresses accepted.
+        let (count, pages) = match crate::cap::pageset_table::get_pageset(pageset_id) {
+            Some(ps) => ps,
+            None => return SyscallError::INVALID_HANDLE,
+        };
+        match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages[..count], flags) {
+            Ok(()) => SyscallError::OK,
+            Err(_) => SyscallError::UNKNOWN,
         }
     }
 }
@@ -633,6 +624,18 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 /// DTB PageSet ID returned in x1.
 fn sys_get_boot_info() -> u64 {
     crate::dtb_pageset_id()
+}
+
+/// sys_register_device_page(phys_addr) — wrap a physical address as a tracked PageSet.
+/// x0 = physical MMIO address (page-aligned).
+/// Returns the PageSet ID. Used by the device manager to create MMIO PageSets
+/// for drivers. Drivers then map via sys_map_pages with the PageSet ID.
+fn sys_register_device_page(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
+    let phys_addr = ctx.gpr[0];
+    match crate::cap::pageset_table::register_device_page(phys_addr) {
+        Some(id) => Ok(id),
+        None => Err(SyscallError::OUT_OF_MEMORY),
+    }
 }
 
 fn obj_type_from_u8(v: u8) -> ObjectType {

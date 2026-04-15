@@ -30,6 +30,7 @@ pub fn syscall_name(num: u64) -> &'static str {
         15 => "sys_wait_any",
         16 => "sys_export_handle",
         17 => "sys_get_boot_info",
+        18 => "sys_register_device_page",
         _  => "unknown",
     }
 }

@@ -68,6 +68,16 @@ pub fn consume_pageset(id: u64) -> bool {
     }
 }
 
+/// Wrap a physical MMIO address as a 1-page PageSet (no allocation, just tracking).
+/// Used by the device manager to create trackable PageSets for MMIO pages.
+pub fn register_device_page(phys_addr: u64) -> Option<u64> {
+    let mut pages = [PhysAddr::new(0); MAX_PAGES_PER_SET];
+    pages[0] = PhysAddr::new(phys_addr);
+    let entry = PageSetEntry { count: 1, pages };
+    let result = unsafe { (*TABLE.0.get()).insert(entry) };
+    result.ok().map(|id| id as u64)
+}
+
 /// Look up a PageSet by ID. Returns the page count and physical addresses.
 pub fn get_pageset(id: u64) -> Option<(usize, [PhysAddr; MAX_PAGES_PER_SET])> {
     unsafe {

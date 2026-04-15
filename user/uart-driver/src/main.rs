@@ -79,16 +79,16 @@ pub extern "C" fn _start() -> ! {
         Ok(r) => r,
         Err(_) => { puts("uart-driver: claim call FAILED\n"); loop { unsafe { asm!("wfi"); } } }
     };
-    let uart_phys = claim[0];
+    let mmio_pageset = claim[0];
     let uart_intid = claim[1];
-    if uart_phys == 0 {
+    if mmio_pageset == 0 {
         puts("uart-driver: no PL011 available\n");
         loop { unsafe { asm!("wfi"); } }
     }
     puts("uart-driver: claimed PL011\n");
 
-    // Step 1: Map UART MMIO page into our address space
-    if !sys_map_pages(uart_phys, UART_VA, MAP_FLAG_DEVICE).is_ok() {
+    // Step 1: Map UART MMIO page into our address space (via PageSet ID)
+    if !sys_map_pages(mmio_pageset, UART_VA, MAP_FLAG_DEVICE).is_ok() {
         puts("uart-driver: map MMIO FAILED\n");
         loop { unsafe { asm!("wfi"); } }
     }

@@ -279,3 +279,19 @@ pub fn sys_get_boot_info() -> Result<u64, SyscallError> {
     }
     if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
 }
+
+/// Register a physical MMIO address as a tracked PageSet.
+/// Returns the PageSet ID for use with sys_map_pages.
+pub fn sys_register_device_page(phys_addr: u64) -> Result<u64, SyscallError> {
+    let err: u64;
+    let val: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") phys_addr => err,
+            lateout("x1") val,
+            in("x8") SYS_REGISTER_DEVICE_PAGE,
+        );
+    }
+    if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
+}

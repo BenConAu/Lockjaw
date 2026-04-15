@@ -100,11 +100,22 @@ pub extern "C" fn _start() -> ! {
             for i in 0..devices.count {
                 let dev = devices.devices[i];
                 if dev.compatible_hash == requested_hash && !dev.claimed {
+                    // Register the MMIO page as a tracked PageSet
+                    let mmio_ps = match sys_register_device_page(dev.mmio_addr) {
+                        Ok(id) => id,
+                        Err(_) => {
+                            puts("devmgr: register MMIO page FAILED\n");
+                            sys_reply(server_ep, 0, 0, 0, 0);
+                            found = true;
+                            break;
+                        }
+                    };
                     devices.devices[i].claimed = true;
                     puts("devmgr: claimed device at ");
                     put_hex(dev.mmio_addr);
                     putc(b'\n');
-                    sys_reply(server_ep, dev.mmio_addr, dev.intid as u64, 0, 0);
+                    // Reply with PageSet ID (not raw address) + INTID
+                    sys_reply(server_ep, mmio_ps, dev.intid as u64, 0, 0);
                     found = true;
                     break;
                 }

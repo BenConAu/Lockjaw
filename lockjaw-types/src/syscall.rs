@@ -83,3 +83,4 @@ pub const SYS_RECV_NB: u64 = 14;
 pub const SYS_WAIT_ANY: u64 = 15;
 pub const SYS_EXPORT_HANDLE: u64 = 16;
 pub const SYS_GET_BOOT_INFO: u64 = 17;
+pub const SYS_REGISTER_DEVICE_PAGE: u64 = 18;
