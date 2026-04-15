@@ -89,6 +89,13 @@ pub fn validate_mapping(virt_addr: u64, page_count: usize) -> MapValidation {
     }
 }
 
+/// Validate that user mappings + stack pages fit in the mapping buffer.
+/// Returns true if the combined count fits within `capacity` entries
+/// and both counts are nonzero.
+pub fn validate_process_mappings(mapping_count: usize, stack_count: usize, capacity: usize) -> bool {
+    mapping_count > 0 && stack_count > 0 && mapping_count + stack_count <= capacity
+}
+
 /// Classify an L2 page table entry for the mapping path.
 /// Determines whether the slot is empty (need to allocate L3), already has
 /// an L3 table (reuse it), or is a block descriptor (conflict).
@@ -272,5 +279,37 @@ mod tests {
         let pte = build_user_page(PhysAddr::new(0x0900_0000), MAIR_DEVICE, SH_NON);
         assert_eq!(pte.attr_index(), MAIR_DEVICE);
         assert_eq!(pte.sh(), SH_NON);
+    }
+
+    // --- validate_process_mappings tests ---
+
+    #[test]
+    fn process_mappings_fit() {
+        assert!(validate_process_mappings(30, 1, 32));
+    }
+
+    #[test]
+    fn process_mappings_exact_fit() {
+        assert!(validate_process_mappings(28, 4, 32));
+    }
+
+    #[test]
+    fn process_mappings_overflow() {
+        assert!(!validate_process_mappings(30, 5, 32));
+    }
+
+    #[test]
+    fn process_mappings_zero_mappings() {
+        assert!(!validate_process_mappings(0, 1, 32));
+    }
+
+    #[test]
+    fn process_mappings_zero_stack() {
+        assert!(!validate_process_mappings(10, 0, 32));
+    }
+
+    #[test]
+    fn process_mappings_no_room_for_stack() {
+        assert!(!validate_process_mappings(32, 1, 32));
     }
 }

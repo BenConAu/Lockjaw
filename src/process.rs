@@ -48,9 +48,13 @@ pub unsafe fn create_process(
     parent_handle_to_copy: u64,
     caller_ttbr0: PhysAddr,
 ) -> Result<(), &'static str> {
-    // Need room for mapping_count entries + stack pages
-    if mapping_count == 0 || mapping_count + 1 > MAPPINGS_PER_PAGE {
-        return Err("invalid mapping count");
+    // Look up stack PageSet early so we can validate total mapping count
+    let (stack_count, stack_pages) = pageset_table::get_pageset(stack_pageset_id)
+        .ok_or("invalid stack pageset")?;
+
+    // Validate that user mappings + stack pages fit in the scratch buffer
+    if !lockjaw_types::vmem::validate_process_mappings(mapping_count, stack_count, MAPPINGS_PER_PAGE) {
+        return Err("mapping count exceeds buffer capacity");
     }
 
     // Use the caller-provided scratch page as the Mapping buffer.
@@ -89,14 +93,7 @@ pub unsafe fn create_process(
         count += 1;
     }
 
-    // Add stack pages (the PageSet may contain multiple pages for larger stacks)
-    let (stack_count, stack_pages) = pageset_table::get_pageset(stack_pageset_id)
-        .ok_or("invalid stack pageset")?;
-    if stack_count == 0 {
-        return Err("empty stack pageset");
-    }
-
-    // Map all stack pages contiguously at USER_STACK_BASE
+    // Add stack pages contiguously at USER_STACK_BASE
     let stack_va: u64 = lockjaw_types::constants::USER_STACK_BASE;
     for s in 0..stack_count {
         mappings[count] = Mapping {
