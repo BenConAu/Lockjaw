@@ -131,14 +131,15 @@ unsafe fn create_kernel_object(
     obj_type: ObjectType,
     init_fn: unsafe fn(PhysAddr) -> Result<(), crate::cap::object::CreateError>,
 ) -> Result<u64, SyscallError> {
-    let (count, pages) = match crate::cap::pageset_table::get_pageset(pageset_id) {
+    let (count, header_paddr) = match crate::cap::pageset_table::get_pageset(pageset_id) {
         Some(ps) => ps,
         None => return Err(SyscallError::INVALID_HANDLE),
     };
     if count != 1 {
         return Err(SyscallError::INVALID_PARAMETER);
     }
-    let paddr = pages[0];
+    let header = crate::cap::pageset_table::read_header(header_paddr);
+    let paddr = PhysAddr::new(header.get_page(0).unwrap());
     if init_fn(paddr).is_err() {
         return Err(SyscallError::UNKNOWN);
     }
@@ -292,11 +293,17 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
         }
 
         // All mappings go through PageSets — no raw physical addresses accepted.
-        let (count, pages) = match crate::cap::pageset_table::get_pageset(pageset_id) {
+        let (count, header_paddr) = match crate::cap::pageset_table::get_pageset(pageset_id) {
             Some(ps) => ps,
             None => return SyscallError::INVALID_HANDLE,
         };
-        match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages[..count], flags) {
+        // Read page addresses from the header page
+        let header = crate::cap::pageset_table::read_header(header_paddr);
+        let mut page_addrs = [PhysAddr::new(0); 16];
+        for i in 0..count.min(16) {
+            page_addrs[i] = PhysAddr::new(header.get_page(i).unwrap());
+        }
+        match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &page_addrs[..count], flags) {
             Ok(()) => SyscallError::OK,
             Err(_) => SyscallError::UNKNOWN,
         }

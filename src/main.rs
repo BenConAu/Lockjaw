@@ -107,10 +107,11 @@ pub extern "C" fn kmain() -> ! {
     // Register DTB pages as a PageSet so userspace can map them normally.
     // This avoids the MAIR_DEVICE aliasing problem (DTB is normal RAM, not MMIO).
     unsafe {
-        let mut dtb_pages = [mm::addr::PhysAddr::new(0); lockjaw_types::pageset_table::MAX_PAGES_PER_SET];
-        dtb_pages[0] = mm::addr::PhysAddr::new(dtb_paddr);
-        dtb_pages[1] = mm::addr::PhysAddr::new(dtb_paddr + mm::addr::PAGE_SIZE);
-        let dtb_ps_id = cap::pageset_table::register_existing(2, dtb_pages)
+        let dtb_pages = [
+            mm::addr::PhysAddr::new(dtb_paddr),
+            mm::addr::PhysAddr::new(dtb_paddr + mm::addr::PAGE_SIZE),
+        ];
+        let dtb_ps_id = cap::pageset_table::register_existing(2, &dtb_pages)
             .expect("DTB PageSet registration failed");
         DTB_PAGESET_ID = dtb_ps_id;
         kprintln!("DTB PageSet registered: id={}", dtb_ps_id);

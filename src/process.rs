@@ -49,7 +49,7 @@ pub unsafe fn create_process(
     caller_ttbr0: PhysAddr,
 ) -> Result<(), &'static str> {
     // Look up stack PageSet early so we can validate total mapping count
-    let (stack_count, stack_pages) = pageset_table::get_pageset(stack_pageset_id)
+    let (stack_count, stack_header_paddr) = pageset_table::get_pageset(stack_pageset_id)
         .ok_or("invalid stack pageset")?;
 
     // Validate that user mappings + stack pages fit in the scratch buffer
@@ -58,14 +58,16 @@ pub unsafe fn create_process(
     }
 
     // Use the caller-provided scratch page as the Mapping buffer.
-    let (scratch_count, scratch_pages) = pageset_table::get_pageset(scratch_pageset_id)
+    let (scratch_count, scratch_header_paddr) = pageset_table::get_pageset(scratch_pageset_id)
         .ok_or("invalid scratch pageset")?;
     if scratch_count != 1 {
         return Err("scratch must be 1 page");
     }
-    page_alloc::zero_page(scratch_pages[0]);
+    let scratch_header = pageset_table::read_header(scratch_header_paddr);
+    let scratch_paddr = PhysAddr::new(scratch_header.get_page(0).unwrap());
+    page_alloc::zero_page(scratch_paddr);
     // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    let buf_va = (scratch_pages[0].as_u64() + KERNEL_VA_OFFSET) as *mut Mapping;
+    let buf_va = (scratch_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut Mapping;
     let mappings = core::slice::from_raw_parts_mut(buf_va, MAPPINGS_PER_PAGE);
     let mut count = 0;
 
@@ -76,7 +78,7 @@ pub unsafe fn create_process(
             .ok_or("unmapped user mapping pointer")?;
 
         // Resolve the PageSet ID to a physical address
-        let (ps_count, ps_pages) = pageset_table::get_pageset(user_mapping.pageset_id)
+        let (ps_count, ps_header_paddr) = pageset_table::get_pageset(user_mapping.pageset_id)
             .ok_or("invalid pageset ID")?;
 
         let page_idx = user_mapping.page_index as usize;
@@ -84,9 +86,10 @@ pub unsafe fn create_process(
             return Err("page index out of range");
         }
 
+        let ps_header = pageset_table::read_header(ps_header_paddr);
         mappings[count] = Mapping {
             virt_addr: user_mapping.virt_addr,
-            phys_addr: ps_pages[page_idx],
+            phys_addr: PhysAddr::new(ps_header.get_page(page_idx).unwrap()),
             user_accessible: true,
             executable: (user_mapping.flags & FLAG_EXECUTABLE) != 0,
         };
@@ -94,11 +97,12 @@ pub unsafe fn create_process(
     }
 
     // Add stack pages contiguously at USER_STACK_BASE
+    let stack_header = pageset_table::read_header(stack_header_paddr);
     let stack_va: u64 = lockjaw_types::constants::USER_STACK_BASE;
     for s in 0..stack_count {
         mappings[count] = Mapping {
             virt_addr: stack_va + (s as u64) * PAGE_SIZE,
-            phys_addr: stack_pages[s],
+            phys_addr: PhysAddr::new(stack_header.get_page(s).unwrap()),
             user_accessible: true,
             executable: false,
         };

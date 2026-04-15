@@ -1,22 +1,79 @@
-/// Pure PageSet table model for tracking allocated page sets.
+/// Pure PageSet table and header model for tracking allocated page sets.
 ///
-/// This is the decision logic — no static mut, no page allocator, no unsafe.
+/// This is the decision logic -- no static mut, no page allocator, no unsafe.
 /// The kernel owns the mutable state and calls these functions to determine
 /// what to do. Tests can create instances and verify behavior directly.
-
-use crate::addr::PhysAddr;
 
 /// Maximum number of PageSets tracked in a table.
 pub const MAX_PAGESETS: usize = 32;
 
-/// Maximum pages per PageSet.
-pub const MAX_PAGES_PER_SET: usize = 16;
+/// Maximum data pages per PageSet. Each PageSet uses one additional page
+/// as a header storing the physical addresses of all data pages. The header
+/// page holds: count (u64), reserved (u64), then up to 510 page addresses.
+pub const MAX_PAGES_PER_SET: usize = 510;
 
-/// A tracked PageSet: a set of physical page addresses.
+// ---------------------------------------------------------------------------
+// PageSetHeader -- lives in the first allocated page of every PageSet
+// ---------------------------------------------------------------------------
+
+/// Page-resident header for a PageSet. Stored in the first allocated page.
+/// Contains the physical addresses of all data pages in the set.
+/// The kernel reads/writes this in place via KERNEL_VA_OFFSET.
+/// Tests create instances on the stack and verify page lookup logic.
+#[repr(C)]
+pub struct PageSetHeader {
+    /// Number of data pages in the set (does not count the header page itself).
+    pub count: u64,
+    /// Reserved for future use.
+    pub _reserved: u64,
+    /// Physical addresses of the data pages. Only pages[0..count] are valid.
+    pub pages: [u64; MAX_PAGES_PER_SET],
+}
+
+impl PageSetHeader {
+    /// Create an empty header.
+    pub const fn empty() -> Self {
+        Self {
+            count: 0,
+            _reserved: 0,
+            pages: [0; MAX_PAGES_PER_SET],
+        }
+    }
+
+    /// Initialize the header with the given page addresses.
+    pub fn init(&mut self, page_addrs: &[u64]) {
+        self.count = page_addrs.len() as u64;
+        for (i, addr) in page_addrs.iter().enumerate() {
+            self.pages[i] = *addr;
+        }
+    }
+
+    /// Get the physical address of a data page by index.
+    /// Returns None if the index is out of range.
+    pub fn get_page(&self, index: usize) -> Option<u64> {
+        if index < self.count as usize {
+            Some(self.pages[index])
+        } else {
+            None
+        }
+    }
+
+    /// Get the number of data pages.
+    pub fn data_page_count(&self) -> usize {
+        self.count as usize
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PageSetEntry -- thin entry stored in the tracking table
+// ---------------------------------------------------------------------------
+
+/// A tracked PageSet: just the count and the header page's physical address.
+/// The actual page addresses live in the header page, not in the table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageSetEntry {
     pub count: usize,
-    pub pages: [PhysAddr; MAX_PAGES_PER_SET],
+    pub header_paddr: u64,
 }
 
 /// Errors from PageSet table operations.
@@ -29,7 +86,7 @@ pub enum PageSetError {
 }
 
 /// A table that tracks allocated PageSets by slot index.
-/// No global state — the caller owns the instance.
+/// No global state -- the caller owns the instance.
 pub struct PageSetTable {
     slots: [Option<PageSetEntry>; MAX_PAGESETS],
 }
@@ -88,12 +145,13 @@ mod tests {
     use super::*;
 
     fn make_entry(count: usize) -> PageSetEntry {
-        let mut pages = [PhysAddr::new(0); MAX_PAGES_PER_SET];
-        for i in 0..count {
-            pages[i] = PhysAddr::new(0x1000 * (i as u64 + 1));
+        PageSetEntry {
+            count,
+            header_paddr: 0x1000 * (count as u64 + 1),
         }
-        PageSetEntry { count, pages }
     }
+
+    // --- PageSetTable tests ---
 
     #[test]
     fn insert_and_get() {
@@ -104,8 +162,6 @@ mod tests {
 
         let got = table.get(id).unwrap();
         assert_eq!(got.count, 2);
-        assert_eq!(got.pages[0].as_u64(), 0x1000);
-        assert_eq!(got.pages[1].as_u64(), 0x2000);
     }
 
     #[test]
@@ -126,11 +182,9 @@ mod tests {
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
 
-        // Remove slot 0
         table.remove(id0).unwrap();
         assert_eq!(table.count(), 1);
 
-        // Next insert should reuse slot 0
         let id2 = table.insert(make_entry(1)).unwrap();
         assert_eq!(id2, 0);
     }
@@ -147,15 +201,19 @@ mod tests {
     #[test]
     fn invalid_count_zero() {
         let mut table = PageSetTable::new();
-        assert_eq!(table.insert(make_entry(0)), Err(PageSetError::InvalidCount));
+        assert_eq!(
+            table.insert(PageSetEntry { count: 0, header_paddr: 0x1000 }),
+            Err(PageSetError::InvalidCount)
+        );
     }
 
     #[test]
     fn invalid_count_too_large() {
         let mut table = PageSetTable::new();
-        let mut entry = make_entry(1);
-        entry.count = MAX_PAGES_PER_SET + 1;
-        assert_eq!(table.insert(entry), Err(PageSetError::InvalidCount));
+        assert_eq!(
+            table.insert(PageSetEntry { count: MAX_PAGES_PER_SET + 1, header_paddr: 0x1000 }),
+            Err(PageSetError::InvalidCount)
+        );
     }
 
     #[test]
@@ -172,32 +230,15 @@ mod tests {
     }
 
     #[test]
-    fn remove_returns_entry() {
-        let mut table = PageSetTable::new();
-        let id = table.insert(make_entry(3)).unwrap();
-
-        let removed = table.remove(id).unwrap();
-        assert_eq!(removed.count, 3);
-
-        // Slot is now empty
-        assert_eq!(table.get(id), Err(PageSetError::SlotEmpty));
-    }
-
-    #[test]
     fn consume_after_get_prevents_reuse() {
-        // Models create_kernel_object: get the page, use it, then consume
-        // so nobody can look it up or re-donate it.
         let mut table = PageSetTable::new();
         let id = table.insert(make_entry(1)).unwrap();
 
-        // "Use" the page (get returns the entry)
         let entry = table.get(id).unwrap();
         assert_eq!(entry.count, 1);
 
-        // Consume (remove) — page is now kernel-owned
         table.remove(id).unwrap();
 
-        // Original ID is dead: get fails, second remove fails
         assert_eq!(table.get(id), Err(PageSetError::SlotEmpty));
         assert_eq!(table.remove(id), Err(PageSetError::SlotEmpty));
     }
@@ -208,12 +249,21 @@ mod tests {
         let id0 = table.insert(make_entry(1)).unwrap();
         let id1 = table.insert(make_entry(2)).unwrap();
 
-        // Consume id0
         table.remove(id0).unwrap();
 
-        // id1 is still accessible
         let entry = table.get(id1).unwrap();
         assert_eq!(entry.count, 2);
+    }
+
+    #[test]
+    fn remove_returns_entry() {
+        let mut table = PageSetTable::new();
+        let id = table.insert(make_entry(3)).unwrap();
+
+        let removed = table.remove(id).unwrap();
+        assert_eq!(removed.count, 3);
+
+        assert_eq!(table.get(id), Err(PageSetError::SlotEmpty));
     }
 
     #[test]
@@ -226,5 +276,53 @@ mod tests {
     fn remove_invalid_id_fails() {
         let mut table = PageSetTable::new();
         assert_eq!(table.remove(MAX_PAGESETS), Err(PageSetError::InvalidId));
+    }
+
+    // --- PageSetHeader tests ---
+
+    #[test]
+    fn header_empty() {
+        let h = PageSetHeader::empty();
+        assert_eq!(h.data_page_count(), 0);
+        assert_eq!(h.get_page(0), None);
+    }
+
+    #[test]
+    fn header_init_and_get() {
+        let mut h = PageSetHeader::empty();
+        h.init(&[0x1000, 0x2000, 0x3000]);
+        assert_eq!(h.data_page_count(), 3);
+        assert_eq!(h.get_page(0), Some(0x1000));
+        assert_eq!(h.get_page(1), Some(0x2000));
+        assert_eq!(h.get_page(2), Some(0x3000));
+        assert_eq!(h.get_page(3), None);
+    }
+
+    #[test]
+    fn header_single_page() {
+        let mut h = PageSetHeader::empty();
+        h.init(&[0xABCD_0000]);
+        assert_eq!(h.data_page_count(), 1);
+        assert_eq!(h.get_page(0), Some(0xABCD_0000));
+    }
+
+    #[test]
+    fn header_many_pages() {
+        let mut h = PageSetHeader::empty();
+        // Test with 75 pages (320x240x4 framebuffer)
+        let mut addrs = [0u64; 75];
+        for i in 0..75 {
+            addrs[i] = (i as u64 + 1) * 0x1000;
+        }
+        h.init(&addrs);
+        assert_eq!(h.data_page_count(), 75);
+        assert_eq!(h.get_page(0), Some(0x1000));
+        assert_eq!(h.get_page(74), Some(75 * 0x1000));
+        assert_eq!(h.get_page(75), None);
+    }
+
+    #[test]
+    fn header_size_fits_in_page() {
+        assert!(core::mem::size_of::<PageSetHeader>() <= 4096);
     }
 }
