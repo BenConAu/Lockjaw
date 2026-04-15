@@ -60,6 +60,12 @@ pub unsafe fn current_tcb_paddr() -> PhysAddr {
     THREADS[CURRENT].unwrap()
 }
 
+/// Return the index of the currently running thread in the run queue.
+/// Used by crash diagnostics to identify the faulting thread.
+pub unsafe fn current_thread_index() -> usize {
+    CURRENT
+}
+
 /// Block the current thread and schedule away to the next Ready thread.
 /// Sets the thread's state to Blocked. The caller must have already set
 /// the TCB's ipc_blocked_on field. This function does not return until

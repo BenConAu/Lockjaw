@@ -217,7 +217,7 @@ pub extern "C" fn _start() -> ! {
 
     // Spawn child processes.
     spawn_elf(HELLO_ELF, "hello", 0x0070_0000, 0x00A0_0000, scratch_ps, hello_boot_ep, 1);
-    spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000, scratch_ps, ep_handle, 2);
+    spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000, scratch_ps, ep_handle, 4);
     spawn_elf(DEVMGR_ELF, "device-manager", 0x0072_0000, 0x00E0_0000, scratch_ps, u64::MAX, 4);
 
     // Bootstrap hello: export a test notification into its handle table.

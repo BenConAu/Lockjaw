@@ -44,3 +44,18 @@ pub fn check_canary() {
         }
     }
 }
+
+/// Check the kernel stack canary and report status without panicking.
+/// Used by crash diagnostics — if the canary is corrupted during a crash,
+/// we want to print that fact, not trigger a second panic.
+pub fn check_canary_report(prefix: &str) {
+    unsafe {
+        let canary_ptr = &raw const __stack_bottom as *const u64;
+        let value = ptr::read_volatile(canary_ptr);
+        if value == STACK_CANARY {
+            crate::kprintln!("{}  Kernel stack canary: INTACT", prefix);
+        } else {
+            crate::kprintln!("{}  Kernel stack canary: *** CORRUPTED *** — register dump may be unreliable", prefix);
+        }
+    }
+}

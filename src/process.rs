@@ -153,6 +153,7 @@ pub unsafe fn create_process(
             ttbr0_paddr: ttbr0,
             user_entry_point: entry_point,
             user_stack_top: stack_va + (stack_count as u64) * PAGE_SIZE,
+            user_stack_base: stack_va,
         },
         tcb_page.start_addr(),
     ).map_err(|_| "TCB create failed")?;

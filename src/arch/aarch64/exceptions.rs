@@ -107,7 +107,7 @@ fn classify_address(addr: u64) -> &'static str {
 // Structured crash output
 // ---------------------------------------------------------------------------
 
-fn print_fault(prefix: &str, ctx: &ExceptionContext) {
+fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
     let esr = ctx.esr;
     let ec = (esr >> 26) & 0x3F;
     let far: u64;
@@ -115,11 +115,61 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext) {
 
     crate::kprintln!("========================================");
     crate::kprintln!("{}  HARDWARE EXCEPTION", prefix);
+
+    // Kernel stack canary check — if corrupted, register dump is unreliable
+    crate::mm::stack::check_canary_report(prefix);
+
+    // Thread identification
+    unsafe {
+        let thread_idx = crate::sched::scheduler::current_thread_index();
+        crate::kprintln!("{}  Thread: #{}", prefix, thread_idx);
+    }
+
     crate::kprintln!("{}  ESR:  {:#010x} — {} — {}", prefix, esr,
         exception_class_str(ec), data_fault_str(esr));
     crate::kprintln!("{}  ELR:  {:#018x} [{}]", prefix, ctx.elr, classify_address(ctx.elr));
     crate::kprintln!("{}  FAR:  {:#018x} [{}]", prefix, far, classify_address(far));
     crate::kprintln!("{}  SPSR: {:#018x}", prefix, ctx.spsr);
+    if is_user {
+        let sp_el0: u64;
+        unsafe { core::arch::asm!("mrs {}, SP_EL0", out(reg) sp_el0) };
+        crate::kprintln!("{}  SP_EL0: {:#018x}", prefix, sp_el0);
+    }
+
+    // User stack overflow detection
+    if is_user && (ec == 0x24) && (esr & 0x3F) >= 0x04 && (esr & 0x3F) <= 0x07 {
+        // Data abort from lower EL with translation fault — check if near stack
+        unsafe {
+            let tcb_paddr = crate::sched::scheduler::current_tcb_paddr();
+            let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET)
+                as *const crate::sched::tcb::Tcb;
+            let stack_base = (*tcb).user_stack_base;
+            let stack_top = (*tcb).user_stack_top;
+            if stack_base != 0 {
+                crate::kprintln!("{}  Stack: {:#x} - {:#x} ({} bytes)",
+                    prefix, stack_base, stack_top, stack_top - stack_base);
+                // Check below stack base (normal downward overflow)
+                if far < stack_base && far >= stack_base.saturating_sub(crate::mm::addr::PAGE_SIZE) {
+                    crate::kprintln!("{}  *** USER STACK OVERFLOW DETECTED ***", prefix);
+                    crate::kprintln!("{}  Overflowed by {} bytes (below stack base)", prefix, stack_base - far);
+                }
+                // Check above stack top (abnormal, but still unmapped for small stacks)
+                if far >= stack_top && far < stack_top + crate::mm::addr::PAGE_SIZE {
+                    crate::kprintln!("{}  *** USER STACK OVERFLOW DETECTED ***", prefix);
+                    crate::kprintln!("{}  Fault {} bytes above stack top", prefix, far - stack_top);
+                }
+            }
+        }
+    }
+
+    // Dump first 16 GPRs
+    for i in 0..4 {
+        crate::kprintln!("{}  x{:02}={:#018x}  x{:02}={:#018x}  x{:02}={:#018x}  x{:02}={:#018x}",
+            prefix,
+            i*4, ctx.gpr[i*4], i*4+1, ctx.gpr[i*4+1],
+            i*4+2, ctx.gpr[i*4+2], i*4+3, ctx.gpr[i*4+3]);
+    }
+
     crate::kprintln!("========================================");
 }
 
@@ -130,7 +180,7 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext) {
 /// Synchronous exception from same EL (kernel fault).
 #[no_mangle]
 extern "C" fn handle_exception_sync(ctx: &ExceptionContext) {
-    print_fault("[FAULT:KERN]", ctx);
+    print_fault("[FAULT:KERN]", ctx, false);
     loop { unsafe { core::arch::asm!("wfi") }; }
 }
 
@@ -147,7 +197,7 @@ extern "C" fn handle_exception_sync_lower(ctx: &mut ExceptionContext) {
         }
         _ => {
             // Userspace fault
-            print_fault("[FAULT:USER]", ctx);
+            print_fault("[FAULT:USER]", ctx, true);
             loop { unsafe { core::arch::asm!("wfi") }; }
         }
     }
@@ -162,13 +212,13 @@ extern "C" fn handle_exception_irq(ctx: &ExceptionContext) {
 
 #[no_mangle]
 extern "C" fn handle_exception_fiq(ctx: &ExceptionContext) {
-    print_fault("[FAULT:KERN]", ctx);
+    print_fault("[FAULT:KERN]", ctx, false);
     loop { unsafe { core::arch::asm!("wfi") }; }
 }
 
 #[no_mangle]
 extern "C" fn handle_exception_serror(ctx: &ExceptionContext) {
-    print_fault("[FAULT:KERN]", ctx);
+    print_fault("[FAULT:KERN]", ctx, false);
     loop { unsafe { core::arch::asm!("wfi") }; }
 }
 
