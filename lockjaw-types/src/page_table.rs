@@ -273,6 +273,100 @@ impl PageTableWalk {
 }
 
 // ---------------------------------------------------------------------------
+// Mapping walk state machine
+// ---------------------------------------------------------------------------
+
+/// Result of each step in a mapping walk (L0->L1->L2).
+/// Unlike PageTableWalk (which reads through all 4 levels), MapWalk stops
+/// at L2 and returns the slot state so the kernel can allocate or reuse
+/// the L3 table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapWalkResult {
+    /// Read the u64 at this physical address and call step().
+    ReadPte(u64),
+    /// Reached the target L2 slot. The kernel should use map_action_for_l2()
+    /// on the state to decide whether to allocate or reuse an L3 table.
+    ReachedL2 {
+        l2_table_paddr: u64,
+        l2_idx: usize,
+        l3_start: usize,
+        state: crate::vmem::L2SlotState,
+    },
+    /// Walk faulted: invalid entry at L0 or L1.
+    Fault,
+    /// Validation failed (bad VA, too many pages, spans L2 boundary, etc).
+    InvalidMapping,
+}
+
+/// Pure mapping walk state machine. Walks L0->L1->L2 to find the target
+/// slot for inserting page mappings. The kernel feeds raw PTE values;
+/// this module validates the request, interprets PTEs, and classifies
+/// the L2 slot.
+pub struct MapWalk {
+    level: u8,
+    l2_idx: usize,
+    l3_start: usize,
+    l2_table_paddr: u64,
+}
+
+impl MapWalk {
+    /// Begin a mapping walk. Validates the request and returns the first
+    /// physical address to read (L0[0]).
+    pub fn start(ttbr0_paddr: u64, virt_addr: u64, page_count: usize) -> (Self, MapWalkResult) {
+        use crate::vmem::{validate_mapping, MapValidation};
+
+        let (l2_idx, l3_start) = match validate_mapping(virt_addr, page_count) {
+            MapValidation::Ok { l2_idx, l3_start } => (l2_idx, l3_start),
+            _ => {
+                let walk = Self { level: 0, l2_idx: 0, l3_start: 0, l2_table_paddr: 0 };
+                return (walk, MapWalkResult::InvalidMapping);
+            }
+        };
+
+        let walk = Self { level: 0, l2_idx, l3_start, l2_table_paddr: 0 };
+        // User mappings are always in L0[0], so read entry at index 0
+        let pte_paddr = ttbr0_paddr + 0 * 8;
+        (walk, MapWalkResult::ReadPte(pte_paddr))
+    }
+
+    /// Feed a raw PTE value read from the address returned by the previous step.
+    pub fn step(&mut self, pte_raw: u64) -> MapWalkResult {
+        let pte = PageTableEntry::from_raw(pte_raw);
+
+        match self.level {
+            0 => {
+                // L0[0] must be a table pointing to L1
+                if !pte.is_table() { return MapWalkResult::Fault; }
+                let l1_table = pte.output_addr().as_u64();
+                self.level = 1;
+                // User mappings are in L1[0]
+                MapWalkResult::ReadPte(l1_table + 0 * 8)
+            }
+            1 => {
+                // L1[0] must be a table pointing to L2
+                if !pte.is_table() { return MapWalkResult::Fault; }
+                let l2_table = pte.output_addr().as_u64();
+                self.l2_table_paddr = l2_table;
+                self.level = 2;
+                // Read the target L2 entry
+                MapWalkResult::ReadPte(l2_table + (self.l2_idx as u64) * 8)
+            }
+            2 => {
+                // Classify the L2 entry
+                let state = crate::vmem::classify_l2_entry(pte);
+                MapWalkResult::ReachedL2 {
+                    l2_table_paddr: self.l2_table_paddr,
+                    l2_idx: self.l2_idx,
+                    l3_start: self.l3_start,
+                    state,
+                }
+            }
+            _ => MapWalkResult::Fault,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -492,5 +586,100 @@ mod tests {
             PhysAddr::new(0xFF_0000), MAIR_NORMAL, AP_RW_ALL, SH_INNER,
         ).raw());
         assert_eq!(r, WalkResult::Done(0xFF_0000 + 0xABC));
+    }
+
+    // --- MapWalk tests ---
+
+    #[test]
+    fn map_walk_reaches_l2_with_existing_table() {
+        // VA 0x0040_0000: L2[2], L3[0]
+        let (mut w, r) = MapWalk::start(0x1_0000, 0x0040_0000, 1);
+        assert_eq!(r, MapWalkResult::ReadPte(0x1_0000)); // L0[0]
+
+        // L0 → table at 0x2_0000
+        let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        assert_eq!(r, MapWalkResult::ReadPte(0x2_0000)); // L1[0]
+
+        // L1 → table at 0x3_0000
+        let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
+        assert_eq!(r, MapWalkResult::ReadPte(0x3_0000 + 2 * 8)); // L2[2]
+
+        // L2[2] → existing L3 table
+        let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x4_0000)).raw());
+        assert_eq!(r, MapWalkResult::ReachedL2 {
+            l2_table_paddr: 0x3_0000,
+            l2_idx: 2,
+            l3_start: 0,
+            state: crate::vmem::L2SlotState::HasL3Table,
+        });
+    }
+
+    #[test]
+    fn map_walk_reaches_l2_empty_slot() {
+        let (mut w, _) = MapWalk::start(0x1_0000, 0x0040_0000, 1);
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
+
+        // L2[2] → empty
+        let r = w.step(PageTableEntry::empty().raw());
+        assert_eq!(r, MapWalkResult::ReachedL2 {
+            l2_table_paddr: 0x3_0000,
+            l2_idx: 2,
+            l3_start: 0,
+            state: crate::vmem::L2SlotState::Empty,
+        });
+    }
+
+    #[test]
+    fn map_walk_reaches_l2_block_conflict() {
+        let (mut w, _) = MapWalk::start(0x1_0000, 0x0040_0000, 1);
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
+
+        // L2[2] → 2MB block (conflict)
+        let r = w.step(PageTableEntry::new_block(
+            PhysAddr::new(0x20_0000), MAIR_NORMAL, AP_RW_ALL, SH_INNER,
+        ).raw());
+        assert_eq!(r, MapWalkResult::ReachedL2 {
+            l2_table_paddr: 0x3_0000,
+            l2_idx: 2,
+            l3_start: 0,
+            state: crate::vmem::L2SlotState::IsBlock,
+        });
+    }
+
+    #[test]
+    fn map_walk_fault_invalid_l0() {
+        let (mut w, _) = MapWalk::start(0x1_0000, 0x0040_0000, 1);
+        let r = w.step(PageTableEntry::empty().raw());
+        assert_eq!(r, MapWalkResult::Fault);
+    }
+
+    #[test]
+    fn map_walk_fault_invalid_l1() {
+        let (mut w, _) = MapWalk::start(0x1_0000, 0x0040_0000, 1);
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        let r = w.step(PageTableEntry::empty().raw());
+        assert_eq!(r, MapWalkResult::Fault);
+    }
+
+    #[test]
+    fn map_walk_invalid_mapping() {
+        // VA in kernel range — should fail validation
+        let (_, r) = MapWalk::start(0x1_0000, 0x4000_0000, 1);
+        assert_eq!(r, MapWalkResult::InvalidMapping);
+    }
+
+    #[test]
+    fn map_walk_l3_start_from_va_offset() {
+        // VA 0x0040_3000: L2[2], L3[3]
+        let (mut w, _) = MapWalk::start(0x1_0000, 0x0040_3000, 1);
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
+        let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x4_0000)).raw());
+        match r {
+            MapWalkResult::ReachedL2 { l3_start, .. } => assert_eq!(l3_start, 3),
+            _ => panic!("expected ReachedL2"),
+        }
     }
 }

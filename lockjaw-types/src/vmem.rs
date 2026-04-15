@@ -89,6 +89,39 @@ pub fn validate_mapping(virt_addr: u64, page_count: usize) -> MapValidation {
     }
 }
 
+/// Classify an L2 page table entry for the mapping path.
+/// Determines whether the slot is empty (need to allocate L3), already has
+/// an L3 table (reuse it), or is a block descriptor (conflict).
+pub fn classify_l2_entry(pte: crate::page_table::PageTableEntry) -> L2SlotState {
+    if pte.is_table() {
+        L2SlotState::HasL3Table
+    } else if !pte.is_valid() {
+        L2SlotState::Empty
+    } else {
+        L2SlotState::IsBlock
+    }
+}
+
+/// Select memory attributes from mapping flags.
+/// Returns (MAIR index, shareability) for the page table entry.
+pub fn select_attrs(flags: u64) -> (u8, u8) {
+    use crate::page_table::*;
+    if flags & MAP_FLAG_DEVICE != 0 {
+        (MAIR_DEVICE, SH_NON)
+    } else {
+        (MAIR_NORMAL, SH_INNER)
+    }
+}
+
+/// Build a user-accessible page entry with no-execute permissions.
+/// All user pages are AP_RW_ALL + UXN + PXN (read-write, no execute).
+pub fn build_user_page(phys: crate::addr::PhysAddr, attr: u8, sh: u8) -> crate::page_table::PageTableEntry {
+    use crate::page_table::*;
+    PageTableEntry::new_page(phys, attr, AP_RW_ALL, sh)
+        .with_uxn()
+        .with_pxn()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -96,6 +129,8 @@ pub fn validate_mapping(virt_addr: u64, page_count: usize) -> MapValidation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::addr::PhysAddr;
+    use crate::page_table::*;
 
     #[test]
     fn indices_for_user_code_va() {
@@ -179,5 +214,63 @@ mod tests {
     #[test]
     fn validate_too_many_pages() {
         assert_eq!(validate_mapping(0x0040_0000, 17), MapValidation::ErrorTooManyPages);
+    }
+
+    // --- classify_l2_entry tests ---
+
+    #[test]
+    fn classify_table_entry() {
+        let pte = PageTableEntry::new_table(PhysAddr::new(0x1000));
+        assert_eq!(classify_l2_entry(pte), L2SlotState::HasL3Table);
+    }
+
+    #[test]
+    fn classify_empty_entry() {
+        assert_eq!(classify_l2_entry(PageTableEntry::empty()), L2SlotState::Empty);
+    }
+
+    #[test]
+    fn classify_block_entry() {
+        let pte = PageTableEntry::new_block(PhysAddr::new(0x20_0000), MAIR_NORMAL, AP_RW_ALL, SH_INNER);
+        assert_eq!(classify_l2_entry(pte), L2SlotState::IsBlock);
+    }
+
+    // --- select_attrs tests ---
+
+    #[test]
+    fn attrs_normal_memory() {
+        let (attr, sh) = select_attrs(0);
+        assert_eq!(attr, MAIR_NORMAL);
+        assert_eq!(sh, SH_INNER);
+    }
+
+    #[test]
+    fn attrs_device_memory() {
+        let (attr, sh) = select_attrs(MAP_FLAG_DEVICE);
+        assert_eq!(attr, MAIR_DEVICE);
+        assert_eq!(sh, SH_NON);
+    }
+
+    // --- build_user_page tests ---
+
+    #[test]
+    fn user_page_has_correct_flags() {
+        let pte = build_user_page(PhysAddr::new(0x5000), MAIR_NORMAL, SH_INNER);
+        assert!(pte.is_valid());
+        assert_eq!(pte.ap(), AP_RW_ALL);
+        assert_eq!(pte.attr_index(), MAIR_NORMAL);
+        assert_eq!(pte.sh(), SH_INNER);
+        assert!(pte.af());
+        assert_eq!(pte.output_addr().as_u64(), 0x5000);
+        // UXN (bit 54) and PXN (bit 53) must be set
+        assert_ne!(pte.raw() & (1 << 54), 0);
+        assert_ne!(pte.raw() & (1 << 53), 0);
+    }
+
+    #[test]
+    fn user_page_device_attrs() {
+        let pte = build_user_page(PhysAddr::new(0x0900_0000), MAIR_DEVICE, SH_NON);
+        assert_eq!(pte.attr_index(), MAIR_DEVICE);
+        assert_eq!(pte.sh(), SH_NON);
     }
 }

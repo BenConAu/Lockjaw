@@ -95,8 +95,7 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     let mut l3_count: usize = 0;
 
     for m in mappings {
-        let l2_idx = ((m.virt_addr >> 21) & 0x1FF) as usize;
-        let l3_idx = ((m.virt_addr >> 12) & 0x1FF) as usize;
+        let (_, _, l2_idx, l3_idx) = lockjaw_types::vmem::page_table_indices(m.virt_addr);
 
         // Allocate L3 table for this 2MB region if not already done
         let l3_va = {
@@ -194,88 +193,63 @@ pub unsafe fn map_pages_in_existing(
     pages: &[PhysAddr],
     flags: u64,
 ) -> Result<(), VmemError> {
-    use lockjaw_types::vmem::{validate_mapping, map_action_for_l2, MapValidation, MapAction, L2SlotState};
+    use lockjaw_types::page_table::{MapWalk, MapWalkResult};
+    use lockjaw_types::vmem::{map_action_for_l2, MapAction, select_attrs, build_user_page};
 
-    // Validate using the pure model (tested by unit tests)
-    let (l2_idx, l3_start) = match validate_mapping(virt_addr, pages.len()) {
-        MapValidation::Ok { l2_idx, l3_start } => (l2_idx, l3_start),
-        _ => return Err(VmemError::TooManyMappings),
-    };
+    // Walk L0 → L1 → L2 using the pure state machine (tested on host).
+    // The kernel only does memory reads; all PTE interpretation is in lockjaw-types.
+    let (mut walk, mut result) = MapWalk::start(ttbr0_paddr.as_u64(), virt_addr, pages.len());
+    loop {
+        match result {
+            MapWalkResult::ReadPte(pte_paddr) => {
+                // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
+                let pte_va = pte_paddr + KERNEL_VA_OFFSET;
+                let pte_raw = core::ptr::read_volatile(pte_va as *const u64);
+                result = walk.step(pte_raw);
+            }
+            MapWalkResult::ReachedL2 { l2_table_paddr, l2_idx, l3_start, state } => {
+                // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
+                let l2_va = (l2_table_paddr + KERNEL_VA_OFFSET) as *mut PageTable;
 
-    // Walk L0 → L1 → L2 (read existing page table pointers)
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    let l0_va = (ttbr0_paddr.as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
-    let l0_entry = (*l0_va).entries[0];
-    if !l0_entry.is_table() {
-        return Err(VmemError::OutOfPages);
-    }
+                // Ask the model what to do with this L2 slot
+                let l3_va = match map_action_for_l2(state) {
+                    MapAction::UseExistingL3 => {
+                        let l3_paddr = (*l2_va).entries[l2_idx].output_addr();
+                        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
+                        (l3_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut PageTable
+                    }
+                    MapAction::AllocateL3 => {
+                        let l3_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
+                        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
+                        let va = (l3_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+                        ptr::write_bytes(va, 0, 1);
+                        (*l2_va).entries[l2_idx] = PageTableEntry::new_table(l3_page.start_addr());
+                        va
+                    }
+                    MapAction::ErrorBlockConflict => {
+                        return Err(VmemError::TooManyL3Regions);
+                    }
+                };
 
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    let l1_va = (l0_entry.output_addr().as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
-    let l1_entry = (*l1_va).entries[0];
-    if !l1_entry.is_table() {
-        return Err(VmemError::OutOfPages);
-    }
+                // Select memory attributes and write page entries (pure logic from lockjaw-types)
+                let (attr, sh) = select_attrs(flags);
+                for (i, phys) in pages.iter().enumerate() {
+                    (*l3_va).entries[l3_start + i] = build_user_page(*phys, attr, sh);
+                }
 
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    let l2_va = (l1_entry.output_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+                // TLB invalidate so the new mappings take effect
+                core::arch::asm!(
+                    "dsb ish",
+                    "tlbi vmalle1is",
+                    "dsb ish",
+                    "isb",
+                );
 
-    // Determine L2 slot state and ask the model what to do
-    let l2_entry = (*l2_va).entries[l2_idx];
-    let l2_state = if l2_entry.is_table() {
-        L2SlotState::HasL3Table
-    } else if !l2_entry.is_valid() {
-        L2SlotState::Empty
-    } else {
-        L2SlotState::IsBlock
-    };
-
-    let l3_va = match map_action_for_l2(l2_state) {
-        MapAction::UseExistingL3 => {
-            let l3_paddr = l2_entry.output_addr();
-            // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-            (l3_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut PageTable
+                return Ok(());
+            }
+            MapWalkResult::Fault => return Err(VmemError::OutOfPages),
+            MapWalkResult::InvalidMapping => return Err(VmemError::TooManyMappings),
         }
-        MapAction::AllocateL3 => {
-            let l3_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
-            // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-            let va = (l3_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
-            ptr::write_bytes(va, 0, 1);
-            (*l2_va).entries[l2_idx] = PageTableEntry::new_table(l3_page.start_addr());
-            va
-        }
-        MapAction::ErrorBlockConflict => {
-            return Err(VmemError::TooManyL3Regions);
-        }
-    };
-
-    // Select memory attributes based on flags
-    let (attr, sh) = if flags & MAP_FLAG_DEVICE != 0 {
-        (MAIR_DEVICE, SH_NON)   // Strongly ordered, non-cacheable device memory
-    } else {
-        (MAIR_NORMAL, SH_INNER) // Normal cacheable memory
-    };
-
-    // Map each page at the L3 indices computed by the model
-    for (i, phys) in pages.iter().enumerate() {
-        let l3_idx = l3_start + i;
-
-        // User page: read-write, no execute
-        let entry = PageTableEntry::new_page(*phys, attr, AP_RW_ALL, sh)
-            .with_uxn()
-            .with_pxn();
-
-        (*l3_va).entries[l3_idx] = entry;
     }
-
-    // TLB invalidate so the new mappings take effect
-    core::arch::asm!(
-        "dsb ish",
-        "tlbi vmalle1is",
-        "dsb ish",
-        "isb",
-    );
-
-    Ok(())
 }
 
