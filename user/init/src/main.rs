@@ -40,8 +40,14 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
     };
 
     // Allocate a page for the mapping array
-    let map_array_ps = sys_alloc_pages(1);
-    sys_map_pages(map_array_ps, map_array_va, 0);
+    let map_array_ps = match sys_alloc_pages(1) {
+        Ok(id) => id,
+        Err(_) => { puts("init: alloc map array FAILED\n"); return false; }
+    };
+    if !sys_map_pages(map_array_ps, map_array_va, 0).is_ok() {
+        puts("init: map array FAILED\n");
+        return false;
+    }
     let map_array = map_array_va as *mut ProcessMapping;
     let mut mapping_count: usize = 0;
 
@@ -51,14 +57,13 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
         let num_pages = ((seg.mem_size + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
 
         for p in 0..num_pages {
-            let ps_id = sys_alloc_pages(1);
-            if ps_id == u64::MAX {
-                puts("init: alloc for segment FAILED\n");
-                return false;
-            }
+            let ps_id = match sys_alloc_pages(1) {
+                Ok(id) => id,
+                Err(_) => { puts("init: alloc for segment FAILED\n"); return false; }
+            };
 
             let temp_va: u64 = temp_base_va + (mapping_count as u64) * PAGE_SIZE;
-            if sys_map_pages(ps_id, temp_va, 0) != 0 {
+            if !sys_map_pages(ps_id, temp_va, 0).is_ok() {
                 puts("init: map for segment FAILED\n");
                 return false;
             }
@@ -97,11 +102,10 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
         }
     }
 
-    let stack_ps = sys_alloc_pages(stack_pages);
-    if stack_ps == u64::MAX {
-        puts("init: alloc stack FAILED\n");
-        return false;
-    }
+    let stack_ps = match sys_alloc_pages(stack_pages) {
+        Ok(id) => id,
+        Err(_) => { puts("init: alloc stack FAILED\n"); return false; }
+    };
 
     puts("init: spawning ");
     puts(name);
@@ -115,7 +119,7 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
         handle_to_copy,
     );
 
-    if result == 0 {
+    if result.is_ok() {
         puts("init: ");
         puts(name);
         puts(" spawned OK\n");
@@ -137,52 +141,60 @@ pub extern "C" fn _start() -> ! {
     puts("Hello from userspace init!\n");
 
     // Test sys_alloc_pages
-    let test_ps = sys_alloc_pages(1);
-    if test_ps != u64::MAX {
-        puts("init: alloc_pages(1) OK, id=");
-        putc(b'0' + test_ps as u8);
-        putc(b'\n');
-    } else {
-        puts("init: alloc_pages FAILED\n");
-    }
+    match sys_alloc_pages(1) {
+        Ok(test_ps) => {
+            puts("init: alloc_pages(1) OK, id=");
+            putc(b'0' + test_ps as u8);
+            putc(b'\n');
 
-    // Test sys_map_pages
-    let map_result = sys_map_pages(test_ps, 0x0060_0000, 0);
-    if map_result == 0 {
-        puts("init: map_pages OK\n");
-        unsafe {
-            let ptr = 0x0060_0000 as *mut u64;
-            core::ptr::write_volatile(ptr, 0xDEAD_CAFE);
-            let readback = core::ptr::read_volatile(ptr);
-            if readback == 0xDEAD_CAFE {
-                puts("init: mapped memory read/write OK\n");
+            // Test sys_map_pages
+            if sys_map_pages(test_ps, 0x0060_0000, 0).is_ok() {
+                puts("init: map_pages OK\n");
+                unsafe {
+                    let ptr = 0x0060_0000 as *mut u64;
+                    core::ptr::write_volatile(ptr, 0xDEAD_CAFE);
+                    let readback = core::ptr::read_volatile(ptr);
+                    if readback == 0xDEAD_CAFE {
+                        puts("init: mapped memory read/write OK\n");
+                    } else {
+                        puts("init: mapped memory MISMATCH\n");
+                    }
+                }
             } else {
-                puts("init: mapped memory MISMATCH\n");
+                puts("init: map_pages FAILED\n");
             }
         }
-    } else {
-        puts("init: map_pages FAILED\n");
+        Err(_) => {
+            puts("init: alloc_pages FAILED\n");
+        }
     }
 
     // Test sys_export_handle — verify it reaches the kernel and validates correctly.
     // Create an endpoint and try to export a handle on it (no caller blocked → should fail).
-    let test_ep_ps = sys_alloc_pages(1);
-    let test_ep = sys_create_endpoint(test_ep_ps);
-    let export_result = sys_export_handle(test_ep, test_ep); // export test_ep to nobody
-    if export_result == 6 {
-        // SYS_ERR_NO_CALLER = 6 — correct, nobody is blocked on this endpoint
-        puts("init: sys_export_handle validation OK (no caller)\n");
-    } else {
-        puts("init: sys_export_handle UNEXPECTED result=");
-        putc(b'0' + export_result as u8);
-        putc(b'\n');
+    let test_ep_ps = match sys_alloc_pages(1) {
+        Ok(id) => id,
+        Err(_) => { puts("init: alloc FAILED\n"); loop { sys_yield(); } }
+    };
+    let test_ep = match sys_create_endpoint(test_ep_ps) {
+        Ok(h) => h,
+        Err(_) => { puts("init: create endpoint FAILED\n"); loop { sys_yield(); } }
+    };
+    match sys_export_handle(test_ep, test_ep) {
+        Err(e) if e == SyscallError::NO_CALLER => {
+            puts("init: sys_export_handle validation OK (no caller)\n");
+        }
+        _ => {
+            puts("init: sys_export_handle UNEXPECTED result\n");
+        }
     }
 
     // Test sys_get_boot_info — map the DTB PageSet and verify the magic.
-    let dtb_ps = sys_get_boot_info();
+    let dtb_ps = match sys_get_boot_info() {
+        Ok(id) => id,
+        Err(_) => { puts("init: get_boot_info FAILED\n"); loop { sys_yield(); } }
+    };
     let dtb_va: u64 = 0x0010_0000;
-    let dtb_map = sys_map_pages(dtb_ps, dtb_va, 0);
-    if dtb_map == 0 {
+    if sys_map_pages(dtb_ps, dtb_va, 0).is_ok() {
         let magic = unsafe {
             let p = dtb_va as *const u8;
             u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
@@ -198,22 +210,33 @@ pub extern "C" fn _start() -> ! {
 
     // Allocate a scratch page for create_process — reused across spawns.
     // The kernel uses it as a temporary Mapping buffer during address space creation.
-    let scratch_ps = sys_alloc_pages(1);
-    if scratch_ps == u64::MAX {
-        puts("init: alloc scratch page FAILED\n");
-        loop { sys_yield(); }
-    }
+    let scratch_ps = match sys_alloc_pages(1) {
+        Ok(id) => id,
+        Err(_) => { puts("init: alloc scratch page FAILED\n"); loop { sys_yield(); } }
+    };
 
     // Create an endpoint for communicating with the UART server.
-    let ep_ps = sys_alloc_pages(1);
-    let ep_handle = sys_create_endpoint(ep_ps);
+    let ep_ps = match sys_alloc_pages(1) {
+        Ok(id) => id,
+        Err(_) => { puts("init: alloc ep page FAILED\n"); loop { sys_yield(); } }
+    };
+    let ep_handle = match sys_create_endpoint(ep_ps) {
+        Ok(h) => h,
+        Err(_) => { puts("init: create endpoint FAILED\n"); loop { sys_yield(); } }
+    };
     puts("init: endpoint created, handle=");
     putc(b'0' + ep_handle as u8);
     putc(b'\n');
 
     // Create bootstrap endpoint for hello (test sys_export_handle end-to-end).
-    let hello_boot_ps = sys_alloc_pages(1);
-    let hello_boot_ep = sys_create_endpoint(hello_boot_ps);
+    let hello_boot_ps = match sys_alloc_pages(1) {
+        Ok(id) => id,
+        Err(_) => { puts("init: alloc hello boot FAILED\n"); loop { sys_yield(); } }
+    };
+    let hello_boot_ep = match sys_create_endpoint(hello_boot_ps) {
+        Ok(h) => h,
+        Err(_) => { puts("init: create hello boot ep FAILED\n"); loop { sys_yield(); } }
+    };
 
     // Spawn child processes.
     spawn_elf(HELLO_ELF, "hello", 0x0070_0000, 0x00A0_0000, scratch_ps, hello_boot_ep, 1);
@@ -222,10 +245,19 @@ pub extern "C" fn _start() -> ! {
 
     // Bootstrap hello: export a test notification into its handle table.
     puts("init: waiting for hello bootstrap...\n");
-    let _hello_req = sys_receive(hello_boot_ep);
-    let test_notif_ps = sys_alloc_pages(1);
-    let test_notif = sys_create_notification(test_notif_ps);
-    let exported_idx = sys_export_handle(hello_boot_ep, test_notif);
+    let _ = sys_receive(hello_boot_ep);
+    let test_notif_ps = match sys_alloc_pages(1) {
+        Ok(id) => id,
+        Err(_) => { puts("init: alloc notif FAILED\n"); loop { sys_yield(); } }
+    };
+    let test_notif = match sys_create_notification(test_notif_ps) {
+        Ok(h) => h,
+        Err(_) => { puts("init: create notif FAILED\n"); loop { sys_yield(); } }
+    };
+    let exported_idx = match sys_export_handle(hello_boot_ep, test_notif) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export FAILED\n"); loop { sys_yield(); } }
+    };
     sys_reply(hello_boot_ep, exported_idx, 0, 0, 0);
     puts("init: hello bootstrapped, exported handle ");
     putc(b'0' + exported_idx as u8);

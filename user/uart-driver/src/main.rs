@@ -72,21 +72,25 @@ pub extern "C" fn _start() -> ! {
     puts("uart-driver: starting\n");
 
     // Step 1: Map UART1 MMIO page into our address space
-    let map_result = sys_map_pages(UART_PHYS, UART_VA, MAP_FLAG_DEVICE);
-    if map_result != 0 {
+    if !sys_map_pages(UART_PHYS, UART_VA, MAP_FLAG_DEVICE).is_ok() {
         puts("uart-driver: map MMIO FAILED\n");
         loop { unsafe { asm!("wfi"); } }
     }
     puts("uart-driver: MMIO mapped\n");
 
     // Step 2: Create a notification for the UART RX interrupt
-    let notif_ps = sys_alloc_pages(1);
-    let notif_handle = sys_create_notification(notif_ps);
+    let notif_ps = match sys_alloc_pages(1) {
+        Ok(id) => id,
+        Err(_) => { puts("uart-driver: alloc FAILED\n"); loop { unsafe { asm!("wfi"); } } }
+    };
+    let notif_handle = match sys_create_notification(notif_ps) {
+        Ok(h) => h,
+        Err(_) => { puts("uart-driver: create notif FAILED\n"); loop { unsafe { asm!("wfi"); } } }
+    };
     puts("uart-driver: notification created\n");
 
     // Step 3: Bind UART1 IRQ (INTID 40) to the notification
-    let bind_result = sys_bind_irq(UART_INTID, notif_handle);
-    if bind_result != 0 {
+    if !sys_bind_irq(UART_INTID, notif_handle).is_ok() {
         puts("uart-driver: bind IRQ FAILED\n");
         loop { unsafe { asm!("wfi"); } }
     }
@@ -114,12 +118,16 @@ pub extern "C" fn _start() -> ! {
     ];
 
     loop {
-        let mask = sys_wait_any(&entries);
+        let mask = match sys_wait_any(&entries) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
 
         // Bit 0: endpoint ready — IPC TX request
         if mask & 1 != 0 {
-            let ch = sys_receive(0);
-            unsafe { uart_putc(ch as u8); }
+            if let Ok(ch) = sys_receive(0) {
+                unsafe { uart_putc(ch as u8); }
+            }
             sys_reply(0, 0, 0, 0, 0);
         }
 

@@ -10,7 +10,7 @@ pub use lockjaw_types::elf;
 // Re-export shared constants and types from lockjaw-types.
 pub use lockjaw_types::addr::PAGE_SIZE;
 pub use lockjaw_types::vmem::MAP_FLAG_DEVICE;
-pub use lockjaw_types::syscall::SYS_ERR_WOULD_BLOCK;
+pub use lockjaw_types::syscall::SyscallError;
 pub use lockjaw_types::wait::WaitEntry;
 pub use lockjaw_types::device::PL011_HASH;
 

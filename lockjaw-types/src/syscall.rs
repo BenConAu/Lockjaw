@@ -1,42 +1,67 @@
-/// Syscall error codes shared between kernel and userspace.
+/// Syscall error type — distinct from return values at the type level.
 ///
-/// Returned in x0 when a syscall fails. Success is always 0.
-/// Userspace can match on these to diagnose failures.
+/// Returned in x1 on syscall exit. x1 = 0 means success, nonzero = error.
+/// The return VALUE (if any) is in x0 and is only meaningful when x1 = 0.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct SyscallError(pub u64);
 
-/// Syscall succeeded.
+impl SyscallError {
+    /// No error — syscall succeeded.
+    pub const OK: Self = SyscallError(0);
+
+    /// The handle index is invalid or the slot is empty.
+    pub const INVALID_HANDLE: Self = SyscallError(1);
+
+    /// The handle does not have the required rights for this operation.
+    pub const INSUFFICIENT_RIGHTS: Self = SyscallError(2);
+
+    /// The page allocator has no free pages.
+    pub const OUT_OF_MEMORY: Self = SyscallError(3);
+
+    /// A parameter is invalid (wrong type, out of range, etc).
+    pub const INVALID_PARAMETER: Self = SyscallError(4);
+
+    /// The endpoint is busy (e.g. already has a sender/receiver blocked).
+    pub const ENDPOINT_BUSY: Self = SyscallError(5);
+
+    /// No caller is waiting for a reply on this endpoint.
+    pub const NO_CALLER: Self = SyscallError(6);
+
+    /// The scheduler's run queue is full.
+    pub const QUEUE_FULL: Self = SyscallError(7);
+
+    /// The notification value is not monotonically increasing.
+    pub const NOT_MONOTONIC: Self = SyscallError(8);
+
+    /// A thread is already waiting on this notification (single-waiter limit).
+    pub const ALREADY_WAITING: Self = SyscallError(9);
+
+    /// The operation would block but non-blocking was requested.
+    pub const WOULD_BLOCK: Self = SyscallError(10);
+
+    /// An unknown or unrecoverable error occurred.
+    pub const UNKNOWN: Self = SyscallError(u64::MAX);
+
+    /// Check if this represents success (no error).
+    pub fn is_ok(self) -> bool {
+        self.0 == 0
+    }
+}
+
+// Keep the old SYS_ERR_* constants as aliases during migration.
+// TODO: Remove once all kernel code uses SyscallError directly.
 pub const SYS_OK: u64 = 0;
-
-/// The handle index is invalid or the slot is empty.
 pub const SYS_ERR_INVALID_HANDLE: u64 = 1;
-
-/// The handle does not have the required rights for this operation.
 pub const SYS_ERR_INSUFFICIENT_RIGHTS: u64 = 2;
-
-/// The page allocator has no free pages.
 pub const SYS_ERR_OUT_OF_MEMORY: u64 = 3;
-
-/// A parameter is invalid (wrong type, out of range, etc).
 pub const SYS_ERR_INVALID_PARAMETER: u64 = 4;
-
-/// The endpoint is busy (e.g. already has a sender/receiver blocked).
 pub const SYS_ERR_ENDPOINT_BUSY: u64 = 5;
-
-/// No caller is waiting for a reply on this endpoint.
 pub const SYS_ERR_NO_CALLER: u64 = 6;
-
-/// The scheduler's run queue is full.
 pub const SYS_ERR_QUEUE_FULL: u64 = 7;
-
-/// The notification value is not monotonically increasing.
 pub const SYS_ERR_NOT_MONOTONIC: u64 = 8;
-
-/// A thread is already waiting on this notification (single-waiter limit).
 pub const SYS_ERR_ALREADY_WAITING: u64 = 9;
-
-/// The operation would block but non-blocking was requested.
 pub const SYS_ERR_WOULD_BLOCK: u64 = 10;
-
-/// An unknown or unrecoverable error occurred.
 pub const SYS_ERR_UNKNOWN: u64 = u64::MAX;
 
 /// Syscall numbers.

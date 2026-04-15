@@ -8,14 +8,29 @@ use crate::mm::addr::PhysAddr;
 use crate::sched::scheduler;
 use crate::sched::tcb::Tcb;
 
-// Syscall numbers and error codes from lockjaw-types (shared with userspace).
+// Syscall numbers and error type from lockjaw-types.
 use lockjaw_types::syscall::*;
+use lockjaw_types::syscall::SyscallError;
+
+/// Result of a syscall dispatch.
+/// x0 is ALWAYS the error (0 = success, nonzero = SyscallError).
+/// x1 is the return value for value-returning syscalls.
+/// x1-x4 are IPC message words for message-returning syscalls.
+enum SyscallReturn {
+    /// Syscall has no return value — x0=error, x1 unchanged.
+    Void(SyscallError),
+    /// Syscall returns a single value — x0=error, x1=value on success.
+    Value(Result<u64, SyscallError>),
+    /// Syscall returns IPC message words — x0=error, x1-x4=msg on success.
+    /// The handler already wrote x1-x4; dispatch only writes x0.
+    Message(SyscallError),
+}
 
 /// Dispatch a syscall from userspace.
 ///
 /// Called from handle_exception_sync_lower when ESR_EL1.EC = 0x15 (SVC from AArch64).
-/// Reads the syscall number from x8, dispatches to the handler, and writes the
-/// return value (SYS_OK or an error code from lockjaw_types::syscall) to x0.
+/// Reads the syscall number from x8, dispatches to the handler, and writes
+/// error/return values to the appropriate registers.
 pub fn handle_syscall(ctx: &mut ExceptionContext) {
     let syscall_num = ctx.gpr[8]; // x8
 
@@ -27,30 +42,52 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         (*tcb).current_syscall_args = [ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]];
     }
 
-    ctx.gpr[0] = match syscall_num {
-        SYS_DEBUG_PUTC => sys_debug_putc(ctx.gpr[0]),
-        SYS_YIELD => sys_yield(),
-        SYS_SEND => sys_send(ctx),
+    // Dispatch. Void syscalls return SyscallError only.
+    // Value-returning syscalls return Result<u64, SyscallError>.
+    // Message syscalls return SyscallReturn::Message with x1-x4 pre-set.
+    // x0 = error (always), x1 = value (Value), x1-x4 = msg (Message).
+    let ret = match syscall_num {
+        SYS_DEBUG_PUTC => SyscallReturn::Void(sys_debug_putc(ctx.gpr[0])),
+        SYS_YIELD => SyscallReturn::Void(sys_yield()),
+        SYS_SEND => SyscallReturn::Void(sys_send(ctx)),
         SYS_RECEIVE => sys_receive(ctx),
         SYS_CALL => sys_call(ctx),
-        SYS_REPLY => sys_reply(ctx),
-        SYS_ALLOC_PAGES => sys_alloc_pages(ctx),
-        SYS_MAP_PAGES => sys_map_pages(ctx),
-        SYS_CREATE_PROCESS => sys_create_process(ctx),
-        SYS_CREATE_NOTIFICATION => sys_create_notification(ctx),
-        SYS_SIGNAL_NOTIFICATION => sys_signal_notification(ctx),
-        SYS_WAIT_NOTIFICATION => sys_wait_notification(ctx),
-        SYS_BIND_IRQ => sys_bind_irq(ctx),
-        SYS_CREATE_ENDPOINT => sys_create_endpoint(ctx),
+        SYS_REPLY => SyscallReturn::Void(sys_reply(ctx)),
+        SYS_ALLOC_PAGES => SyscallReturn::Value(sys_alloc_pages(ctx)),
+        SYS_MAP_PAGES => SyscallReturn::Void(sys_map_pages(ctx)),
+        SYS_CREATE_PROCESS => SyscallReturn::Void(sys_create_process(ctx)),
+        SYS_CREATE_NOTIFICATION => SyscallReturn::Value(sys_create_notification(ctx)),
+        SYS_SIGNAL_NOTIFICATION => SyscallReturn::Void(sys_signal_notification(ctx)),
+        SYS_WAIT_NOTIFICATION => SyscallReturn::Value(sys_wait_notification(ctx)),
+        SYS_BIND_IRQ => SyscallReturn::Void(sys_bind_irq(ctx)),
+        SYS_CREATE_ENDPOINT => SyscallReturn::Value(sys_create_endpoint(ctx)),
         SYS_RECV_NB => sys_recv_nb(ctx),
-        SYS_WAIT_ANY => sys_wait_any(ctx),
-        SYS_EXPORT_HANDLE => sys_export_handle(ctx),
-        SYS_GET_BOOT_INFO => sys_get_boot_info(),
+        SYS_WAIT_ANY => SyscallReturn::Value(sys_wait_any(ctx)),
+        SYS_EXPORT_HANDLE => SyscallReturn::Value(sys_export_handle(ctx)),
+        SYS_GET_BOOT_INFO => SyscallReturn::Value(Ok(sys_get_boot_info())),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
-            SYS_ERR_INVALID_PARAMETER
+            SyscallReturn::Void(SyscallError::INVALID_PARAMETER)
         }
     };
+    // x0 = error (always). x1 = value (for Value), x1-x4 = msg (for Message).
+    match ret {
+        SyscallReturn::Void(err) => {
+            ctx.gpr[0] = err.0;
+        }
+        SyscallReturn::Value(Ok(val)) => {
+            ctx.gpr[0] = 0;
+            ctx.gpr[1] = val;
+        }
+        SyscallReturn::Value(Err(err)) => {
+            ctx.gpr[0] = err.0;
+        }
+        SyscallReturn::Message(err) => {
+            // x1-x4 already written by the handler (IPC message words).
+            // Only set x0 = error status.
+            ctx.gpr[0] = err.0;
+        }
+    }
 
     // Clear syscall breadcrumb
     unsafe {
@@ -68,15 +105,15 @@ unsafe fn caller_handle_table() -> PhysAddr {
 }
 
 /// Look up a handle in the current thread's handle table with type checking.
-/// Returns the HandleEntry on success, or a syscall error code on failure.
-unsafe fn lookup_handle(handle: u32, required_rights: Rights, expected_type: ObjectType) -> Result<handle_table::HandleEntry, u64> {
+/// Returns the HandleEntry on success, or a SyscallError on failure.
+unsafe fn lookup_handle(handle: u32, required_rights: Rights, expected_type: ObjectType) -> Result<handle_table::HandleEntry, SyscallError> {
     let ht_paddr = caller_handle_table();
 
     let entry = handle_table::handle_lookup(ht_paddr, handle, required_rights)
-        .map_err(|_| SYS_ERR_INVALID_HANDLE)?;
+        .map_err(|_| SyscallError::INVALID_HANDLE)?;
 
     if entry.obj_type != expected_type {
-        return Err(SYS_ERR_INVALID_PARAMETER);
+        return Err(SyscallError::INVALID_PARAMETER);
     }
 
     Ok(entry)
@@ -89,142 +126,142 @@ unsafe fn create_kernel_object(
     pageset_id: u64,
     obj_type: ObjectType,
     init_fn: unsafe fn(PhysAddr) -> Result<(), crate::cap::object::CreateError>,
-) -> u64 {
+) -> Result<u64, SyscallError> {
     let (count, pages) = match crate::cap::pageset_table::get_pageset(pageset_id) {
         Some(ps) => ps,
-        None => return SYS_ERR_INVALID_HANDLE,
+        None => return Err(SyscallError::INVALID_HANDLE),
     };
     if count != 1 {
-        return SYS_ERR_INVALID_PARAMETER;
+        return Err(SyscallError::INVALID_PARAMETER);
     }
     let paddr = pages[0];
     if init_fn(paddr).is_err() {
-        return SYS_ERR_UNKNOWN;
+        return Err(SyscallError::UNKNOWN);
     }
     let ht_paddr = caller_handle_table();
     match handle_table::handle_insert(
         ht_paddr, paddr, obj_type,
         Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE),
     ) {
-        Ok(handle) => handle as u64,
-        Err(_) => SYS_ERR_OUT_OF_MEMORY,
+        Ok(handle) => Ok(handle as u64),
+        Err(_) => Err(SyscallError::OUT_OF_MEMORY),
     }
 }
 
-fn sys_debug_putc(char_val: u64) -> u64 {
+fn sys_debug_putc(char_val: u64) -> SyscallError {
     let uart = Uart::new();
     uart.putc(char_val as u8);
-    0
+    SyscallError::OK
 }
 
-fn sys_yield() -> u64 {
+fn sys_yield() -> SyscallError {
     unsafe { scheduler::tick(); }
-    0
+    SyscallError::OK
 }
 
 /// sys_send(handle, msg0, msg1, msg2, msg3) — send a message on an endpoint.
 /// x0 = endpoint handle, x1-x4 = message registers.
-fn sys_send(ctx: &mut ExceptionContext) -> u64 {
+fn sys_send(ctx: &mut ExceptionContext) -> SyscallError {
     let handle = ctx.gpr[0] as u32;
     let msg = [ctx.gpr[1], ctx.gpr[2], ctx.gpr[3], ctx.gpr[4]];
 
     unsafe {
         let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Endpoint) {
             Ok(e) => e,
-            Err(code) => return code,
+            Err(e) => return e,
         };
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
         let tcb_paddr = scheduler::current_tcb_paddr();
         match endpoint::ipc_send(ep_paddr, msg, tcb_paddr) {
-            Ok(()) => SYS_OK,
-            Err(_) => SYS_ERR_ENDPOINT_BUSY,
+            Ok(()) => SyscallError::OK,
+            Err(_) => SyscallError::ENDPOINT_BUSY,
         }
     }
 }
 
 /// sys_receive(handle) — receive a message from an endpoint.
-/// x0 = endpoint handle. Message returned in x0-x3.
-fn sys_receive(ctx: &mut ExceptionContext) -> u64 {
+/// x0 = endpoint handle. On success: x0=0, x1-x4 = message words.
+fn sys_receive(ctx: &mut ExceptionContext) -> SyscallReturn {
     let handle = ctx.gpr[0] as u32;
 
     unsafe {
         let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ), ObjectType::Endpoint) {
             Ok(e) => e,
-            Err(code) => return code,
+            Err(e) => return SyscallReturn::Message(e),
         };
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
         let tcb_paddr = scheduler::current_tcb_paddr();
         match endpoint::ipc_receive(ep_paddr, tcb_paddr) {
             Ok(msg) => {
-                ctx.gpr[0] = msg[0];
-                ctx.gpr[1] = msg[1];
-                ctx.gpr[2] = msg[2];
-                ctx.gpr[3] = msg[3];
-                return msg[0];
+                ctx.gpr[1] = msg[0];
+                ctx.gpr[2] = msg[1];
+                ctx.gpr[3] = msg[2];
+                ctx.gpr[4] = msg[3];
+                SyscallReturn::Message(SyscallError::OK)
             }
-            Err(_) => return SYS_ERR_UNKNOWN,
+            Err(_) => SyscallReturn::Message(SyscallError::UNKNOWN),
         }
     }
 }
 
 /// sys_call(handle, msg0, msg1, msg2, msg3) — send message and block for reply.
-/// Combines send + receive in one syscall. Returns the reply in x0-x3.
-fn sys_call(ctx: &mut ExceptionContext) -> u64 {
+/// Combines send + receive in one syscall. On success: x0=0, x1-x4 = reply words.
+fn sys_call(ctx: &mut ExceptionContext) -> SyscallReturn {
     let handle = ctx.gpr[0] as u32;
     let msg = [ctx.gpr[1], ctx.gpr[2], ctx.gpr[3], ctx.gpr[4]];
 
     unsafe {
         let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE), ObjectType::Endpoint) {
             Ok(e) => e,
-            Err(code) => return code,
+            Err(e) => return SyscallReturn::Message(e),
         };
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
         let tcb_paddr = scheduler::current_tcb_paddr();
         match endpoint::ipc_call(ep_paddr, msg, tcb_paddr) {
             Ok(reply) => {
-                ctx.gpr[0] = reply[0];
-                ctx.gpr[1] = reply[1];
-                ctx.gpr[2] = reply[2];
-                ctx.gpr[3] = reply[3];
-                return reply[0];
+                ctx.gpr[1] = reply[0];
+                ctx.gpr[2] = reply[1];
+                ctx.gpr[3] = reply[2];
+                ctx.gpr[4] = reply[3];
+                SyscallReturn::Message(SyscallError::OK)
             }
-            Err(_) => return SYS_ERR_UNKNOWN,
+            Err(_) => SyscallReturn::Message(SyscallError::UNKNOWN),
         }
     }
 }
 
-/// sys_reply(msg0, msg1, msg2, msg3) — reply to the last caller on handle 0.
+/// sys_reply(msg0, msg1, msg2, msg3) — reply to the last caller on an endpoint.
 /// x0 = handle, x1-x4 = reply message.
-fn sys_reply(ctx: &mut ExceptionContext) -> u64 {
+fn sys_reply(ctx: &mut ExceptionContext) -> SyscallError {
     let handle = ctx.gpr[0] as u32;
     let reply_msg = [ctx.gpr[1], ctx.gpr[2], ctx.gpr[3], ctx.gpr[4]];
 
     unsafe {
         let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Endpoint) {
             Ok(e) => e,
-            Err(code) => return code,
+            Err(e) => return e,
         };
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
         match endpoint::ipc_reply(ep_paddr, reply_msg) {
-            Ok(()) => 0,
-            Err(_) => SYS_ERR_UNKNOWN,
+            Ok(()) => SyscallError::OK,
+            Err(_) => SyscallError::UNKNOWN,
         }
     }
 }
 
 /// sys_alloc_pages(count) — allocate physical pages.
 /// x0 = number of pages to allocate.
-/// Returns a PageSet ID on success, SYS_ERR_OUT_OF_MEMORY on failure.
-fn sys_alloc_pages(ctx: &mut ExceptionContext) -> u64 {
+/// Returns a PageSet ID in x1 on success.
+fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let count = ctx.gpr[0] as usize;
 
     match crate::cap::pageset_table::alloc_pages(count) {
-        Some(id) => id,
-        None => SYS_ERR_OUT_OF_MEMORY,
+        Some(id) => Ok(id),
+        None => Err(SyscallError::OUT_OF_MEMORY),
     }
 }
 
@@ -233,8 +270,7 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> u64 {
 /// When flags & MAP_FLAG_DEVICE: x0 = raw physical MMIO address (page-aligned).
 /// x1 = virtual address to map at (must be page-aligned, in user range).
 /// x2 = flags.
-/// Returns SYS_OK on success.
-fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
+fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     let x0 = ctx.gpr[0];
     let virt_addr = ctx.gpr[1];
     let flags = ctx.gpr[2];
@@ -246,25 +282,25 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
         let ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
 
         if ttbr0.as_u64() == 0 {
-            return SYS_ERR_INVALID_PARAMETER;
+            return SyscallError::INVALID_PARAMETER;
         }
 
         if flags & crate::arch::aarch64::vmem::MAP_FLAG_DEVICE != 0 {
             // x0 = raw physical address for device MMIO (single page)
             let pages = [PhysAddr::new(x0)];
             match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages, flags) {
-                Ok(()) => SYS_OK,
-                Err(_) => SYS_ERR_INVALID_PARAMETER,
+                Ok(()) => SyscallError::OK,
+                Err(_) => SyscallError::INVALID_PARAMETER,
             }
         } else {
             // x0 = PageSet ID (normal memory)
             let (count, pages) = match crate::cap::pageset_table::get_pageset(x0) {
                 Some(ps) => ps,
-                None => return SYS_ERR_INVALID_HANDLE,
+                None => return SyscallError::INVALID_HANDLE,
             };
             match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, &pages[..count], flags) {
-                Ok(()) => SYS_OK,
-                Err(_) => SYS_ERR_UNKNOWN,
+                Ok(()) => SyscallError::OK,
+                Err(_) => SyscallError::UNKNOWN,
             }
         }
     }
@@ -276,8 +312,7 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
 /// x2 = entry point VA for the new process
 /// x3 = PageSet ID for the stack page
 /// x4 = PageSet ID for a scratch page (kernel uses as Mapping buffer, caller keeps)
-/// Returns 0 on success, SYS_ERR_UNKNOWN on failure.
-fn sys_create_process(ctx: &mut ExceptionContext) -> u64 {
+fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
     let mappings_va = ctx.gpr[0];
     let mapping_count = ctx.gpr[1] as usize;
     let entry_point = ctx.gpr[2];
@@ -292,61 +327,61 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> u64 {
         let caller_ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
 
         match crate::process::create_process(mappings_va, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy, caller_ttbr0) {
-            Ok(()) => SYS_OK,
-            Err(_) => SYS_ERR_UNKNOWN,
+            Ok(()) => SyscallError::OK,
+            Err(_) => SyscallError::UNKNOWN,
         }
     }
 }
 
 /// sys_create_notification(pageset_id) — create a Notification from a donated page.
 /// x0 = PageSet ID (must be a 1-page PageSet).
-/// Returns the new handle index on success.
-fn sys_create_notification(ctx: &mut ExceptionContext) -> u64 {
+/// Returns the new handle index in x1 on success.
+fn sys_create_notification(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     unsafe { create_kernel_object(ctx.gpr[0], ObjectType::Notification, crate::ipc::notification::create_notification) }
 }
 
 /// sys_signal_notification(handle, value) — signal a notification.
 /// x0 = notification handle, x1 = new timeline value (must be > current).
-/// Returns SYS_OK on success. Wakes any thread waiting with threshold <= value.
-fn sys_signal_notification(ctx: &mut ExceptionContext) -> u64 {
+/// Wakes any thread waiting with threshold <= value.
+fn sys_signal_notification(ctx: &mut ExceptionContext) -> SyscallError {
     let handle = ctx.gpr[0] as u32;
     let new_value = ctx.gpr[1];
 
     unsafe {
         let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Notification) {
             Ok(e) => e,
-            Err(code) => return code,
+            Err(e) => return e,
         };
 
         let notif_paddr = PhysAddr::new(entry.object_paddr);
         match crate::ipc::notification::notification_signal(notif_paddr, new_value) {
-            Ok(()) => SYS_OK,
-            Err(lockjaw_types::notification_state::NotificationError::ValueNotMonotonic) => SYS_ERR_NOT_MONOTONIC,
-            Err(_) => SYS_ERR_UNKNOWN,
+            Ok(()) => SyscallError::OK,
+            Err(lockjaw_types::notification_state::NotificationError::ValueNotMonotonic) => SyscallError::NOT_MONOTONIC,
+            Err(_) => SyscallError::UNKNOWN,
         }
     }
 }
 
 /// sys_wait_notification(handle, threshold) — wait on a notification.
 /// x0 = notification handle, x1 = threshold value to wait for.
-/// Returns the current counter value when counter >= threshold.
+/// Returns the current counter value in x1 when counter >= threshold.
 /// Blocks if counter < threshold.
-fn sys_wait_notification(ctx: &mut ExceptionContext) -> u64 {
+fn sys_wait_notification(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let handle = ctx.gpr[0] as u32;
     let threshold = ctx.gpr[1];
 
     unsafe {
         let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ), ObjectType::Notification) {
             Ok(e) => e,
-            Err(code) => return code,
+            Err(e) => return Err(e),
         };
 
         let notif_paddr = PhysAddr::new(entry.object_paddr);
         let tcb_paddr = scheduler::current_tcb_paddr();
         match crate::ipc::notification::notification_wait(notif_paddr, threshold, tcb_paddr) {
-            Ok(value) => value,
-            Err(lockjaw_types::notification_state::NotificationError::AlreadyHasWaiter) => SYS_ERR_ALREADY_WAITING,
-            Err(_) => SYS_ERR_UNKNOWN,
+            Ok(value) => Ok(value),
+            Err(lockjaw_types::notification_state::NotificationError::AlreadyHasWaiter) => Err(SyscallError::ALREADY_WAITING),
+            Err(_) => Err(SyscallError::UNKNOWN),
         }
     }
 }
@@ -354,15 +389,14 @@ fn sys_wait_notification(ctx: &mut ExceptionContext) -> u64 {
 /// sys_bind_irq(intid, notification_handle) — bind a hardware IRQ to a notification.
 /// x0 = hardware INTID, x1 = notification handle.
 /// When the IRQ fires, the kernel signals the notification (increments timeline by 1).
-/// Returns SYS_OK on success.
-fn sys_bind_irq(ctx: &mut ExceptionContext) -> u64 {
+fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
     let intid = ctx.gpr[0] as u32;
     let notif_handle = ctx.gpr[1] as u32;
 
     unsafe {
         let entry = match lookup_handle(notif_handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Notification) {
             Ok(e) => e,
-            Err(code) => return code,
+            Err(e) => return e,
         };
 
         let notif_paddr = PhysAddr::new(entry.object_paddr);
@@ -371,30 +405,30 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> u64 {
             if intid >= 32 {
                 crate::arch::aarch64::gic::enable_spi(intid);
             }
-            SYS_OK
+            SyscallError::OK
         } else {
-            SYS_ERR_INVALID_PARAMETER
+            SyscallError::INVALID_PARAMETER
         }
     }
 }
 
 /// sys_create_endpoint(pageset_id) — create an Endpoint from a donated page.
 /// x0 = PageSet ID (must be a 1-page PageSet).
-/// Returns the new handle index on success.
-fn sys_create_endpoint(ctx: &mut ExceptionContext) -> u64 {
+/// Returns the new handle index in x1 on success.
+fn sys_create_endpoint(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     unsafe { create_kernel_object(ctx.gpr[0], ObjectType::Endpoint, endpoint::create_endpoint) }
 }
 
 /// sys_recv_nb(handle) — non-blocking receive on an endpoint.
-/// x0 = endpoint handle. If a sender is waiting, returns the message in x0-x3.
-/// Otherwise returns SYS_ERR_WOULD_BLOCK immediately.
-fn sys_recv_nb(ctx: &mut ExceptionContext) -> u64 {
+/// x0 = endpoint handle. On success: x0=0, x1-x4 = message words.
+/// Returns SyscallError::WOULD_BLOCK if no sender is waiting.
+fn sys_recv_nb(ctx: &mut ExceptionContext) -> SyscallReturn {
     let handle = ctx.gpr[0] as u32;
 
     unsafe {
         let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ), ObjectType::Endpoint) {
             Ok(e) => e,
-            Err(code) => return code,
+            Err(e) => return SyscallReturn::Message(e),
         };
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
@@ -402,14 +436,14 @@ fn sys_recv_nb(ctx: &mut ExceptionContext) -> u64 {
 
         match endpoint::ipc_receive_nb(ep_paddr, tcb_paddr) {
             Ok(msg) => {
-                ctx.gpr[0] = msg[0];
-                ctx.gpr[1] = msg[1];
-                ctx.gpr[2] = msg[2];
-                ctx.gpr[3] = msg[3];
-                return msg[0];
+                ctx.gpr[1] = msg[0];
+                ctx.gpr[2] = msg[1];
+                ctx.gpr[3] = msg[2];
+                ctx.gpr[4] = msg[3];
+                SyscallReturn::Message(SyscallError::OK)
             }
-            Err(endpoint::IpcError::WouldBlock) => return SYS_ERR_WOULD_BLOCK,
-            Err(_) => return SYS_ERR_UNKNOWN,
+            Err(endpoint::IpcError::WouldBlock) => SyscallReturn::Message(SyscallError::WOULD_BLOCK),
+            Err(_) => SyscallReturn::Message(SyscallError::UNKNOWN),
         }
     }
 }
@@ -417,8 +451,8 @@ fn sys_recv_nb(ctx: &mut ExceptionContext) -> u64 {
 /// sys_wait_any(entries_ptr, count) — wait until any of N objects is ready.
 /// x0 = pointer to WaitEntry array in caller memory.
 /// x1 = count (1..MAX_WAIT_OBJECTS).
-/// Returns bitmask of ready objects in x0 (bit N = entry N is ready).
-fn sys_wait_any(ctx: &mut ExceptionContext) -> u64 {
+/// Returns bitmask of ready objects in x1 (bit N = entry N is ready).
+fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     use lockjaw_types::wait::{WaitEntry, MAX_WAIT_OBJECTS, validate_wait_count};
     use crate::ipc::notification;
     use crate::mm::user_access::copy_from_user;
@@ -427,7 +461,7 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> u64 {
     let count = ctx.gpr[1] as usize;
 
     if !validate_wait_count(count) {
-        return SYS_ERR_INVALID_PARAMETER;
+        return Err(SyscallError::INVALID_PARAMETER);
     }
 
     unsafe {
@@ -446,17 +480,17 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> u64 {
             let user_va = entries_va + (i as u64) * core::mem::size_of::<WaitEntry>() as u64;
             let entry: WaitEntry = match copy_from_user(ttbr0, user_va) {
                 Some(e) => e,
-                None => return SYS_ERR_INVALID_PARAMETER,
+                None => return Err(SyscallError::INVALID_PARAMETER),
             };
             let he = match handle_table::handle_lookup(
                 ht_paddr, entry.handle as u32,
                 Rights::from_bits(crate::cap::rights::RIGHT_READ),
             ) {
                 Ok(e) => e,
-                Err(_) => return SYS_ERR_INVALID_HANDLE,
+                Err(_) => return Err(SyscallError::INVALID_HANDLE),
             };
             if he.obj_type != ObjectType::Endpoint && he.obj_type != ObjectType::Notification {
-                return SYS_ERR_INVALID_PARAMETER;
+                return Err(SyscallError::INVALID_PARAMETER);
             }
             paddrs[i] = PhysAddr::new(he.object_paddr);
             types[i] = he.obj_type;
@@ -466,7 +500,7 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> u64 {
         // Fast path: check if any object is already ready
         let mask = check_readiness(&paddrs, &types, &thresholds, count);
         if mask != 0 {
-            return mask;
+            return Ok(mask);
         }
 
         // Slow path: register as readiness waiter on each object, then block
@@ -501,7 +535,7 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> u64 {
         (*tcb).wait_count = 0;
 
         // Re-check all objects (others may have become ready while blocked)
-        check_readiness(&paddrs, &types, &thresholds, wc)
+        Ok(check_readiness(&paddrs, &types, &thresholds, wc))
     }
 }
 
@@ -537,8 +571,8 @@ fn check_readiness(
 /// into a blocked caller's handle table.
 /// x0 = endpoint handle (must have a caller blocked via sys_call).
 /// x1 = handle index in the exporter's table to duplicate.
-/// Returns the new handle index in the caller's table, or an error.
-fn sys_export_handle(ctx: &mut ExceptionContext) -> u64 {
+/// Returns the new handle index in x1 in the caller's table, or an error.
+fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let ep_handle = ctx.gpr[0] as u32;
     let handle_to_export = ctx.gpr[1] as u32;
 
@@ -546,7 +580,7 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> u64 {
         // Look up the endpoint — exporter needs WRITE rights
         let ep_entry = match lookup_handle(ep_handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Endpoint) {
             Ok(e) => e,
-            Err(code) => return code,
+            Err(e) => return Err(e),
         };
 
         let ep_paddr = PhysAddr::new(ep_entry.object_paddr);
@@ -554,7 +588,7 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> u64 {
         // Verify a caller is blocked waiting for reply
         let caller_tcb = endpoint::read_caller_tcb(ep_paddr);
         if caller_tcb == 0 {
-            return SYS_ERR_NO_CALLER;
+            return Err(SyscallError::NO_CALLER);
         }
 
         // Look up the handle to export in the exporter's own table
@@ -563,7 +597,7 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> u64 {
             ht_paddr, handle_to_export, Rights::none(),
         ) {
             Ok(e) => e,
-            Err(_) => return SYS_ERR_INVALID_HANDLE,
+            Err(_) => return Err(SyscallError::INVALID_HANDLE),
         };
 
         // Find the blocked caller's handle table
@@ -580,14 +614,14 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> u64 {
             export_entry.obj_type,
             export_entry.rights,
         ) {
-            Ok(new_index) => new_index as u64,
-            Err(_) => SYS_ERR_OUT_OF_MEMORY,
+            Ok(new_index) => Ok(new_index as u64),
+            Err(_) => Err(SyscallError::OUT_OF_MEMORY),
         }
     }
 }
 
 /// sys_get_boot_info() — returns boot information.
-/// x0 = DTB PageSet ID.
+/// DTB PageSet ID returned in x1.
 fn sys_get_boot_info() -> u64 {
     crate::dtb_pageset_id()
 }

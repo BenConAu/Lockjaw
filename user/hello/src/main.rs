@@ -11,7 +11,13 @@ pub extern "C" fn _start() -> ! {
     // Bootstrap: call init on handle 0 to receive our handles.
     // Init exports handles into our table and replies with indices.
     puts("hello: bootstrapping...\n");
-    let reply = sys_call_ret4(0, 0, 0, 0, 0);
+    let reply = match sys_call_ret4(0, 0, 0, 0, 0) {
+        Ok(r) => r,
+        Err(_) => {
+            puts("hello: bootstrap FAILED\n");
+            loop { sys_yield(); }
+        }
+    };
     puts("hello: got handle ");
     putc(b'0' + reply[0] as u8);
     putc(b'\n');

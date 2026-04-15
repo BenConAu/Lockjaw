@@ -28,9 +28,11 @@ pub extern "C" fn _start() -> ! {
     // sys_get_boot_info returns the PageSet ID for the DTB physical pages.
     // sys_map_pages without MAP_FLAG_DEVICE maps with normal memory attributes,
     // avoiding the MAIR aliasing problem with the kernel identity map.
-    let dtb_ps = sys_get_boot_info();
-    let map_result = sys_map_pages(dtb_ps, DTB_VA, 0);
-    if map_result != 0 {
+    let dtb_ps = match sys_get_boot_info() {
+        Ok(id) => id,
+        Err(_) => { puts("devmgr: get_boot_info FAILED\n"); halt(); }
+    };
+    if !sys_map_pages(dtb_ps, DTB_VA, 0).is_ok() {
         puts("devmgr: DTB map FAILED\n");
         halt();
     }
