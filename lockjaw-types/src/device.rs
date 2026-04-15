@@ -22,6 +22,9 @@ pub const fn compatible_hash(s: &[u8]) -> u64 {
 /// Pre-computed hash for "arm,pl011" — used by the UART driver.
 pub const PL011_HASH: u64 = compatible_hash(b"arm,pl011");
 
+/// Pre-computed hash for "qemu,fw-cfg-mmio" — used by the ramfb display driver.
+pub const FW_CFG_HASH: u64 = compatible_hash(b"qemu,fw-cfg-mmio");
+
 /// Maximum number of devices the device manager can track.
 /// QEMU virt has 32 virtio-mmio devices alone, plus UARTs, GIC, etc.
 pub const MAX_DEVICES: usize = 64;
@@ -55,6 +58,16 @@ mod tests {
     #[test]
     fn pl011_hash_is_deterministic() {
         assert_eq!(compatible_hash(b"arm,pl011"), PL011_HASH);
+    }
+
+    #[test]
+    fn fw_cfg_hash_is_deterministic() {
+        assert_eq!(compatible_hash(b"qemu,fw-cfg-mmio"), FW_CFG_HASH);
+    }
+
+    #[test]
+    fn fw_cfg_hash_differs_from_pl011() {
+        assert_ne!(FW_CFG_HASH, PL011_HASH);
     }
 
     #[test]

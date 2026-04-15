@@ -65,7 +65,7 @@ pub enum MapValidation {
 
 /// Validate a contiguous mapping of `page_count` pages starting at `virt_addr`.
 pub fn validate_mapping(virt_addr: u64, page_count: usize) -> MapValidation {
-    if page_count == 0 || page_count > 16 {
+    if page_count == 0 || page_count > 512 {
         return MapValidation::ErrorTooManyPages;
     }
 
@@ -227,7 +227,21 @@ mod tests {
 
     #[test]
     fn validate_too_many_pages() {
-        assert_eq!(validate_mapping(0x0040_0000, 17), MapValidation::ErrorTooManyPages);
+        assert_eq!(validate_mapping(0x0040_0000, 513), MapValidation::ErrorTooManyPages);
+    }
+
+    #[test]
+    fn validate_framebuffer_75_pages() {
+        // 320x240x4 = 307,200 bytes = 75 pages, fits in one L2 region at 0x0020_0000
+        let result = validate_mapping(0x0020_0000, 75);
+        assert_eq!(result, MapValidation::Ok { l2_idx: 1, l3_start: 0 });
+    }
+
+    #[test]
+    fn validate_framebuffer_300_pages() {
+        // 640x480x4 = 1,228,800 bytes = 300 pages, fits in one L2 region at 0x0020_0000
+        let result = validate_mapping(0x0020_0000, 300);
+        assert_eq!(result, MapValidation::Ok { l2_idx: 1, l3_start: 0 });
     }
 
     // --- classify_l2_entry tests ---

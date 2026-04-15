@@ -144,8 +144,6 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     Ok(l0_page.start_addr())
 }
 
-// Re-export the flag constant so kernel code can use it without importing lockjaw_types.
-pub use lockjaw_types::vmem::MAP_FLAG_DEVICE;
 
 /// Translate a user virtual address to a kernel-accessible VA by walking
 /// the given page table. Returns None if any level is unmapped.
@@ -186,19 +184,22 @@ pub unsafe fn translate_user_va(ttbr0_paddr: PhysAddr, user_va: u64) -> Option<u
 /// Validation is done by the pure model in lockjaw_types::vmem (tested on host).
 ///
 /// # Safety
-/// `ttbr0_paddr` must be a valid L0 page table. All page paddrs must be valid.
+/// `ttbr0_paddr` must be a valid L0 page table.
+/// `header` must be a valid PageSetHeader with page_count data pages.
 pub unsafe fn map_pages_in_existing(
     ttbr0_paddr: PhysAddr,
     virt_addr: u64,
-    pages: &[PhysAddr],
+    header: &lockjaw_types::pageset_table::PageSetHeader,
     flags: u64,
 ) -> Result<(), VmemError> {
     use lockjaw_types::page_table::{MapWalk, MapWalkResult};
     use lockjaw_types::vmem::{map_action_for_l2, MapAction, select_attrs, build_user_page};
 
+    let page_count = header.data_page_count();
+
     // Walk L0 → L1 → L2 using the pure state machine (tested on host).
     // The kernel only does memory reads; all PTE interpretation is in lockjaw-types.
-    let (mut walk, mut result) = MapWalk::start(ttbr0_paddr.as_u64(), virt_addr, pages.len());
+    let (mut walk, mut result) = MapWalk::start(ttbr0_paddr.as_u64(), virt_addr, page_count);
     loop {
         match result {
             MapWalkResult::ReadPte(pte_paddr) => {
@@ -231,10 +232,12 @@ pub unsafe fn map_pages_in_existing(
                     }
                 };
 
-                // Select memory attributes and write page entries (pure logic from lockjaw-types)
+                // Select memory attributes and write page entries.
+                // Read each page address from the header (no stack array needed).
                 let (attr, sh) = select_attrs(flags);
-                for (i, phys) in pages.iter().enumerate() {
-                    (*l3_va).entries[l3_start + i] = build_user_page(*phys, attr, sh);
+                for i in 0..page_count {
+                    let phys = PhysAddr::new(header.get_page(i).unwrap());
+                    (*l3_va).entries[l3_start + i] = build_user_page(phys, attr, sh);
                 }
 
                 // TLB invalidate so the new mappings take effect

@@ -295,3 +295,19 @@ pub fn sys_register_device_page(phys_addr: u64) -> Result<u64, SyscallError> {
     }
     if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
 }
+
+/// Query the physical address of a page within a PageSet.
+/// Used by drivers that need to program DMA base registers.
+pub fn sys_query_pageset_phys(pageset_id: u64, page_index: u64) -> Result<u64, SyscallError> {
+    let err: u64;
+    let val: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") pageset_id => err,
+            inlateout("x1") page_index => val,
+            in("x8") SYS_QUERY_PAGESET_PHYS,
+        );
+    }
+    if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
+}
