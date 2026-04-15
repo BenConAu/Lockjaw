@@ -1,0 +1,13 @@
+[package]
+name = "lockjaw-ramfb-driver"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+lockjaw-userlib = { path = "../lockjaw-userlib" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
