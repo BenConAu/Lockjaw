@@ -27,42 +27,118 @@ pub struct ExceptionContext {
 // Rust exception handlers (called from assembly stubs)
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-extern "C" fn handle_exception_sync(ctx: &ExceptionContext) {
-    let esr = ctx.esr;
-    let ec = (esr >> 26) & 0x3F; // Exception Class
-    let iss = esr & 0x01FF_FFFF; // Instruction Specific Syndrome
+// ---------------------------------------------------------------------------
+// ESR decode helpers
+// ---------------------------------------------------------------------------
 
-    crate::kprintln!();
-    crate::kprintln!("!!! EXCEPTION: Synchronous !!!");
-    crate::kprintln!("  ELR_EL1:  {:#018x}", ctx.elr);
-    crate::kprintln!("  ESR_EL1:  {:#018x} (EC={:#04x} ISS={:#07x})", esr, ec, iss);
-    crate::kprintln!("  SPSR_EL1: {:#018x}", ctx.spsr);
+fn exception_class_str(ec: u64) -> &'static str {
+    match ec {
+        0x00 => "Unknown reason",
+        0x01 => "Trapped WFI/WFE",
+        0x15 => "SVC from AArch64 (syscall)",
+        0x18 => "Trapped MSR/MRS/System instruction",
+        0x20 => "Instruction Abort from lower EL",
+        0x21 => "Instruction Abort from same EL",
+        0x22 => "PC alignment fault",
+        0x24 => "Data Abort from lower EL",
+        0x25 => "Data Abort from same EL",
+        0x26 => "SP alignment fault",
+        0x2C => "Trapped FP exception",
+        0x30 => "Breakpoint from lower EL",
+        0x31 => "Breakpoint from same EL",
+        0x3C => "BRK instruction",
+        _    => "Other/reserved",
+    }
+}
+
+fn data_fault_str(dfsc: u64) -> &'static str {
+    match dfsc & 0x3F {
+        0x04 => "Translation fault, level 0",
+        0x05 => "Translation fault, level 1",
+        0x06 => "Translation fault, level 2",
+        0x07 => "Translation fault, level 3",
+        0x09 => "Access flag fault, level 1",
+        0x0A => "Access flag fault, level 2",
+        0x0B => "Access flag fault, level 3",
+        0x0D => "Permission fault, level 1",
+        0x0E => "Permission fault, level 2",
+        0x0F => "Permission fault, level 3",
+        0x10 => "Synchronous external abort",
+        0x21 => "Alignment fault",
+        _    => "Other/reserved DFSC",
+    }
+}
+
+/// Classify a virtual address into a known memory region.
+///
+/// These ranges are specific to QEMU virt (aarch64) with our kernel config:
+/// - KERNEL higher-half: TTBR1 mapping at 0xFFFF_0000_0000_0000 + phys
+///   (set up by enable_higher_half in mmu.rs)
+/// - NULL DEREF: first page, always unmapped, catches null pointer dereferences
+/// - DEVICE MMIO: 0x0800_0000 - 0x09FF_FFFF covers GIC (0x0800_0000) and
+///   UARTs (0x0900_0000, 0x0904_0000). From QEMU virt DTB, verified via
+///   `qemu-system-aarch64 -machine virt,dumpdtb=...`
+/// - USERSPACE: 0x0000_1000 - 0x3FFF_FFFF, the first 1GB minus the null page.
+///   User processes are mapped in this range (code at 0x0040_0000, stack at
+///   0x0080_0000). Constrained by L0[0]/L1[0] in create_address_space.
+/// - RAM: 0x4000_0000 - 0x47FF_FFFF, 128MB physical RAM on QEMU virt default.
+///   RAM_BASE is defined in platform.rs. Kernel is loaded at 0x4020_0000.
+fn classify_address(addr: u64) -> &'static str {
+    if addr >= 0xFFFF_0000_0000_0000 {
+        "KERNEL higher-half"
+    } else if addr < 0x1000 {
+        "NULL DEREF (near-zero)"
+    } else if addr >= 0x0800_0000 && addr < 0x0A00_0000 {
+        // GIC at 0x0800_0000, UARTs at 0x0900_0000/0x0904_0000
+        // (QEMU virt DTB: intc@8000000, pl011@9000000, pl011@9040000)
+        "DEVICE MMIO region"
+    } else if addr < 0x4000_0000 {
+        // First 1GB: user process virtual address space
+        "USERSPACE"
+    } else if addr < 0x4800_0000 {
+        // 0x4000_0000 - 0x47FF_FFFF: 128MB RAM (QEMU virt default)
+        "RAM (physical range)"
+    } else {
+        "NON-CANONICAL / unmapped gap"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Structured crash output
+// ---------------------------------------------------------------------------
+
+fn print_fault(prefix: &str, ctx: &ExceptionContext) {
+    let esr = ctx.esr;
+    let ec = (esr >> 26) & 0x3F;
     let far: u64;
     unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
-    crate::kprintln!("  FAR_EL1:  {:#018x}", far);
 
-    match ec {
-        0x00 => crate::kprintln!("  Cause: Unknown reason"),
-        0x15 => crate::kprintln!("  Cause: SVC (syscall) from AArch64"),
-        0x20 => crate::kprintln!("  Cause: Instruction abort, lower EL"),
-        0x21 => crate::kprintln!("  Cause: Instruction abort, same EL"),
-        0x24 => crate::kprintln!("  Cause: Data abort, lower EL"),
-        0x25 => crate::kprintln!("  Cause: Data abort, same EL"),
-        _ => crate::kprintln!("  Cause: EC={:#04x}", ec),
-    }
+    crate::kprintln!("========================================");
+    crate::kprintln!("{}  HARDWARE EXCEPTION", prefix);
+    crate::kprintln!("{}  ESR:  {:#010x} — {} — {}", prefix, esr,
+        exception_class_str(ec), data_fault_str(esr));
+    crate::kprintln!("{}  ELR:  {:#018x} [{}]", prefix, ctx.elr, classify_address(ctx.elr));
+    crate::kprintln!("{}  FAR:  {:#018x} [{}]", prefix, far, classify_address(far));
+    crate::kprintln!("{}  SPSR: {:#018x}", prefix, ctx.spsr);
+    crate::kprintln!("========================================");
+}
 
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
+// ---------------------------------------------------------------------------
+// Rust exception handlers (called from assembly stubs)
+// ---------------------------------------------------------------------------
+
+/// Synchronous exception from same EL (kernel fault).
+#[no_mangle]
+extern "C" fn handle_exception_sync(ctx: &ExceptionContext) {
+    print_fault("[FAULT:KERN]", ctx);
+    loop { unsafe { core::arch::asm!("wfi") }; }
 }
 
 /// Synchronous exception from lower EL (userspace).
 /// Dispatches SVC (syscalls) and prints faults.
 #[no_mangle]
 extern "C" fn handle_exception_sync_lower(ctx: &mut ExceptionContext) {
-    let esr = ctx.esr;
-    let ec = (esr >> 26) & 0x3F;
+    let ec = (ctx.esr >> 26) & 0x3F;
 
     match ec {
         0x15 => {
@@ -70,18 +146,9 @@ extern "C" fn handle_exception_sync_lower(ctx: &mut ExceptionContext) {
             crate::syscall::handler::handle_syscall(ctx);
         }
         _ => {
-            // Userspace fault — print details and halt
-            let iss = esr & 0x01FF_FFFF;
-            crate::kprintln!();
-            crate::kprintln!("!!! USERSPACE FAULT !!!");
-            crate::kprintln!("  ELR_EL1:  {:#018x}", ctx.elr);
-            crate::kprintln!("  ESR_EL1:  {:#018x} (EC={:#04x} ISS={:#07x})", esr, ec, iss);
-            let far: u64;
-            unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
-            crate::kprintln!("  FAR_EL1:  {:#018x}", far);
-            loop {
-                unsafe { core::arch::asm!("wfi") };
-            }
+            // Userspace fault
+            print_fault("[FAULT:USER]", ctx);
+            loop { unsafe { core::arch::asm!("wfi") }; }
         }
     }
 }
@@ -94,21 +161,15 @@ extern "C" fn handle_exception_irq(ctx: &ExceptionContext) {
 }
 
 #[no_mangle]
-extern "C" fn handle_exception_fiq(_ctx: &ExceptionContext) {
-    crate::kprintln!("!!! EXCEPTION: FIQ (unexpected) !!!");
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
+extern "C" fn handle_exception_fiq(ctx: &ExceptionContext) {
+    print_fault("[FAULT:KERN]", ctx);
+    loop { unsafe { core::arch::asm!("wfi") }; }
 }
 
 #[no_mangle]
 extern "C" fn handle_exception_serror(ctx: &ExceptionContext) {
-    crate::kprintln!("!!! EXCEPTION: SError !!!");
-    crate::kprintln!("  ELR_EL1:  {:#018x}", ctx.elr);
-    crate::kprintln!("  ESR_EL1:  {:#018x}", ctx.esr);
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
+    print_fault("[FAULT:KERN]", ctx);
+    loop { unsafe { core::arch::asm!("wfi") }; }
 }
 
 // ---------------------------------------------------------------------------

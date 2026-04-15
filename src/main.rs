@@ -502,11 +502,13 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     use core::fmt::Write;
     let mut uart = Uart::new();
 
-    let _ = writeln!(uart, "\n!!! KERNEL PANIC !!!");
+    let _ = writeln!(uart, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    let _ = writeln!(uart, "[PANIC:KERN]  KERNEL PANIC");
     if let Some(location) = info.location() {
-        let _ = writeln!(uart, "  at {}:{}", location.file(), location.line());
+        let _ = writeln!(uart, "[PANIC:KERN]  {}:{}", location.file(), location.line());
     }
-    let _ = writeln!(uart, "  {}", info.message());
+    let _ = writeln!(uart, "[PANIC:KERN]  {}", info.message());
+    let _ = writeln!(uart, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
 
     loop {
         unsafe { core::arch::asm!("wfi") };
