@@ -61,8 +61,11 @@ pub fn is_notification_ready(current_value: u64, threshold: u64) -> bool {
 
 /// Check whether an endpoint has a blocked caller (required for sys_export_handle).
 /// The exporter can only export a handle into a caller that is waiting for a reply.
-pub fn can_export_to_caller(state: EpState) -> bool {
-    state == EpState::HasCaller
+/// Note: after sys_receive on a HasCaller endpoint, the state transitions to Idle
+/// but the caller remains blocked (caller_tcb_paddr is still set). The check must
+/// use the caller paddr, not the endpoint state.
+pub fn can_export_to_caller(caller_tcb_paddr: u64) -> bool {
+    caller_tcb_paddr != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -157,23 +160,13 @@ mod tests {
     // --- can_export_to_caller ---
 
     #[test]
-    fn export_allowed_when_has_caller() {
-        assert!(can_export_to_caller(EpState::HasCaller));
+    fn export_allowed_when_caller_present() {
+        assert!(can_export_to_caller(0x4020_0000)); // any nonzero paddr
     }
 
     #[test]
-    fn export_denied_when_idle() {
-        assert!(!can_export_to_caller(EpState::Idle));
-    }
-
-    #[test]
-    fn export_denied_when_has_sender() {
-        assert!(!can_export_to_caller(EpState::HasSender));
-    }
-
-    #[test]
-    fn export_denied_when_has_receiver() {
-        assert!(!can_export_to_caller(EpState::HasReceiver));
+    fn export_denied_when_no_caller() {
+        assert!(!can_export_to_caller(0));
     }
 
     // --- validate_wait_count ---

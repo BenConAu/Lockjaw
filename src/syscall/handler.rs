@@ -263,21 +263,20 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> u64 {
 /// x4 = PageSet ID for a scratch page (kernel uses as Mapping buffer, caller keeps)
 /// Returns 0 on success, SYS_ERR_UNKNOWN on failure.
 fn sys_create_process(ctx: &mut ExceptionContext) -> u64 {
-    let mappings_ptr = ctx.gpr[0] as *const crate::process::ProcessMapping;
+    let mappings_va = ctx.gpr[0];
     let mapping_count = ctx.gpr[1] as usize;
     let entry_point = ctx.gpr[2];
     let stack_pageset_id = ctx.gpr[3];
     let scratch_pageset_id = ctx.gpr[4];
     let parent_handle_to_copy = ctx.gpr[5];
 
-    // Validate the userspace mappings pointer
-    let byte_count = (mapping_count * core::mem::size_of::<crate::process::ProcessMapping>()) as u64;
-    if !lockjaw_types::wait::validate_user_buffer(ctx.gpr[0], byte_count) {
-        return SYS_ERR_INVALID_PARAMETER;
-    }
-
     unsafe {
-        match crate::process::create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy) {
+        // Get caller's TTBR0 for safe user memory access
+        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
+        let caller_ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
+
+        match crate::process::create_process(mappings_va, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy, caller_ttbr0) {
             Ok(()) => SYS_OK,
             Err(_) => SYS_ERR_UNKNOWN,
         }
@@ -405,34 +404,35 @@ fn sys_recv_nb(ctx: &mut ExceptionContext) -> u64 {
 /// x1 = count (1..MAX_WAIT_OBJECTS).
 /// Returns bitmask of ready objects in x0 (bit N = entry N is ready).
 fn sys_wait_any(ctx: &mut ExceptionContext) -> u64 {
-    use lockjaw_types::wait::{WaitEntry, MAX_WAIT_OBJECTS, validate_user_buffer, validate_wait_count};
+    use lockjaw_types::wait::{WaitEntry, MAX_WAIT_OBJECTS, validate_wait_count};
     use crate::ipc::notification;
+    use crate::mm::user_access::copy_from_user;
 
-    let entries_ptr = ctx.gpr[0] as *const WaitEntry;
+    let entries_va = ctx.gpr[0];
     let count = ctx.gpr[1] as usize;
 
     if !validate_wait_count(count) {
         return SYS_ERR_INVALID_PARAMETER;
     }
 
-    // Validate the userspace pointer is within the user VA range
-    let byte_count = (count * core::mem::size_of::<WaitEntry>()) as u64;
-    if !validate_user_buffer(ctx.gpr[0], byte_count) {
-        return SYS_ERR_INVALID_PARAMETER;
-    }
-
     unsafe {
         let tcb_paddr = scheduler::current_tcb_paddr();
         let tcb = (tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *mut Tcb;
+        let ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
         let ht_paddr = caller_handle_table();
 
-        // Resolve handles to paddrs and types
+        // Read WaitEntry array from user memory via page table walk (TTBR1).
+        // Never touches TTBR0 — immune to context switches.
         let mut paddrs = [PhysAddr::new(0); MAX_WAIT_OBJECTS];
         let mut types = [ObjectType::HandleTable; MAX_WAIT_OBJECTS];
         let mut thresholds = [0u64; MAX_WAIT_OBJECTS];
 
         for i in 0..count {
-            let entry = core::ptr::read(entries_ptr.add(i));
+            let user_va = entries_va + (i as u64) * core::mem::size_of::<WaitEntry>() as u64;
+            let entry: WaitEntry = match copy_from_user(ttbr0, user_va) {
+                Some(e) => e,
+                None => return SYS_ERR_INVALID_PARAMETER,
+            };
             let he = match handle_table::handle_lookup(
                 ht_paddr, entry.handle as u32,
                 Rights::from_bits(crate::cap::rights::RIGHT_READ),
@@ -524,8 +524,6 @@ fn check_readiness(
 /// x1 = handle index in the exporter's table to duplicate.
 /// Returns the new handle index in the caller's table, or an error.
 fn sys_export_handle(ctx: &mut ExceptionContext) -> u64 {
-    use lockjaw_types::wait::can_export_to_caller;
-
     let ep_handle = ctx.gpr[0] as u32;
     let handle_to_export = ctx.gpr[1] as u32;
 
@@ -538,9 +536,9 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> u64 {
 
         let ep_paddr = PhysAddr::new(ep_entry.object_paddr);
 
-        // Verify a caller is blocked (pure check from lockjaw-types)
-        let ep_state = endpoint::read_state(ep_paddr);
-        if !can_export_to_caller(ep_state) {
+        // Verify a caller is blocked waiting for reply
+        let caller_tcb = endpoint::read_caller_tcb(ep_paddr);
+        if caller_tcb == 0 {
             return SYS_ERR_NO_CALLER;
         }
 
@@ -555,8 +553,10 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> u64 {
 
         // Find the blocked caller's handle table
         let caller_tcb_paddr = endpoint::read_caller_tcb(ep_paddr);
+        crate::kprintln!("[export] caller_tcb={:#x}", caller_tcb_paddr);
         let caller_tcb = (caller_tcb_paddr + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
         let caller_ht = PhysAddr::new((*caller_tcb).handle_table_paddr);
+        crate::kprintln!("[export] caller_ht={:#x}", caller_ht.as_u64());
 
         // Insert a copy into the caller's table
         match handle_table::handle_insert(

@@ -211,10 +211,25 @@ pub extern "C" fn _start() -> ! {
     putc(b'0' + ep_handle as u8);
     putc(b'\n');
 
+    // Create bootstrap endpoint for hello (test sys_export_handle end-to-end).
+    let hello_boot_ps = sys_alloc_pages(1);
+    let hello_boot_ep = sys_create_endpoint(hello_boot_ps);
+
     // Spawn child processes.
-    spawn_elf(HELLO_ELF, "hello", 0x0070_0000, 0x00A0_0000, scratch_ps, u64::MAX, 1);
-    spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000, scratch_ps, ep_handle, 1);
+    spawn_elf(HELLO_ELF, "hello", 0x0070_0000, 0x00A0_0000, scratch_ps, hello_boot_ep, 1);
+    spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000, scratch_ps, ep_handle, 2);
     spawn_elf(DEVMGR_ELF, "device-manager", 0x0072_0000, 0x00E0_0000, scratch_ps, u64::MAX, 4);
+
+    // Bootstrap hello: export a test notification into its handle table.
+    puts("init: waiting for hello bootstrap...\n");
+    let _hello_req = sys_receive(hello_boot_ep);
+    let test_notif_ps = sys_alloc_pages(1);
+    let test_notif = sys_create_notification(test_notif_ps);
+    let exported_idx = sys_export_handle(hello_boot_ep, test_notif);
+    sys_reply(hello_boot_ep, exported_idx, 0, 0, 0);
+    puts("init: hello bootstrapped, exported handle ");
+    putc(b'0' + exported_idx as u8);
+    putc(b'\n');
 
     // Print via IPC to the UART server.
     loop {

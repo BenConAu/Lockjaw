@@ -66,6 +66,7 @@ pub fn sys_create_endpoint(pageset_id: u64) -> u64 {
     result
 }
 
+/// Send a message and block for reply. Returns the first reply word.
 pub fn sys_call(handle: u64, msg0: u64, msg1: u64, msg2: u64, msg3: u64) -> u64 {
     let result: u64;
     unsafe {
@@ -81,6 +82,30 @@ pub fn sys_call(handle: u64, msg0: u64, msg1: u64, msg2: u64, msg3: u64) -> u64 
         );
     }
     result
+}
+
+/// Send a message and block for reply. Returns all 4 reply words.
+pub fn sys_call_ret4(handle: u64, msg0: u64, msg1: u64, msg2: u64, msg3: u64) -> [u64; 4] {
+    let r0: u64;
+    let r1: u64;
+    let r2: u64;
+    let r3: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x0") handle,
+            in("x1") msg0,
+            in("x2") msg1,
+            in("x3") msg2,
+            in("x4") msg3,
+            in("x8") SYS_CALL,
+            lateout("x0") r0,
+            lateout("x1") r1,
+            lateout("x2") r2,
+            lateout("x3") r3,
+        );
+    }
+    [r0, r1, r2, r3]
 }
 
 pub fn sys_reply(handle: u64, msg0: u64, msg1: u64, msg2: u64, msg3: u64) {

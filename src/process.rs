@@ -40,20 +40,20 @@ const FLAG_EXECUTABLE: u64 = 1 << 0;
 /// `mappings_ptr` must point to `mapping_count` valid ProcessMapping entries
 /// in the caller's address space. TTBR0 must be the caller's page table.
 pub unsafe fn create_process(
-    mappings_ptr: *const ProcessMapping,
+    mappings_va: u64,
     mapping_count: usize,
     entry_point: u64,
     stack_pageset_id: u64,
     scratch_pageset_id: u64,
     parent_handle_to_copy: u64,
+    caller_ttbr0: PhysAddr,
 ) -> Result<(), &'static str> {
-    // Need room for mapping_count entries + 1 stack page
+    // Need room for mapping_count entries + stack pages
     if mapping_count == 0 || mapping_count + 1 > MAPPINGS_PER_PAGE {
         return Err("invalid mapping count");
     }
 
     // Use the caller-provided scratch page as the Mapping buffer.
-    // This avoids putting a large array on the kernel stack.
     let (scratch_count, scratch_pages) = pageset_table::get_pageset(scratch_pageset_id)
         .ok_or("invalid scratch pageset")?;
     if scratch_count != 1 {
@@ -65,7 +65,10 @@ pub unsafe fn create_process(
     let mut count = 0;
 
     for i in 0..mapping_count {
-        let user_mapping = core::ptr::read(mappings_ptr.add(i));
+        // Read ProcessMapping from user memory via page table walk (TTBR1).
+        let entry_va = mappings_va + (i as u64) * core::mem::size_of::<ProcessMapping>() as u64;
+        let user_mapping: ProcessMapping = crate::mm::user_access::copy_from_user(caller_ttbr0, entry_va)
+            .ok_or("unmapped user mapping pointer")?;
 
         // Resolve the PageSet ID to a physical address
         let (ps_count, ps_pages) = pageset_table::get_pageset(user_mapping.pageset_id)
