@@ -133,6 +133,21 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn alloc_endpoint(label: &str) -> u64 {
+    let ps = match sys_alloc_pages(1) {
+        Ok(id) => id,
+        Err(_) => { puts("init: alloc "); puts(label); puts(" FAILED\n"); loop { sys_yield(); } }
+    };
+    match sys_create_endpoint(ps) {
+        Ok(h) => h,
+        Err(_) => { puts("init: create "); puts(label); puts(" FAILED\n"); loop { sys_yield(); } }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -215,33 +230,20 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("init: alloc scratch page FAILED\n"); loop { sys_yield(); } }
     };
 
-    // Create an endpoint for communicating with the UART server.
-    let ep_ps = match sys_alloc_pages(1) {
-        Ok(id) => id,
-        Err(_) => { puts("init: alloc ep page FAILED\n"); loop { sys_yield(); } }
-    };
-    let ep_handle = match sys_create_endpoint(ep_ps) {
-        Ok(h) => h,
-        Err(_) => { puts("init: create endpoint FAILED\n"); loop { sys_yield(); } }
-    };
-    puts("init: endpoint created, handle=");
-    putc(b'0' + ep_handle as u8);
-    putc(b'\n');
-
-    // Create bootstrap endpoint for hello (test sys_export_handle end-to-end).
-    let hello_boot_ps = match sys_alloc_pages(1) {
-        Ok(id) => id,
-        Err(_) => { puts("init: alloc hello boot FAILED\n"); loop { sys_yield(); } }
-    };
-    let hello_boot_ep = match sys_create_endpoint(hello_boot_ps) {
-        Ok(h) => h,
-        Err(_) => { puts("init: create hello boot ep FAILED\n"); loop { sys_yield(); } }
-    };
+    // Create endpoints for IPC infrastructure.
+    // ep_handle: UART server endpoint (init sends characters, UART driver serves)
+    // devmgr_ep: device-manager server endpoint (drivers send claims, devmgr serves)
+    // hello_boot_ep, devmgr_boot_ep, uart_boot_ep: bootstrap endpoints (used once each)
+    let ep_handle = alloc_endpoint("uart srv");
+    let devmgr_ep = alloc_endpoint("devmgr srv");
+    let hello_boot_ep = alloc_endpoint("hello boot");
+    let devmgr_boot_ep = alloc_endpoint("devmgr boot");
+    let uart_boot_ep = alloc_endpoint("uart boot");
 
     // Spawn child processes.
     spawn_elf(HELLO_ELF, "hello", 0x0070_0000, 0x00A0_0000, scratch_ps, hello_boot_ep, 1);
-    spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000, scratch_ps, ep_handle, 4);
-    spawn_elf(DEVMGR_ELF, "device-manager", 0x0072_0000, 0x00E0_0000, scratch_ps, u64::MAX, 4);
+    spawn_elf(DEVMGR_ELF, "device-manager", 0x0072_0000, 0x00E0_0000, scratch_ps, devmgr_boot_ep, 8);
+    spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000, scratch_ps, uart_boot_ep, 4);
 
     // Bootstrap hello: export a test notification into its handle table.
     puts("init: waiting for hello bootstrap...\n");
@@ -259,9 +261,31 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("init: export FAILED\n"); loop { sys_yield(); } }
     };
     sys_reply(hello_boot_ep, exported_idx, 0, 0, 0);
-    puts("init: hello bootstrapped, exported handle ");
-    putc(b'0' + exported_idx as u8);
-    putc(b'\n');
+    puts("init: hello bootstrapped\n");
+
+    // Bootstrap device-manager: export devmgr_ep so it can serve device claims.
+    puts("init: waiting for devmgr bootstrap...\n");
+    let _ = sys_receive(devmgr_boot_ep);
+    let devmgr_ep_idx = match sys_export_handle(devmgr_boot_ep, devmgr_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export devmgr_ep FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(devmgr_boot_ep, devmgr_ep_idx, 0, 0, 0);
+    puts("init: devmgr bootstrapped\n");
+
+    // Bootstrap UART driver: export ep_handle (its IPC server) and devmgr_ep (its client).
+    puts("init: waiting for uart bootstrap...\n");
+    let _ = sys_receive(uart_boot_ep);
+    let uart_ep_idx = match sys_export_handle(uart_boot_ep, ep_handle) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export uart ep FAILED\n"); loop { sys_yield(); } }
+    };
+    let uart_devmgr_idx = match sys_export_handle(uart_boot_ep, devmgr_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export devmgr to uart FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(uart_boot_ep, uart_ep_idx, uart_devmgr_idx, 0, 0);
+    puts("init: uart bootstrapped\n");
 
     // Print via IPC to the UART server.
     loop {

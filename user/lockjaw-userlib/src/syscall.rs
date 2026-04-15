@@ -175,6 +175,28 @@ pub fn sys_receive(handle: u64) -> Result<u64, SyscallError> {
     if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
 }
 
+/// Blocking receive on an endpoint.
+/// Returns all 4 message words on success. Blocks until a sender is waiting.
+pub fn sys_receive_ret4(handle: u64) -> Result<[u64; 4], SyscallError> {
+    let err: u64;
+    let r1: u64;
+    let r2: u64;
+    let r3: u64;
+    let r4: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") handle => err,
+            lateout("x1") r1,
+            lateout("x2") r2,
+            lateout("x3") r3,
+            lateout("x4") r4,
+            in("x8") SYS_RECEIVE,
+        );
+    }
+    if err == 0 { Ok([r1, r2, r3, r4]) } else { Err(SyscallError(err)) }
+}
+
 /// Non-blocking receive on an endpoint.
 /// Returns the first message word if a sender is waiting,
 /// or Err(SyscallError::WOULD_BLOCK) if no message is pending.

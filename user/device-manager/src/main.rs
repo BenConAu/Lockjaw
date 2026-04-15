@@ -16,6 +16,9 @@ const DTB_VA: u64 = 0x0010_0000;
 /// Number of DTB pages to map (actual content is ~8KB).
 const DTB_PAGES: u64 = 2;
 
+/// UART0 physical address — reserved for kernel debug output.
+const KERNEL_UART0_PHYS: u64 = 0x0900_0000;
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -23,6 +26,17 @@ const DTB_PAGES: u64 = 2;
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     puts("devmgr: starting\n");
+
+    // Bootstrap: call init on handle 0 to receive our server endpoint.
+    puts("devmgr: bootstrapping...\n");
+    let reply = match sys_call_ret4(0, 0, 0, 0, 0) {
+        Ok(r) => r,
+        Err(_) => { puts("devmgr: bootstrap FAILED\n"); halt(); }
+    };
+    let server_ep = reply[0];
+    puts("devmgr: bootstrapped, server_ep=");
+    put_decimal(server_ep);
+    putc(b'\n');
 
     // Step 1: Get the DTB PageSet from the kernel and map it.
     // sys_get_boot_info returns the PageSet ID for the DTB physical pages.
@@ -42,7 +56,7 @@ pub extern "C" fn _start() -> ! {
     let dtb_slice = unsafe {
         core::slice::from_raw_parts(DTB_VA as *const u8, (DTB_PAGES * PAGE_SIZE) as usize)
     };
-    let devices = match parse_fdt(dtb_slice) {
+    let mut devices = match parse_fdt(dtb_slice) {
         Ok(d) => d,
         Err(_) => {
             puts("devmgr: DTB parse FAILED\n");
@@ -54,6 +68,7 @@ pub extern "C" fn _start() -> ! {
     puts(" devices\n");
 
     // Step 3: Print PL011 device addresses found in the DTB.
+    // Reserve UART0 for the kernel (it uses 0x0900_0000 for debug output).
     let pl011_hash = PL011_HASH;
     for i in 0..devices.count {
         let dev = &devices.devices[i];
@@ -62,12 +77,46 @@ pub extern "C" fn _start() -> ! {
             put_hex(dev.mmio_addr);
             puts(" intid=");
             put_decimal(dev.intid as u64);
+            if dev.mmio_addr == KERNEL_UART0_PHYS {
+                puts(" (kernel, reserved)");
+                devices.devices[i].claimed = true;
+            }
             putc(b'\n');
         }
     }
 
-    puts("devmgr: idle\n");
-    loop { sys_yield(); }
+    // Step 3: IPC server loop — serve device claim requests.
+    puts("devmgr: serving\n");
+    loop {
+        let msg = match sys_receive_ret4(server_ep) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let cmd = msg[0];
+
+        if cmd == CMD_CLAIM_DEVICE {
+            let requested_hash = msg[1];
+            let mut found = false;
+            for i in 0..devices.count {
+                let dev = devices.devices[i];
+                if dev.compatible_hash == requested_hash && !dev.claimed {
+                    devices.devices[i].claimed = true;
+                    puts("devmgr: claimed device at ");
+                    put_hex(dev.mmio_addr);
+                    putc(b'\n');
+                    sys_reply(server_ep, dev.mmio_addr, dev.intid as u64, 0, 0);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                puts("devmgr: no matching device\n");
+                sys_reply(server_ep, 0, 0, 0, 0);
+            }
+        } else {
+            sys_reply(server_ep, 0, 0, 0, 0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

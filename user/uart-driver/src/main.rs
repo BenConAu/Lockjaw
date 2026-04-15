@@ -25,13 +25,6 @@ const UARTIMSC_RXIM: u32 = 1 << 4; // RX interrupt mask
 /// conflict with L2[4] (kernel device MMIO block) and L2[2] (user code).
 const UART_VA: u64 = 0x0020_0000;
 
-/// PL011 UART1 physical address on QEMU virt (from DTB: pl011@9040000).
-/// UART0 (0x0900_0000) stays with the kernel for kprintln/debug.
-const UART_PHYS: u64 = 0x0904_0000;
-
-/// UART1 SPI interrupt: SPI 8 = INTID 40 on QEMU virt (from DTB: interrupts <0 8 4>).
-const UART_INTID: u64 = 40;
-
 // ---------------------------------------------------------------------------
 // UART MMIO helpers
 // ---------------------------------------------------------------------------
@@ -71,8 +64,31 @@ pub extern "C" fn _start() -> ! {
     // Print early banner via sys_debug_putc (kernel UART, known to work)
     puts("uart-driver: starting\n");
 
-    // Step 1: Map UART1 MMIO page into our address space
-    if !sys_map_pages(UART_PHYS, UART_VA, MAP_FLAG_DEVICE).is_ok() {
+    // Bootstrap: call init on handle 0 to receive our handles.
+    puts("uart-driver: bootstrapping...\n");
+    let reply = match sys_call_ret4(0, 0, 0, 0, 0) {
+        Ok(r) => r,
+        Err(_) => { puts("uart-driver: bootstrap FAILED\n"); loop { unsafe { asm!("wfi"); } } }
+    };
+    let uart_srv_ep = reply[0];    // IPC server endpoint (character requests from init)
+    let devmgr_client = reply[1];  // device-manager client endpoint
+    puts("uart-driver: bootstrapped\n");
+
+    // Claim a PL011 device from the device manager.
+    let claim = match sys_call_ret4(devmgr_client, CMD_CLAIM_DEVICE, PL011_HASH, 0, 0) {
+        Ok(r) => r,
+        Err(_) => { puts("uart-driver: claim call FAILED\n"); loop { unsafe { asm!("wfi"); } } }
+    };
+    let uart_phys = claim[0];
+    let uart_intid = claim[1];
+    if uart_phys == 0 {
+        puts("uart-driver: no PL011 available\n");
+        loop { unsafe { asm!("wfi"); } }
+    }
+    puts("uart-driver: claimed PL011\n");
+
+    // Step 1: Map UART MMIO page into our address space
+    if !sys_map_pages(uart_phys, UART_VA, MAP_FLAG_DEVICE).is_ok() {
         puts("uart-driver: map MMIO FAILED\n");
         loop { unsafe { asm!("wfi"); } }
     }
@@ -89,8 +105,8 @@ pub extern "C" fn _start() -> ! {
     };
     puts("uart-driver: notification created\n");
 
-    // Step 3: Bind UART1 IRQ (INTID 40) to the notification
-    if !sys_bind_irq(UART_INTID, notif_handle).is_ok() {
+    // Step 3: Bind UART IRQ to the notification
+    if !sys_bind_irq(uart_intid, notif_handle).is_ok() {
         puts("uart-driver: bind IRQ FAILED\n");
         loop { unsafe { asm!("wfi"); } }
     }
@@ -108,13 +124,13 @@ pub extern "C" fn _start() -> ! {
     puts("uart-driver: server ready\n");
 
     // Step 5: Event-driven server loop using sys_wait_any.
-    // Handle 0 = endpoint (copied from parent at process creation).
-    // Handle at notif_handle = notification (created above, bound to UART1 IRQ).
+    // uart_srv_ep = IPC endpoint for character requests from init.
+    // notif_handle = notification bound to the UART RX IRQ.
     // The thread sleeps until either an IPC message or an IRQ arrives.
     let mut irq_threshold: u64 = 1;
     let mut entries = [
-        WaitEntry { handle: 0, threshold: 0 },                       // endpoint
-        WaitEntry { handle: notif_handle, threshold: irq_threshold }, // notification
+        WaitEntry { handle: uart_srv_ep, threshold: 0 },                       // endpoint
+        WaitEntry { handle: notif_handle, threshold: irq_threshold },           // notification
     ];
 
     loop {
@@ -125,10 +141,10 @@ pub extern "C" fn _start() -> ! {
 
         // Bit 0: endpoint ready — IPC TX request
         if mask & 1 != 0 {
-            if let Ok(ch) = sys_receive(0) {
+            if let Ok(ch) = sys_receive(uart_srv_ep) {
                 unsafe { uart_putc(ch as u8); }
             }
-            sys_reply(0, 0, 0, 0, 0);
+            sys_reply(uart_srv_ep, 0, 0, 0, 0);
         }
 
         // Bit 1: notification ready — UART RX interrupt fired
