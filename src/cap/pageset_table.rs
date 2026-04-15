@@ -36,8 +36,18 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
 
     // Insert into the table (pure logic, validated by unit tests)
     let entry = PageSetEntry { count, pages };
-    unsafe {
-        (*TABLE.0.get()).insert(entry).ok().map(|id| id as u64)
+    let result = unsafe { (*TABLE.0.get()).insert(entry) };
+    match result {
+        Ok(id) => Some(id as u64),
+        Err(_) => {
+            // Table full — free the pages we allocated so they aren't leaked
+            for j in 0..count {
+                page_alloc::dealloc_page(
+                    crate::mm::addr::PhysPage::containing(pages[j])
+                );
+            }
+            None
+        }
     }
 }
 
