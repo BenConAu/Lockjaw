@@ -60,6 +60,14 @@ pub fn register_existing(count: usize, pages: [PhysAddr; MAX_PAGES_PER_SET]) -> 
     }
 }
 
+/// Remove a PageSet from the table, preventing reuse.
+/// Called after a PageSet's pages are donated to a kernel object.
+pub fn consume_pageset(id: u64) -> bool {
+    unsafe {
+        (*TABLE.0.get()).remove(id as usize).is_ok()
+    }
+}
+
 /// Look up a PageSet by ID. Returns the page count and physical addresses.
 pub fn get_pageset(id: u64) -> Option<(usize, [PhysAddr; MAX_PAGES_PER_SET])> {
     unsafe {

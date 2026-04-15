@@ -141,6 +141,8 @@ unsafe fn create_kernel_object(
     if init_fn(paddr).is_err() {
         return Err(SyscallError::UNKNOWN);
     }
+    // Consume the PageSet so it can't be reused or re-mapped
+    crate::cap::pageset_table::consume_pageset(pageset_id);
     let ht_paddr = caller_handle_table();
     match handle_table::handle_insert(
         ht_paddr, paddr, obj_type,

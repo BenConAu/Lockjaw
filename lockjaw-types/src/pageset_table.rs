@@ -184,6 +184,39 @@ mod tests {
     }
 
     #[test]
+    fn consume_after_get_prevents_reuse() {
+        // Models create_kernel_object: get the page, use it, then consume
+        // so nobody can look it up or re-donate it.
+        let mut table = PageSetTable::new();
+        let id = table.insert(make_entry(1)).unwrap();
+
+        // "Use" the page (get returns the entry)
+        let entry = table.get(id).unwrap();
+        assert_eq!(entry.count, 1);
+
+        // Consume (remove) — page is now kernel-owned
+        table.remove(id).unwrap();
+
+        // Original ID is dead: get fails, second remove fails
+        assert_eq!(table.get(id), Err(PageSetError::SlotEmpty));
+        assert_eq!(table.remove(id), Err(PageSetError::SlotEmpty));
+    }
+
+    #[test]
+    fn consume_does_not_affect_other_entries() {
+        let mut table = PageSetTable::new();
+        let id0 = table.insert(make_entry(1)).unwrap();
+        let id1 = table.insert(make_entry(2)).unwrap();
+
+        // Consume id0
+        table.remove(id0).unwrap();
+
+        // id1 is still accessible
+        let entry = table.get(id1).unwrap();
+        assert_eq!(entry.count, 2);
+    }
+
+    #[test]
     fn remove_empty_slot_fails() {
         let mut table = PageSetTable::new();
         assert_eq!(table.remove(0), Err(PageSetError::SlotEmpty));
