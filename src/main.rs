@@ -261,6 +261,13 @@ pub extern "C" fn kmain() -> ! {
         ipc::endpoint::create_endpoint(ep_page).expect("create endpoint");
         kprintln!("  Endpoint created at phys {:#x}", ep_page.as_u64());
 
+        // Reply object for the ipc_sender benchmark thread. One page,
+        // pre-allocated and stashed in a static so ipc_sender can pass it
+        // on every call without needing a handle table lookup.
+        let bench_reply_page = mm::page_alloc::alloc_page().expect("bench reply alloc").start_addr();
+        ipc::reply::create_reply(bench_reply_page).expect("create bench reply");
+        IPC_BENCH_REPLY_PADDR = bench_reply_page.as_u64();
+
         // Create handle table for sender (Thread A)
         let ht_a_page = mm::page_alloc::alloc_page().expect("ht alloc").start_addr();
         let ht_info = cap::object::HandleTableCreateInfo { slot_count: 8 };
@@ -478,17 +485,24 @@ unsafe fn lookup_endpoint() -> (mm::addr::PhysAddr, mm::addr::PhysAddr) {
     (mm::addr::PhysAddr::new(entry.object_paddr), tcb_paddr)
 }
 
+/// Reply object used by the ipc_sender benchmark kernel thread. Allocated
+/// and initialized in kmain before the scheduler starts. Stored as a raw
+/// paddr so both threads can read it without needing a handle table.
+static mut IPC_BENCH_REPLY_PADDR: u64 = 0;
+
 /// Client thread: calls the server with a request, gets a reply.
 /// Uses ipc_call (send + block for reply in one operation).
 fn ipc_sender() -> ! {
     const BENCHMARK_ROUNDS: u64 = 10000;
     let mut counter: u64 = 1;
+    // SAFETY: single-core kernel, read-only after boot
+    let reply_paddr = unsafe { mm::addr::PhysAddr::new(IPC_BENCH_REPLY_PADDR) };
 
     // Warm up
     for _ in 0..10 {
         unsafe {
             let (ep, tcb) = lookup_endpoint();
-            ipc::endpoint::ipc_call(ep, [counter, 0, 0, 0], tcb).expect("call");
+            ipc::endpoint::ipc_call(ep, reply_paddr, [counter, 0, 0, 0], tcb).expect("call");
         }
         counter += 1;
     }
@@ -498,7 +512,7 @@ fn ipc_sender() -> ! {
     for _ in 0..BENCHMARK_ROUNDS {
         unsafe {
             let (ep, tcb) = lookup_endpoint();
-            let reply = ipc::endpoint::ipc_call(ep, [counter, 0, 0, 0], tcb).expect("call");
+            let reply = ipc::endpoint::ipc_call(ep, reply_paddr, [counter, 0, 0, 0], tcb).expect("call");
             // Print first few to verify the server doubled our value
             if counter <= 13 {
                 kprintln!("[IPC] call({}) -> reply({})", counter, reply[0]);
@@ -518,7 +532,7 @@ fn ipc_sender() -> ! {
     loop {
         unsafe {
             let (ep, tcb) = lookup_endpoint();
-            ipc::endpoint::ipc_call(ep, [counter, 0, 0, 0], tcb).expect("call");
+            ipc::endpoint::ipc_call(ep, reply_paddr, [counter, 0, 0, 0], tcb).expect("call");
         }
         counter += 1;
     }
@@ -531,7 +545,7 @@ fn ipc_receiver() -> ! {
             let (ep, tcb) = lookup_endpoint();
             let msg = ipc::endpoint::ipc_receive(ep, tcb).expect("receive");
             let reply = [msg[0] * 2, msg[1], msg[2], msg[3]];
-            ipc::endpoint::ipc_reply(ep, reply).expect("reply");
+            ipc::reply::ipc_reply(tcb, reply).expect("reply");
         }
     }
 }

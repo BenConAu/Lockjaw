@@ -130,9 +130,15 @@ unsafe fn fwcfg_find_file(name: &[u8]) -> u16 {
 pub extern "C" fn _start() -> ! {
     puts("ramfb: starting\n");
 
+    // Allocate our Reply object for outbound sys_call (bootstrap + claim).
+    let reply_obj = match sys_alloc_pages(1).and_then(sys_create_reply) {
+        Ok(h) => h,
+        Err(_) => { puts("ramfb: create reply FAILED\n"); halt(); }
+    };
+
     // Bootstrap: get devmgr_client from init
     puts("ramfb: bootstrapping...\n");
-    let reply = match sys_call_ret4(0, 0, 0, 0, 0) {
+    let reply = match sys_call_ret4(0, reply_obj, 0, 0, 0, 0) {
         Ok(r) => r,
         Err(_) => { puts("ramfb: bootstrap FAILED\n"); halt(); }
     };
@@ -140,7 +146,7 @@ pub extern "C" fn _start() -> ! {
     puts("ramfb: bootstrapped\n");
 
     // Claim fw_cfg device from device manager
-    let claim = match sys_call_ret4(devmgr_client, CMD_CLAIM_DEVICE, FW_CFG_HASH, 0, 0) {
+    let claim = match sys_call_ret4(devmgr_client, reply_obj, CMD_CLAIM_DEVICE, FW_CFG_HASH, 0, 0) {
         Ok(r) => r,
         Err(_) => { puts("ramfb: claim FAILED\n"); halt(); }
     };

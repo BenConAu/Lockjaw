@@ -215,21 +215,38 @@ fn sys_receive(ctx: &mut ExceptionContext) -> SyscallReturn {
     }
 }
 
-/// sys_call(handle, msg0, msg1, msg2, msg3) — send message and block for reply.
-/// Combines send + receive in one syscall. On success: x0=0, x1-x4 = reply words.
+/// sys_call(ep_handle, reply_handle, msg0, msg1, msg2, msg3) — send message
+/// and block for reply. The Reply object identifies the caller; on return,
+/// it's Fresh and ready to reuse on the next call.
+/// x0 = endpoint handle, x1 = reply handle, x2-x5 = message.
+/// On success: x0 = 0, x1-x4 = reply words.
 fn sys_call(ctx: &mut ExceptionContext) -> SyscallReturn {
-    let handle = ctx.gpr[0] as u32;
-    let msg = [ctx.gpr[1], ctx.gpr[2], ctx.gpr[3], ctx.gpr[4]];
+    let ep_handle = ctx.gpr[0] as u32;
+    let reply_handle = ctx.gpr[1] as u32;
+    let msg = [ctx.gpr[2], ctx.gpr[3], ctx.gpr[4], ctx.gpr[5]];
 
     unsafe {
-        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE), ObjectType::Endpoint) {
+        let ep_entry = match lookup_handle(
+            ep_handle,
+            Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE),
+            ObjectType::Endpoint,
+        ) {
+            Ok(e) => e,
+            Err(e) => return SyscallReturn::Message(e),
+        };
+        let reply_entry = match lookup_handle(
+            reply_handle,
+            Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE),
+            ObjectType::Reply,
+        ) {
             Ok(e) => e,
             Err(e) => return SyscallReturn::Message(e),
         };
 
-        let ep_paddr = PhysAddr::new(entry.object_paddr);
+        let ep_paddr = PhysAddr::new(ep_entry.object_paddr);
+        let reply_paddr = PhysAddr::new(reply_entry.object_paddr);
         let tcb_paddr = scheduler::current_tcb_paddr();
-        match endpoint::ipc_call(ep_paddr, msg, tcb_paddr) {
+        match endpoint::ipc_call(ep_paddr, reply_paddr, msg, tcb_paddr) {
             Ok(reply) => {
                 ctx.gpr[1] = reply[0];
                 ctx.gpr[2] = reply[1];
@@ -237,26 +254,25 @@ fn sys_call(ctx: &mut ExceptionContext) -> SyscallReturn {
                 ctx.gpr[4] = reply[3];
                 SyscallReturn::Message(SyscallError::OK)
             }
+            Err(endpoint::IpcError::ReplyBound) => {
+                SyscallReturn::Message(SyscallError::REPLY_BOUND)
+            }
             Err(_) => SyscallReturn::Message(SyscallError::UNKNOWN),
         }
     }
 }
 
-/// sys_reply(msg0, msg1, msg2, msg3) — reply to the last caller on an endpoint.
-/// x0 = handle, x1-x4 = reply message.
+/// sys_reply(msg0, msg1, msg2, msg3) — reply to the call currently bound on
+/// the replier's TCB (set by the preceding sys_receive). No endpoint handle
+/// is needed; the Reply object carries caller identity.
+/// x0-x3 = reply message. Returns NO_CALLER if the TCB has no bound call.
 fn sys_reply(ctx: &mut ExceptionContext) -> SyscallError {
-    let handle = ctx.gpr[0] as u32;
-    let reply_msg = [ctx.gpr[1], ctx.gpr[2], ctx.gpr[3], ctx.gpr[4]];
-
+    let reply_msg = [ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]];
     unsafe {
-        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Endpoint) {
-            Ok(e) => e,
-            Err(e) => return e,
-        };
-
-        let ep_paddr = PhysAddr::new(entry.object_paddr);
-        match endpoint::ipc_reply(ep_paddr, reply_msg) {
+        let tcb_paddr = scheduler::current_tcb_paddr();
+        match crate::ipc::reply::ipc_reply(tcb_paddr, reply_msg) {
             Ok(()) => SyscallError::OK,
+            Err(endpoint::IpcError::NoCaller) => SyscallError::NO_CALLER,
             Err(_) => SyscallError::UNKNOWN,
         }
     }
@@ -564,7 +580,7 @@ fn check_readiness(
     count: usize,
 ) -> u64 {
     use lockjaw_types::wait::{ObjectReadiness, compute_ready_mask, MAX_WAIT_OBJECTS};
-    use lockjaw_types::ipc_state::EpState;
+    use lockjaw_types::ipc_state_reply::EpState;
 
     let mut objects = [ObjectReadiness::Endpoint(EpState::Idle); MAX_WAIT_OBJECTS];
     for i in 0..count {
@@ -583,31 +599,37 @@ fn check_readiness(
     compute_ready_mask(&objects[..count])
 }
 
-/// sys_export_handle(endpoint_handle, handle_to_export) — duplicate a handle
-/// into a blocked caller's handle table.
-/// x0 = endpoint handle (must have a caller blocked via sys_call).
-/// x1 = handle index in the exporter's table to duplicate.
-/// Returns the new handle index in x1 in the caller's table, or an error.
+/// sys_export_handle(handle_to_export) — duplicate a handle into the
+/// currently-being-handled caller's handle table.
+///
+/// x0 = handle index in the exporter's table to duplicate.
+/// Returns the new handle index (in the caller's table) in x1, or
+/// NO_CALLER if the exporting thread has no bound call.
+///
+/// Post-redesign: the caller is identified via the exporter's own TCB's
+/// `current_reply_paddr` → Reply object → `caller_tcb_paddr`. The old
+/// ep-handle argument is dropped.
 fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    let ep_handle = ctx.gpr[0] as u32;
-    let handle_to_export = ctx.gpr[1] as u32;
+    let handle_to_export = ctx.gpr[0] as u32;
 
     unsafe {
-        // Look up the endpoint — exporter needs WRITE rights
-        let ep_entry = match lookup_handle(ep_handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Endpoint) {
-            Ok(e) => e,
-            Err(e) => return Err(e),
-        };
-
-        let ep_paddr = PhysAddr::new(ep_entry.object_paddr);
-
-        // Verify a caller is blocked waiting for reply
-        let caller_tcb = endpoint::read_caller_tcb(ep_paddr);
-        if caller_tcb == 0 {
+        // Find the bound caller via our TCB's current_reply_paddr.
+        let exporter_tcb_paddr = scheduler::current_tcb_paddr();
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
+        let exporter_tcb = (exporter_tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
+        let reply_paddr_u64 = (*exporter_tcb).current_reply_paddr;
+        if reply_paddr_u64 == 0 {
+            return Err(SyscallError::NO_CALLER);
+        }
+        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
+        let reply = (reply_paddr_u64 + crate::mm::addr::KERNEL_VA_OFFSET)
+            as *const crate::ipc::reply::ReplyObject;
+        let caller_tcb_paddr_u64 = (*reply).caller_tcb_paddr;
+        if caller_tcb_paddr_u64 == 0 {
             return Err(SyscallError::NO_CALLER);
         }
 
-        // Look up the handle to export in the exporter's own table
+        // Look up the handle to export in the exporter's own table.
         let ht_paddr = caller_handle_table();
         let export_entry = match handle_table::handle_lookup(
             ht_paddr, handle_to_export, Rights::none(),
@@ -616,15 +638,10 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
             Err(_) => return Err(SyscallError::INVALID_HANDLE),
         };
 
-        // Find the blocked caller's handle table
-        let caller_tcb_paddr = endpoint::read_caller_tcb(ep_paddr);
-        crate::kprintln!("[export] caller_tcb={:#x}", caller_tcb_paddr);
         // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-        let caller_tcb = (caller_tcb_paddr + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
+        let caller_tcb = (caller_tcb_paddr_u64 + crate::mm::addr::KERNEL_VA_OFFSET) as *const Tcb;
         let caller_ht = PhysAddr::new((*caller_tcb).handle_table_paddr);
-        crate::kprintln!("[export] caller_ht={:#x}", caller_ht.as_u64());
 
-        // Insert a copy into the caller's table
         match handle_table::handle_insert(
             caller_ht,
             PhysAddr::new(export_entry.object_paddr),

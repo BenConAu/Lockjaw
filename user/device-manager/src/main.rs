@@ -32,9 +32,16 @@ const KERNEL_UART0_PHYS: u64 = 0x0900_0000;
 pub extern "C" fn _start() -> ! {
     puts("devmgr: starting\n");
 
+    // Allocate our Reply object for outbound sys_call (just the bootstrap
+    // call to init; after that we only reply, we don't call).
+    let reply_obj = match sys_alloc_pages(1).and_then(sys_create_reply) {
+        Ok(h) => h,
+        Err(_) => { puts("devmgr: create reply FAILED\n"); halt(); }
+    };
+
     // Bootstrap: call init on handle 0 to receive our server endpoint.
     puts("devmgr: bootstrapping...\n");
-    let reply = match sys_call_ret4(0, 0, 0, 0, 0) {
+    let reply = match sys_call_ret4(0, reply_obj, 0, 0, 0, 0) {
         Ok(r) => r,
         Err(_) => { puts("devmgr: bootstrap FAILED\n"); halt(); }
     };
@@ -110,7 +117,7 @@ pub extern "C" fn _start() -> ! {
                         Ok(id) => id,
                         Err(_) => {
                             puts("devmgr: register MMIO page FAILED\n");
-                            sys_reply(server_ep, 0, 0, 0, 0);
+                            sys_reply(0, 0, 0, 0);
                             found = true;
                             break;
                         }
@@ -120,17 +127,17 @@ pub extern "C" fn _start() -> ! {
                     put_hex(dev.mmio_addr);
                     putc(b'\n');
                     // Reply with PageSet ID (not raw address) + INTID
-                    sys_reply(server_ep, mmio_ps, dev.intid as u64, 0, 0);
+                    sys_reply(mmio_ps, dev.intid as u64, 0, 0);
                     found = true;
                     break;
                 }
             }
             if !found {
                 puts("devmgr: no matching device\n");
-                sys_reply(server_ep, 0, 0, 0, 0);
+                sys_reply(0, 0, 0, 0);
             }
         } else {
-            sys_reply(server_ep, 0, 0, 0, 0);
+            sys_reply(0, 0, 0, 0);
         }
     }
 }

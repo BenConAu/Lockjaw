@@ -69,9 +69,15 @@ pub extern "C" fn _start() -> ! {
     // Print early banner via sys_debug_putc (kernel UART, known to work)
     puts("uart-driver: starting\n");
 
+    // Allocate our Reply object for outbound sys_call (bootstrap + claim).
+    let reply_obj = match sys_alloc_pages(1).and_then(sys_create_reply) {
+        Ok(h) => h,
+        Err(_) => { puts("uart-driver: create reply FAILED\n"); loop { unsafe { asm!("wfi"); } } }
+    };
+
     // Bootstrap: call init on handle 0 to receive our handles.
     puts("uart-driver: bootstrapping...\n");
-    let reply = match sys_call_ret4(0, 0, 0, 0, 0) {
+    let reply = match sys_call_ret4(0, reply_obj, 0, 0, 0, 0) {
         Ok(r) => r,
         Err(_) => { puts("uart-driver: bootstrap FAILED\n"); loop { unsafe { asm!("wfi"); } } }
     };
@@ -80,7 +86,7 @@ pub extern "C" fn _start() -> ! {
     puts("uart-driver: bootstrapped\n");
 
     // Claim a PL011 device from the device manager.
-    let claim = match sys_call_ret4(devmgr_client, CMD_CLAIM_DEVICE, PL011_HASH, 0, 0) {
+    let claim = match sys_call_ret4(devmgr_client, reply_obj, CMD_CLAIM_DEVICE, PL011_HASH, 0, 0) {
         Ok(r) => r,
         Err(_) => { puts("uart-driver: claim call FAILED\n"); loop { unsafe { asm!("wfi"); } } }
     };
@@ -149,7 +155,7 @@ pub extern "C" fn _start() -> ! {
             if let Ok(ch) = sys_receive(uart_srv_ep) {
                 unsafe { uart_putc(ch as u8); }
             }
-            sys_reply(uart_srv_ep, 0, 0, 0, 0);
+            sys_reply(0, 0, 0, 0);
         }
 
         // Bit 1: notification ready — UART RX interrupt fired

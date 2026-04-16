@@ -4,7 +4,7 @@
 /// The kernel reads object state and calls these functions to determine
 /// readiness and validate syscall parameters.
 
-use crate::ipc_state::EpState;
+use crate::ipc_state_reply::EpState;
 
 /// Maximum number of objects in a single sys_wait_any call.
 pub const MAX_WAIT_OBJECTS: usize = 4;
@@ -49,9 +49,9 @@ pub fn validate_wait_count(count: usize) -> bool {
 // Readiness
 // ---------------------------------------------------------------------------
 
-/// Check whether an endpoint is ready for a receiver (has a pending sender or caller).
+/// Check whether an endpoint is ready for a receiver (has ≥1 Send/Call waiter queued).
 pub fn is_endpoint_ready(state: EpState) -> bool {
-    matches!(state, EpState::HasSender | EpState::HasCaller)
+    matches!(state, EpState::HasWaiters)
 }
 
 /// Check whether a notification value meets a wait threshold.
@@ -244,13 +244,8 @@ mod tests {
     // --- is_endpoint_ready ---
 
     #[test]
-    fn endpoint_ready_has_sender() {
-        assert!(is_endpoint_ready(EpState::HasSender));
-    }
-
-    #[test]
-    fn endpoint_ready_has_caller() {
-        assert!(is_endpoint_ready(EpState::HasCaller));
+    fn endpoint_ready_has_waiters() {
+        assert!(is_endpoint_ready(EpState::HasWaiters));
     }
 
     #[test]
@@ -306,7 +301,7 @@ mod tests {
     fn uart_driver_ipc_message_arrives() {
         // Sender waiting on endpoint, notification below threshold → endpoint ready
         let objects = [
-            ObjectReadiness::Endpoint(EpState::HasSender),
+            ObjectReadiness::Endpoint(EpState::HasWaiters),
             ObjectReadiness::Notification { value: 0, threshold: 1 },
         ];
         assert_eq!(compute_ready_mask(&objects), 0b01);
@@ -326,7 +321,7 @@ mod tests {
     fn uart_driver_both_ready() {
         // Caller waiting + notification met → both ready
         let objects = [
-            ObjectReadiness::Endpoint(EpState::HasCaller),
+            ObjectReadiness::Endpoint(EpState::HasWaiters),
             ObjectReadiness::Notification { value: 5, threshold: 3 },
         ];
         assert_eq!(compute_ready_mask(&objects), 0b11);
@@ -336,7 +331,7 @@ mod tests {
     fn uart_driver_notification_not_yet() {
         // Endpoint has a caller, notification one below threshold
         let objects = [
-            ObjectReadiness::Endpoint(EpState::HasCaller),
+            ObjectReadiness::Endpoint(EpState::HasWaiters),
             ObjectReadiness::Notification { value: 4, threshold: 5 },
         ];
         assert_eq!(compute_ready_mask(&objects), 0b01);
@@ -346,7 +341,7 @@ mod tests {
 
     #[test]
     fn single_endpoint_ready() {
-        let objects = [ObjectReadiness::Endpoint(EpState::HasSender)];
+        let objects = [ObjectReadiness::Endpoint(EpState::HasWaiters)];
         assert_eq!(compute_ready_mask(&objects), 0b1);
     }
 
@@ -361,7 +356,7 @@ mod tests {
         let objects = [
             ObjectReadiness::Endpoint(EpState::Idle),
             ObjectReadiness::Notification { value: 0, threshold: 1 },
-            ObjectReadiness::Endpoint(EpState::HasSender),
+            ObjectReadiness::Endpoint(EpState::HasWaiters),
             ObjectReadiness::Notification { value: 0, threshold: 1 },
         ];
         assert_eq!(compute_ready_mask(&objects), 0b0100);
@@ -370,9 +365,9 @@ mod tests {
     #[test]
     fn four_objects_all_ready() {
         let objects = [
-            ObjectReadiness::Endpoint(EpState::HasSender),
+            ObjectReadiness::Endpoint(EpState::HasWaiters),
             ObjectReadiness::Notification { value: 10, threshold: 5 },
-            ObjectReadiness::Endpoint(EpState::HasCaller),
+            ObjectReadiness::Endpoint(EpState::HasWaiters),
             ObjectReadiness::Notification { value: 1, threshold: 0 },
         ];
         assert_eq!(compute_ready_mask(&objects), 0b1111);

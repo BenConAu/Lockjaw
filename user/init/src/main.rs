@@ -218,7 +218,7 @@ pub extern "C" fn _start() -> ! {
         Ok(h) => h,
         Err(_) => { puts("init: create endpoint FAILED\n"); loop { sys_yield(); } }
     };
-    match sys_export_handle(test_ep, test_ep) {
+    match sys_export_handle(test_ep) {
         Err(e) if e == SyscallError::NO_CALLER => {
             puts("init: sys_export_handle validation OK (no caller)\n");
         }
@@ -280,40 +280,51 @@ pub extern "C" fn _start() -> ! {
         Ok(h) => h,
         Err(_) => { puts("init: create notif FAILED\n"); loop { sys_yield(); } }
     };
-    let exported_idx = match sys_export_handle(hello_boot_ep, test_notif) {
+    let exported_idx = match sys_export_handle(test_notif) {
         Ok(idx) => idx,
         Err(_) => { puts("init: export FAILED\n"); loop { sys_yield(); } }
     };
-    sys_reply(hello_boot_ep, exported_idx, 0, 0, 0);
+    sys_reply(exported_idx, 0, 0, 0);
     puts("init: hello bootstrapped\n");
 
     // Bootstrap device-manager: export devmgr_ep so it can serve device claims.
     puts("init: waiting for devmgr bootstrap...\n");
     let _ = sys_receive(devmgr_boot_ep);
-    let devmgr_ep_idx = match sys_export_handle(devmgr_boot_ep, devmgr_ep) {
+    let devmgr_ep_idx = match sys_export_handle(devmgr_ep) {
         Ok(idx) => idx,
         Err(_) => { puts("init: export devmgr_ep FAILED\n"); loop { sys_yield(); } }
     };
-    sys_reply(devmgr_boot_ep, devmgr_ep_idx, 0, 0, 0);
+    sys_reply(devmgr_ep_idx, 0, 0, 0);
     puts("init: devmgr bootstrapped\n");
 
     // Bootstrap UART driver: export ep_handle (its IPC server) and devmgr_ep (its client).
     puts("init: waiting for uart bootstrap...\n");
     let _ = sys_receive(uart_boot_ep);
-    let uart_ep_idx = match sys_export_handle(uart_boot_ep, ep_handle) {
+    let uart_ep_idx = match sys_export_handle(ep_handle) {
         Ok(idx) => idx,
         Err(_) => { puts("init: export uart ep FAILED\n"); loop { sys_yield(); } }
     };
-    let uart_devmgr_idx = match sys_export_handle(uart_boot_ep, devmgr_ep) {
+    let uart_devmgr_idx = match sys_export_handle(devmgr_ep) {
         Ok(idx) => idx,
         Err(_) => { puts("init: export devmgr to uart FAILED\n"); loop { sys_yield(); } }
     };
-    sys_reply(uart_boot_ep, uart_ep_idx, uart_devmgr_idx, 0, 0);
+    sys_reply(uart_ep_idx, uart_devmgr_idx, 0, 0);
     puts("init: uart bootstrapped\n");
+
+    // Allocate a Reply object for init's own outbound calls (ipc_puts to
+    // the uart server). Each client that issues sys_call needs one.
+    let init_reply_ps = match sys_alloc_pages(1) {
+        Ok(id) => id,
+        Err(_) => { puts("init: alloc reply page FAILED\n"); loop { sys_yield(); } }
+    };
+    let init_reply = match sys_create_reply(init_reply_ps) {
+        Ok(h) => h,
+        Err(_) => { puts("init: create reply FAILED\n"); loop { sys_yield(); } }
+    };
 
     // Print via IPC to the UART server.
     loop {
-        ipc_puts(ep_handle, "init: alive (via IPC)\n");
+        ipc_puts(ep_handle, init_reply, "init: alive (via IPC)\n");
         sys_yield();
     }
 }
