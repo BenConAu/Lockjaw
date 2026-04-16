@@ -104,6 +104,10 @@ pub unsafe fn ipc_send(
         let receiver_tcb = tcb_ptr_mut(receiver);
         (*receiver_tcb).ipc_msg = msg;
         (*receiver_tcb).ipc_wait_kind = WAIT_KIND_NONE;
+        // Receiver's ipc_blocked_on was set when it queued itself; clear it
+        // now so teardown/diagnostic code never sees a runnable thread that
+        // looks blocked on an endpoint.
+        (*receiver_tcb).ipc_blocked_on = 0;
         scheduler::unblock_thread(receiver);
         (*ep).state = EP_IDLE;
         return Ok(());
@@ -231,6 +235,8 @@ pub unsafe fn ipc_call(
         (*receiver_tcb).ipc_msg = msg;
         (*receiver_tcb).ipc_wait_kind = WAIT_KIND_NONE;
         (*receiver_tcb).current_reply_paddr = reply_paddr.as_u64();
+        // Clear the receiver's blocked-on pointer — it's runnable now.
+        (*receiver_tcb).ipc_blocked_on = 0;
         scheduler::unblock_thread(receiver);
         (*ep).state = EP_IDLE;
     } else {
