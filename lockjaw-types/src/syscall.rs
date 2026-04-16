@@ -40,6 +40,11 @@ impl SyscallError {
     /// The operation would block but non-blocking was requested.
     pub const WOULD_BLOCK: Self = SyscallError(10);
 
+    /// A Reply object passed to sys_call is already bound to an outstanding
+    /// call. Each client thread uses one Reply at a time — the previous call
+    /// must complete (receive reply) before reusing.
+    pub const REPLY_BOUND: Self = SyscallError(11);
+
     /// An unknown or unrecoverable error occurred.
     pub const UNKNOWN: Self = SyscallError(u64::MAX);
 
@@ -85,3 +90,4 @@ pub const SYS_EXPORT_HANDLE: u64 = 16;
 pub const SYS_GET_BOOT_INFO: u64 = 17;
 pub const SYS_REGISTER_DEVICE_PAGE: u64 = 18;
 pub const SYS_QUERY_PAGESET_PHYS: u64 = 19;
+pub const SYS_CREATE_REPLY: u64 = 20;

@@ -12,6 +12,7 @@ pub enum ObjectType {
     ThreadControlBlock = 1,
     Endpoint = 2,
     Notification = 3,
+    Reply = 4,
 }
 
 /// Header written at the start of every kernel object's donated memory.
@@ -86,6 +87,22 @@ pub fn query_notification_size(_info: &NotificationCreateInfo) -> ObjectSize {
     ObjectSize { pages: 1 }
 }
 
+// ---------------------------------------------------------------------------
+// Reply create-info
+// ---------------------------------------------------------------------------
+
+/// Describes a Reply object to create. Reply objects are per-client mailboxes
+/// used for sys_call; each client creates one at startup and reuses it. A
+/// Reply holds the blocked caller's TCB paddr so the server's sys_reply can
+/// target the specific caller without touching endpoint state.
+#[derive(Clone, Copy, Debug)]
+pub struct ReplyCreateInfo;
+
+/// How many pages does a Reply need? Always 1.
+pub fn query_reply_size(_info: &ReplyCreateInfo) -> ObjectSize {
+    ObjectSize { pages: 1 }
+}
+
 /// Error from object creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateError {
@@ -134,6 +151,13 @@ mod tests {
         assert_eq!(ObjectType::HandleTable, ObjectType::HandleTable);
         assert_ne!(ObjectType::HandleTable, ObjectType::ThreadControlBlock);
         assert_ne!(ObjectType::Endpoint, ObjectType::HandleTable);
+        assert_ne!(ObjectType::Reply, ObjectType::Endpoint);
+    }
+
+    #[test]
+    fn reply_fits_in_one_page() {
+        let size = query_reply_size(&ReplyCreateInfo);
+        assert_eq!(size.pages, 1);
     }
 
     #[test]

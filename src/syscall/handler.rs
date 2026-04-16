@@ -68,6 +68,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_GET_BOOT_INFO => SyscallReturn::Value(Ok(sys_get_boot_info())),
         SYS_REGISTER_DEVICE_PAGE => SyscallReturn::Value(sys_register_device_page(ctx)),
         SYS_QUERY_PAGESET_PHYS => SyscallReturn::Value(sys_query_pageset_phys(ctx)),
+        SYS_CREATE_REPLY => SyscallReturn::Value(sys_create_reply(ctx)),
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             SyscallReturn::Void(SyscallError::INVALID_PARAMETER)
@@ -423,6 +424,14 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
 /// Returns the new handle index in x1 on success.
 fn sys_create_endpoint(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     unsafe { create_kernel_object(ctx.gpr[0], ObjectType::Endpoint, endpoint::create_endpoint) }
+}
+
+/// sys_create_reply(pageset_id) — create a Reply object from a donated page.
+/// x0 = PageSet ID (must be a 1-page PageSet).
+/// Returns the new handle index in x1 on success. Unused until the IPC
+/// cutover commit wires sys_call to consume Reply objects.
+fn sys_create_reply(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
+    unsafe { create_kernel_object(ctx.gpr[0], ObjectType::Reply, crate::ipc::reply::create_reply) }
 }
 
 /// sys_recv_nb(handle) — non-blocking receive on an endpoint.

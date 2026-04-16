@@ -102,6 +102,24 @@ pub fn sys_create_endpoint(pageset_id: u64) -> Result<u64, SyscallError> {
     if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
 }
 
+/// Create a Reply object from a 1-page PageSet. Each client thread
+/// allocates one of these at startup and reuses it across sys_call
+/// invocations. The Reply is the per-call "who to wake" marker that
+/// replaces the single caller_tcb slot on endpoints.
+pub fn sys_create_reply(pageset_id: u64) -> Result<u64, SyscallError> {
+    let err: u64;
+    let val: u64;
+    unsafe {
+        asm!(
+            "svc #0",                        // trap into kernel
+            inlateout("x0") pageset_id => err, // in: pageset id, out: error code
+            lateout("x1") val,               // out: new handle index
+            in("x8") SYS_CREATE_REPLY,       // syscall number
+        );
+    }
+    if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
+}
+
 /// Send a message and block for reply. Returns the first reply word.
 pub fn sys_call(handle: u64, msg0: u64, msg1: u64, msg2: u64, msg3: u64) -> Result<u64, SyscallError> {
     let err: u64;
