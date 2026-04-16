@@ -63,9 +63,22 @@ pub unsafe fn start() {
 /// Uses the round-robin model (from lockjaw-types) to pick the next Ready
 /// thread, swaps TTBR0 if needed, checks the stack canary, and performs
 /// the context switch.
+///
+/// If the current thread is Blocked (e.g., sitting in block_current's
+/// wfi loop), a Preempt step is invalid — there's nothing to preempt.
+/// We return and let the block_current loop re-check on its next
+/// iteration. IPC unblock operations (from IRQ handlers that signal
+/// notifications or deliver messages) set other threads to Ready, and
+/// the block_current loop picks them up via step(Block).
 pub unsafe fn tick() {
     let state = &*SCHED_STATE.0.get();
     if !ACTIVE || state.thread_count() < 2 {
+        return;
+    }
+    // Can only Preempt a Running thread. If current is Blocked (idle
+    // loop in block_current), the timer tick has no work — return and
+    // the block_current loop will re-evaluate.
+    if state.get(state.current) != Some(SchedThreadState::Running) {
         return;
     }
     schedule(SchedReason::Preempt);
@@ -131,13 +144,16 @@ pub unsafe fn block_current() {
 /// The thread will be picked up by the next scheduling round.
 /// Typically called from IPC endpoint code when a partner arrives.
 /// Takes a TCB paddr (what IPC code has) and looks up the thread index.
+///
+/// Panics if the TCB is not registered (kernel bug — IPC code should
+/// only unblock threads it knows about) or if the thread is not in
+/// the Blocked state (kernel bug — only Blocked threads should be
+/// unblocked, and the IPC state machine shouldn't have them otherwise).
 pub unsafe fn unblock_thread(tcb_paddr: PhysAddr) {
-    let idx = match thread_index_for(tcb_paddr) {
-        Some(i) => i,
-        None => return, // unknown thread — ignore
-    };
+    let idx = thread_index_for(tcb_paddr)
+        .expect("unblock_thread: TCB paddr not registered in scheduler");
     let state = &mut *SCHED_STATE.0.get();
-    let _ = state.unblock(idx);
+    state.unblock(idx).expect("unblock_thread: thread not in Blocked state");
 }
 
 // ---------------------------------------------------------------------------
@@ -160,20 +176,19 @@ unsafe fn schedule(reason: SchedReason) {
     let old_paddr = THREADS[old_idx].unwrap();
     let old_tcb = tcb_ptr_mut(old_paddr);
 
-    let decision = state.decide(reason);
+    // step() validates preconditions, computes the decision, applies it,
+    // and returns the action for the kernel to execute. No separate
+    // decide/apply_decision calls — the model owns the transition.
+    let decision = state.step(reason);
 
     let next_idx = match decision {
         SchedDecision::SwitchTo(idx) => idx,
         SchedDecision::StayOnCurrent | SchedDecision::WaitForInterrupt => {
-            // No context switch. Model's apply_decision validates.
-            let _ = state.apply_decision(reason, decision);
+            // No context switch needed. State has already been validated
+            // and (for StayOnCurrent/WaitForInterrupt) not mutated.
             return;
         }
     };
-
-    // Apply the transition in the model. This validates the move:
-    // demotes old Running -> Ready (on Preempt), promotes next Ready -> Running.
-    state.apply_decision(reason, decision).expect("invalid scheduler transition");
 
     let new_paddr = THREADS[next_idx].unwrap();
     let new_tcb = tcb_ptr_mut(new_paddr);

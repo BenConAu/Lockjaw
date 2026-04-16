@@ -183,14 +183,57 @@ impl SchedState {
         }
     }
 
+    /// Atomic scheduler step: compute the decision from the current state
+    /// and the reason, update the state accordingly, and return what the
+    /// kernel must do. This is the ONLY public way to transition the
+    /// scheduler between thread-switch points — `decide` and
+    /// `apply_decision` are not exposed so the kernel cannot call them
+    /// out of order or with forged arguments.
+    ///
+    /// Preconditions enforced for `reason`:
+    /// - `Preempt`: current must be Running (timer tick / yield)
+    /// - `Block`: current must be Blocked (caller already called
+    ///   `block_current`)
+    ///
+    /// Returns a SchedDecision describing the action taken. The model
+    /// state has already been updated to reflect the decision.
+    pub fn step(&mut self, reason: SchedReason) -> SchedDecision {
+        // Validate entry preconditions for the reason.
+        match reason {
+            SchedReason::Preempt => {
+                assert!(
+                    self.get(self.current) == Some(SchedThreadState::Running),
+                    "step(Preempt) requires current thread to be Running"
+                );
+            }
+            SchedReason::Block => {
+                assert!(
+                    self.get(self.current) == Some(SchedThreadState::Blocked),
+                    "step(Block) requires current thread to be Blocked (call block_current first)"
+                );
+            }
+        }
+
+        let decision = self.decide(reason);
+        self.apply_decision(reason, decision)
+            .expect("internal: decide() produced a decision rejected by apply_decision");
+
+        // Post-condition: invariants must hold.
+        debug_assert!(self.check_invariants(),
+            "scheduler invariants violated after step");
+
+        decision
+    }
+
     /// Apply a scheduling decision, updating states accordingly.
-    /// This is what the kernel calls after select_next returns.
+    /// Private — callers use `step` instead.
     ///
     /// For SwitchTo(idx): transitions old current (if Running) to Ready,
     /// transitions idx from Ready to Running, updates current.
-    /// For StayOnCurrent: no state changes (current stays Running).
-    /// For WaitForInterrupt: no state changes.
-    pub fn apply_decision(
+    /// For StayOnCurrent: validates current is Running, reason is Preempt,
+    /// no other thread is Ready.
+    /// For WaitForInterrupt: validates no thread is Ready.
+    fn apply_decision(
         &mut self,
         reason: SchedReason,
         decision: SchedDecision,
@@ -202,10 +245,16 @@ impl SchedState {
                 }
                 // Demote current Running -> Ready (only on Preempt;
                 // on Block the caller already set it to Blocked).
-                if reason == SchedReason::Preempt
-                    && self.get(self.current) == Some(SchedThreadState::Running)
-                {
+                if reason == SchedReason::Preempt {
+                    if self.get(self.current) != Some(SchedThreadState::Running) {
+                        return Err(SchedError::InvalidTransition);
+                    }
                     self.states[self.current] = Some(SchedThreadState::Ready);
+                } else {
+                    // Block: current must already be Blocked.
+                    if self.get(self.current) != Some(SchedThreadState::Blocked) {
+                        return Err(SchedError::InvalidTransition);
+                    }
                 }
                 self.states[new_idx] = Some(SchedThreadState::Running);
                 self.current = new_idx;
@@ -218,27 +267,62 @@ impl SchedState {
                 if self.get(self.current) != Some(SchedThreadState::Running) {
                     return Err(SchedError::InvalidTransition);
                 }
+                // No other thread may be Ready (StayOnCurrent must only
+                // be chosen when there's no one to switch to).
+                for (i, s) in self.states.iter().enumerate() {
+                    if i != self.current && *s == Some(SchedThreadState::Ready) {
+                        return Err(SchedError::InvalidTransition);
+                    }
+                }
                 Ok(())
             }
-            SchedDecision::WaitForInterrupt => Ok(()),
+            SchedDecision::WaitForInterrupt => {
+                // No thread may be Ready (WaitForInterrupt must only be
+                // chosen when the CPU genuinely has nothing to run).
+                for s in self.states.iter() {
+                    if *s == Some(SchedThreadState::Ready) {
+                        return Err(SchedError::InvalidTransition);
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
     /// Invariants of a valid scheduler state:
-    /// - At most one thread is Running.
-    /// - If reason=Preempt was just called, the Running thread is current.
-    /// - Every registered index has a state.
+    /// - `current < MAX_THREADS_MODEL` (in bounds)
+    /// - `states[current]` is registered (Some)
+    /// - At most one thread is Running
+    /// - If any thread is Running, it is the current thread
     pub fn check_invariants(&self) -> bool {
-        let running_count = self
-            .states
-            .iter()
-            .filter(|s| **s == Some(SchedThreadState::Running))
-            .count();
-        running_count <= 1
+        if self.current >= MAX_THREADS_MODEL {
+            return false;
+        }
+        if self.states[self.current].is_none() {
+            return false;
+        }
+        let mut running_count = 0;
+        let mut running_idx = None;
+        for (i, s) in self.states.iter().enumerate() {
+            if *s == Some(SchedThreadState::Running) {
+                running_count += 1;
+                running_idx = Some(i);
+            }
+        }
+        if running_count > 1 {
+            return false;
+        }
+        if let Some(idx) = running_idx {
+            if idx != self.current {
+                return false;
+            }
+        }
+        true
     }
 
     /// Compute the scheduling decision for a given reason without mutating.
-    pub fn decide(&self, reason: SchedReason) -> SchedDecision {
+    /// Private — callers use `step` instead, which computes + applies atomically.
+    fn decide(&self, reason: SchedReason) -> SchedDecision {
         select_next(self.current, MAX_THREADS_MODEL, reason, |i| {
             self.get(i).unwrap_or(SchedThreadState::Blocked)
         })
@@ -374,6 +458,112 @@ mod tests {
         assert_eq!(r, Err(SchedError::InvalidTransition));
     }
 
+    // --- Atomic step() API ---
+
+    #[test]
+    fn step_preempt_switches_to_ready() {
+        let mut s = SchedState::new();
+        s.add_thread().unwrap();
+        let d = s.step(SchedReason::Preempt);
+        assert_eq!(d, SchedDecision::SwitchTo(1));
+        assert_eq!(s.get(0), Some(SchedThreadState::Ready));
+        assert_eq!(s.get(1), Some(SchedThreadState::Running));
+        assert_eq!(s.current, 1);
+    }
+
+    #[test]
+    fn step_preempt_stays_when_alone_running() {
+        let mut s = SchedState::new();
+        let d = s.step(SchedReason::Preempt);
+        assert_eq!(d, SchedDecision::StayOnCurrent);
+        assert_eq!(s.get(0), Some(SchedThreadState::Running));
+    }
+
+    #[test]
+    fn step_block_switches_to_ready() {
+        let mut s = SchedState::new();
+        s.add_thread().unwrap();
+        s.block_current().unwrap();
+        let d = s.step(SchedReason::Block);
+        assert_eq!(d, SchedDecision::SwitchTo(1));
+        assert_eq!(s.get(0), Some(SchedThreadState::Blocked));
+        assert_eq!(s.get(1), Some(SchedThreadState::Running));
+        assert_eq!(s.current, 1);
+    }
+
+    #[test]
+    fn step_block_waits_when_no_ready() {
+        let mut s = SchedState::new();
+        s.block_current().unwrap();
+        let d = s.step(SchedReason::Block);
+        assert_eq!(d, SchedDecision::WaitForInterrupt);
+        // State unchanged
+        assert_eq!(s.get(0), Some(SchedThreadState::Blocked));
+    }
+
+    #[test]
+    #[should_panic(expected = "step(Preempt) requires current thread to be Running")]
+    fn step_preempt_panics_if_current_not_running() {
+        let mut s = SchedState::new();
+        s.block_current().unwrap();
+        // current is Blocked, Preempt precondition violated
+        let _ = s.step(SchedReason::Preempt);
+    }
+
+    #[test]
+    #[should_panic(expected = "step(Block) requires current thread to be Blocked")]
+    fn step_block_panics_if_current_not_blocked() {
+        let mut s = SchedState::new();
+        // current is Running, Block precondition violated
+        let _ = s.step(SchedReason::Block);
+    }
+
+    #[test]
+    fn timer_tick_while_idle_is_safe() {
+        // Regression: when current is Blocked (idling in block_current's
+        // wfi loop) and a timer IRQ fires, the kernel's tick() must
+        // guard — it cannot call step(Preempt) because the precondition
+        // requires current=Running. The kernel returns early; the model
+        // is unchanged.
+        let mut s = SchedState::new();
+        s.block_current().unwrap();
+        // Verify: current is Blocked
+        assert_eq!(s.get(s.current), Some(SchedThreadState::Blocked));
+        // Verify: calling step(Preempt) in this state would panic
+        // (we don't actually call it; the kernel's tick() guard prevents it)
+        // But check_invariants still holds (even with Blocked current).
+        assert!(s.check_invariants());
+    }
+
+    // --- Strengthened check_invariants ---
+
+    #[test]
+    fn invariants_reject_running_not_current() {
+        let mut s = SchedState::new();
+        s.add_thread().unwrap();
+        // Two Running threads at once is invalid
+        s.states[1] = Some(SchedThreadState::Running);
+        assert!(!s.check_invariants());
+    }
+
+    #[test]
+    fn invariants_reject_running_is_not_current() {
+        let mut s = SchedState::new();
+        s.add_thread().unwrap();
+        // current=0 Ready, thread 1 Running — Running is not current
+        s.states[0] = Some(SchedThreadState::Ready);
+        s.states[1] = Some(SchedThreadState::Running);
+        // current still 0
+        assert!(!s.check_invariants());
+    }
+
+    #[test]
+    fn invariants_reject_current_not_registered() {
+        let mut s = SchedState::new();
+        s.current = 5; // points at unregistered slot
+        assert!(!s.check_invariants());
+    }
+
     // --- Reachable-state exploration (actual BFS) ---
 
     // Starting from the initial state (one Running thread), apply every
@@ -423,21 +613,24 @@ mod tests {
         if s.get(s.current) == Some(SchedThreadState::Running) {
             let mut s2 = s.clone();
             if s2.block_current().is_ok() {
-                // Follow up with schedule(Block) which must complete
-                let d = s2.decide(SchedReason::Block);
-                if s2.apply_decision(SchedReason::Block, d).is_ok() {
-                    out.push(("block".into(), s2));
-                }
+                // Follow up with step(Block) which must complete
+                let _ = s2.step(SchedReason::Block);
+                out.push(("block".into(), s2));
             }
         }
 
-        // Event 3: timer tick (Preempt)
+        // Event 3: timer IRQ (matches kernel tick() semantics). If
+        // current is Running, this is a Preempt. If current is Blocked
+        // (idle loop inside block_current), the kernel's tick() guards
+        // and returns without stepping — state is unchanged. This
+        // models the real-world interrupt-while-idling case.
         {
             let mut s2 = s.clone();
-            let d = s2.decide(SchedReason::Preempt);
-            if s2.apply_decision(SchedReason::Preempt, d).is_ok() {
-                out.push(("preempt".into(), s2));
+            if s.get(s.current) == Some(SchedThreadState::Running) {
+                let _ = s2.step(SchedReason::Preempt);
             }
+            // Otherwise no-op (kernel's tick() returns early)
+            out.push(("timer_irq".into(), s2));
         }
 
         // Event 4: unblock a Blocked thread (simulates IPC partner arrival)
@@ -489,10 +682,9 @@ mod tests {
         s.add_thread().unwrap(); // thread 1 Ready
         s.states[1] = Some(SchedThreadState::Blocked); // force both not runnable
         s.block_current().unwrap();
-        let d = s.decide(SchedReason::Block);
-        assert_eq!(d, SchedDecision::WaitForInterrupt);
         let before = s.clone();
-        s.apply_decision(SchedReason::Block, d).unwrap();
+        let d = s.step(SchedReason::Block);
+        assert_eq!(d, SchedDecision::WaitForInterrupt);
         assert_eq!(s, before, "WaitForInterrupt must not mutate state");
     }
 }
