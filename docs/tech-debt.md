@@ -122,18 +122,6 @@ The eventual design is a **device manager** process that:
 
 ---
 
-## block_current returns immediately when no thread is Ready
-
-**Where:** `src/sched/scheduler.rs:84`, `lockjaw-types/src/scheduler.rs:25`
-
-**What:** `block_current()` marks the thread Blocked and calls `schedule()`. But if no other thread is Ready, the scheduler model returns `StayOnCurrent`, and `schedule()` flips the thread back to Running and returns. Callers like `notification_wait` and IPC `execute_ipc` assume `block_current()` does not return until the thread is unblocked — they resume and read state that hasn't been updated yet.
-
-**Why bootstrap:** With the current workload, there is always at least one Ready thread (the boot/init thread or the IPC test threads). The all-blocked case hasn't been triggered.
-
-**Fix:** `block_current()` must spin or wfi in a loop until the thread is actually unblocked. The scheduler should idle (wfi) when all threads are blocked instead of returning to the caller. Alternatively, keep an explicit idle thread that is always Ready.
-
----
-
 ## Kernel threads leave stale user TTBR0 in hardware
 
 **Where:** `src/sched/scheduler.rs:147`, `src/main.rs:280-310`

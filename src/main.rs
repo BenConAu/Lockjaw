@@ -303,7 +303,6 @@ pub extern "C" fn kmain() -> ! {
         core::ptr::write(idle_tcb_va, sched::tcb::Tcb {
             header: ObjectHeader { obj_type: ObjectType::ThreadControlBlock, page_count: 1 },
             saved_sp: 0,
-            state: sched::tcb::ThreadState::Running,
             entry: idle_thread,
             stack_base: idle_stack_base,
             handle_table_paddr: idle_ht_page.as_u64(),
@@ -416,7 +415,7 @@ pub extern "C" fn kmain() -> ! {
 
         // Allocate user stack (4 pages = 16KB for init, which embeds and spawns
         // multiple processes including the device manager)
-        let user_stack_pages = 4;
+        let user_stack_pages = 8;
         let user_stack_va: u64 = lockjaw_types::constants::USER_STACK_BASE;
         let user_stack_top: u64 = user_stack_va + (user_stack_pages as u64) * mm::addr::PAGE_SIZE;
         for s in 0..user_stack_pages {

@@ -11,7 +11,13 @@ QEMU_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -display none \
 
 INIT_ELF := user/init/target/aarch64-unknown-none/release/lockjaw-init
 
-.PHONY: build build-release build-user build-hash run run-release objdump nm check-stack check-pointers test test-unit test-qemu clean
+USER_CRATES := user/hello user/uart-driver user/device-manager user/init
+
+.PHONY: build build-release build-user build-hash clean-all run run-release objdump nm check-stack check-pointers test test-unit test-qemu clean
+
+clean-all:
+	cargo clean
+	@for d in $(USER_CRATES); do (cd $$d && cargo clean 2>/dev/null); done
 
 build-hash:
 	@mkdir -p target
@@ -19,7 +25,7 @@ build-hash:
 	@cmp -s target/source-hash.txt.tmp target/source-hash.txt 2>/dev/null || mv target/source-hash.txt.tmp target/source-hash.txt
 	@rm -f target/source-hash.txt.tmp
 
-build-user: build-hash
+build-user: clean-all build-hash
 	cd user/hello && cargo build --release
 	cd user/uart-driver && cargo build --release
 	cd user/device-manager && cargo build --release

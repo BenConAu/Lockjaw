@@ -6,24 +6,19 @@ use core::ptr;
 // Thread state
 // ---------------------------------------------------------------------------
 
-/// Scheduling state of a thread.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThreadState {
-    Ready,
-    Running,
-    Blocked,
-}
-
 // ---------------------------------------------------------------------------
 // TCB — stored in donated pages
 // ---------------------------------------------------------------------------
+// Thread scheduling state (Ready/Running/Blocked) is NOT stored here.
+// The scheduler's pure state machine in lockjaw_types::scheduler owns
+// it. The TCB holds hardware-facing context (saved SP, TTBR0, etc.)
+// plus object metadata.
 
 /// Thread Control Block. Stored at the start of a donated page.
 #[repr(C)]
 pub struct Tcb {
     pub header: ObjectHeader,
     pub saved_sp: u64,
-    pub state: ThreadState,
     pub entry: fn() -> !,
     pub stack_base: u64,
     pub handle_table_paddr: u64,
@@ -120,7 +115,6 @@ pub unsafe fn create_tcb(
             page_count: 1,
         },
         saved_sp: saved_ctx_sp,
-        state: ThreadState::Ready,
         entry: info.entry,
         stack_base: stack_va,
         handle_table_paddr: info.handle_table_paddr.as_u64(),
