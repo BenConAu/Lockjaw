@@ -11,9 +11,16 @@ QEMU_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -display none \
 
 INIT_ELF := user/init/target/aarch64-unknown-none/release/lockjaw-init
 
-USER_CRATES := user/hello user/uart-driver user/device-manager user/init
+# ramfb display: add -device ramfb and a display backend.
+QEMU_DISPLAY_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -m 128M \
+	-chardev stdio,mux=on,id=char0 -mon chardev=char0,mode=readline \
+	-serial chardev:char0 -serial chardev:char0 \
+	-device ramfb -display cocoa \
+	-kernel
 
-.PHONY: build build-release build-user build-hash clean-all run run-release objdump nm check-stack check-pointers test test-unit test-qemu clean
+USER_CRATES := user/hello user/uart-driver user/device-manager user/ramfb-driver user/init
+
+.PHONY: build build-release build-user build-hash clean-all run run-release run-display objdump nm check-stack check-pointers test test-unit test-qemu clean
 
 clean-all:
 	cargo clean
@@ -29,6 +36,7 @@ build-user: clean-all build-hash
 	cd user/hello && cargo build --release
 	cd user/uart-driver && cargo build --release
 	cd user/device-manager && cargo build --release
+	cd user/ramfb-driver && cargo build --release
 	cd user/init && cargo build --release
 
 build: build-user check-stack check-pointers
@@ -42,6 +50,9 @@ run: build
 
 run-release: build-release
 	$(QEMU) $(QEMU_FLAGS) $(KERNEL_ELF_RELEASE)
+
+run-display: build
+	$(QEMU) $(QEMU_DISPLAY_FLAGS) $(KERNEL_ELF)
 
 objdump: build
 	cargo objdump -- -d | head -80

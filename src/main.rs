@@ -424,8 +424,8 @@ pub extern "C" fn kmain() -> ! {
             }
         }
 
-        // Allocate user stack (4 pages = 16KB for init, which embeds and spawns
-        // multiple processes including the device manager)
+        // Allocate user stack (8 pages = 32KB for init, which embeds and spawns
+        // multiple processes including the ramfb display driver)
         let user_stack_pages = 8;
         let user_stack_va: u64 = lockjaw_types::constants::USER_STACK_BASE;
         let user_stack_top: u64 = user_stack_va + (user_stack_pages as u64) * mm::addr::PAGE_SIZE;

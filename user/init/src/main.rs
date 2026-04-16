@@ -22,6 +22,10 @@ static UART_ELF: &[u8] = include_bytes!("../../uart-driver/target/aarch64-unknow
 /// Built by: cd user/device-manager && cargo build --release
 static DEVMGR_ELF: &[u8] = include_bytes!("../../device-manager/target/aarch64-unknown-none/release/lockjaw-device-manager");
 
+/// The ramfb display driver ELF binary, embedded at compile time.
+/// Built by: cd user/ramfb-driver && cargo build --release
+static RAMFB_ELF: &[u8] = include_bytes!("../../ramfb-driver/target/aarch64-unknown-none/release/lockjaw-ramfb-driver");
+
 // ---------------------------------------------------------------------------
 // ELF spawn helper
 // ---------------------------------------------------------------------------
@@ -133,6 +137,7 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
     puts("init: spawning ");
     puts(name);
     puts("...\n");
+
     let result = sys_create_process(
         map_array_va,
         mapping_count as u64,
@@ -263,11 +268,13 @@ pub extern "C" fn _start() -> ! {
     let hello_boot_ep = alloc_endpoint("hello boot");
     let devmgr_boot_ep = alloc_endpoint("devmgr boot");
     let uart_boot_ep = alloc_endpoint("uart boot");
+    let ramfb_boot_ep = alloc_endpoint("ramfb boot");
 
     // Spawn child processes.
     spawn_elf(HELLO_ELF, "hello", 0x0070_0000, 0x00A0_0000, scratch_ps, hello_boot_ep, 1);
     spawn_elf(DEVMGR_ELF, "device-manager", 0x0072_0000, 0x00E0_0000, scratch_ps, devmgr_boot_ep, 8);
     spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000, scratch_ps, uart_boot_ep, 4);
+    spawn_elf(RAMFB_ELF, "ramfb-driver", 0x0073_0000, 0x0100_0000, scratch_ps, ramfb_boot_ep, 4);
 
     // Bootstrap hello: export a test notification into its handle table.
     puts("init: waiting for hello bootstrap...\n");
@@ -310,6 +317,16 @@ pub extern "C" fn _start() -> ! {
     };
     sys_reply(uart_ep_idx, uart_devmgr_idx, 0, 0);
     puts("init: uart bootstrapped\n");
+
+    // Bootstrap ramfb driver: export devmgr_ep so it can claim fw_cfg.
+    puts("init: waiting for ramfb bootstrap...\n");
+    let _ = sys_receive(ramfb_boot_ep);
+    let ramfb_devmgr_idx = match sys_export_handle(devmgr_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export devmgr to ramfb FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(ramfb_devmgr_idx, 0, 0, 0);
+    puts("init: ramfb bootstrapped\n");
 
     // Allocate a Reply object for init's own outbound calls (ipc_puts to
     // the uart server). Each client that issues sys_call needs one.

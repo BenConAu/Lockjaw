@@ -42,8 +42,10 @@ const FOURCC_XRGB8888: u32 = 0x34325258;
 /// fw_cfg MMIO page (1 page)
 const FWCFG_VA: u64 = 0x0020_0000;
 
-/// Framebuffer VA (must be L2-aligned for large mapping)
-const FB_VA: u64 = 0x0040_0000;
+/// Framebuffer VA (must be L2-aligned for large mapping).
+/// Chosen above the driver's text (0x400000) and data (up to ~0x440000)
+/// segments and above the user stack region (~0x800000) to avoid overlap.
+const FB_VA: u64 = 0x1000_0000;
 
 // ---------------------------------------------------------------------------
 // fw_cfg MMIO helpers
