@@ -6,11 +6,9 @@
 //!
 //! No allocation — the storage is the TCB's own page.
 //!
-//! These helpers are unused until the IPC cutover commit rewires
-//! `execute_ipc` around queue semantics. Marked `#[allow(dead_code)]`
-//! until then so the build stays warning-clean.
-
-#![allow(dead_code)]
+//! `remove`, `is_empty`, and `peek_head` are used by future process
+//! teardown and readiness paths; `#[allow(dead_code)]` on them keeps
+//! the build clean until those callers land.
 
 use crate::ipc::endpoint::EndpointObject;
 use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
@@ -70,6 +68,7 @@ pub unsafe fn dequeue(ep: *mut EndpointObject) -> Option<PhysAddr> {
 /// # Safety
 /// `ep` must be a valid EndpointObject pointer. `tcb_paddr` must be
 /// the paddr of a valid Tcb (whether or not it's actually queued here).
+#[allow(dead_code)]
 pub unsafe fn remove(ep: *mut EndpointObject, tcb_paddr: PhysAddr) -> bool {
     let target = tcb_paddr.as_u64();
     let mut prev: u64 = 0;
@@ -102,6 +101,7 @@ pub unsafe fn remove(ep: *mut EndpointObject, tcb_paddr: PhysAddr) -> bool {
 ///
 /// # Safety
 /// `ep` must be a valid EndpointObject pointer.
+#[allow(dead_code)]
 pub unsafe fn is_empty(ep: *const EndpointObject) -> bool {
     (*ep).queue_head == 0
 }
@@ -110,6 +110,7 @@ pub unsafe fn is_empty(ep: *const EndpointObject) -> bool {
 ///
 /// # Safety
 /// `ep` must be a valid EndpointObject pointer.
+#[allow(dead_code)]
 pub unsafe fn peek_head(ep: *const EndpointObject) -> Option<PhysAddr> {
     let head = (*ep).queue_head;
     if head == 0 { None } else { Some(PhysAddr::new(head)) }

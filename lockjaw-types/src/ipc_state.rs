@@ -1,17 +1,17 @@
-//! IPC state machine model for the Reply-object + intrusive-queue design.
+//! IPC state machine model — Reply-object + intrusive-queue design.
 //!
-//! This module runs in parallel with [`crate::ipc_state`] during the IPC
-//! redesign. The kernel still consumes the old module; this one is exercised
-//! only by host tests. The cutover commit will swap the kernel over to this
-//! module, and the subsequent cleanup commit will remove the old one.
+//! This is the pure model the kernel's endpoint implementation mirrors.
+//! Every `step()` transition corresponds to a sequence of effects the kernel
+//! applies over live TCB/endpoint pointers; the model proves that shape is
+//! internally consistent and free of the multi-caller overwrite bug.
 //!
-//! ### Why a new model
+//! ### What changed from the earlier one-caller model
 //!
-//! The old model assumes at most one caller per endpoint (a single
-//! `caller_tcb_paddr` slot). Two clients calling the same endpoint before
-//! the server replies silently overwrite each other — a real corruption bug
-//! hit during ramfb/uart-driver bring-up. The new model eliminates that
-//! failure mode by:
+//! The previous design assumed at most one caller per endpoint (a single
+//! `caller_tcb_paddr` slot on the EndpointObject). Two clients calling the
+//! same endpoint before the server replied silently overwrote each other —
+//! a real corruption bug hit during ramfb/uart-driver bring-up. This model
+//! eliminates that failure mode by:
 //!
 //! 1. Making the endpoint a queue of waiters rather than a single-slot
 //!    rendezvous.

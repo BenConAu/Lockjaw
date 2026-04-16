@@ -7,7 +7,7 @@ use crate::sched::tcb::Tcb;
 use core::ptr;
 
 // ---------------------------------------------------------------------------
-// Endpoint state tags — mirror lockjaw_types::ipc_state_reply::EpState
+// Endpoint state tags — mirror lockjaw_types::ipc_state::EpState
 // ---------------------------------------------------------------------------
 
 pub const EP_IDLE: u8 = 0;
@@ -29,25 +29,19 @@ pub const WAIT_KIND_CALL: u8 = 3;
 
 /// Kernel-side endpoint object stored in a donated page.
 ///
-/// The `state`, `queue_head`, and `queue_tail` fields drive all current
-/// IPC. The legacy `blocked_tcb_paddr` / `msg` / `caller_tcb_paddr`
-/// fields are unused after the Reply-object redesign; they will be
-/// removed in the cleanup commit.
+/// The state is simply "do we have waiters, a blocked receiver, or nobody."
+/// Waiters link themselves into the queue via `ipc_queue_next` in their own
+/// TCBs; messages travel via the waiter's `ipc_msg`. Per-call caller
+/// identity lives on each client's Reply object, not on the endpoint.
 #[repr(C)]
 pub struct EndpointObject {
     pub header: ObjectHeader,
     /// EP_IDLE, EP_HAS_WAITERS, or EP_HAS_RECEIVER.
     pub state: u8,
-    /// Legacy — unused. Kept to preserve struct layout until cleanup.
-    pub blocked_tcb_paddr: u64,
-    /// Legacy — unused. Messages travel via TCB.ipc_msg now.
-    pub msg: [u64; 4],
-    /// Legacy — unused. Per-call identity lives in Reply objects.
-    pub caller_tcb_paddr: u64,
     /// Thread waiting via sys_wait_any for readiness.
     pub readiness_waiter: lockjaw_types::wait::ReadinessWaiter,
     /// Head of the intrusive waiter queue (paddr of first queued TCB,
-    /// 0 = empty). TCBs link via their ipc_queue_next field.
+    /// 0 = empty). TCBs link via their `ipc_queue_next` field.
     pub queue_head: u64,
     /// Tail of the intrusive waiter queue.
     pub queue_tail: u64,
@@ -66,9 +60,6 @@ pub unsafe fn create_endpoint(base_paddr: PhysAddr) -> Result<(), CreateError> {
             page_count: 1,
         },
         state: EP_IDLE,
-        blocked_tcb_paddr: 0,
-        msg: [0; 4],
-        caller_tcb_paddr: 0,
         readiness_waiter: lockjaw_types::wait::ReadinessWaiter::empty(),
         queue_head: 0,
         queue_tail: 0,
@@ -92,7 +83,7 @@ pub enum IpcError {
 // IPC operations
 // ---------------------------------------------------------------------------
 //
-// Each operation mirrors a transition in lockjaw_types::ipc_state_reply.
+// Each operation mirrors a transition in lockjaw_types::ipc_state.
 // The model proves the state-machine shape; the kernel mechanically
 // implements the same transitions over live pointers.
 
@@ -285,8 +276,8 @@ pub unsafe fn ipc_receive_nb(
 // ---------------------------------------------------------------------------
 
 /// Read the endpoint's model EpState. Used by sys_wait_any for readiness.
-pub fn read_state(ep_paddr: PhysAddr) -> lockjaw_types::ipc_state_reply::EpState {
-    use lockjaw_types::ipc_state_reply::EpState;
+pub fn read_state(ep_paddr: PhysAddr) -> lockjaw_types::ipc_state::EpState {
+    use lockjaw_types::ipc_state::EpState;
     unsafe {
         match (*ep_ptr(ep_paddr)).state {
             EP_HAS_WAITERS => EpState::HasWaiters,

@@ -4,7 +4,7 @@
 /// The kernel reads object state and calls these functions to determine
 /// readiness and validate syscall parameters.
 
-use crate::ipc_state_reply::EpState;
+use crate::ipc_state::EpState;
 
 /// Maximum number of objects in a single sys_wait_any call.
 pub const MAX_WAIT_OBJECTS: usize = 4;

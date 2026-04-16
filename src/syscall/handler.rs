@@ -580,7 +580,7 @@ fn check_readiness(
     count: usize,
 ) -> u64 {
     use lockjaw_types::wait::{ObjectReadiness, compute_ready_mask, MAX_WAIT_OBJECTS};
-    use lockjaw_types::ipc_state_reply::EpState;
+    use lockjaw_types::ipc_state::EpState;
 
     let mut objects = [ObjectReadiness::Endpoint(EpState::Idle); MAX_WAIT_OBJECTS];
     for i in 0..count {
