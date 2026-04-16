@@ -22,6 +22,17 @@ const FWCFG_DMA: u64 = 0x10;      // DMA address register (write-only, 64-bit BE
 const FW_CFG_FILE_DIR: u16 = 0x0019;
 
 // ---------------------------------------------------------------------------
+// fw_cfg DMA control flags (in the FWCfgDmaAccess.control BE u32)
+// ---------------------------------------------------------------------------
+// Since QEMU v2.4 PIO writes to the DATA register are no-ops; writes must go
+// through the DMA interface (reinstated in v2.9). That's what drives ramfb's
+// write-callback. See QEMU docs/specs/fw_cfg.rst.
+const DMA_CTRL_ERROR:  u32 = 1 << 0;  // set by device on failure
+const DMA_CTRL_SKIP:   u32 = 1 << 2;  // skip bytes without reading/writing
+const DMA_CTRL_SELECT: u32 = 1 << 3;  // selector in bits 16..31 of control
+const DMA_CTRL_WRITE:  u32 = 1 << 4;  // transfer is guest -> device
+
+// ---------------------------------------------------------------------------
 // ramfb configuration
 // ---------------------------------------------------------------------------
 
@@ -46,6 +57,10 @@ const FWCFG_VA: u64 = 0x0020_0000;
 /// Chosen above the driver's text (0x400000) and data (up to ~0x440000)
 /// segments and above the user stack region (~0x800000) to avoid overlap.
 const FB_VA: u64 = 0x1000_0000;
+
+/// One-page scratch region for the FWCfgDmaAccess header + the 28-byte
+/// RAMFBConfig it references. Lives in guest RAM so QEMU can read both.
+const DMA_VA: u64 = 0x0030_0000;
 
 // ---------------------------------------------------------------------------
 // fw_cfg MMIO helpers
@@ -219,18 +234,81 @@ pub extern "C" fn _start() -> ! {
     }
     puts("ramfb: test pattern written\n");
 
-    // Write RAMFBConfig to fw_cfg (28 bytes, all big-endian)
-    let mut config = [0u8; 28];
-    config[0..8].copy_from_slice(&fb_phys.to_be_bytes());          // addr
-    config[8..12].copy_from_slice(&FOURCC_XRGB8888.to_be_bytes()); // fourcc
-    config[12..16].copy_from_slice(&0u32.to_be_bytes());           // flags
-    config[16..20].copy_from_slice(&FB_WIDTH.to_be_bytes());       // width
-    config[20..24].copy_from_slice(&FB_HEIGHT.to_be_bytes());      // height
-    config[24..28].copy_from_slice(&FB_STRIDE.to_be_bytes());      // stride
+    // Allocate a scratch page for the DMA control header + the inline
+    // RAMFBConfig. We need both in guest RAM at known physical addresses
+    // because QEMU reads them by phys addr during the DMA transfer.
+    let dma_ps = match sys_alloc_pages(1) {
+        Ok(id) => id,
+        Err(_) => { puts("ramfb: alloc dma FAILED\n"); halt(); }
+    };
+    if !sys_map_pages(dma_ps, DMA_VA, 0).is_ok() {
+        puts("ramfb: map dma FAILED\n");
+        halt();
+    }
+    let dma_phys = match sys_query_pageset_phys(dma_ps, 0) {
+        Ok(p) => p,
+        Err(_) => { puts("ramfb: query dma phys FAILED\n"); halt(); }
+    };
+
+    // Layout inside the DMA page:
+    //   [0..16]   FWCfgDmaAccess header (control, length, address — all BE)
+    //   [16..44]  RAMFBConfig  (addr, fourcc, flags, width, height, stride — all BE)
+    let header_va = DMA_VA as *mut u8;
+    let config_va = (DMA_VA + 16) as *mut u8;
+    let config_phys = dma_phys + 16;
 
     unsafe {
-        fwcfg_select(ramfb_sel);
-        fwcfg_write_bytes(&config);
+        // Fill RAMFBConfig.
+        let mut cfg = [0u8; 28];
+        cfg[0..8].copy_from_slice(&fb_phys.to_be_bytes());
+        cfg[8..12].copy_from_slice(&FOURCC_XRGB8888.to_be_bytes());
+        cfg[12..16].copy_from_slice(&0u32.to_be_bytes());
+        cfg[16..20].copy_from_slice(&FB_WIDTH.to_be_bytes());
+        cfg[20..24].copy_from_slice(&FB_HEIGHT.to_be_bytes());
+        cfg[24..28].copy_from_slice(&FB_STRIDE.to_be_bytes());
+        for (i, b) in cfg.iter().enumerate() {
+            ptr::write_volatile(config_va.add(i), *b);
+        }
+
+        // Fill FWCfgDmaAccess: control, length, address.
+        let control: u32 =
+            ((ramfb_sel as u32) << 16) | DMA_CTRL_SELECT | DMA_CTRL_WRITE;
+        for (i, b) in control.to_be_bytes().iter().enumerate() {
+            ptr::write_volatile(header_va.add(i), *b);
+        }
+        for (i, b) in (28u32).to_be_bytes().iter().enumerate() {
+            ptr::write_volatile(header_va.add(4 + i), *b);
+        }
+        for (i, b) in config_phys.to_be_bytes().iter().enumerate() {
+            ptr::write_volatile(header_va.add(8 + i), *b);
+        }
+
+        // Full system barrier: make sure the header is observable in RAM
+        // before we trigger the DMA via the MMIO register.
+        asm!("dsb sy");                          // finish prior stores before MMIO
+
+        // Trigger DMA: write the guest-physical address of the header,
+        // big-endian, to the 64-bit DMA address register.
+        ptr::write_volatile((FWCFG_VA + FWCFG_DMA) as *mut u64, dma_phys.to_be());
+
+        // Poll the control field. QEMU clears the READ/SKIP/SELECT/WRITE
+        // bits when the transfer finishes; ERROR (bit 0) means failure.
+        loop {
+            let cb = [
+                ptr::read_volatile(header_va.add(0)),
+                ptr::read_volatile(header_va.add(1)),
+                ptr::read_volatile(header_va.add(2)),
+                ptr::read_volatile(header_va.add(3)),
+            ];
+            let ctl = u32::from_be_bytes(cb);
+            if ctl & DMA_CTRL_ERROR != 0 {
+                puts("ramfb: DMA error\n");
+                halt();
+            }
+            if ctl & (DMA_CTRL_SELECT | DMA_CTRL_SKIP | DMA_CTRL_WRITE) == 0 {
+                break;
+            }
+        }
     }
     puts("ramfb: display configured\n");
 
