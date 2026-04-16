@@ -55,6 +55,13 @@ pub struct EndpointObject {
     /// Thread waiting via sys_wait_any for readiness.
     /// Woken (without consuming) when a sender/caller arrives.
     pub readiness_waiter: lockjaw_types::wait::ReadinessWaiter,
+    /// Head of the intrusive waiter queue (paddr of first queued TCB,
+    /// 0 = empty). Written by enqueue/dequeue. Unused until the IPC
+    /// cutover commit switches execute_ipc over to queue semantics.
+    pub queue_head: u64,
+    /// Tail of the intrusive waiter queue (paddr of last queued TCB,
+    /// 0 = empty). Enables O(1) append.
+    pub queue_tail: u64,
 }
 
 /// Initialize an endpoint object in donated memory.
@@ -74,6 +81,8 @@ pub unsafe fn create_endpoint(base_paddr: PhysAddr) -> Result<(), CreateError> {
         msg: [0; 4],
         caller_tcb_paddr: 0,
         readiness_waiter: lockjaw_types::wait::ReadinessWaiter::empty(),
+        queue_head: 0,
+        queue_tail: 0,
     });
     Ok(())
 }

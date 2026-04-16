@@ -28,6 +28,23 @@ pub struct Tcb {
     /// messages here; the syscall handler copies them to the exception
     /// context (x0-x3) for userspace. Do not use for other purposes.
     pub ipc_msg: [u64; 4],
+    /// Intrusive link in an endpoint's waiter queue (paddr of next TCB,
+    /// 0 = tail). Written on enqueue, cleared on dequeue. Unused until
+    /// the IPC cutover commit wires the new queue-based endpoint.
+    pub ipc_queue_next: u64,
+    /// Kind of wait currently held on an endpoint: 0 = none, 1 = Send,
+    /// 2 = Receive, 3 = Call. Set on enqueue, cleared on dequeue.
+    /// The server reads this on sys_receive to decide whether to unblock
+    /// the head waiter (Send) or leave it blocked awaiting reply (Call).
+    pub ipc_wait_kind: u8,
+    /// Server-side: paddr of the Reply object bound to the call currently
+    /// being handled by this thread. Set by sys_receive when dequeuing a
+    /// Call; cleared by sys_reply. 0 = no outstanding call.
+    pub current_reply_paddr: u64,
+    /// Caller-side: paddr of this thread's own Reply object while queued
+    /// as a Call waiter, so the server can pick it up on sys_receive.
+    /// 0 when not queued as a Call.
+    pub ipc_call_reply_paddr: u64,
     /// ELF entry point VA for user processes (0 for kernel threads).
     pub user_entry_point: u64,
     /// User stack top VA for user processes (0 for kernel threads).
@@ -50,6 +67,9 @@ pub struct Tcb {
     /// Process name for diagnostics. NUL-terminated, max 15 chars + NUL.
     pub name: [u8; 16],
 }
+
+// A TCB must fit in one 4 KB page — it's allocated from a single donated page.
+const _: () = assert!(core::mem::size_of::<Tcb>() <= PAGE_SIZE as usize);
 
 // ---------------------------------------------------------------------------
 // Vulkan-style create-info
@@ -121,6 +141,10 @@ pub unsafe fn create_tcb(
         ttbr0_paddr: info.ttbr0_paddr.as_u64(),
         ipc_blocked_on: 0,
         ipc_msg: [0; 4],
+        ipc_queue_next: 0,
+        ipc_wait_kind: 0,
+        current_reply_paddr: 0,
+        ipc_call_reply_paddr: 0,
         user_entry_point: info.user_entry_point,
         user_stack_top: info.user_stack_top,
         user_stack_base: info.user_stack_base,
