@@ -1,6 +1,7 @@
 use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
 use crate::ipc::endpoint::IpcError;
-use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
+use crate::mm::addr::PhysAddr;
+use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::scheduler;
 use crate::sched::tcb::Tcb;
 use core::ptr;
@@ -34,9 +35,9 @@ pub struct ReplyObject {
 /// # Safety
 /// `base_paddr` must be a donated page (one page, not mapped by userspace).
 pub unsafe fn create_reply(base_paddr: PhysAddr) -> Result<(), CreateError> {
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    let obj_va = (base_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut ReplyObject;
-    ptr::write(obj_va, ReplyObject {
+    let mut slot = KernelMut::<ReplyObject>::from_paddr(base_paddr);
+    // SAFETY: writing into freshly donated, uninitialized storage.
+    ptr::write(slot.as_mut_ptr(), ReplyObject {
         header: ObjectHeader {
             obj_type: ObjectType::Reply,
             page_count: 1,
@@ -64,47 +65,38 @@ pub unsafe fn ipc_reply(
     replier_tcb_paddr: PhysAddr,
     msg: [u64; 4],
 ) -> Result<(), IpcError> {
-    let replier_tcb = tcb_ptr_mut(replier_tcb_paddr);
-    let reply_paddr_u64 = (*replier_tcb).current_reply_paddr;
+    let mut replier_tcb = KernelMut::<Tcb>::from_paddr(replier_tcb_paddr);
+    let reply_paddr_u64 = replier_tcb.get().current_reply_paddr;
     if reply_paddr_u64 == 0 {
         return Err(IpcError::NoCaller);
     }
 
-    let reply = reply_ptr_mut(PhysAddr::new(reply_paddr_u64));
-    if (*reply).state != REPLY_STATE_BOUND {
+    let mut reply = KernelMut::<ReplyObject>::from_paddr(PhysAddr::new(reply_paddr_u64));
+    if reply.get().state != REPLY_STATE_BOUND {
         // Someone else (or stale state) — shouldn't happen in a coherent kernel.
         return Err(IpcError::NoCaller);
     }
-    let caller_paddr_u64 = (*reply).caller_tcb_paddr;
-    let caller_paddr = PhysAddr::new(caller_paddr_u64);
-    let caller_tcb = tcb_ptr_mut(caller_paddr);
+    let caller_paddr = PhysAddr::new(reply.get().caller_tcb_paddr);
+    let mut caller_tcb = KernelMut::<Tcb>::from_paddr(caller_paddr);
 
     // Deliver the reply message straight to the caller's ipc_msg.
-    (*caller_tcb).ipc_msg = msg;
-    (*caller_tcb).ipc_blocked_on = 0;
+    {
+        let c = caller_tcb.get_mut();
+        c.ipc_msg = msg;
+        c.ipc_blocked_on = 0;
+    }
 
     // Unblock BEFORE clearing the Reply (ordering rule: UnblockThread
     // precedes ClearReply, because unblock reads reply.caller).
     scheduler::unblock_thread(caller_paddr);
 
     // Return the Reply to Fresh and detach this server from the call.
-    (*reply).state = REPLY_STATE_FRESH;
-    (*reply).caller_tcb_paddr = 0;
-    (*replier_tcb).current_reply_paddr = 0;
+    {
+        let r = reply.get_mut();
+        r.state = REPLY_STATE_FRESH;
+        r.caller_tcb_paddr = 0;
+    }
+    replier_tcb.get_mut().current_reply_paddr = 0;
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Pointer helpers
-// ---------------------------------------------------------------------------
-
-unsafe fn reply_ptr_mut(paddr: PhysAddr) -> *mut ReplyObject {
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut ReplyObject
-}
-
-unsafe fn tcb_ptr_mut(paddr: PhysAddr) -> *mut Tcb {
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut Tcb
 }

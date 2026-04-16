@@ -1,7 +1,8 @@
 use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
 use crate::ipc::ep_queue;
 use crate::ipc::reply::{REPLY_STATE_BOUND, REPLY_STATE_FRESH, ReplyObject};
-use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
+use crate::mm::addr::PhysAddr;
+use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::scheduler;
 use crate::sched::tcb::Tcb;
 use core::ptr;
@@ -52,9 +53,9 @@ pub struct EndpointObject {
 /// # Safety
 /// `base_paddr` must point to a donated page not mapped by userspace.
 pub unsafe fn create_endpoint(base_paddr: PhysAddr) -> Result<(), CreateError> {
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    let ep_va = (base_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut EndpointObject;
-    ptr::write(ep_va, EndpointObject {
+    let mut slot = KernelMut::<EndpointObject>::from_paddr(base_paddr);
+    // SAFETY: writing into freshly donated, uninitialized storage.
+    ptr::write(slot.as_mut_ptr(), EndpointObject {
         header: ObjectHeader {
             obj_type: ObjectType::Endpoint,
             page_count: 1,
@@ -96,34 +97,42 @@ pub unsafe fn ipc_send(
     msg: [u64; 4],
     sender_tcb_paddr: PhysAddr,
 ) -> Result<(), IpcError> {
-    let ep = ep_ptr_mut(endpoint_paddr);
+    let mut ep = KernelMut::<EndpointObject>::from_paddr(endpoint_paddr);
 
-    if (*ep).state == EP_HAS_RECEIVER {
+    if ep.get().state == EP_HAS_RECEIVER {
         // Fast path: receiver is queued. Dequeue, transfer, unblock.
-        let receiver = ep_queue::dequeue(ep).expect("HasReceiver without queued waiter");
-        let receiver_tcb = tcb_ptr_mut(receiver);
-        (*receiver_tcb).ipc_msg = msg;
-        (*receiver_tcb).ipc_wait_kind = WAIT_KIND_NONE;
-        // Receiver's ipc_blocked_on was set when it queued itself; clear it
-        // now so teardown/diagnostic code never sees a runnable thread that
-        // looks blocked on an endpoint.
-        (*receiver_tcb).ipc_blocked_on = 0;
+        let receiver = ep_queue::dequeue(ep.get_mut())
+            .expect("HasReceiver without queued waiter");
+        let mut receiver_tcb = KernelMut::<Tcb>::from_paddr(receiver);
+        {
+            let r = receiver_tcb.get_mut();
+            r.ipc_msg = msg;
+            r.ipc_wait_kind = WAIT_KIND_NONE;
+            // Receiver's ipc_blocked_on was set when it queued itself; clear
+            // it so teardown/diagnostics never see a runnable thread that
+            // looks blocked on an endpoint.
+            r.ipc_blocked_on = 0;
+        }
         scheduler::unblock_thread(receiver);
-        (*ep).state = EP_IDLE;
+        ep.get_mut().state = EP_IDLE;
         return Ok(());
     }
 
     // Slow path: queue self as Send, block.
-    let sender_tcb = tcb_ptr_mut(sender_tcb_paddr);
-    (*sender_tcb).ipc_msg = msg;
-    (*sender_tcb).ipc_wait_kind = WAIT_KIND_SEND;
-    (*sender_tcb).ipc_blocked_on = endpoint_paddr.as_u64();
-    ep_queue::enqueue(ep, sender_tcb_paddr);
+    let mut sender_tcb = KernelMut::<Tcb>::from_paddr(sender_tcb_paddr);
+    {
+        let s = sender_tcb.get_mut();
+        s.ipc_msg = msg;
+        s.ipc_wait_kind = WAIT_KIND_SEND;
+        s.ipc_blocked_on = endpoint_paddr.as_u64();
+    }
+    ep_queue::enqueue(ep.get_mut(), sender_tcb_paddr);
 
-    let became_has_waiters = (*ep).state == EP_IDLE;
+    let ep_ref = ep.get_mut();
+    let became_has_waiters = ep_ref.state == EP_IDLE;
     if became_has_waiters {
-        (*ep).state = EP_HAS_WAITERS;
-        wake_readiness_waiter_if_registered(ep);
+        ep_ref.state = EP_HAS_WAITERS;
+        wake_readiness_waiter_if_registered(ep_ref);
     }
 
     scheduler::block_current();
@@ -139,42 +148,43 @@ pub unsafe fn ipc_receive(
     endpoint_paddr: PhysAddr,
     receiver_tcb_paddr: PhysAddr,
 ) -> Result<[u64; 4], IpcError> {
-    let ep = ep_ptr_mut(endpoint_paddr);
-    let receiver_tcb = tcb_ptr_mut(receiver_tcb_paddr);
+    let mut ep = KernelMut::<EndpointObject>::from_paddr(endpoint_paddr);
+    let mut receiver_tcb = KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr);
 
     // Single-reply-slot rule: cannot Receive while holding an outstanding Reply.
-    if (*receiver_tcb).current_reply_paddr != 0 {
+    if receiver_tcb.get().current_reply_paddr != 0 {
         return Err(IpcError::EndpointBusy);
     }
 
-    match (*ep).state {
+    match ep.get().state {
         EP_HAS_WAITERS => {
             // Dequeue head — either a Send or Call waiter.
-            let head = ep_queue::dequeue(ep).expect("HasWaiters without queued waiter");
-            let head_tcb = tcb_ptr_mut(head);
-            let msg = (*head_tcb).ipc_msg;
-            let kind = (*head_tcb).ipc_wait_kind;
-            (*head_tcb).ipc_wait_kind = WAIT_KIND_NONE;
+            let head = ep_queue::dequeue(ep.get_mut())
+                .expect("HasWaiters without queued waiter");
+            let mut head_tcb = KernelMut::<Tcb>::from_paddr(head);
+            let msg = head_tcb.get().ipc_msg;
+            let kind = head_tcb.get().ipc_wait_kind;
+            head_tcb.get_mut().ipc_wait_kind = WAIT_KIND_NONE;
 
             match kind {
                 WAIT_KIND_SEND => {
                     // Sender is done — wake it.
-                    (*head_tcb).ipc_blocked_on = 0;
+                    head_tcb.get_mut().ipc_blocked_on = 0;
                     scheduler::unblock_thread(head);
                 }
                 WAIT_KIND_CALL => {
                     // Caller stays blocked awaiting reply. Bind the caller's
                     // Reply object to THIS receiver's current_reply slot.
-                    let reply_paddr = (*head_tcb).ipc_call_reply_paddr;
-                    (*head_tcb).ipc_call_reply_paddr = 0;
-                    (*receiver_tcb).current_reply_paddr = reply_paddr;
+                    let reply_paddr = head_tcb.get().ipc_call_reply_paddr;
+                    head_tcb.get_mut().ipc_call_reply_paddr = 0;
+                    receiver_tcb.get_mut().current_reply_paddr = reply_paddr;
                 }
                 _ => unreachable!("HasWaiters queue only holds Send or Call"),
             }
 
             // If the queue is now empty, collapse back to Idle.
-            if (*ep).queue_head == 0 {
-                (*ep).state = EP_IDLE;
+            if ep.get().queue_head == 0 {
+                ep.get_mut().state = EP_IDLE;
             }
             Ok(msg)
         }
@@ -184,15 +194,18 @@ pub unsafe fn ipc_receive(
         }
         EP_IDLE | _ => {
             // Slow path: queue self as Receive, block.
-            (*receiver_tcb).ipc_wait_kind = WAIT_KIND_RECEIVE;
-            (*receiver_tcb).ipc_blocked_on = endpoint_paddr.as_u64();
-            ep_queue::enqueue(ep, receiver_tcb_paddr);
-            (*ep).state = EP_HAS_RECEIVER;
+            {
+                let r = receiver_tcb.get_mut();
+                r.ipc_wait_kind = WAIT_KIND_RECEIVE;
+                r.ipc_blocked_on = endpoint_paddr.as_u64();
+            }
+            ep_queue::enqueue(ep.get_mut(), receiver_tcb_paddr);
+            ep.get_mut().state = EP_HAS_RECEIVER;
             scheduler::block_current();
 
             // On wake, msg + current_reply_paddr are already populated by
             // whichever sender/caller fast-pathed us.
-            Ok((*receiver_tcb).ipc_msg)
+            Ok(receiver_tcb.get().ipc_msg)
         }
     }
 }
@@ -211,53 +224,64 @@ pub unsafe fn ipc_call(
     msg: [u64; 4],
     caller_tcb_paddr: PhysAddr,
 ) -> Result<[u64; 4], IpcError> {
-    let ep = ep_ptr_mut(endpoint_paddr);
-    let reply = reply_ptr_mut(reply_paddr);
+    let mut ep = KernelMut::<EndpointObject>::from_paddr(endpoint_paddr);
+    let mut reply = KernelMut::<ReplyObject>::from_paddr(reply_paddr);
 
     // Precondition: the Reply object must be Fresh.
-    if (*reply).state != REPLY_STATE_FRESH {
+    if reply.get().state != REPLY_STATE_FRESH {
         return Err(IpcError::ReplyBound);
     }
 
     // Bind the Reply to this caller before touching the endpoint. This
     // pairing is what the new model calls out: the caller's identity
     // lives on the Reply object, not on the endpoint.
-    (*reply).state = REPLY_STATE_BOUND;
-    (*reply).caller_tcb_paddr = caller_tcb_paddr.as_u64();
+    {
+        let r = reply.get_mut();
+        r.state = REPLY_STATE_BOUND;
+        r.caller_tcb_paddr = caller_tcb_paddr.as_u64();
+    }
 
-    let caller_tcb = tcb_ptr_mut(caller_tcb_paddr);
+    let mut caller_tcb = KernelMut::<Tcb>::from_paddr(caller_tcb_paddr);
 
-    if (*ep).state == EP_HAS_RECEIVER {
+    if ep.get().state == EP_HAS_RECEIVER {
         // Fast path: receiver queued. Dequeue, deliver msg + bind reply,
         // unblock server, block self.
-        let receiver = ep_queue::dequeue(ep).expect("HasReceiver without queued waiter");
-        let receiver_tcb = tcb_ptr_mut(receiver);
-        (*receiver_tcb).ipc_msg = msg;
-        (*receiver_tcb).ipc_wait_kind = WAIT_KIND_NONE;
-        (*receiver_tcb).current_reply_paddr = reply_paddr.as_u64();
-        // Clear the receiver's blocked-on pointer — it's runnable now.
-        (*receiver_tcb).ipc_blocked_on = 0;
+        let receiver = ep_queue::dequeue(ep.get_mut())
+            .expect("HasReceiver without queued waiter");
+        let mut receiver_tcb = KernelMut::<Tcb>::from_paddr(receiver);
+        {
+            let r = receiver_tcb.get_mut();
+            r.ipc_msg = msg;
+            r.ipc_wait_kind = WAIT_KIND_NONE;
+            r.current_reply_paddr = reply_paddr.as_u64();
+            // Clear the receiver's blocked-on pointer — it's runnable now.
+            r.ipc_blocked_on = 0;
+        }
         scheduler::unblock_thread(receiver);
-        (*ep).state = EP_IDLE;
+        ep.get_mut().state = EP_IDLE;
     } else {
         // Slow path: store msg in own TCB, queue as Call, block.
-        (*caller_tcb).ipc_msg = msg;
-        (*caller_tcb).ipc_wait_kind = WAIT_KIND_CALL;
-        (*caller_tcb).ipc_call_reply_paddr = reply_paddr.as_u64();
-        ep_queue::enqueue(ep, caller_tcb_paddr);
-        let became_has_waiters = (*ep).state == EP_IDLE;
+        {
+            let c = caller_tcb.get_mut();
+            c.ipc_msg = msg;
+            c.ipc_wait_kind = WAIT_KIND_CALL;
+            c.ipc_call_reply_paddr = reply_paddr.as_u64();
+        }
+        ep_queue::enqueue(ep.get_mut(), caller_tcb_paddr);
+        let ep_ref = ep.get_mut();
+        let became_has_waiters = ep_ref.state == EP_IDLE;
         if became_has_waiters {
-            (*ep).state = EP_HAS_WAITERS;
-            wake_readiness_waiter_if_registered(ep);
+            ep_ref.state = EP_HAS_WAITERS;
+            wake_readiness_waiter_if_registered(ep_ref);
         }
     }
 
-    (*caller_tcb).ipc_blocked_on = endpoint_paddr.as_u64();
+    caller_tcb.get_mut().ipc_blocked_on = endpoint_paddr.as_u64();
     scheduler::block_current();
 
     // On wake, the reply has been written into our ipc_msg and the
     // Reply object has been returned to Fresh by the server's ipc_reply.
-    Ok((*caller_tcb).ipc_msg)
+    Ok(caller_tcb.get().ipc_msg)
 }
 
 /// Non-blocking receive. Returns `WouldBlock` if the queue has nothing
@@ -269,10 +293,12 @@ pub unsafe fn ipc_receive_nb(
     endpoint_paddr: PhysAddr,
     receiver_tcb_paddr: PhysAddr,
 ) -> Result<[u64; 4], IpcError> {
-    let ep = ep_ptr_mut(endpoint_paddr);
-    if (*ep).state != EP_HAS_WAITERS {
+    let ep = KernelMut::<EndpointObject>::from_paddr(endpoint_paddr);
+    if ep.get().state != EP_HAS_WAITERS {
         return Err(IpcError::WouldBlock);
     }
+    // Drop the KernelMut before the nested call re-acquires one.
+    drop(ep);
     // A Send or Call is queued — reuse the normal receive path (won't block).
     ipc_receive(endpoint_paddr, receiver_tcb_paddr)
 }
@@ -284,55 +310,42 @@ pub unsafe fn ipc_receive_nb(
 /// Read the endpoint's model EpState. Used by sys_wait_any for readiness.
 pub fn read_state(ep_paddr: PhysAddr) -> lockjaw_types::ipc_state::EpState {
     use lockjaw_types::ipc_state::EpState;
-    unsafe {
-        match (*ep_ptr(ep_paddr)).state {
-            EP_HAS_WAITERS => EpState::HasWaiters,
-            EP_HAS_RECEIVER => EpState::HasReceiver,
-            _ => EpState::Idle,
-        }
+    // SAFETY: ep_paddr is a trusted kernel object paddr (produced only via
+    // handle-table lookup on an Endpoint handle).
+    let ep = unsafe { KernelMut::<EndpointObject>::from_paddr(ep_paddr) };
+    match ep.get().state {
+        EP_HAS_WAITERS => EpState::HasWaiters,
+        EP_HAS_RECEIVER => EpState::HasReceiver,
+        _ => EpState::Idle,
     }
 }
 
 /// Register a thread as a readiness waiter on this endpoint.
 /// The thread will be woken (without consuming) when a sender/caller arrives.
+///
+/// # Safety
+/// `ep_paddr` must point to a live `EndpointObject`.
 pub unsafe fn set_readiness_waiter(ep_paddr: PhysAddr, waiter_paddr: PhysAddr) {
-    let ep = ep_ptr_mut(ep_paddr);
-    let _ = (*ep).readiness_waiter.register(waiter_paddr.as_u64());
+    let mut ep = KernelMut::<EndpointObject>::from_paddr(ep_paddr);
+    let _ = ep.get_mut().readiness_waiter.register(waiter_paddr.as_u64());
 }
 
 /// Clear the readiness waiter if it matches the expected thread.
+///
+/// # Safety
+/// `ep_paddr` must point to a live `EndpointObject`.
 pub unsafe fn clear_readiness_waiter(ep_paddr: PhysAddr, expected: PhysAddr) {
-    let ep = ep_ptr_mut(ep_paddr);
-    (*ep).readiness_waiter.clear_if_match(expected.as_u64());
+    let mut ep = KernelMut::<EndpointObject>::from_paddr(ep_paddr);
+    ep.get_mut().readiness_waiter.clear_if_match(expected.as_u64());
 }
 
-unsafe fn wake_readiness_waiter_if_registered(ep: *mut EndpointObject) {
-    if (*ep).readiness_waiter.is_registered() {
-        scheduler::unblock_thread(PhysAddr::new((*ep).readiness_waiter.paddr));
-        (*ep).readiness_waiter.paddr = 0;
+fn wake_readiness_waiter_if_registered(ep: &mut EndpointObject) {
+    if ep.readiness_waiter.is_registered() {
+        // SAFETY: readiness waiter paddr was set via set_readiness_waiter
+        // from a trusted TCB paddr; the scheduler treats it as such.
+        unsafe {
+            scheduler::unblock_thread(PhysAddr::new(ep.readiness_waiter.paddr));
+        }
+        ep.readiness_waiter.paddr = 0;
     }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-unsafe fn ep_ptr(paddr: PhysAddr) -> *const EndpointObject {
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    (paddr.as_u64() + KERNEL_VA_OFFSET) as *const EndpointObject
-}
-
-unsafe fn ep_ptr_mut(paddr: PhysAddr) -> *mut EndpointObject {
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut EndpointObject
-}
-
-unsafe fn tcb_ptr_mut(paddr: PhysAddr) -> *mut Tcb {
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut Tcb
-}
-
-unsafe fn reply_ptr_mut(paddr: PhysAddr) -> *mut ReplyObject {
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut ReplyObject
 }
