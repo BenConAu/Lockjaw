@@ -1,4 +1,5 @@
-use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
+use crate::mm::addr::PhysAddr;
+use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::tcb::Tcb;
 use crate::sched::context::context_switch;
 use core::cell::UnsafeCell;
@@ -174,7 +175,7 @@ unsafe fn schedule(reason: SchedReason) {
     let state = &mut *SCHED_STATE.0.get();
     let old_idx = state.current;
     let old_paddr = THREADS[old_idx].unwrap();
-    let old_tcb = tcb_ptr_mut(old_paddr);
+    let mut old_tcb = KernelMut::<Tcb>::from_paddr(old_paddr);
 
     // step() validates preconditions, computes the decision, applies it,
     // and returns the action for the kernel to execute. No separate
@@ -191,16 +192,16 @@ unsafe fn schedule(reason: SchedReason) {
     };
 
     let new_paddr = THREADS[next_idx].unwrap();
-    let new_tcb = tcb_ptr_mut(new_paddr);
+    let new_tcb = KernelMut::<Tcb>::from_paddr(new_paddr);
 
     // Check stack canary of the thread we're switching away from
-    check_thread_canary(old_tcb);
+    check_thread_canary(old_tcb.get());
 
     // Swap TTBR0 if the new thread has a different address space.
     // TTBR0 is irrelevant during kernel execution (all kernel code
     // accessed via TTBR1), so swapping before context_switch is safe.
     // When the new thread eventually erets to EL0, TTBR0 is already set.
-    let new_ttbr0 = (*new_tcb).ttbr0_paddr;
+    let new_ttbr0 = new_tcb.get().ttbr0_paddr;
     if new_ttbr0 != 0 {
         core::arch::asm!(
             "msr TTBR0_EL1, {val}",           // Install new process page table
@@ -212,24 +213,21 @@ unsafe fn schedule(reason: SchedReason) {
         );
     }
 
-    // Context switch: save old SP, load new SP, swap callee-saved regs
-    // SAFETY: context switch register pointers
-    let old_sp_ptr = &mut (*old_tcb).saved_sp as *mut u64;
-    // SAFETY: context switch register pointers
-    let new_sp_ptr = &(*new_tcb).saved_sp as *const u64;
+    // Context switch: save old SP, load new SP, swap callee-saved regs.
+    // context_switch is extern "C" and takes raw pointers; coerce the
+    // typed references here, with single SAFETY annotations.
+    // SAFETY: old_tcb is live; field reference is unique for the duration
+    let old_sp_ptr = &mut old_tcb.get_mut().saved_sp as *mut u64;
+    // SAFETY: new_tcb is live; shared field reference
+    let new_sp_ptr = &new_tcb.get().saved_sp as *const u64;
     context_switch(old_sp_ptr, new_sp_ptr);
 }
 
-unsafe fn tcb_ptr_mut(paddr: PhysAddr) -> *mut Tcb {
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut Tcb
-}
-
 /// Check the stack canary for a thread.
-unsafe fn check_thread_canary(tcb: *const Tcb) {
-    // SAFETY: kernel stack address
-    let canary_ptr = (*tcb).stack_base as *const u64;
-    let value = ptr::read_volatile(canary_ptr);
+fn check_thread_canary(tcb: &Tcb) {
+    // SAFETY: kernel stack address — Tcb guarantees stack_base points
+    // at the base of a kernel-owned page whose first u64 is the canary.
+    let value = unsafe { ptr::read_volatile(tcb.stack_base as *const u64) };
     if value != lockjaw_types::constants::STACK_CANARY {
         panic!(
             "Thread stack canary corrupted! Expected {:#018x}, got {:#018x}",
