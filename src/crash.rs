@@ -5,7 +5,7 @@
 /// the panic handler. We write directly to the UART via core::fmt::Write
 /// and discard errors with `let _ =`. No .unwrap() on any fallible path.
 
-use crate::mm::addr::KERNEL_VA_OFFSET;
+use crate::mm::kernel_ptr::KernelRef;
 use crate::sched::tcb::Tcb;
 use core::fmt::Write;
 
@@ -46,11 +46,11 @@ pub fn print_thread_context(prefix: &str) {
         let thread_idx = crate::sched::scheduler::current_thread_index();
 
         if let Some(tcb_paddr) = crate::sched::scheduler::try_current_tcb_paddr() {
-            // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-            let tcb = (tcb_paddr.as_u64() + KERNEL_VA_OFFSET) as *const Tcb;
+            let tcb = KernelRef::<Tcb>::from_paddr(tcb_paddr);
+            let tcb_ref = tcb.get();
 
-            // Print thread index and process name
-            let name_bytes = core::ptr::read_volatile(&(*tcb).name);
+            // volatile reads: crash path must not assume Tcb is well-formed
+            let name_bytes = core::ptr::read_volatile(&tcb_ref.name);
             let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
             let name = core::str::from_utf8_unchecked(&name_bytes[..name_len]);
             if name_len > 0 {
@@ -59,9 +59,9 @@ pub fn print_thread_context(prefix: &str) {
                 let _ = writeln!(uart, "{}  Thread: #{}", prefix, thread_idx);
             }
 
-            let sc = core::ptr::read_volatile(&(*tcb).current_syscall);
+            let sc = core::ptr::read_volatile(&tcb_ref.current_syscall);
             if sc != u64::MAX {
-                let [a0, a1, a2, a3] = core::ptr::read_volatile(&(*tcb).current_syscall_args);
+                let [a0, a1, a2, a3] = core::ptr::read_volatile(&tcb_ref.current_syscall_args);
                 let _ = writeln!(uart, "{}  During syscall: {} (x0={:#x}, x1={:#x}, x2={:#x}, x3={:#x})",
                     prefix, syscall_name(sc), a0, a1, a2, a3);
             }

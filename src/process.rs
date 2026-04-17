@@ -1,7 +1,8 @@
 use crate::arch::aarch64::vmem::{Mapping, create_address_space, MAPPINGS_PER_PAGE};
 use crate::cap::object::{HandleTableCreateInfo, create_handle_table};
 use crate::cap::pageset_table;
-use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET, PAGE_SIZE};
+use crate::mm::addr::{PhysAddr, PAGE_SIZE};
+use crate::mm::kernel_ptr::{KernelMut, KernelRef};
 use crate::mm::page_alloc;
 use crate::sched::tcb::{Tcb, TcbCreateInfo, create_tcb};
 use crate::sched::scheduler;
@@ -67,9 +68,8 @@ pub unsafe fn create_process(
     let scratch_header = pageset_table::read_header(scratch_header_paddr);
     let scratch_paddr = PhysAddr::new(scratch_header.get_page(0).unwrap());
     page_alloc::zero_page(scratch_paddr);
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    let buf_va = (scratch_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut Mapping;
-    let mappings = core::slice::from_raw_parts_mut(buf_va, MAPPINGS_PER_PAGE);
+    let mut buf = KernelMut::<Mapping>::from_paddr(scratch_paddr);
+    let mappings = core::slice::from_raw_parts_mut(buf.as_mut_ptr(), MAPPINGS_PER_PAGE);
     let mut count = 0;
 
     for i in 0..mapping_count {
@@ -128,9 +128,8 @@ pub unsafe fn create_process(
     // This is the simplest form of capability transfer at process creation.
     if parent_handle_to_copy != u64::MAX {
         let parent_tcb_paddr = scheduler::current_tcb_paddr();
-        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-        let parent_tcb = (parent_tcb_paddr.as_u64() + KERNEL_VA_OFFSET) as *const crate::sched::tcb::Tcb;
-        let parent_ht = PhysAddr::new((*parent_tcb).handle_table_paddr);
+        let parent_tcb = KernelRef::<Tcb>::from_paddr(parent_tcb_paddr);
+        let parent_ht = PhysAddr::new(parent_tcb.get().handle_table_paddr);
 
         let entry = crate::cap::handle_table::handle_lookup(
             parent_ht, parent_handle_to_copy as u32,
@@ -175,11 +174,11 @@ pub unsafe fn create_process(
 fn process_entry() -> ! {
     unsafe {
         let tcb_paddr = scheduler::current_tcb_paddr();
-        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-        let tcb = (tcb_paddr.as_u64() + KERNEL_VA_OFFSET) as *const Tcb;
-        let entry = (*tcb).user_entry_point;
-        let stack_top = (*tcb).user_stack_top;
-        let ttbr0 = PhysAddr::new((*tcb).ttbr0_paddr);
+        let tcb = KernelRef::<Tcb>::from_paddr(tcb_paddr);
+        let t = tcb.get();
+        let entry = t.user_entry_point;
+        let stack_top = t.user_stack_top;
+        let ttbr0 = PhysAddr::new(t.ttbr0_paddr);
 
         crate::arch::aarch64::mmu::drop_to_el0_with_ttbr0(ttbr0, entry, stack_top);
     }
