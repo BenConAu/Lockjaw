@@ -9,6 +9,7 @@ pub mod object;
 pub mod pageset_table;
 pub mod scheduler;
 pub mod syscall;
+pub mod user_pod;
 pub mod device;
 pub mod fdt;
 pub mod vmem;

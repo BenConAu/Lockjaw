@@ -26,6 +26,9 @@ pub struct WaitEntry {
     pub threshold: u64,
 }
 
+// SAFETY: WaitEntry is repr(C) with only u64 fields — every bit pattern is valid.
+unsafe impl crate::user_pod::UserPod for WaitEntry {}
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------

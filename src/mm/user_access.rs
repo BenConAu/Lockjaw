@@ -18,8 +18,13 @@ use core::mem;
 ///
 /// # Safety
 /// `ttbr0_paddr` must be a valid L0 page table.
-/// T must be safe to read from arbitrary bytes (no references, no padding invariants).
-pub unsafe fn copy_from_user<T: Copy>(ttbr0_paddr: PhysAddr, user_va: u64) -> Option<T> {
+///
+/// The `UserPod` bound guarantees T is safe to construct from arbitrary
+/// bytes — no niches, no references, no enums with restricted discriminants.
+/// This closes the soundness hole in the original `T: Copy` bound, where
+/// e.g. `bool` (valid bit patterns 0 or 1 only) would be UB to read from
+/// untrusted memory.
+pub unsafe fn copy_from_user<T: lockjaw_types::user_pod::UserPod>(ttbr0_paddr: PhysAddr, user_va: u64) -> Option<T> {
     // Validate the user VA is in the user range and doesn't cross a page boundary.
     // A cross-page read would continue into whatever physical page is adjacent
     // in kernel VA space, not the user's next page.

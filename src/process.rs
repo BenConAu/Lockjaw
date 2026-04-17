@@ -22,6 +22,9 @@ pub struct ProcessMapping {
     pub flags: u64,
 }
 
+// SAFETY: ProcessMapping is repr(C) with only u64 fields — every bit pattern valid.
+unsafe impl lockjaw_types::user_pod::UserPod for ProcessMapping {}
+
 const FLAG_EXECUTABLE: u64 = 1 << 0;
 
 /// Create a new process from a userspace-provided mapping list.
