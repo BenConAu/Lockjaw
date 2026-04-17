@@ -30,21 +30,20 @@ pub struct ReplyObject {
     pub caller_tcb_paddr: u64,
 }
 
-/// Initialize a Reply object in donated physical memory.
-///
-/// # Safety
-/// `base_paddr` must be a donated page (one page, not mapped by userspace).
-pub unsafe fn create_reply(base_paddr: PhysAddr) -> Result<(), CreateError> {
-    let mut slot = KernelMut::<ReplyObject>::from_paddr(base_paddr);
-    // SAFETY: writing into freshly donated, uninitialized storage.
-    ptr::write(slot.as_mut_ptr(), ReplyObject {
-        header: ObjectHeader {
-            obj_type: ObjectType::Reply,
-            page_count: 1,
-        },
-        state: REPLY_STATE_FRESH,
-        caller_tcb_paddr: 0,
-    });
+/// Initialize a Reply object in a donated page.
+pub fn create_reply(page: crate::mm::addr::DonatedPage) -> Result<(), CreateError> {
+    // SAFETY: DonatedPage guarantees owned storage.
+    let mut slot = unsafe { KernelMut::<ReplyObject>::from_paddr(page.paddr()) };
+    unsafe {
+        ptr::write(slot.as_mut_ptr(), ReplyObject {
+            header: ObjectHeader {
+                obj_type: ObjectType::Reply,
+                page_count: 1,
+            },
+            state: REPLY_STATE_FRESH,
+            caller_tcb_paddr: 0,
+        });
+    }
     Ok(())
 }
 

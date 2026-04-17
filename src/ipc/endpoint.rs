@@ -48,23 +48,25 @@ pub struct EndpointObject {
     pub queue_tail: u64,
 }
 
-/// Initialize an endpoint object in donated memory.
-///
-/// # Safety
-/// `base_paddr` must point to a donated page not mapped by userspace.
-pub unsafe fn create_endpoint(base_paddr: PhysAddr) -> Result<(), CreateError> {
-    let mut slot = KernelMut::<EndpointObject>::from_paddr(base_paddr);
+/// Initialize an endpoint object in a donated page. The `DonatedPage`
+/// newtype guarantees the page is kernel-owned and not mapped elsewhere.
+pub fn create_endpoint(page: crate::mm::addr::DonatedPage) -> Result<(), CreateError> {
+    // SAFETY: DonatedPage guarantees owned storage; KernelMut::from_paddr
+    // performs the one VA cast.
+    let mut slot = unsafe { KernelMut::<EndpointObject>::from_paddr(page.paddr()) };
     // SAFETY: writing into freshly donated, uninitialized storage.
-    ptr::write(slot.as_mut_ptr(), EndpointObject {
-        header: ObjectHeader {
-            obj_type: ObjectType::Endpoint,
-            page_count: 1,
-        },
-        state: EP_IDLE,
-        readiness_waiter: lockjaw_types::wait::ReadinessWaiter::empty(),
-        queue_head: 0,
-        queue_tail: 0,
-    });
+    unsafe {
+        ptr::write(slot.as_mut_ptr(), EndpointObject {
+            header: ObjectHeader {
+                obj_type: ObjectType::Endpoint,
+                page_count: 1,
+            },
+            state: EP_IDLE,
+            readiness_waiter: lockjaw_types::wait::ReadinessWaiter::empty(),
+            queue_head: 0,
+            queue_tail: 0,
+        });
+    }
     Ok(())
 }
 

@@ -22,23 +22,22 @@ pub struct NotificationObject {
     pub readiness_threshold: u64,
 }
 
-/// Initialize a Notification in donated physical memory.
-///
-/// # Safety
-/// `base_paddr` must be a donated page.
-pub unsafe fn create_notification(base_paddr: PhysAddr) -> Result<(), CreateError> {
-    let mut slot = KernelMut::<NotificationObject>::from_paddr(base_paddr);
-    // SAFETY: writing into freshly donated, uninitialized storage.
-    ptr::write(slot.as_mut_ptr(), NotificationObject {
-        header: ObjectHeader {
-            obj_type: ObjectType::Notification,
-            page_count: 1,
-        },
-        state: NotificationState::new(),
-        blocked_tcb_paddr: 0,
-        readiness_waiter: lockjaw_types::wait::ReadinessWaiter::empty(),
-        readiness_threshold: 0,
-    });
+/// Initialize a Notification in a donated page.
+pub fn create_notification(page: crate::mm::addr::DonatedPage) -> Result<(), CreateError> {
+    // SAFETY: DonatedPage guarantees owned storage.
+    let mut slot = unsafe { KernelMut::<NotificationObject>::from_paddr(page.paddr()) };
+    unsafe {
+        ptr::write(slot.as_mut_ptr(), NotificationObject {
+            header: ObjectHeader {
+                obj_type: ObjectType::Notification,
+                page_count: 1,
+            },
+            state: NotificationState::new(),
+            blocked_tcb_paddr: 0,
+            readiness_waiter: lockjaw_types::wait::ReadinessWaiter::empty(),
+            readiness_threshold: 0,
+        });
+    }
     Ok(())
 }
 
