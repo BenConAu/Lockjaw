@@ -343,11 +343,7 @@ pub unsafe fn clear_readiness_waiter(ep_paddr: PhysAddr, expected: PhysAddr) {
 
 fn wake_readiness_waiter_if_registered(ep: &mut EndpointObject) {
     if ep.readiness_waiter.is_registered() {
-        // SAFETY: readiness waiter paddr was set via set_readiness_waiter
-        // from a trusted TCB paddr; the scheduler treats it as such.
-        unsafe {
-            scheduler::unblock_thread(PhysAddr::new(ep.readiness_waiter.paddr));
-        }
+        scheduler::unblock_thread(PhysAddr::new(ep.readiness_waiter.paddr));
         ep.readiness_waiter.paddr = 0;
     }
 }

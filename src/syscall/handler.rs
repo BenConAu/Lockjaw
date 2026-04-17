@@ -167,7 +167,7 @@ fn sys_debug_putc(char_val: u64) -> SyscallError {
 }
 
 fn sys_yield() -> SyscallError {
-    unsafe { scheduler::tick(); }
+    scheduler::tick();
     SyscallError::OK
 }
 

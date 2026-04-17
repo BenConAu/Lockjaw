@@ -10,24 +10,57 @@ use lockjaw_types::scheduler::{
 
 const MAX_THREADS: usize = 8;
 
-/// Physical addresses of TCBs in the run queue. None = empty slot.
-/// Indexed by SchedState.current. This is the concrete mapping from
-/// abstract thread indices to TCB physical pages.
-static mut THREADS: [Option<PhysAddr>; MAX_THREADS] = [None; MAX_THREADS];
+// ---------------------------------------------------------------------------
+// Scheduler singleton — wraps all mutable globals behind safe methods
+// ---------------------------------------------------------------------------
 
-/// The scheduler's abstract state — the model owns thread states and
-/// current thread index. All scheduler operations (block, unblock,
-/// transitions) go through this.
-struct SyncSchedState(UnsafeCell<SchedState>);
-unsafe impl Sync for SyncSchedState {}
-static SCHED_STATE: SyncSchedState = SyncSchedState(UnsafeCell::new(SchedState::new_const()));
+/// The kernel scheduler. Wraps three pieces of global mutable state
+/// (the abstract SchedState model, the TCB-paddr table, and the
+/// active flag) in a single struct with safe methods. Internal access
+/// uses `UnsafeCell`; the SAFETY justification for `impl Sync` lives
+/// in one place rather than at every call site.
+pub struct Scheduler {
+    state: UnsafeCell<SchedState>,
+    threads: UnsafeCell<[Option<PhysAddr>; MAX_THREADS]>,
+    active: UnsafeCell<bool>,
+}
 
-/// Whether the scheduler is active (set after init + first threads added).
-static mut ACTIVE: bool = false;
+/// SAFETY: single-core kernel. Kernel entry (exception vectors) masks
+/// IRQs before touching scheduler state; the only preemption point is
+/// the timer tick handler, which calls `tick()` — a leaf that does not
+/// re-enter any scheduler method. When SMP lands, replace this with a
+/// proper SpinMutex.
+unsafe impl Sync for Scheduler {}
+
+impl Scheduler {
+    const fn new() -> Self {
+        Scheduler {
+            state: UnsafeCell::new(SchedState::new_const()),
+            threads: UnsafeCell::new([None; MAX_THREADS]),
+            active: UnsafeCell::new(false),
+        }
+    }
+
+    /// Raw pointer to the scheduler state. Callers must create `&mut`
+    /// references in scoped blocks that never overlap — the Rust
+    /// aliasing model forbids two `&mut` to the same UnsafeCell even
+    /// on single-core. Never return `&mut` from a `&self` method.
+    fn state_ptr(&self) -> *mut SchedState {
+        self.state.get()
+    }
+
+    fn threads_ptr(&self) -> *mut [Option<PhysAddr>; MAX_THREADS] {
+        self.threads.get()
+    }
+}
+
+pub static SCHEDULER: Scheduler = Scheduler::new();
 
 // ---------------------------------------------------------------------------
-// Public API
+// Public API — safe wrappers around SCHEDULER methods
 // ---------------------------------------------------------------------------
+// Callers keep using `scheduler::add_thread(p)` — the only change is
+// they no longer need an `unsafe { }` block around the call.
 
 /// Register a thread in the run queue.
 ///
@@ -35,29 +68,33 @@ static mut ACTIVE: bool = false;
 /// saved_sp will be filled on the first context switch away from it, and
 /// its state is marked Running (since it's already executing).
 /// Subsequent threads are added as Ready.
-/// Returns false if the run queue is full (MAX_THREADS = 8 reached).
-pub unsafe fn add_thread(tcb_paddr: PhysAddr) -> bool {
-    let state = &mut *SCHED_STATE.0.get();
-    let idx = match state.add_thread() {
-        Some(i) => i,
-        None => return false,
-    };
-    // First add_thread is the boot/init thread — model puts it in Ready
-    // but it's actually already running. Mark it Running.
-    if idx == 0 {
-        state.mark_initial_running();
+/// Returns `false` if the run queue is full (MAX_THREADS = 8 reached).
+pub fn add_thread(tcb_paddr: PhysAddr) -> bool {
+    // SAFETY: single-core, IRQs masked — exclusive access to state + threads.
+    unsafe {
+        let state = &mut *SCHEDULER.state_ptr();
+        let idx = match state.add_thread() {
+            Some(i) => i,
+            None => return false,
+        };
+        // First add_thread is the boot/init thread — model puts it in Ready
+        // but it's actually already running. Mark it Running.
+        if idx == 0 {
+            state.mark_initial_running();
+        }
+        if idx >= MAX_THREADS {
+            return false;
+        }
+        (*SCHEDULER.threads_ptr())[idx] = Some(tcb_paddr);
+        true
     }
-    if idx >= MAX_THREADS {
-        return false;
-    }
-    THREADS[idx] = Some(tcb_paddr);
-    true
 }
 
 /// Activate the scheduler. After this call, timer ticks trigger scheduling.
 /// Must be called after all initial threads are registered via add_thread().
-pub unsafe fn start() {
-    ACTIVE = true;
+pub fn start() {
+    // SAFETY: single-core, called once during boot.
+    unsafe { *SCHEDULER.active.get() = true; }
 }
 
 /// Called from the timer tick handler every TIMER_TICK_MS milliseconds.
@@ -71,45 +108,57 @@ pub unsafe fn start() {
 /// iteration. IPC unblock operations (from IRQ handlers that signal
 /// notifications or deliver messages) set other threads to Ready, and
 /// the block_current loop picks them up via step(Block).
-pub unsafe fn tick() {
-    let state = &*SCHED_STATE.0.get();
-    if !ACTIVE || state.thread_count() < 2 {
-        return;
+pub fn tick() {
+    // SAFETY: single-core, IRQs masked — exclusive access.
+    unsafe {
+        let active = *SCHEDULER.active.get();
+        let state = &*SCHEDULER.state_ptr();
+        if !active || state.thread_count() < 2 {
+            return;
+        }
+        // Can only Preempt a Running thread. If current is Blocked (idle
+        // loop in block_current), the timer tick has no work — return and
+        // the block_current loop will re-evaluate.
+        if state.get(state.current) != Some(SchedThreadState::Running) {
+            return;
+        }
+        // schedule() performs context_switch (asm) — inherently unsafe.
+        schedule(SchedReason::Preempt);
     }
-    // Can only Preempt a Running thread. If current is Blocked (idle
-    // loop in block_current), the timer tick has no work — return and
-    // the block_current loop will re-evaluate.
-    if state.get(state.current) != Some(SchedThreadState::Running) {
-        return;
-    }
-    schedule(SchedReason::Preempt);
 }
 
 /// Return the physical address of the currently running thread's TCB.
 /// Used by syscall handlers to look up the caller's handle table and TTBR0.
-pub unsafe fn current_tcb_paddr() -> PhysAddr {
-    let state = &*SCHED_STATE.0.get();
-    THREADS[state.current].unwrap()
+pub fn current_tcb_paddr() -> PhysAddr {
+    // SAFETY: single-core, IRQs masked — read-only access, no aliasing.
+    unsafe {
+        let idx = (*SCHEDULER.state_ptr()).current;
+        (*SCHEDULER.threads_ptr())[idx].unwrap()
+    }
 }
 
 /// Return the index of the currently running thread in the run queue.
 /// Used by crash diagnostics to identify the faulting thread.
-pub unsafe fn current_thread_index() -> usize {
-    let state = &*SCHED_STATE.0.get();
-    state.current
+pub fn current_thread_index() -> usize {
+    // SAFETY: single-core, IRQs masked — read-only access.
+    unsafe { (*SCHEDULER.state_ptr()).current }
 }
 
 /// Like current_tcb_paddr but returns None instead of panicking.
 /// Safe to call from the panic handler without risk of re-entrant panic.
-/// Uses raw pointer reads to avoid bounds-check panics and static-mut-ref warnings.
-pub unsafe fn try_current_tcb_paddr() -> Option<PhysAddr> {
-    // SAFETY: raw pointer to static
-    let state_ptr = SCHED_STATE.0.get() as *const SchedState;
-    let idx = (*state_ptr).current;
-    if idx >= MAX_THREADS { return None; }
-    // SAFETY: raw pointer to static
-    let ptr = (&raw const THREADS as *const Option<PhysAddr>).add(idx);
-    core::ptr::read_volatile(ptr)
+/// Uses raw pointer reads to avoid bounds-check panics.
+pub fn try_current_tcb_paddr() -> Option<PhysAddr> {
+    // SAFETY: raw pointer reads for crash-robustness (no bounds checks).
+    unsafe {
+        let state_ptr = SCHEDULER.state.get() as *const SchedState;
+        let idx = (*state_ptr).current;
+        if idx >= MAX_THREADS { return None; }
+        // SAFETY: raw pointer to UnsafeCell interior for crash-safe volatile read
+        let threads_ptr = SCHEDULER.threads.get() as *const [Option<PhysAddr>; MAX_THREADS];
+        // SAFETY: raw pointer to array element — avoids slice bounds check
+        let ptr = (threads_ptr as *const Option<PhysAddr>).add(idx);
+        core::ptr::read_volatile(ptr)
+    }
 }
 
 /// Block the current thread and schedule away.
@@ -117,27 +166,36 @@ pub unsafe fn try_current_tcb_paddr() -> Option<PhysAddr> {
 /// If no thread is Ready, halts via wfi until an interrupt wakes something.
 /// Saves/restores the DAIF mask around wfi to preserve the kernel's
 /// "single-threaded during syscall" invariant.
-pub unsafe fn block_current() {
-    let state = &mut *SCHED_STATE.0.get();
-    state.block_current().expect("block_current: not Running");
+pub fn block_current() {
+    // SAFETY: single-core, IRQs masked. Each &mut borrow is scoped to
+    // avoid overlapping — we re-derive from the raw pointer after each
+    // context switch because schedule() invalidates prior references.
+    unsafe {
+        (&mut *SCHEDULER.state_ptr()).block_current().expect("block_current: not Running");
+    }
     loop {
-        schedule(SchedReason::Block);
+        // schedule() performs context_switch (asm) — inherently unsafe.
+        unsafe { schedule(SchedReason::Block); }
         // Re-read: schedule may have switched us out and back in.
         // If we're Running again, an unblock_thread + schedule decided
         // to pick us, so we resume.
-        let state = &*SCHED_STATE.0.get();
-        if state.get(state.current) == Some(SchedThreadState::Running) {
-            return;
+        unsafe {
+            let state = &*SCHEDULER.state_ptr();
+            if state.get(state.current) == Some(SchedThreadState::Running) {
+                return;
+            }
         }
         // All blocked. Wait for an IRQ, preserving DAIF around wfi so
         // we return to the caller with the same IRQ mask we had on entry.
-        core::arch::asm!(
-            "mrs x0, DAIF",            // Save current IRQ mask
-            "msr DAIFClr, #2",         // Unmask IRQ (bit 1) so wfi can wake
-            "wfi",                      // Halt until an IRQ arrives
-            "msr DAIF, x0",            // Restore original mask
-            out("x0") _,
-        );
+        unsafe {
+            core::arch::asm!(
+                "mrs x0, DAIF",            // Save current IRQ mask
+                "msr DAIFClr, #2",         // Unmask IRQ (bit 1) so wfi can wake
+                "wfi",                      // Halt until an IRQ arrives
+                "msr DAIF, x0",            // Restore original mask
+                out("x0") _,
+            );
+        }
     }
 }
 
@@ -150,31 +208,37 @@ pub unsafe fn block_current() {
 /// only unblock threads it knows about) or if the thread is not in
 /// the Blocked state (kernel bug — only Blocked threads should be
 /// unblocked, and the IPC state machine shouldn't have them otherwise).
-pub unsafe fn unblock_thread(tcb_paddr: PhysAddr) {
+pub fn unblock_thread(tcb_paddr: PhysAddr) {
     let idx = thread_index_for(tcb_paddr)
         .expect("unblock_thread: TCB paddr not registered in scheduler");
-    let state = &mut *SCHED_STATE.0.get();
-    state.unblock(idx).expect("unblock_thread: thread not in Blocked state");
+    // SAFETY: single-core, IRQs masked — exclusive access.
+    unsafe {
+        (&mut *SCHEDULER.state_ptr()).unblock(idx)
+            .expect("unblock_thread: thread not in Blocked state");
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
 
-/// Find the thread index for a given TCB paddr. O(N) but N is small.
-unsafe fn thread_index_for(paddr: PhysAddr) -> Option<usize> {
+fn thread_index_for(paddr: PhysAddr) -> Option<usize> {
+    // SAFETY: single-core, IRQs masked — read-only access.
+    let threads = unsafe { &*SCHEDULER.threads_ptr() };
     for i in 0..MAX_THREADS {
-        if THREADS[i] == Some(paddr) {
+        if threads[i] == Some(paddr) {
             return Some(i);
         }
     }
     None
 }
 
+/// The actual context-switch path. Unsafe because it calls the asm
+/// context_switch trampoline and touches hardware registers (TTBR0).
 unsafe fn schedule(reason: SchedReason) {
-    let state = &mut *SCHED_STATE.0.get();
+    let state = &mut *SCHEDULER.state_ptr();
     let old_idx = state.current;
-    let old_paddr = THREADS[old_idx].unwrap();
+    let old_paddr = (*SCHEDULER.threads_ptr())[old_idx].unwrap();
     let mut old_tcb = KernelMut::<Tcb>::from_paddr(old_paddr);
 
     // step() validates preconditions, computes the decision, applies it,
@@ -191,7 +255,7 @@ unsafe fn schedule(reason: SchedReason) {
         }
     };
 
-    let new_paddr = THREADS[next_idx].unwrap();
+    let new_paddr = (*SCHEDULER.threads_ptr())[next_idx].unwrap();
     let new_tcb = KernelMut::<Tcb>::from_paddr(new_paddr);
 
     // Check stack canary of the thread we're switching away from
