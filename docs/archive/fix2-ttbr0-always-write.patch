@@ -1,0 +1,108 @@
+diff --git a/docs/tech-debt.md b/docs/tech-debt.md
+index e924d84..69d6835 100644
+--- a/docs/tech-debt.md
++++ b/docs/tech-debt.md
+@@ -122,18 +122,6 @@ The eventual design is a **device manager** process that:
+ 
+ ---
+ 
+-## Kernel threads leave stale user TTBR0 in hardware
+-
+-**Where:** `src/sched/scheduler.rs:147`, `src/main.rs:280-310`
+-
+-**What:** Kernel threads are created with `ttbr0_paddr = 0`. The scheduler only writes TTBR0_EL1 when `new_ttbr0 != 0`. When switching from a user process to a kernel thread, the previous user process's page table stays in TTBR0_EL1. An accidental lower-half access from a kernel thread would hit the previous process's memory instead of faulting cleanly.
+-
+-**Why bootstrap:** Kernel threads only access higher-half addresses (via TTBR1). No kernel code accidentally touches the lower half. The risk is latent.
+-
+-**Fix:** When switching to a thread with `ttbr0_paddr == 0`, zero out TTBR0_EL1 (or set it to an empty page table) so lower-half accesses fault cleanly. This prevents any future kernel bug from silently accessing user memory.
+-
+----
+-
+ ## SYS_RECV_NB naming inconsistency
+ 
+ **Where:** `lockjaw-types/src/syscall.rs`, `src/syscall/handler.rs`, `user/lockjaw-userlib/src/syscall.rs`
+diff --git a/src/sched/scheduler.rs b/src/sched/scheduler.rs
+index 4057373..ad7d283 100644
+--- a/src/sched/scheduler.rs
++++ b/src/sched/scheduler.rs
+@@ -3,6 +3,7 @@ use crate::sched::tcb::Tcb;
+ use crate::sched::context::context_switch;
+ use core::cell::UnsafeCell;
+ use core::ptr;
++use lockjaw_types::page_table::PageTable;
+ use lockjaw_types::scheduler::{
+     SchedDecision, SchedReason, SchedState, SchedThreadState,
+ };
+@@ -14,6 +15,13 @@ const MAX_THREADS: usize = 8;
+ /// abstract thread indices to TCB physical pages.
+ static mut THREADS: [Option<PhysAddr>; MAX_THREADS] = [None; MAX_THREADS];
+ 
++/// An empty user-space L0 page table. Installed in TTBR0_EL1 when
++/// switching to a kernel thread (ttbr0_paddr == 0). Any lower-half
++/// access while this is active walks a zeroed table and translation-
++/// faults cleanly, instead of silently hitting the previous user
++/// process's memory.
++static EMPTY_USER_L0: PageTable = PageTable::empty();
++
+ /// The scheduler's abstract state — the model owns thread states and
+ /// current thread index. All scheduler operations (block, unblock,
+ /// transitions) go through this.
+@@ -196,20 +204,47 @@ unsafe fn schedule(reason: SchedReason) {
+     // Check stack canary of the thread we're switching away from
+     check_thread_canary(old_tcb);
+ 
+-    // Swap TTBR0 if the new thread has a different address space.
+-    // TTBR0 is irrelevant during kernel execution (all kernel code
+-    // accessed via TTBR1), so swapping before context_switch is safe.
+-    // When the new thread eventually erets to EL0, TTBR0 is already set.
+-    let new_ttbr0 = (*new_tcb).ttbr0_paddr;
+-    if new_ttbr0 != 0 {
++    // Always track the correct TTBR0 for the new thread. For kernel
++    // threads (ttbr0_paddr == 0), use the empty L0 page so any
++    // lower-half page-walk finds invalid entries and faults cleanly
++    // instead of hitting the previous process's memory.
++    //
++    // The TLB flush is the expensive part (QEMU drops all cached TBs).
++    // We only flush when switching TO a user thread — that's the only
++    // moment stale TTBR0 entries could leak into active execution.
++    // While a kernel thread runs, it lives in TTBR1/higher-half and
++    // never consults TTBR0 TLB entries, so we don't need to flush on
++    // user→kernel transitions. A misbehaving kernel that accidentally
++    // touches lower half on a TLB miss still faults (TTBR0 points at
++    // EMPTY_USER_L0); the only residual gap is a TLB-hit on a stale
++    // entry, which is a narrow bug class we're choosing not to pay
++    // for on every context switch.
++    let new_user_paddr = (*new_tcb).ttbr0_paddr;
++    let new_ttbr0 = if new_user_paddr != 0 {
++        new_user_paddr
++    } else {
++        // SAFETY: linker symbol
++        &EMPTY_USER_L0 as *const _ as u64
++    };
++    let current_ttbr0: u64;
++    core::arch::asm!("mrs {val}, TTBR0_EL1", val = out(reg) current_ttbr0);
++    if current_ttbr0 != new_ttbr0 {
+         core::arch::asm!(
+-            "msr TTBR0_EL1, {val}",           // Install new process page table
+-            "dsb ish",                          // Ensure TTBR0 write completes
+-            "tlbi vmalle1is",                   // Flush TLB (all entries, inner shareable)
+-            "dsb ish",                          // Ensure TLB flush completes
+-            "isb",                              // Sync pipeline
++            "msr TTBR0_EL1, {val}",         // Install new page table
++            "isb",                            // Sync pipeline so new TTBR0 takes effect
+             val = in(reg) new_ttbr0,
+         );
++        // Flush TLB only when the new thread is a user thread. The
++        // flush drops any stale entries from a prior user; without it,
++        // the new user could TLB-hit into another process's mappings.
++        if new_user_paddr != 0 {
++            core::arch::asm!(
++                "dsb ish",                    // Ensure TTBR0 write is observed
++                "tlbi vmalle1is",             // Flush TLB (all entries, inner shareable)
++                "dsb ish",                    // Ensure flush completes
++                "isb",                        // Sync pipeline
++            );
++        }
+     }
+ 
+     // Context switch: save old SP, load new SP, swap callee-saved regs

@@ -130,7 +130,9 @@ The eventual design is a **device manager** process that:
 
 **Why bootstrap:** Kernel threads only access higher-half addresses (via TTBR1). No kernel code accidentally touches the lower half. The risk is latent.
 
-**Fix:** When switching to a thread with `ttbr0_paddr == 0`, zero out TTBR0_EL1 (or set it to an empty page table) so lower-half accesses fault cleanly. This prevents any future kernel bug from silently accessing user memory.
+**Attempted fix (shelved):** Always write TTBR0 on context switch — `EMPTY_USER_L0` for kernel threads, user's table for user threads — with a conditional TLB flush only on kernel→user transitions to avoid a ~20x boot slowdown from per-switch `tlbi vmalle1is`. Patch archived at `docs/archive/fix2-ttbr0-always-write.patch`. Set aside because it still leaves a residual TLB-hit correctness gap and because the directional fix (below) subsumes it.
+
+**Fix:** Remove the kernel's dependency on lower-half VAs entirely. Once the kernel is relinked at higher-half (see "Kernel identity map in user TTBR0") and no kernel code references lower-half addresses, TTBR0 becomes purely user-owned: the scheduler can leave it alone on kernel-thread switches without any correctness concern, and the TLB flush only needs to happen at user↔user transitions.
 
 ---
 
