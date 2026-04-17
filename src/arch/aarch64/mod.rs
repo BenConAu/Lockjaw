@@ -15,7 +15,7 @@ pub fn irq_dispatch() {
     let intid = unsafe { gic::handle_irq() };
 
     // Check if this INTID is bound to a userspace notification
-    if let Some(notif_paddr) = unsafe { irq_bind::lookup(intid) } {
+    if let Some(notif_paddr) = irq_bind::lookup(intid) {
         // Signal the notification — increment timeline value by 1
         // The notification_signal function handles waking any waiting thread
         unsafe {
