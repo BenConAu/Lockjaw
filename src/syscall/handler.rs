@@ -5,7 +5,8 @@ use crate::cap::object::ObjectType;
 use crate::cap::rights::Rights;
 use crate::ipc::endpoint;
 use crate::mm::addr::PhysAddr;
-use crate::mm::kernel_ptr::{KernelMut, KernelRef};
+use crate::mm::kernel_ptr::KernelRef;
+use crate::sched::current::CurrentThread;
 use crate::sched::scheduler;
 use crate::sched::tcb::Tcb;
 
@@ -36,13 +37,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
     let syscall_num = ctx.gpr[8]; // x8
 
     // Record syscall breadcrumb for crash diagnostics
-    unsafe {
-        let tcb_paddr = scheduler::current_tcb_paddr();
-        let mut tcb = KernelMut::<Tcb>::from_paddr(tcb_paddr);
-        let t = tcb.get_mut();
-        t.current_syscall = syscall_num;
-        t.current_syscall_args = [ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]];
-    }
+    CurrentThread::set_breadcrumb(syscall_num, [ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]]);
 
     // Dispatch. Void syscalls return SyscallError only.
     // Value-returning syscalls return Result<u64, SyscallError>.
@@ -95,18 +90,12 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
     }
 
     // Clear syscall breadcrumb
-    unsafe {
-        let tcb_paddr = scheduler::current_tcb_paddr();
-        let mut tcb = KernelMut::<Tcb>::from_paddr(tcb_paddr);
-        tcb.get_mut().current_syscall = u64::MAX;
-    }
+    CurrentThread::clear_breadcrumb();
 }
 
 /// Get the current thread's handle table physical address.
-unsafe fn caller_handle_table() -> PhysAddr {
-    let tcb_paddr = scheduler::current_tcb_paddr();
-    let tcb = KernelRef::<Tcb>::from_paddr(tcb_paddr);
-    PhysAddr::new(tcb.get().handle_table_paddr)
+fn caller_handle_table() -> PhysAddr {
+    CurrentThread::handle_table_paddr()
 }
 
 /// Look up a handle in the current thread's handle table with type checking.
@@ -174,7 +163,7 @@ fn sys_send(ctx: &mut ExceptionContext) -> SyscallError {
         };
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
-        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb_paddr = CurrentThread::tcb_paddr();
         match endpoint::ipc_send(ep_paddr, msg, tcb_paddr) {
             Ok(()) => SyscallError::OK,
             Err(_) => SyscallError::ENDPOINT_BUSY,
@@ -194,7 +183,7 @@ fn sys_receive(ctx: &mut ExceptionContext) -> SyscallReturn {
         };
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
-        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb_paddr = CurrentThread::tcb_paddr();
         match endpoint::ipc_receive(ep_paddr, tcb_paddr) {
             Ok(msg) => {
                 ctx.gpr[1] = msg[0];
@@ -238,7 +227,7 @@ fn sys_call(ctx: &mut ExceptionContext) -> SyscallReturn {
 
         let ep_paddr = PhysAddr::new(ep_entry.object_paddr);
         let reply_paddr = PhysAddr::new(reply_entry.object_paddr);
-        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb_paddr = CurrentThread::tcb_paddr();
         match endpoint::ipc_call(ep_paddr, reply_paddr, msg, tcb_paddr) {
             Ok(reply) => {
                 ctx.gpr[1] = reply[0];
@@ -262,7 +251,7 @@ fn sys_call(ctx: &mut ExceptionContext) -> SyscallReturn {
 fn sys_reply(ctx: &mut ExceptionContext) -> SyscallError {
     let reply_msg = [ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]];
     unsafe {
-        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb_paddr = CurrentThread::tcb_paddr();
         match crate::ipc::reply::ipc_reply(tcb_paddr, reply_msg) {
             Ok(()) => SyscallError::OK,
             Err(endpoint::IpcError::NoCaller) => SyscallError::NO_CALLER,
@@ -293,10 +282,7 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     let flags = ctx.gpr[2];
 
     unsafe {
-        // Get the caller's TTBR0 from their TCB
-        let tcb_paddr = scheduler::current_tcb_paddr();
-        let tcb = KernelRef::<Tcb>::from_paddr(tcb_paddr);
-        let ttbr0 = PhysAddr::new(tcb.get().ttbr0_paddr);
+        let ttbr0 = CurrentThread::ttbr0();
 
         if ttbr0.as_u64() == 0 {
             return SyscallError::INVALID_PARAMETER;
@@ -331,10 +317,7 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
     let name_va = ctx.gpr[6];
 
     unsafe {
-        // Get caller's TTBR0 for safe user memory access
-        let tcb_paddr = scheduler::current_tcb_paddr();
-        let tcb = KernelRef::<Tcb>::from_paddr(tcb_paddr);
-        let caller_ttbr0 = PhysAddr::new(tcb.get().ttbr0_paddr);
+        let caller_ttbr0 = CurrentThread::ttbr0();
 
         // Read process name from user memory (16 bytes, NUL-padded)
         let name: [u8; 16] = crate::mm::user_access::copy_from_user(caller_ttbr0, name_va)
@@ -391,7 +374,7 @@ fn sys_wait_notification(ctx: &mut ExceptionContext) -> Result<u64, SyscallError
         };
 
         let notif_paddr = PhysAddr::new(entry.object_paddr);
-        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb_paddr = CurrentThread::tcb_paddr();
         match crate::ipc::notification::notification_wait(notif_paddr, threshold, tcb_paddr) {
             Ok(value) => Ok(value),
             Err(lockjaw_types::notification_state::NotificationError::AlreadyHasWaiter) => Err(SyscallError::ALREADY_WAITING),
@@ -454,7 +437,7 @@ fn sys_recv_nb(ctx: &mut ExceptionContext) -> SyscallReturn {
         };
 
         let ep_paddr = PhysAddr::new(entry.object_paddr);
-        let tcb_paddr = scheduler::current_tcb_paddr();
+        let tcb_paddr = CurrentThread::tcb_paddr();
 
         match endpoint::ipc_receive_nb(ep_paddr, tcb_paddr) {
             Ok(msg) => {
@@ -487,9 +470,8 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     }
 
     unsafe {
-        let tcb_paddr = scheduler::current_tcb_paddr();
-        let mut tcb = KernelMut::<Tcb>::from_paddr(tcb_paddr);
-        let ttbr0 = PhysAddr::new(tcb.get().ttbr0_paddr);
+        let tcb_paddr = CurrentThread::tcb_paddr();
+        let ttbr0 = CurrentThread::ttbr0();
         let ht_paddr = caller_handle_table();
 
         // Read WaitEntry array from user memory via page table walk (TTBR1).
@@ -536,28 +518,25 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 
         // Store wait state in TCB for post-wake cleanup
         {
-            let t = tcb.get_mut();
-            for i in 0..count {
-                t.wait_objects[i] = paddrs[i].as_u64();
-                t.wait_thresholds[i] = thresholds[i];
-                t.wait_types[i] = types[i] as u8;
-            }
-            t.wait_count = count as u8;
+            let type_bytes: [u8; MAX_WAIT_OBJECTS] = core::array::from_fn(|i| {
+                if i < count { types[i] as u8 } else { 0 }
+            });
+            CurrentThread::store_wait_state(&paddrs, &thresholds, &type_bytes, count);
         }
 
         scheduler::block_current();
 
         // Woke up — unregister from all objects (only clear our own registration)
-        let wc = tcb.get().wait_count as usize;
+        let wc = CurrentThread::wait_count();
         for i in 0..wc {
-            let p = PhysAddr::new(tcb.get().wait_objects[i]);
-            match obj_type_from_u8(tcb.get().wait_types[i]) {
+            let (p, type_tag) = CurrentThread::wait_entry(i);
+            match obj_type_from_u8(type_tag) {
                 ObjectType::Endpoint => endpoint::clear_readiness_waiter(p, tcb_paddr),
                 ObjectType::Notification => notification::clear_readiness_waiter(p, tcb_paddr),
                 _ => {}
             }
         }
-        tcb.get_mut().wait_count = 0;
+        CurrentThread::clear_wait_count();
 
         // Re-check all objects (others may have become ready while blocked)
         Ok(check_readiness(&paddrs, &types, &thresholds, wc))
@@ -607,9 +586,7 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 
     unsafe {
         // Find the bound caller via our TCB's current_reply_paddr.
-        let exporter_tcb_paddr = scheduler::current_tcb_paddr();
-        let exporter_tcb = KernelRef::<Tcb>::from_paddr(exporter_tcb_paddr);
-        let reply_paddr_u64 = exporter_tcb.get().current_reply_paddr;
+        let reply_paddr_u64 = CurrentThread::current_reply_paddr();
         if reply_paddr_u64 == 0 {
             return Err(SyscallError::NO_CALLER);
         }
