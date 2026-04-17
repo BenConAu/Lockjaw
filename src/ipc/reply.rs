@@ -31,8 +31,8 @@ pub struct ReplyObject {
 }
 
 /// Initialize a Reply object in a donated page.
-pub fn create_reply(page: crate::mm::addr::DonatedPage) -> Result<(), CreateError> {
-    // SAFETY: DonatedPage guarantees owned storage.
+pub fn create_reply(page: crate::mm::addr::ObjectInitPage) -> Result<(), CreateError> {
+    // SAFETY: ObjectInitPage guarantees owned storage.
     let mut slot = unsafe { KernelMut::<ReplyObject>::from_paddr(page.paddr()) };
     unsafe {
         ptr::write(slot.as_mut_ptr(), ReplyObject {

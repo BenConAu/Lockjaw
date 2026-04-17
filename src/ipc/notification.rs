@@ -23,8 +23,8 @@ pub struct NotificationObject {
 }
 
 /// Initialize a Notification in a donated page.
-pub fn create_notification(page: crate::mm::addr::DonatedPage) -> Result<(), CreateError> {
-    // SAFETY: DonatedPage guarantees owned storage.
+pub fn create_notification(page: crate::mm::addr::ObjectInitPage) -> Result<(), CreateError> {
+    // SAFETY: ObjectInitPage guarantees owned storage.
     let mut slot = unsafe { KernelMut::<NotificationObject>::from_paddr(page.paddr()) };
     unsafe {
         ptr::write(slot.as_mut_ptr(), NotificationObject {

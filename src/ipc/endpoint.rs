@@ -48,10 +48,10 @@ pub struct EndpointObject {
     pub queue_tail: u64,
 }
 
-/// Initialize an endpoint object in a donated page. The `DonatedPage`
+/// Initialize an endpoint object in a donated page. The `ObjectInitPage`
 /// newtype guarantees the page is kernel-owned and not mapped elsewhere.
-pub fn create_endpoint(page: crate::mm::addr::DonatedPage) -> Result<(), CreateError> {
-    // SAFETY: DonatedPage guarantees owned storage; KernelMut::from_paddr
+pub fn create_endpoint(page: crate::mm::addr::ObjectInitPage) -> Result<(), CreateError> {
+    // SAFETY: ObjectInitPage guarantees owned storage; KernelMut::from_paddr
     // performs the one VA cast.
     let mut slot = unsafe { KernelMut::<EndpointObject>::from_paddr(page.paddr()) };
     // SAFETY: writing into freshly donated, uninitialized storage.

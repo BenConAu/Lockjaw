@@ -258,14 +258,14 @@ pub extern "C" fn kmain() -> ! {
 
         // Create endpoint object
         let ep_page = mm::page_alloc::alloc_page().expect("endpoint alloc").start_addr();
-        ipc::endpoint::create_endpoint(mm::addr::DonatedPage::new(ep_page)).expect("create endpoint");
+        ipc::endpoint::create_endpoint(mm::addr::ObjectInitPage::new(ep_page)).expect("create endpoint");
         kprintln!("  Endpoint created at phys {:#x}", ep_page.as_u64());
 
         // Reply object for the ipc_sender benchmark thread. One page,
         // pre-allocated and stashed in a static so ipc_sender can pass it
         // on every call without needing a handle table lookup.
         let bench_reply_page = mm::page_alloc::alloc_page().expect("bench reply alloc").start_addr();
-        ipc::reply::create_reply(mm::addr::DonatedPage::new(bench_reply_page)).expect("create bench reply");
+        ipc::reply::create_reply(mm::addr::ObjectInitPage::new(bench_reply_page)).expect("create bench reply");
         IPC_BENCH_REPLY_PADDR = bench_reply_page.as_u64();
 
         // Create handle table for sender (Thread A)

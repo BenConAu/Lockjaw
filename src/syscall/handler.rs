@@ -125,30 +125,20 @@ unsafe fn lookup_handle(handle: u32, required_rights: Rights, expected_type: Obj
 }
 
 /// Common logic for sys_create_notification, sys_create_endpoint, etc.
-/// Looks up the PageSet, validates it's 1 page, donates it, calls the
-/// safe init function, and inserts a handle into the caller's table.
+/// Validates the PageSet is 1 page, calls the safe init function, then
+/// consumes the PageSet and inserts a handle into the caller's table.
 unsafe fn create_kernel_object(
     pageset_id: u64,
     obj_type: ObjectType,
-    init_fn: fn(crate::mm::addr::DonatedPage) -> Result<(), crate::cap::object::CreateError>,
+    init_fn: fn(crate::mm::addr::ObjectInitPage) -> Result<(), crate::cap::object::CreateError>,
 ) -> Result<u64, SyscallError> {
-    let (count, header_paddr) = match crate::cap::pageset_table::get_pageset(pageset_id) {
-        Some(ps) => ps,
-        None => return Err(SyscallError::INVALID_HANDLE),
-    };
-    if count != 1 {
-        return Err(SyscallError::INVALID_PARAMETER);
-    }
-    let header = crate::cap::pageset_table::read_header(header_paddr);
-    let paddr = PhysAddr::new(header.get_page(0).unwrap());
-    // SAFETY: the page is kernel-allocated and about to be consumed;
-    // the factory writes into it but does not escape the paddr.
-    let page = crate::mm::addr::DonatedPage::new(paddr);
+    let page = crate::cap::pageset_table::donate_single_page(pageset_id)?;
+    let paddr = page.paddr();
     if init_fn(page).is_err() {
         return Err(SyscallError::UNKNOWN);
     }
-    // Consume the PageSet only after successful initialization, so a
-    // failed init doesn't leak the donated page.
+    // Consume only after successful initialization — preserves rollback
+    // semantics if init_fn ever fails.
     crate::cap::pageset_table::consume_pageset(pageset_id);
     let ht_paddr = caller_handle_table();
     match handle_table::handle_insert(
