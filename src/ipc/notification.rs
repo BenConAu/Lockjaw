@@ -51,6 +51,7 @@ pub unsafe fn notification_signal(
     new_value: u64,
 ) -> Result<(), NotificationError> {
     let mut obj = KernelMut::<NotificationObject>::from_paddr(notif_paddr);
+    debug_assert_eq!(obj.get().header.obj_type, ObjectType::Notification);
 
     match obj.get_mut().state.signal(new_value)? {
         SignalResult::Updated => {}
@@ -91,6 +92,7 @@ pub unsafe fn notification_wait(
     caller_tcb_paddr: PhysAddr,
 ) -> Result<u64, NotificationError> {
     let mut obj = KernelMut::<NotificationObject>::from_paddr(notif_paddr);
+    debug_assert_eq!(obj.get().header.obj_type, ObjectType::Notification);
 
     match obj.get_mut().state.wait(threshold)? {
         WaitResult::Ready => {

@@ -100,6 +100,7 @@ pub unsafe fn ipc_send(
     sender_tcb_paddr: PhysAddr,
 ) -> Result<(), IpcError> {
     let mut ep = KernelMut::<EndpointObject>::from_paddr(endpoint_paddr);
+    debug_assert_eq!(ep.get().header.obj_type, ObjectType::Endpoint);
 
     if ep.get().state == EP_HAS_RECEIVER {
         // Fast path: receiver is queued. Dequeue, transfer, unblock.
@@ -151,6 +152,7 @@ pub unsafe fn ipc_receive(
     receiver_tcb_paddr: PhysAddr,
 ) -> Result<[u64; 4], IpcError> {
     let mut ep = KernelMut::<EndpointObject>::from_paddr(endpoint_paddr);
+    debug_assert_eq!(ep.get().header.obj_type, ObjectType::Endpoint);
     let mut receiver_tcb = KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr);
 
     // Single-reply-slot rule: cannot Receive while holding an outstanding Reply.
@@ -228,6 +230,8 @@ pub unsafe fn ipc_call(
 ) -> Result<[u64; 4], IpcError> {
     let mut ep = KernelMut::<EndpointObject>::from_paddr(endpoint_paddr);
     let mut reply = KernelMut::<ReplyObject>::from_paddr(reply_paddr);
+    debug_assert_eq!(ep.get().header.obj_type, ObjectType::Endpoint);
+    debug_assert_eq!(reply.get().header.obj_type, ObjectType::Reply);
 
     // Precondition: the Reply object must be Fresh.
     if reply.get().state != REPLY_STATE_FRESH {
@@ -296,6 +300,7 @@ pub unsafe fn ipc_receive_nb(
     receiver_tcb_paddr: PhysAddr,
 ) -> Result<[u64; 4], IpcError> {
     let ep = KernelMut::<EndpointObject>::from_paddr(endpoint_paddr);
+    debug_assert_eq!(ep.get().header.obj_type, ObjectType::Endpoint);
     if ep.get().state != EP_HAS_WAITERS {
         return Err(IpcError::WouldBlock);
     }

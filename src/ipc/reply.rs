@@ -71,6 +71,7 @@ pub unsafe fn ipc_reply(
     }
 
     let mut reply = KernelMut::<ReplyObject>::from_paddr(PhysAddr::new(reply_paddr_u64));
+    debug_assert_eq!(reply.get().header.obj_type, ObjectType::Reply);
     if reply.get().state != REPLY_STATE_BOUND {
         // Someone else (or stale state) — shouldn't happen in a coherent kernel.
         return Err(IpcError::NoCaller);
