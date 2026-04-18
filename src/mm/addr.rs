@@ -49,3 +49,14 @@ impl ObjectInitPage {
         self.0
     }
 }
+
+/// Derive the physical address of a kernel object from a reference.
+/// The reference must point into the kernel's direct-mapped VA region
+/// (i.e. obtained via KernelRef/KernelMut). Reverses the
+/// `paddr + KERNEL_VA_OFFSET` cast that KernelMut::from_paddr performs.
+#[inline]
+pub(crate) fn paddr_of<T>(r: &T) -> PhysAddr {
+    // SAFETY: r points into the kernel's direct-mapped VA region; subtracting
+    // KERNEL_VA_OFFSET reverses the KernelMut::from_paddr cast.
+    PhysAddr::new(r as *const T as usize as u64 - KERNEL_VA_OFFSET)
+}

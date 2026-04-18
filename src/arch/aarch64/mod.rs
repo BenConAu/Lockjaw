@@ -18,14 +18,13 @@ pub fn irq_dispatch() {
     if let Some(notif_paddr) = irq_bind::lookup(intid) {
         // Signal the notification — increment timeline value by 1
         // The notification_signal function handles waking any waiting thread
-        unsafe {
-            use crate::ipc::notification;
-            // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-            let obj = (notif_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET)
-                as *const notification::NotificationObject;
-            let new_value = (*obj).state.value + 1;
-            let _ = notification::notification_signal(notif_paddr, new_value);
-        }
+        use crate::ipc::notification;
+        use crate::mm::kernel_ptr::KernelMut;
+        // SAFETY: notif_paddr was stored by irq_bind::bind from a valid
+        // NotificationObject handle lookup.
+        let mut obj = unsafe { KernelMut::<notification::NotificationObject>::from_paddr(notif_paddr) };
+        let new_value = obj.get().state.value + 1;
+        let _ = notification::notification_signal(obj.get_mut(), new_value);
         return;
     }
 

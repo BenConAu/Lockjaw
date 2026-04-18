@@ -136,6 +136,25 @@ The eventual design is a **device manager** process that:
 
 ---
 
+## KernelMut produces `&mut T` across context switches
+
+**Where:** `src/mm/kernel_ptr.rs` (`KernelMut::get_mut`), consumed by `src/ipc/endpoint.rs`, `src/ipc/notification.rs`
+
+**What:** `KernelMut::get_mut()` returns `&mut T` — a Rust exclusive reference with `noalias` semantics. IPC functions that block (ipc_send slow path, ipc_receive, ipc_call, notification_wait) hold this `&mut T` alive across `scheduler::block_current()`. While the thread is suspended, another thread can enter the kernel and create its own `&mut T` to the same endpoint or notification, producing two simultaneous exclusive references to the same object. Under Stacked Borrows / Tree Borrows, this is undefined behavior regardless of single-core execution.
+
+**Why bootstrap:** Single-core with IRQs masked during kernel entry means only one thread executes kernel code at a time. The compiler cannot observe the aliasing because `block_current()` is an opaque function call that prevents reordering across it. No current compiler exploits this. But it is technically UB under Rust's aliasing model and would be flagged by Miri.
+
+**Impact:** Latent. Becomes a real bug under (a) Miri testing of kernel code, (b) SMP where two cores execute syscalls concurrently, or (c) future compiler optimizations that exploit `noalias` more aggressively across opaque calls.
+
+**Fix:** Replace `KernelMut::get_mut() -> &mut T` with raw-pointer field access for any kernel object that can be touched by multiple threads across blocking operations. Options:
+1. Add `KernelMut::field_ptr() -> *mut T` and access fields via `(*ptr).field` (no `&mut T` created).
+2. Introduce a `SharedKernelObj<T>` wrapper that only provides `UnsafeCell`-style raw-pointer access, distinct from `KernelMut<T>` which remains valid for truly-exclusive objects (e.g., TCBs during their own context switch).
+3. Use `addr_of_mut!` macro for field access without creating intermediate references.
+
+The fix should be a focused refactor of `kernel_ptr.rs` + all IPC/notification call sites, not mixed into other work.
+
+---
+
 ## SYS_RECV_NB naming inconsistency
 
 **Where:** `lockjaw-types/src/syscall.rs`, `src/syscall/handler.rs`, `user/lockjaw-userlib/src/syscall.rs`

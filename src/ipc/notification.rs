@@ -1,5 +1,5 @@
 use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
-use crate::mm::addr::PhysAddr;
+use crate::mm::addr::{PhysAddr, paddr_of};
 use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::scheduler;
 use crate::sched::tcb::Tcb;
@@ -43,36 +43,29 @@ pub fn create_notification(page: crate::mm::addr::ObjectInitPage) -> Result<(), 
 
 /// Signal a notification with a new timeline value.
 /// If a waiter's threshold is met, unblocks it.
-///
-/// # Safety
-/// `notif_paddr` must be a valid NotificationObject.
-pub unsafe fn notification_signal(
-    notif_paddr: PhysAddr,
+pub fn notification_signal(
+    obj: &mut NotificationObject,
     new_value: u64,
 ) -> Result<(), NotificationError> {
-    let mut obj = KernelMut::<NotificationObject>::from_paddr(notif_paddr);
-    debug_assert_eq!(obj.get().header.obj_type, ObjectType::Notification);
+    debug_assert_eq!(obj.header.obj_type, ObjectType::Notification);
 
-    match obj.get_mut().state.signal(new_value)? {
+    match obj.state.signal(new_value)? {
         SignalResult::Updated => {}
         SignalResult::WakeWaiter => {
-            let waiter = PhysAddr::new(obj.get().blocked_tcb_paddr);
-            obj.get_mut().blocked_tcb_paddr = 0;
+            let waiter = PhysAddr::new(obj.blocked_tcb_paddr);
+            obj.blocked_tcb_paddr = 0;
             scheduler::unblock_thread(waiter);
         }
     }
 
     // Check readiness waiter (registered via sys_wait_any).
     // Wake if the new value meets the readiness threshold.
-    let should_wake = obj.get().readiness_waiter.is_registered()
-        && lockjaw_types::wait::is_notification_ready(new_value, obj.get().readiness_threshold);
+    let should_wake = obj.readiness_waiter.is_registered()
+        && lockjaw_types::wait::is_notification_ready(new_value, obj.readiness_threshold);
     if should_wake {
-        let waiter = PhysAddr::new(obj.get().readiness_waiter.paddr);
-        {
-            let o = obj.get_mut();
-            o.readiness_waiter.paddr = 0;
-            o.readiness_threshold = 0;
-        }
+        let waiter = PhysAddr::new(obj.readiness_waiter.paddr);
+        obj.readiness_waiter.paddr = 0;
+        obj.readiness_threshold = 0;
         scheduler::unblock_thread(waiter);
     }
 
@@ -82,34 +75,31 @@ pub unsafe fn notification_signal(
 /// Wait on a notification until the timeline value reaches the threshold.
 /// Returns immediately if the counter is already >= threshold.
 /// Otherwise blocks the calling thread.
-///
-/// # Safety
-/// `notif_paddr` must be a valid NotificationObject.
-/// `caller_tcb_paddr` must be the calling thread's TCB.
-pub unsafe fn notification_wait(
-    notif_paddr: PhysAddr,
+pub fn notification_wait(
+    obj: &mut NotificationObject,
     threshold: u64,
-    caller_tcb_paddr: PhysAddr,
 ) -> Result<u64, NotificationError> {
-    let mut obj = KernelMut::<NotificationObject>::from_paddr(notif_paddr);
-    debug_assert_eq!(obj.get().header.obj_type, ObjectType::Notification);
+    debug_assert_eq!(obj.header.obj_type, ObjectType::Notification);
 
-    match obj.get_mut().state.wait(threshold)? {
+    match obj.state.wait(threshold)? {
         WaitResult::Ready => {
             // Counter already past threshold — return current value
-            Ok(obj.get().state.value)
+            Ok(obj.state.value)
         }
         WaitResult::Block => {
             // Block until signaled
-            obj.get_mut().blocked_tcb_paddr = caller_tcb_paddr.as_u64();
+            let caller_tcb_paddr = scheduler::current_tcb_paddr();
+            obj.blocked_tcb_paddr = caller_tcb_paddr.as_u64();
 
-            let mut caller_tcb = KernelMut::<Tcb>::from_paddr(caller_tcb_paddr);
+            // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
+            let mut caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_tcb_paddr) };
+            let notif_paddr = paddr_of(obj);
             caller_tcb.get_mut().ipc_blocked_on = notif_paddr.as_u64();
 
             scheduler::block_current();
 
             // When we wake up, return the current value
-            Ok(obj.get().state.value)
+            Ok(obj.state.value)
         }
     }
 }

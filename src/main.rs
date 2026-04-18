@@ -301,6 +301,8 @@ pub extern "C" fn kmain() -> ! {
         cap::object::create_handle_table(&ht_info, ht_a_page).expect("create ht a");
         handle_table::handle_insert(ht_a_page, ep_page, ObjectType::Endpoint,
             cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE)).expect("insert ep handle");
+        handle_table::handle_insert(ht_a_page, bench_reply_page, ObjectType::Reply,
+            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE)).expect("insert reply handle");
 
         // Create handle table for receiver (Thread B) — also needs RW for ping-pong
         let ht_b_page = mm::page_alloc::alloc_page().expect("ht alloc").start_addr();
@@ -499,19 +501,6 @@ pub extern "C" fn kmain() -> ! {
 // IPC test threads (Phase 7)
 // ---------------------------------------------------------------------------
 
-/// Helper: look up endpoint at handle 0 for the current thread.
-unsafe fn lookup_endpoint() -> (mm::addr::PhysAddr, mm::addr::PhysAddr) {
-    let tcb_paddr = sched::scheduler::current_tcb_paddr();
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    let tcb = (tcb_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *const sched::tcb::Tcb;
-    let ht_paddr = mm::addr::PhysAddr::new((*tcb).handle_table_paddr);
-    let entry = cap::handle_table::handle_lookup(
-        ht_paddr, 0,
-        cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
-    ).expect("handle lookup");
-    (mm::addr::PhysAddr::new(entry.object_paddr), tcb_paddr)
-}
-
 /// Reply object used by the ipc_sender benchmark kernel thread. Allocated
 /// and initialized in kmain before the scheduler starts. Stored as a raw
 /// paddr so both threads can read it without needing a handle table.
@@ -519,30 +508,26 @@ static IPC_BENCH_REPLY_PADDR: BootOnce = BootOnce::new();
 
 /// Client thread: calls the server with a request, gets a reply.
 /// Uses ipc_call (send + block for reply in one operation).
+/// Endpoint at handle 0, Reply at handle 1.
 fn ipc_sender() -> ! {
     const BENCHMARK_ROUNDS: u64 = 10000;
     let mut counter: u64 = 1;
-    let reply_paddr = mm::addr::PhysAddr::new(IPC_BENCH_REPLY_PADDR.get());
 
     // Warm up
     for _ in 0..10 {
-        unsafe {
-            let (ep, tcb) = lookup_endpoint();
-            ipc::endpoint::ipc_call(ep, reply_paddr, [counter, 0, 0, 0], tcb).expect("call");
-        }
+        cap::object_ops::call(0, 1, [counter, 0, 0, 0])
+            .expect("lookup").expect("call");
         counter += 1;
     }
 
     // Benchmark using call/reply pattern
     let start_tick = arch::aarch64::timer::tick_count();
     for _ in 0..BENCHMARK_ROUNDS {
-        unsafe {
-            let (ep, tcb) = lookup_endpoint();
-            let reply = ipc::endpoint::ipc_call(ep, reply_paddr, [counter, 0, 0, 0], tcb).expect("call");
-            // Print first few to verify the server doubled our value
-            if counter <= 13 {
-                kprintln!("[IPC] call({}) -> reply({})", counter, reply[0]);
-            }
+        let reply_msg = cap::object_ops::call(0, 1, [counter, 0, 0, 0])
+            .expect("lookup").expect("call");
+        // Print first few to verify the server doubled our value
+        if counter <= 13 {
+            kprintln!("[IPC] call({}) -> reply({})", counter, reply_msg[0]);
         }
         counter += 1;
     }
@@ -556,10 +541,8 @@ fn ipc_sender() -> ! {
     }
 
     loop {
-        unsafe {
-            let (ep, tcb) = lookup_endpoint();
-            ipc::endpoint::ipc_call(ep, reply_paddr, [counter, 0, 0, 0], tcb).expect("call");
-        }
+        cap::object_ops::call(0, 1, [counter, 0, 0, 0])
+            .expect("lookup").expect("call");
         counter += 1;
     }
 }
@@ -567,12 +550,10 @@ fn ipc_sender() -> ! {
 /// Server thread: receives a request, doubles the first value, replies.
 fn ipc_receiver() -> ! {
     loop {
-        unsafe {
-            let (ep, tcb) = lookup_endpoint();
-            let msg = ipc::endpoint::ipc_receive(ep, tcb).expect("receive");
-            let reply = [msg[0] * 2, msg[1], msg[2], msg[3]];
-            ipc::reply::ipc_reply(tcb, reply).expect("reply");
-        }
+        let msg = cap::object_ops::receive(0)
+            .expect("lookup").expect("receive");
+        let reply = [msg[0] * 2, msg[1], msg[2], msg[3]];
+        ipc::reply::ipc_reply(reply).expect("reply");
     }
 }
 

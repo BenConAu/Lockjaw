@@ -47,7 +47,7 @@ pub fn create_reply(page: crate::mm::addr::ObjectInitPage) -> Result<(), CreateE
     Ok(())
 }
 
-/// Reply to the call currently bound on `replier_tcb_paddr`. Reads the
+/// Reply to the call currently bound on the current thread. Reads the
 /// replier's `current_reply_paddr` (set earlier by `ipc_receive` when it
 /// dequeued a Call waiter), writes `msg` into the caller's TCB, returns
 /// the Reply object to Fresh, and unblocks the caller.
@@ -56,28 +56,27 @@ pub fn create_reply(page: crate::mm::addr::ObjectInitPage) -> Result<(), CreateE
 /// TCB to the caller's TCB via the Reply object. This is the property that
 /// eliminates the multi-caller race: two outstanding callers' Replies are
 /// independent objects with independent bindings.
-///
-/// # Safety
-/// `replier_tcb_paddr` must be a valid TCB. Any Reply object referenced via
-/// that TCB's `current_reply_paddr` must be a valid kernel object.
-pub unsafe fn ipc_reply(
-    replier_tcb_paddr: PhysAddr,
+pub fn ipc_reply(
     msg: [u64; 4],
 ) -> Result<(), IpcError> {
-    let mut replier_tcb = KernelMut::<Tcb>::from_paddr(replier_tcb_paddr);
+    let replier_tcb_paddr = scheduler::current_tcb_paddr();
+    // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
+    let mut replier_tcb = unsafe { KernelMut::<Tcb>::from_paddr(replier_tcb_paddr) };
     let reply_paddr_u64 = replier_tcb.get().current_reply_paddr;
     if reply_paddr_u64 == 0 {
         return Err(IpcError::NoCaller);
     }
 
-    let mut reply = KernelMut::<ReplyObject>::from_paddr(PhysAddr::new(reply_paddr_u64));
+    // SAFETY: current_reply_paddr was set by ipc_receive from a valid Reply.
+    let mut reply = unsafe { KernelMut::<ReplyObject>::from_paddr(PhysAddr::new(reply_paddr_u64)) };
     debug_assert_eq!(reply.get().header.obj_type, ObjectType::Reply);
     if reply.get().state != REPLY_STATE_BOUND {
         // Someone else (or stale state) — shouldn't happen in a coherent kernel.
         return Err(IpcError::NoCaller);
     }
     let caller_paddr = PhysAddr::new(reply.get().caller_tcb_paddr);
-    let mut caller_tcb = KernelMut::<Tcb>::from_paddr(caller_paddr);
+    // SAFETY: Reply.caller_tcb_paddr was set by ipc_call from a valid TCB.
+    let mut caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_paddr) };
 
     // Deliver the reply message straight to the caller's ipc_msg.
     {

@@ -93,11 +93,6 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
     CurrentThread::clear_breadcrumb();
 }
 
-/// Look up a handle in the current thread's handle table with type checking.
-fn lookup_handle(handle: u32, required_rights: Rights, expected_type: ObjectType) -> Result<handle_table::HandleEntry, SyscallError> {
-    CurrentThread::handle_table().lookup(handle, required_rights, expected_type)
-}
-
 /// Common logic for sys_create_notification, sys_create_endpoint, etc.
 /// Validates the PageSet is 1 page, calls the safe init function, then
 /// consumes the PageSet and inserts a handle into the caller's table.
@@ -135,19 +130,10 @@ fn sys_yield() -> SyscallError {
 fn sys_send(ctx: &mut ExceptionContext) -> SyscallError {
     let handle = ctx.gpr[0] as u32;
     let msg = [ctx.gpr[1], ctx.gpr[2], ctx.gpr[3], ctx.gpr[4]];
-
-    unsafe {
-        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Endpoint) {
-            Ok(e) => e,
-            Err(e) => return e,
-        };
-
-        let ep_paddr = PhysAddr::new(entry.object_paddr);
-        let tcb_paddr = CurrentThread::tcb_paddr();
-        match endpoint::ipc_send(ep_paddr, msg, tcb_paddr) {
-            Ok(()) => SyscallError::OK,
-            Err(_) => SyscallError::ENDPOINT_BUSY,
-        }
+    match crate::cap::object_ops::send(handle, msg) {
+        Ok(Ok(())) => SyscallError::OK,
+        Ok(Err(_)) => SyscallError::ENDPOINT_BUSY,
+        Err(e) => e,
     }
 }
 
@@ -155,25 +141,16 @@ fn sys_send(ctx: &mut ExceptionContext) -> SyscallError {
 /// x0 = endpoint handle. On success: x0=0, x1-x4 = message words.
 fn sys_receive(ctx: &mut ExceptionContext) -> SyscallReturn {
     let handle = ctx.gpr[0] as u32;
-
-    unsafe {
-        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ), ObjectType::Endpoint) {
-            Ok(e) => e,
-            Err(e) => return SyscallReturn::Message(e),
-        };
-
-        let ep_paddr = PhysAddr::new(entry.object_paddr);
-        let tcb_paddr = CurrentThread::tcb_paddr();
-        match endpoint::ipc_receive(ep_paddr, tcb_paddr) {
-            Ok(msg) => {
-                ctx.gpr[1] = msg[0];
-                ctx.gpr[2] = msg[1];
-                ctx.gpr[3] = msg[2];
-                ctx.gpr[4] = msg[3];
-                SyscallReturn::Message(SyscallError::OK)
-            }
-            Err(_) => SyscallReturn::Message(SyscallError::UNKNOWN),
+    match crate::cap::object_ops::receive(handle) {
+        Ok(Ok(msg)) => {
+            ctx.gpr[1] = msg[0];
+            ctx.gpr[2] = msg[1];
+            ctx.gpr[3] = msg[2];
+            ctx.gpr[4] = msg[3];
+            SyscallReturn::Message(SyscallError::OK)
         }
+        Ok(Err(_)) => SyscallReturn::Message(SyscallError::UNKNOWN),
+        Err(e) => SyscallReturn::Message(e),
     }
 }
 
@@ -186,41 +163,17 @@ fn sys_call(ctx: &mut ExceptionContext) -> SyscallReturn {
     let ep_handle = ctx.gpr[0] as u32;
     let reply_handle = ctx.gpr[1] as u32;
     let msg = [ctx.gpr[2], ctx.gpr[3], ctx.gpr[4], ctx.gpr[5]];
-
-    unsafe {
-        let ep_entry = match lookup_handle(
-            ep_handle,
-            Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE),
-            ObjectType::Endpoint,
-        ) {
-            Ok(e) => e,
-            Err(e) => return SyscallReturn::Message(e),
-        };
-        let reply_entry = match lookup_handle(
-            reply_handle,
-            Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE),
-            ObjectType::Reply,
-        ) {
-            Ok(e) => e,
-            Err(e) => return SyscallReturn::Message(e),
-        };
-
-        let ep_paddr = PhysAddr::new(ep_entry.object_paddr);
-        let reply_paddr = PhysAddr::new(reply_entry.object_paddr);
-        let tcb_paddr = CurrentThread::tcb_paddr();
-        match endpoint::ipc_call(ep_paddr, reply_paddr, msg, tcb_paddr) {
-            Ok(reply) => {
-                ctx.gpr[1] = reply[0];
-                ctx.gpr[2] = reply[1];
-                ctx.gpr[3] = reply[2];
-                ctx.gpr[4] = reply[3];
-                SyscallReturn::Message(SyscallError::OK)
-            }
-            Err(endpoint::IpcError::ReplyBound) => {
-                SyscallReturn::Message(SyscallError::REPLY_BOUND)
-            }
-            Err(_) => SyscallReturn::Message(SyscallError::UNKNOWN),
+    match crate::cap::object_ops::call(ep_handle, reply_handle, msg) {
+        Ok(Ok(reply_msg)) => {
+            ctx.gpr[1] = reply_msg[0];
+            ctx.gpr[2] = reply_msg[1];
+            ctx.gpr[3] = reply_msg[2];
+            ctx.gpr[4] = reply_msg[3];
+            SyscallReturn::Message(SyscallError::OK)
         }
+        Ok(Err(endpoint::IpcError::ReplyBound)) => SyscallReturn::Message(SyscallError::REPLY_BOUND),
+        Ok(Err(_)) => SyscallReturn::Message(SyscallError::UNKNOWN),
+        Err(e) => SyscallReturn::Message(e),
     }
 }
 
@@ -230,13 +183,10 @@ fn sys_call(ctx: &mut ExceptionContext) -> SyscallReturn {
 /// x0-x3 = reply message. Returns NO_CALLER if the TCB has no bound call.
 fn sys_reply(ctx: &mut ExceptionContext) -> SyscallError {
     let reply_msg = [ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]];
-    unsafe {
-        let tcb_paddr = CurrentThread::tcb_paddr();
-        match crate::ipc::reply::ipc_reply(tcb_paddr, reply_msg) {
-            Ok(()) => SyscallError::OK,
-            Err(endpoint::IpcError::NoCaller) => SyscallError::NO_CALLER,
-            Err(_) => SyscallError::UNKNOWN,
-        }
+    match crate::ipc::reply::ipc_reply(reply_msg) {
+        Ok(()) => SyscallError::OK,
+        Err(endpoint::IpcError::NoCaller) => SyscallError::NO_CALLER,
+        Err(_) => SyscallError::UNKNOWN,
     }
 }
 
@@ -323,19 +273,11 @@ fn sys_create_notification(ctx: &mut ExceptionContext) -> Result<u64, SyscallErr
 fn sys_signal_notification(ctx: &mut ExceptionContext) -> SyscallError {
     let handle = ctx.gpr[0] as u32;
     let new_value = ctx.gpr[1];
-
-    unsafe {
-        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Notification) {
-            Ok(e) => e,
-            Err(e) => return e,
-        };
-
-        let notif_paddr = PhysAddr::new(entry.object_paddr);
-        match crate::ipc::notification::notification_signal(notif_paddr, new_value) {
-            Ok(()) => SyscallError::OK,
-            Err(lockjaw_types::notification_state::NotificationError::ValueNotMonotonic) => SyscallError::NOT_MONOTONIC,
-            Err(_) => SyscallError::UNKNOWN,
-        }
+    match crate::cap::object_ops::signal_notification(handle, new_value) {
+        Ok(Ok(())) => SyscallError::OK,
+        Ok(Err(lockjaw_types::notification_state::NotificationError::ValueNotMonotonic)) => SyscallError::NOT_MONOTONIC,
+        Ok(Err(_)) => SyscallError::UNKNOWN,
+        Err(e) => e,
     }
 }
 
@@ -346,20 +288,11 @@ fn sys_signal_notification(ctx: &mut ExceptionContext) -> SyscallError {
 fn sys_wait_notification(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let handle = ctx.gpr[0] as u32;
     let threshold = ctx.gpr[1];
-
-    unsafe {
-        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ), ObjectType::Notification) {
-            Ok(e) => e,
-            Err(e) => return Err(e),
-        };
-
-        let notif_paddr = PhysAddr::new(entry.object_paddr);
-        let tcb_paddr = CurrentThread::tcb_paddr();
-        match crate::ipc::notification::notification_wait(notif_paddr, threshold, tcb_paddr) {
-            Ok(value) => Ok(value),
-            Err(lockjaw_types::notification_state::NotificationError::AlreadyHasWaiter) => Err(SyscallError::ALREADY_WAITING),
-            Err(_) => Err(SyscallError::UNKNOWN),
-        }
+    match crate::cap::object_ops::wait_notification(handle, threshold) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(lockjaw_types::notification_state::NotificationError::AlreadyHasWaiter)) => Err(SyscallError::ALREADY_WAITING),
+        Ok(Err(_)) => Err(SyscallError::UNKNOWN),
+        Err(e) => Err(e),
     }
 }
 
@@ -370,22 +303,24 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
     let intid = ctx.gpr[0] as u32;
     let notif_handle = ctx.gpr[1] as u32;
 
-    unsafe {
-        let entry = match lookup_handle(notif_handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), ObjectType::Notification) {
-            Ok(e) => e,
-            Err(e) => return e,
-        };
-
-        let notif_paddr = PhysAddr::new(entry.object_paddr);
-        if crate::arch::aarch64::irq_bind::bind(intid, notif_paddr) {
-            // Enable SPI in the GIC distributor (PPIs are already enabled in gic::init)
-            if intid >= 32 {
-                crate::arch::aarch64::gic::enable_spi(intid);
-            }
-            SyscallError::OK
-        } else {
-            SyscallError::INVALID_PARAMETER
+    // bind_irq needs the notification paddr for the arch/ binding layer,
+    // not a mutable reference — use the existing typed lookup.
+    let ht = CurrentThread::handle_table();
+    let entry = match ht.lookup(notif_handle, Rights::from_bits(crate::cap::rights::RIGHT_WRITE), crate::cap::object::ObjectType::Notification) {
+        Ok(e) => e,
+        Err(e) => return e,
+    };
+    let notif_paddr = PhysAddr::new(entry.object_paddr);
+    if crate::arch::aarch64::irq_bind::bind(intid, notif_paddr) {
+        // Enable SPI in the GIC distributor (PPIs are already enabled in gic::init)
+        if intid >= 32 {
+            // SAFETY: intid validated by irq_bind::bind; enable_spi is a GIC
+            // MMIO write that is safe to execute for any valid SPI.
+            unsafe { crate::arch::aarch64::gic::enable_spi(intid) };
         }
+        SyscallError::OK
+    } else {
+        SyscallError::INVALID_PARAMETER
     }
 }
 
@@ -408,27 +343,17 @@ fn sys_create_reply(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 /// Returns SyscallError::WOULD_BLOCK if no sender is waiting.
 fn sys_recv_nb(ctx: &mut ExceptionContext) -> SyscallReturn {
     let handle = ctx.gpr[0] as u32;
-
-    unsafe {
-        let entry = match lookup_handle(handle, Rights::from_bits(crate::cap::rights::RIGHT_READ), ObjectType::Endpoint) {
-            Ok(e) => e,
-            Err(e) => return SyscallReturn::Message(e),
-        };
-
-        let ep_paddr = PhysAddr::new(entry.object_paddr);
-        let tcb_paddr = CurrentThread::tcb_paddr();
-
-        match endpoint::ipc_receive_nb(ep_paddr, tcb_paddr) {
-            Ok(msg) => {
-                ctx.gpr[1] = msg[0];
-                ctx.gpr[2] = msg[1];
-                ctx.gpr[3] = msg[2];
-                ctx.gpr[4] = msg[3];
-                SyscallReturn::Message(SyscallError::OK)
-            }
-            Err(endpoint::IpcError::WouldBlock) => SyscallReturn::Message(SyscallError::WOULD_BLOCK),
-            Err(_) => SyscallReturn::Message(SyscallError::UNKNOWN),
+    match crate::cap::object_ops::recv_nb(handle) {
+        Ok(Ok(msg)) => {
+            ctx.gpr[1] = msg[0];
+            ctx.gpr[2] = msg[1];
+            ctx.gpr[3] = msg[2];
+            ctx.gpr[4] = msg[3];
+            SyscallReturn::Message(SyscallError::OK)
         }
+        Ok(Err(endpoint::IpcError::WouldBlock)) => SyscallReturn::Message(SyscallError::WOULD_BLOCK),
+        Ok(Err(_)) => SyscallReturn::Message(SyscallError::UNKNOWN),
+        Err(e) => SyscallReturn::Message(e),
     }
 }
 

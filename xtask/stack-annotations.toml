@@ -16,6 +16,9 @@
 "<core::fmt::Formatter>::pad" = "fmt-internal"
 "<core::fmt::Formatter>::pad_integral" = "fmt-internal"
 "<core::fmt::Formatter>::pad_integral::write_prefix" = "fmt-internal"
+"<lockjaw_types::syscall::SyscallError as core::fmt::Debug>::fmt" = "fmt-internal"
+"<core::fmt::builders::PadAdapter as core::fmt::Write>::write_str" = "fmt-internal"
+"<core::fmt::builders::PadAdapter as core::fmt::Write>::write_char" = "fmt-internal"
 
 # Thread entry trampoline calls the thread's entry function via blr x19.
 # All possible targets listed here:
