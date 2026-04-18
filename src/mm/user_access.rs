@@ -65,14 +65,3 @@ impl UserAddressSpace {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Legacy free function — kept for callers not yet migrated
-// ---------------------------------------------------------------------------
-
-/// Read a value of type T from a user virtual address.
-///
-/// # Safety
-/// `ttbr0_paddr` must be a valid L0 page table.
-pub unsafe fn copy_from_user<T: lockjaw_types::user_pod::UserPod>(ttbr0_paddr: PhysAddr, user_va: u64) -> Option<T> {
-    UserAddressSpace::from_ttbr0(ttbr0_paddr).read(user_va)
-}

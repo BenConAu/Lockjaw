@@ -252,11 +252,9 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
     // Read process name from user memory (16 bytes, NUL-padded)
     let name: [u8; 16] = addr_space.read(name_va).unwrap_or([0u8; 16]);
 
-    unsafe {
-        match crate::process::create_process(mappings_va, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy, addr_space.ttbr0(), name) {
-            Ok(()) => SyscallError::OK,
-            Err(_) => SyscallError::UNKNOWN,
-        }
+    match crate::process::create_process(&addr_space, mappings_va, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy, name) {
+        Ok(()) => SyscallError::OK,
+        Err(_) => SyscallError::UNKNOWN,
     }
 }
 
