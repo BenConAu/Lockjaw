@@ -98,12 +98,10 @@ pub unsafe fn handle_insert(
     obj_type: ObjectType,
     rights: Rights,
 ) -> Result<u32, HandleError> {
-    let (header, slots_base) = table_ptrs(table_paddr);
-    let slot_count = (*header).slot_count as usize;
+    let (_header, slots) = table_slots(table_paddr);
 
     // Find first empty slot
-    for i in 0..slot_count {
-        let slot = &mut *slot_ptr(slots_base, i);
+    for (i, slot) in slots.iter_mut().enumerate() {
         if slot.object_paddr == 0 {
             slot.object_paddr = object_paddr.as_u64();
             slot.obj_type = obj_type;
@@ -121,14 +119,10 @@ pub unsafe fn handle_lookup(
     handle: u32,
     required: Rights,
 ) -> Result<HandleEntry, HandleError> {
-    let (header, slots_base) = table_ptrs(table_paddr);
-    let slot_count = (*header).slot_count;
+    let (_header, slots) = table_slots(table_paddr);
 
-    if handle >= slot_count {
-        return Err(HandleError::InvalidHandle);
-    }
-
-    let slot = *slot_ptr(slots_base, handle as usize);
+    let slot = slots.get(handle as usize)
+        .ok_or(HandleError::InvalidHandle)?;
     if slot.object_paddr == 0 {
         return Err(HandleError::InvalidHandle);
     }
@@ -138,7 +132,7 @@ pub unsafe fn handle_lookup(
         return Err(HandleError::InsufficientRights);
     }
 
-    Ok(slot)
+    Ok(*slot)
 }
 
 /// Remove a handle, returning what was in the slot.
@@ -146,20 +140,16 @@ pub unsafe fn handle_remove(
     table_paddr: PhysAddr,
     handle: u32,
 ) -> Result<HandleEntry, HandleError> {
-    let (header, slots_base) = table_ptrs(table_paddr);
-    let slot_count = (*header).slot_count;
+    let (_header, slots) = table_slots(table_paddr);
 
-    if handle >= slot_count {
-        return Err(HandleError::InvalidHandle);
-    }
-
-    let slot = &mut *slot_ptr(slots_base, handle as usize);
+    let slot = slots.get_mut(handle as usize)
+        .ok_or(HandleError::InvalidHandle)?;
     if slot.object_paddr == 0 {
         return Err(HandleError::InvalidHandle);
     }
 
     let removed = *slot;
-    // SAFETY: kernel object at known VA
+    // SAFETY: zeroing via the mutable slice reference to mark slot empty.
     ptr::write_bytes(slot as *mut HandleEntry, 0, 1);
     Ok(removed)
 }
@@ -168,16 +158,17 @@ pub unsafe fn handle_remove(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-unsafe fn table_ptrs(table_paddr: PhysAddr) -> (*const HandleTableHeader, u64) {
+/// Get the header pointer and a mutable slice over the handle slots.
+/// Replaces manual offset arithmetic with Rust slice indexing.
+///
+/// # Safety
+/// `table_paddr` must point to a live HandleTableObject in a kernel-owned page.
+unsafe fn table_slots(table_paddr: PhysAddr) -> (*mut HandleTableHeader, &'static mut [HandleEntry]) {
     let base_va = table_paddr.as_u64() + KERNEL_VA_OFFSET;
     // SAFETY: kernel object at known VA
-    let header = base_va as *const HandleTableHeader;
-    let slots_base = base_va + core::mem::size_of::<HandleTableHeader>() as u64;
-    (header, slots_base)
-}
-
-unsafe fn slot_ptr(slots_base: u64, index: usize) -> *mut HandleEntry {
-    let slot_size = core::mem::size_of::<HandleEntry>();
-    // SAFETY: kernel object at known VA
-    (slots_base + (index * slot_size) as u64) as *mut HandleEntry
+    let header = base_va as *mut HandleTableHeader;
+    let slot_count = (*header).slot_count as usize;
+    // SAFETY: slots immediately follow the header in the donated page(s)
+    let slots_ptr = (base_va + core::mem::size_of::<HandleTableHeader>() as u64) as *mut HandleEntry;
+    (header, core::slice::from_raw_parts_mut(slots_ptr, slot_count))
 }
