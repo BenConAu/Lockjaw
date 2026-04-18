@@ -31,8 +31,7 @@ pub struct Tcb {
     /// context (x0-x3) for userspace. Do not use for other purposes.
     pub ipc_msg: [u64; 4],
     /// Intrusive link in an endpoint's waiter queue (paddr of next TCB,
-    /// 0 = tail). Written on enqueue, cleared on dequeue. Unused until
-    /// the IPC cutover commit wires the new queue-based endpoint.
+    /// 0 = tail). Written by ep_queue::enqueue, cleared by dequeue.
     pub ipc_queue_next: u64,
     /// Kind of wait currently held on an endpoint: 0 = none, 1 = Send,
     /// 2 = Receive, 3 = Call. Set on enqueue, cleared on dequeue.

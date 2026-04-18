@@ -31,8 +31,6 @@
 //! compiles to the same code as writing `&*(paddr_plus_offset as *mut
 //! T)` by hand.
 
-// Module-level allow: this commit introduces the primitives; consumers
-// migrate in the immediately following commits and make the API live.
 #![allow(dead_code)]
 
 use crate::mm::addr::{KERNEL_VA_OFFSET, PhysAddr};
@@ -138,7 +136,8 @@ impl<'a, T> KernelMut<'a, T> {
         self.ptr
     }
 
-    /// Raw `*const` for legacy APIs.
+    /// Raw `*const` for sites that need a pointer without `&T` semantics
+    /// (e.g. volatile reads in crash diagnostics, FFI to context_switch).
     #[inline]
     pub fn as_ptr(&self) -> *const T {
         // SAFETY: mut-to-const downgrade of the wrapper's own pointer

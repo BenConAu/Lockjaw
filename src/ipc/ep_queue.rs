@@ -6,9 +6,8 @@
 //!
 //! No allocation — the storage is the TCB's own page.
 //!
-//! `remove`, `is_empty`, and `peek_head` are used by future process
-//! teardown and readiness paths; `#[allow(dead_code)]` on them keeps
-//! the build clean until those callers land.
+//! `remove`, `is_empty`, and `peek_head` have no callers yet — retained
+//! for process teardown (see docs/yagni-parking-lot.md).
 
 use crate::ipc::endpoint::EndpointObject;
 use crate::mm::addr::PhysAddr;

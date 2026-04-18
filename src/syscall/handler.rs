@@ -480,9 +480,8 @@ fn check_readiness(
 /// Returns the new handle index (in the caller's table) in x1, or
 /// NO_CALLER if the exporting thread has no bound call.
 ///
-/// Post-redesign: the caller is identified via the exporter's own TCB's
-/// `current_reply_paddr` → Reply object → `caller_tcb_paddr`. The old
-/// ep-handle argument is dropped.
+/// The caller is identified via the exporter's own TCB's
+/// `current_reply_paddr` → Reply object → `caller_tcb_paddr`.
 fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let handle_to_export = ctx.gpr[0] as u32;
 

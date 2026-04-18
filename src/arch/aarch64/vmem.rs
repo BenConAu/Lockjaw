@@ -57,7 +57,7 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     // L0[0] → L1
     (*l0_va).entries[0] = PageTableEntry::new_table(l1_page.start_addr());
 
-    // Kernel identity map in L1 (same workaround as Phase 6):
+    // Kernel identity map in L1 (workaround: kernel linked at phys addrs):
     // L1[1] = 1GB block at RAM_BASE (kernel-only)
     (*l1_va).entries[1] = PageTableEntry::new_block(
         PhysAddr::new(super::platform::RAM_BASE),

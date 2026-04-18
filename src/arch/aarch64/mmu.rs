@@ -117,7 +117,7 @@ pub unsafe fn enable_mmu() {
         val = in(reg) ttbr0,
     );
 
-    // 4. TTBR1_EL1 — not used yet, will be set up for higher-half in 2.5
+    // 4. TTBR1_EL1 — zeroed here; enable_higher_half() installs the real table
     asm!(
         "msr TTBR1_EL1, {val}",             // Write Translation Table Base Register 1
         val = in(reg) 0u64,

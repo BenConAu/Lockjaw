@@ -50,7 +50,7 @@ impl HandleTableRef {
     }
 
     /// Remove a handle from the table. Returns the removed entry.
-    #[allow(dead_code)] // Used by future handle-revocation paths.
+    #[allow(dead_code)] // No callers yet — needed for handle revocation.
     pub fn remove(&self, handle: u32) -> Result<HandleEntry, SyscallError> {
         // SAFETY: self.0 was validated at construction.
         unsafe { handle_remove(self.0, handle) }
@@ -59,7 +59,7 @@ impl HandleTableRef {
 
     /// The underlying physical address (needed by cross-table operations
     /// like sys_export_handle on the caller's table).
-    #[allow(dead_code)] // Used once cross-table insert migrates fully.
+    #[allow(dead_code)] // No callers yet — needed for cross-table operations.
     pub fn paddr(&self) -> PhysAddr {
         self.0
     }

@@ -35,7 +35,7 @@ pub unsafe fn init_canary() {
 }
 
 /// Check that the stack canary is intact. Panics if corrupted.
-/// Intended to be called periodically (e.g. on every context switch in Phase 5).
+/// Called on context switch and from the panic handler.
 pub fn check_canary() {
     unsafe {
         // SAFETY: linker symbol
