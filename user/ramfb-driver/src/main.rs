@@ -75,21 +75,10 @@ unsafe fn fwcfg_read8() -> u8 {
     ptr::read_volatile((FWCFG_VA + FWCFG_DATA) as *const u8)
 }
 
-unsafe fn fwcfg_write8(val: u8) {
-    ptr::write_volatile((FWCFG_VA + FWCFG_DATA) as *mut u8, val);
-}
-
 /// Read N bytes from the currently selected fw_cfg item.
 unsafe fn fwcfg_read_bytes(buf: &mut [u8]) {
     for b in buf.iter_mut() {
         *b = fwcfg_read8();
-    }
-}
-
-/// Write N bytes to the currently selected fw_cfg item.
-unsafe fn fwcfg_write_bytes(buf: &[u8]) {
-    for &b in buf.iter() {
-        fwcfg_write8(b);
     }
 }
 

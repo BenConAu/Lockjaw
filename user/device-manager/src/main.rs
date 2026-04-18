@@ -9,7 +9,6 @@ static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
 use lockjaw_userlib::*;
 use lockjaw_types::fdt::parse_fdt;
-use lockjaw_types::device::*;
 
 // ---------------------------------------------------------------------------
 // Constants
