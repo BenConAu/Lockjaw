@@ -1,7 +1,8 @@
 // Re-export pure types from lockjaw-types.
 pub use lockjaw_types::object::*;
 
-use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
+use crate::mm::addr::PhysAddr;
+use crate::mm::kernel_ptr::KernelMut;
 use core::ptr;
 
 // ---------------------------------------------------------------------------
@@ -22,13 +23,11 @@ pub unsafe fn create_handle_table(
     }
 
     let required = query_handle_table_size(info);
-    let base_va = base_paddr.as_u64() + KERNEL_VA_OFFSET;
+    let mut header_km = KernelMut::<HandleTableHeader>::from_paddr(base_paddr);
 
     // Write the handle table header
-    // SAFETY: kernel object at known VA
-    let header = base_va as *mut HandleTableHeader;
     ptr::write(
-        header,
+        header_km.as_mut_ptr(),
         HandleTableHeader {
             header: ObjectHeader {
                 obj_type: ObjectType::HandleTable,
@@ -40,7 +39,7 @@ pub unsafe fn create_handle_table(
 
     // Zero all handle slots (empty = object_paddr 0)
     // SAFETY: slots immediately follow the header in the donated page(s)
-    let slots_ptr = (base_va + core::mem::size_of::<HandleTableHeader>() as u64)
+    let slots_ptr = (header_km.as_ptr() as u64 + core::mem::size_of::<HandleTableHeader>() as u64)
         as *mut crate::cap::handle_table::HandleEntry;
     ptr::write_bytes(slots_ptr, 0, info.slot_count as usize);
 

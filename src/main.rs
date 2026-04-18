@@ -406,9 +406,8 @@ pub extern "C" fn kmain() -> ! {
         // Allocate a page for the mapping buffer (avoids large array on the kernel stack)
         let map_buf = mm::page_alloc::alloc_page().expect("mapping buffer page");
         mm::page_alloc::zero_page(map_buf.start_addr());
-        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-        let map_buf_va = (map_buf.start_addr().as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut Mapping;
-        let mappings = core::slice::from_raw_parts_mut(map_buf_va, MAPPINGS_PER_PAGE);
+        let mut map_buf_km = mm::kernel_ptr::KernelMut::<Mapping>::from_paddr(map_buf.start_addr());
+        let mappings = core::slice::from_raw_parts_mut(map_buf_km.as_mut_ptr(), MAPPINGS_PER_PAGE);
         let mut mapping_count = 0;
 
         for i in 0..elf_info.segment_count {
@@ -422,7 +421,6 @@ pub extern "C" fn kmain() -> ! {
             for p in 0..num_pages {
                 assert!(mapping_count < MAPPINGS_PER_PAGE, "init ELF has too many pages for mapping buffer");
                 let page = mm::page_alloc::alloc_page().expect("segment page");
-                let page_va = page.start_addr().as_u64() + mm::addr::KERNEL_VA_OFFSET;
 
                 // Copy file data into this page (if any)
                 let seg_page_offset = (p as u64) * mm::addr::PAGE_SIZE;
@@ -438,8 +436,8 @@ pub extern "C" fn kmain() -> ! {
 
                 if file_remaining > 0 {
                     let src = &INIT_ELF[file_start as usize..(file_start + file_remaining) as usize];
-                    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-                    core::ptr::copy_nonoverlapping(src.as_ptr(), page_va as *mut u8, file_remaining as usize);
+                    let mut page_km = mm::kernel_ptr::KernelMut::<u8>::from_paddr(page.start_addr());
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), page_km.as_mut_ptr(), file_remaining as usize);
                 }
 
                 mappings[mapping_count] = Mapping {
