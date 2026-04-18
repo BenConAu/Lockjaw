@@ -161,11 +161,51 @@ pub fn get_pageset(id: u64) -> Option<(usize, u64)> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PageSetRef — safe typed wrapper over a registered PageSet
+// ---------------------------------------------------------------------------
+
+/// A validated reference to a registered PageSet. Constructed from
+/// `PageSetRef::from_id()`, which proves the ID is live in the table.
+/// All methods are safe — the header_paddr validity is established at
+/// construction time.
+pub struct PageSetRef {
+    count: usize,
+    header_paddr: u64,
+}
+
+impl PageSetRef {
+    /// Look up a PageSet by ID. Returns None if the ID is not registered.
+    pub fn from_id(id: u64) -> Option<Self> {
+        let (count, header_paddr) = get_pageset(id)?;
+        Some(PageSetRef { count, header_paddr })
+    }
+
+    /// Number of data pages in this PageSet.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Get the physical address of a data page by index.
+    pub fn page(&self, index: usize) -> Option<PhysAddr> {
+        // SAFETY: header_paddr came from a registered PageSet — valid kernel page.
+        let header = unsafe { read_header(self.header_paddr) };
+        header.get_page(index).map(PhysAddr::new)
+    }
+
+    /// Access the underlying PageSetHeader (for bulk operations like
+    /// map_pages_in_existing that take the whole header).
+    pub fn header(&self) -> &PageSetHeader {
+        // SAFETY: header_paddr came from a registered PageSet — valid kernel page.
+        unsafe { read_header(self.header_paddr) }
+    }
+}
+
 /// Read the PageSetHeader from a header page.
 ///
 /// # Safety
 /// `header_paddr` must be a valid header page physical address.
-pub unsafe fn read_header(header_paddr: u64) -> &'static PageSetHeader {
+pub(crate) unsafe fn read_header(header_paddr: u64) -> &'static PageSetHeader {
     let header = KernelMut::<PageSetHeader>::from_paddr(PhysAddr::new(header_paddr));
     // Extend lifetime to 'static — the header lives in a kernel-owned page
     // that persists for the life of the PageSet. Callers must not hold the
@@ -187,15 +227,13 @@ pub unsafe fn read_header(header_paddr: u64) -> &'static PageSetHeader {
 /// so syscall handlers can propagate the right error code to userspace.
 pub fn donate_single_page(pageset_id: u64) -> Result<crate::mm::addr::ObjectInitPage, lockjaw_types::syscall::SyscallError> {
     use lockjaw_types::syscall::SyscallError;
-    let (count, header_paddr) = get_pageset(pageset_id)
+    let pageset = PageSetRef::from_id(pageset_id)
         .ok_or(SyscallError::INVALID_HANDLE)?;
-    if count != 1 {
+    if pageset.count() != 1 {
         return Err(SyscallError::INVALID_PARAMETER);
     }
-    // SAFETY: header_paddr came from a registered PageSet — valid kernel page.
-    let header = unsafe { read_header(header_paddr) };
-    let paddr = PhysAddr::new(header.get_page(0)
-        .ok_or(SyscallError::INVALID_HANDLE)?);
+    let paddr = pageset.page(0)
+        .ok_or(SyscallError::INVALID_HANDLE)?;
     // SAFETY: the page is kernel-allocated via the page allocator;
     // ObjectInitPage just wraps the paddr in a typed newtype.
     Ok(unsafe { crate::mm::addr::ObjectInitPage::new(paddr) })

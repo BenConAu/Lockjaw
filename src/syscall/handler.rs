@@ -217,13 +217,12 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     };
 
     // All mappings go through PageSets — no raw physical addresses accepted.
-    let (_count, header_paddr) = match crate::cap::pageset_table::get_pageset(pageset_id) {
+    let pageset = match crate::cap::pageset_table::PageSetRef::from_id(pageset_id) {
         Some(ps) => ps,
         None => return SyscallError::INVALID_HANDLE,
     };
     unsafe {
-        let header = crate::cap::pageset_table::read_header(header_paddr);
-        match crate::arch::aarch64::vmem::map_pages_in_existing(addr_space.ttbr0(), virt_addr, header, flags) {
+        match crate::arch::aarch64::vmem::map_pages_in_existing(addr_space.ttbr0(), virt_addr, pageset.header(), flags) {
             Ok(()) => SyscallError::OK,
             Err(_) => SyscallError::UNKNOWN,
         }
@@ -545,18 +544,11 @@ fn sys_query_pageset_phys(ctx: &mut ExceptionContext) -> Result<u64, SyscallErro
     let pageset_id = ctx.gpr[0];
     let page_index = ctx.gpr[1] as usize;
 
-    let (_count, header_paddr) = match crate::cap::pageset_table::get_pageset(pageset_id) {
-        Some(ps) => ps,
-        None => return Err(SyscallError::INVALID_HANDLE),
-    };
-
-    unsafe {
-        let header = crate::cap::pageset_table::read_header(header_paddr);
-        match header.get_page(page_index) {
-            Some(phys) => Ok(phys),
-            None => Err(SyscallError::INVALID_PARAMETER),
-        }
-    }
+    let pageset = crate::cap::pageset_table::PageSetRef::from_id(pageset_id)
+        .ok_or(SyscallError::INVALID_HANDLE)?;
+    pageset.page(page_index)
+        .map(|p| p.as_u64())
+        .ok_or(SyscallError::INVALID_PARAMETER)
 }
 
 fn obj_type_from_u8(v: u8) -> ObjectType {
