@@ -6,6 +6,7 @@
 //! internally — no `&Tcb` or `&mut Tcb` is ever exposed to the caller,
 //! so aliasing is impossible regardless of call order or nesting.
 
+use crate::cap::handle_table::HandleTableRef;
 use crate::mm::addr::PhysAddr;
 use crate::mm::kernel_ptr::{KernelMut, KernelRef};
 use crate::sched::scheduler;
@@ -31,6 +32,15 @@ impl CurrentThread {
     pub fn handle_table_paddr() -> PhysAddr {
         let tcb = Self::ref_();
         PhysAddr::new(tcb.get().handle_table_paddr)
+    }
+
+    /// Safe typed reference to the current thread's handle table.
+    /// Provides lookup/insert/remove without raw PhysAddr or unsafe.
+    pub fn handle_table() -> HandleTableRef {
+        let paddr = Self::handle_table_paddr();
+        // SAFETY: the TCB's handle_table_paddr was set at thread creation
+        // and always points to a valid HandleTable in a kernel-owned page.
+        unsafe { HandleTableRef::from_paddr(paddr) }
     }
 
     /// Physical address of the current thread's TTBR0 (user page table).

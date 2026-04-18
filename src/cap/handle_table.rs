@@ -1,7 +1,69 @@
 use crate::cap::object::{ObjectType, HandleTableHeader};
 use crate::cap::rights::Rights;
 use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
+use lockjaw_types::syscall::SyscallError;
 use core::ptr;
+
+// ---------------------------------------------------------------------------
+// HandleTableRef — safe typed wrapper over handle table operations
+// ---------------------------------------------------------------------------
+
+/// A reference to a handle table in kernel memory. Constructed from
+/// `CurrentThread::handle_table()` or by wrapping a known-valid
+/// handle-table PhysAddr. All methods are safe — the PhysAddr validity
+/// is established at construction time.
+pub struct HandleTableRef(PhysAddr);
+
+impl HandleTableRef {
+    /// Wrap a known-valid handle table physical address.
+    ///
+    /// # Safety
+    /// `paddr` must point to a live HandleTableObject in a kernel-owned page.
+    pub unsafe fn from_paddr(paddr: PhysAddr) -> Self {
+        HandleTableRef(paddr)
+    }
+
+    /// Look up a handle by index without type checking (for export/transfer).
+    pub fn lookup_any(&self, handle: u32, required_rights: Rights) -> Result<HandleEntry, SyscallError> {
+        // SAFETY: self.0 was validated at construction.
+        unsafe { handle_lookup(self.0, handle, required_rights) }
+            .map_err(|_| SyscallError::INVALID_HANDLE)
+    }
+
+    /// Look up a handle by index with type and rights checking.
+    /// Returns the HandleEntry on success.
+    pub fn lookup(&self, handle: u32, required_rights: Rights, expected_type: ObjectType) -> Result<HandleEntry, SyscallError> {
+        // SAFETY: self.0 was validated at construction.
+        let entry = unsafe { handle_lookup(self.0, handle, required_rights) }
+            .map_err(|_| SyscallError::INVALID_HANDLE)?;
+        if entry.obj_type != expected_type {
+            return Err(SyscallError::INVALID_PARAMETER);
+        }
+        Ok(entry)
+    }
+
+    /// Insert a new handle into the table. Returns the slot index.
+    pub fn insert(&self, object_paddr: PhysAddr, obj_type: ObjectType, rights: Rights) -> Result<u32, SyscallError> {
+        // SAFETY: self.0 was validated at construction.
+        unsafe { handle_insert(self.0, object_paddr, obj_type, rights) }
+            .map_err(|_| SyscallError::OUT_OF_MEMORY)
+    }
+
+    /// Remove a handle from the table. Returns the removed entry.
+    #[allow(dead_code)] // Used by future handle-revocation paths.
+    pub fn remove(&self, handle: u32) -> Result<HandleEntry, SyscallError> {
+        // SAFETY: self.0 was validated at construction.
+        unsafe { handle_remove(self.0, handle) }
+            .map_err(|_| SyscallError::INVALID_HANDLE)
+    }
+
+    /// The underlying physical address (needed by cross-table operations
+    /// like sys_export_handle on the caller's table).
+    #[allow(dead_code)] // Used once cross-table insert migrates fully.
+    pub fn paddr(&self) -> PhysAddr {
+        self.0
+    }
+}
 
 /// A single entry in a handle table. Stored in donated pages immediately
 /// after the HandleTableHeader.

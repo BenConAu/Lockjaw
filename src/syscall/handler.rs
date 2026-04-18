@@ -93,30 +93,15 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
     CurrentThread::clear_breadcrumb();
 }
 
-/// Get the current thread's handle table physical address.
-fn caller_handle_table() -> PhysAddr {
-    CurrentThread::handle_table_paddr()
-}
-
 /// Look up a handle in the current thread's handle table with type checking.
-/// Returns the HandleEntry on success, or a SyscallError on failure.
-unsafe fn lookup_handle(handle: u32, required_rights: Rights, expected_type: ObjectType) -> Result<handle_table::HandleEntry, SyscallError> {
-    let ht_paddr = caller_handle_table();
-
-    let entry = handle_table::handle_lookup(ht_paddr, handle, required_rights)
-        .map_err(|_| SyscallError::INVALID_HANDLE)?;
-
-    if entry.obj_type != expected_type {
-        return Err(SyscallError::INVALID_PARAMETER);
-    }
-
-    Ok(entry)
+fn lookup_handle(handle: u32, required_rights: Rights, expected_type: ObjectType) -> Result<handle_table::HandleEntry, SyscallError> {
+    CurrentThread::handle_table().lookup(handle, required_rights, expected_type)
 }
 
 /// Common logic for sys_create_notification, sys_create_endpoint, etc.
 /// Validates the PageSet is 1 page, calls the safe init function, then
 /// consumes the PageSet and inserts a handle into the caller's table.
-unsafe fn create_kernel_object(
+fn create_kernel_object(
     pageset_id: u64,
     obj_type: ObjectType,
     init_fn: fn(crate::mm::addr::ObjectInitPage) -> Result<(), crate::cap::object::CreateError>,
@@ -129,14 +114,9 @@ unsafe fn create_kernel_object(
     // Consume only after successful initialization — preserves rollback
     // semantics if init_fn ever fails.
     crate::cap::pageset_table::consume_pageset(pageset_id);
-    let ht_paddr = caller_handle_table();
-    match handle_table::handle_insert(
-        ht_paddr, paddr, obj_type,
-        Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE),
-    ) {
-        Ok(handle) => Ok(handle as u64),
-        Err(_) => Err(SyscallError::OUT_OF_MEMORY),
-    }
+    let ht = CurrentThread::handle_table();
+    ht.insert(paddr, obj_type, Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE))
+        .map(|h| h as u64)
 }
 
 fn sys_debug_putc(char_val: u64) -> SyscallError {
@@ -334,7 +314,7 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
 /// x0 = PageSet ID (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_notification(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    unsafe { create_kernel_object(ctx.gpr[0], ObjectType::Notification, crate::ipc::notification::create_notification) }
+    create_kernel_object(ctx.gpr[0], ObjectType::Notification, crate::ipc::notification::create_notification)
 }
 
 /// sys_signal_notification(handle, value) — signal a notification.
@@ -413,15 +393,14 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
 /// x0 = PageSet ID (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_endpoint(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    unsafe { create_kernel_object(ctx.gpr[0], ObjectType::Endpoint, endpoint::create_endpoint) }
+    create_kernel_object(ctx.gpr[0], ObjectType::Endpoint, endpoint::create_endpoint)
 }
 
 /// sys_create_reply(pageset_id) — create a Reply object from a donated page.
 /// x0 = PageSet ID (must be a 1-page PageSet).
-/// Returns the new handle index in x1 on success. Unused until the IPC
-/// cutover commit wires sys_call to consume Reply objects.
+/// Returns the new handle index in x1 on success.
 fn sys_create_reply(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    unsafe { create_kernel_object(ctx.gpr[0], ObjectType::Reply, crate::ipc::reply::create_reply) }
+    create_kernel_object(ctx.gpr[0], ObjectType::Reply, crate::ipc::reply::create_reply)
 }
 
 /// sys_recv_nb(handle) — non-blocking receive on an endpoint.
@@ -472,7 +451,7 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     unsafe {
         let tcb_paddr = CurrentThread::tcb_paddr();
         let ttbr0 = CurrentThread::ttbr0();
-        let ht_paddr = caller_handle_table();
+        let ht = CurrentThread::handle_table();
 
         // Read WaitEntry array from user memory via page table walk (TTBR1).
         // Never touches TTBR0 — immune to context switches.
@@ -486,13 +465,10 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
                 Some(e) => e,
                 None => return Err(SyscallError::INVALID_PARAMETER),
             };
-            let he = match handle_table::handle_lookup(
-                ht_paddr, entry.handle as u32,
+            let he = ht.lookup_any(
+                entry.handle as u32,
                 Rights::from_bits(crate::cap::rights::RIGHT_READ),
-            ) {
-                Ok(e) => e,
-                Err(_) => return Err(SyscallError::INVALID_HANDLE),
-            };
+            )?;
             if he.obj_type != ObjectType::Endpoint && he.obj_type != ObjectType::Notification {
                 return Err(SyscallError::INVALID_PARAMETER);
             }
@@ -599,26 +575,18 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         }
 
         // Look up the handle to export in the exporter's own table.
-        let ht_paddr = caller_handle_table();
-        let export_entry = match handle_table::handle_lookup(
-            ht_paddr, handle_to_export, Rights::none(),
-        ) {
-            Ok(e) => e,
-            Err(_) => return Err(SyscallError::INVALID_HANDLE),
-        };
+        // Type-agnostic: any object type can be exported.
+        let exporter_ht = CurrentThread::handle_table();
+        let export_entry = exporter_ht.lookup_any(handle_to_export, Rights::none())?;
 
+        // Insert into the caller's handle table (cross-table operation).
         let caller_tcb = KernelRef::<Tcb>::from_paddr(PhysAddr::new(caller_tcb_paddr_u64));
-        let caller_ht = PhysAddr::new(caller_tcb.get().handle_table_paddr);
-
-        match handle_table::handle_insert(
-            caller_ht,
+        let caller_ht = handle_table::HandleTableRef::from_paddr(PhysAddr::new(caller_tcb.get().handle_table_paddr));
+        caller_ht.insert(
             PhysAddr::new(export_entry.object_paddr),
             export_entry.obj_type,
             export_entry.rights,
-        ) {
-            Ok(new_index) => Ok(new_index as u64),
-            Err(_) => Err(SyscallError::OUT_OF_MEMORY),
-        }
+        ).map(|idx| idx as u64)
     }
 }
 
