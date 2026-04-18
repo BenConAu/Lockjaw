@@ -25,12 +25,39 @@ extern "C" {
     static __stack_top: u8;
 }
 
-/// DTB PageSet ID, set at boot. Returned by sys_get_boot_info.
-static mut DTB_PAGESET_ID: u64 = 0;
+/// A value set exactly once during boot, read-only after. Replaces
+/// `static mut` for boot-time globals with a safer API that catches
+/// double-init via debug_assert.
+struct BootOnce(core::cell::UnsafeCell<u64>);
+unsafe impl Sync for BootOnce {}
+
+impl BootOnce {
+    const fn new() -> Self {
+        BootOnce(core::cell::UnsafeCell::new(0))
+    }
+
+    /// Set the value. Panics in debug builds if already set.
+    fn set(&self, val: u64) {
+        // SAFETY: single-core, called during boot before scheduler starts.
+        unsafe {
+            debug_assert_eq!(*self.0.get(), 0, "BootOnce already set");
+            *self.0.get() = val;
+        }
+    }
+
+    /// Read the value. Returns 0 if never set.
+    fn get(&self) -> u64 {
+        // SAFETY: single-core; written once at boot, read-only after.
+        unsafe { *self.0.get() }
+    }
+}
+
+/// DTB PageSet ID, set once at boot. Returned by sys_get_boot_info.
+static DTB_PAGESET_ID: BootOnce = BootOnce::new();
 
 /// Get the DTB PageSet ID (called by sys_get_boot_info handler).
 pub fn dtb_pageset_id() -> u64 {
-    unsafe { DTB_PAGESET_ID }
+    DTB_PAGESET_ID.get()
 }
 
 #[no_mangle]
@@ -108,14 +135,14 @@ pub extern "C" fn kmain() -> ! {
 
     // Register DTB pages as a PageSet so userspace can map them normally.
     // This avoids the MAIR_DEVICE aliasing problem (DTB is normal RAM, not MMIO).
-    unsafe {
+    {
         let dtb_pages = [
             mm::addr::PhysAddr::new(dtb_paddr),
             mm::addr::PhysAddr::new(dtb_paddr + mm::addr::PAGE_SIZE),
         ];
         let dtb_ps_id = cap::pageset_table::register_existing(2, &dtb_pages)
             .expect("DTB PageSet registration failed");
-        DTB_PAGESET_ID = dtb_ps_id;
+        DTB_PAGESET_ID.set(dtb_ps_id);
         kprintln!("DTB PageSet registered: id={}", dtb_ps_id);
     }
 
@@ -266,7 +293,7 @@ pub extern "C" fn kmain() -> ! {
         // on every call without needing a handle table lookup.
         let bench_reply_page = mm::page_alloc::alloc_page().expect("bench reply alloc").start_addr();
         ipc::reply::create_reply(mm::addr::ObjectInitPage::new(bench_reply_page)).expect("create bench reply");
-        IPC_BENCH_REPLY_PADDR = bench_reply_page.as_u64();
+        IPC_BENCH_REPLY_PADDR.set(bench_reply_page.as_u64());
 
         // Create handle table for sender (Thread A)
         let ht_a_page = mm::page_alloc::alloc_page().expect("ht alloc").start_addr();
@@ -488,15 +515,14 @@ unsafe fn lookup_endpoint() -> (mm::addr::PhysAddr, mm::addr::PhysAddr) {
 /// Reply object used by the ipc_sender benchmark kernel thread. Allocated
 /// and initialized in kmain before the scheduler starts. Stored as a raw
 /// paddr so both threads can read it without needing a handle table.
-static mut IPC_BENCH_REPLY_PADDR: u64 = 0;
+static IPC_BENCH_REPLY_PADDR: BootOnce = BootOnce::new();
 
 /// Client thread: calls the server with a request, gets a reply.
 /// Uses ipc_call (send + block for reply in one operation).
 fn ipc_sender() -> ! {
     const BENCHMARK_ROUNDS: u64 = 10000;
     let mut counter: u64 = 1;
-    // SAFETY: single-core kernel, read-only after boot
-    let reply_paddr = unsafe { mm::addr::PhysAddr::new(IPC_BENCH_REPLY_PADDR) };
+    let reply_paddr = mm::addr::PhysAddr::new(IPC_BENCH_REPLY_PADDR.get());
 
     // Warm up
     for _ in 0..10 {
