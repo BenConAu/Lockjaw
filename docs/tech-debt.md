@@ -136,22 +136,15 @@ The eventual design is a **device manager** process that:
 
 ---
 
-## KernelMut produces `&mut T` across context switches
+## BlockToken discipline is opt-in
 
-**Where:** `src/mm/kernel_ptr.rs` (`KernelMut::get_mut`), consumed by `src/ipc/endpoint.rs`, `src/ipc/notification.rs`
+**Where:** `src/sched/scheduler.rs` (BlockToken, scoped_mut), consumed by `src/ipc/endpoint.rs`, `src/ipc/notification.rs`
 
-**What:** `KernelMut::get_mut()` returns `&mut T` — a Rust exclusive reference with `noalias` semantics. IPC functions that block (ipc_send slow path, ipc_receive, ipc_call, notification_wait) hold this `&mut T` alive across `scheduler::block_current()`. While the thread is suspended, another thread can enter the kernel and create its own `&mut T` to the same endpoint or notification, producing two simultaneous exclusive references to the same object. Under Stacked Borrows / Tree Borrows, this is undefined behavior regardless of single-core execution.
+**What:** The BlockToken + scoped_mut pattern enforces at compile time that no `&mut T` reference to a shared kernel object survives across `block_current()`. However, the protection is opt-in: code that uses bare `unsafe { &mut *ptr }` instead of `scoped_mut(ptr, &mut tok)` bypasses the guardrail entirely. The token only protects functions that participate in the protocol.
 
-**Why bootstrap:** Single-core with IRQs masked during kernel entry means only one thread executes kernel code at a time. The compiler cannot observe the aliasing because `block_current()` is an opaque function call that prevents reordering across it. No current compiler exploits this. But it is technically UB under Rust's aliasing model and would be flagged by Miri.
+**Current state:** All four blocking IPC paths (ipc_send, ipc_receive, ipc_call, notification_wait) use the token protocol. No bare `&mut *ptr` appears in blocking paths today.
 
-**Impact:** Latent. Becomes a real bug under (a) Miri testing of kernel code, (b) SMP where two cores execute syscalls concurrently, or (c) future compiler optimizations that exploit `noalias` more aggressively across opaque calls.
-
-**Fix:** Replace `KernelMut::get_mut() -> &mut T` with raw-pointer field access for any kernel object that can be touched by multiple threads across blocking operations. Options:
-1. Add `KernelMut::field_ptr() -> *mut T` and access fields via `(*ptr).field` (no `&mut T` created).
-2. Introduce a `SharedKernelObj<T>` wrapper that only provides `UnsafeCell`-style raw-pointer access, distinct from `KernelMut<T>` which remains valid for truly-exclusive objects (e.g., TCBs during their own context switch).
-3. Use `addr_of_mut!` macro for field access without creating intermediate references.
-
-The fix should be a focused refactor of `kernel_ptr.rs` + all IPC/notification call sites, not mixed into other work.
+**Fix:** Enforce via review and grep: `grep -n '&mut \*' src/ipc/` should return only `scoped_mut` calls in blocking functions. If a new blocking IPC function is added, it must use BlockToken. Consider a xtask lint that checks for bare `&mut *raw_ptr` in IPC files.
 
 ---
 

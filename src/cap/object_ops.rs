@@ -27,8 +27,9 @@ pub fn send(handle: u32, msg: [u64; 4]) -> Result<Result<(), endpoint::IpcError>
     )?;
     // SAFETY: handle_lookup verified type == Endpoint; object lives in a
     // kernel-owned page; KernelMut is created and dropped within this call.
-    let mut km = unsafe { KernelMut::<endpoint::EndpointObject>::from_paddr(PhysAddr::new(entry.object_paddr)) };
-    Ok(endpoint::ipc_send(km.get_mut(), msg))
+    // Blocking — pass raw pointer so no &mut T survives across block_current().
+    let km = unsafe { KernelMut::<endpoint::EndpointObject>::from_paddr(PhysAddr::new(entry.object_paddr)) };
+    Ok(endpoint::ipc_send(km.raw_ptr(), msg))
 }
 
 /// Receive a message from an endpoint. Blocks if no sender/caller is queued.
@@ -38,9 +39,9 @@ pub fn receive(handle: u32) -> Result<Result<[u64; 4], endpoint::IpcError>, Sysc
         Rights::from_bits(crate::cap::rights::RIGHT_READ),
         ObjectType::Endpoint,
     )?;
-    // SAFETY: same as send — type verified, KernelMut scoped to this call.
-    let mut km = unsafe { KernelMut::<endpoint::EndpointObject>::from_paddr(PhysAddr::new(entry.object_paddr)) };
-    Ok(endpoint::ipc_receive(km.get_mut()))
+    // Blocking — pass raw pointer so no &mut T survives across block_current().
+    let km = unsafe { KernelMut::<endpoint::EndpointObject>::from_paddr(PhysAddr::new(entry.object_paddr)) };
+    Ok(endpoint::ipc_receive(km.raw_ptr()))
 }
 
 /// Send a message and block for a reply (client call). The Reply object must
@@ -56,9 +57,10 @@ pub fn call(
     let reply_entry = ht.lookup(reply_handle, rw, ObjectType::Reply)?;
     // SAFETY: both types verified; endpoint and reply are distinct objects
     // on distinct pages; both KernelMuts scoped to this call.
-    let mut ep_km = unsafe { KernelMut::<endpoint::EndpointObject>::from_paddr(PhysAddr::new(ep_entry.object_paddr)) };
-    let mut reply_km = unsafe { KernelMut::<reply::ReplyObject>::from_paddr(PhysAddr::new(reply_entry.object_paddr)) };
-    Ok(endpoint::ipc_call(ep_km.get_mut(), reply_km.get_mut(), msg))
+    // Blocking — pass raw pointers so no &mut T survives across block_current().
+    let ep_km = unsafe { KernelMut::<endpoint::EndpointObject>::from_paddr(PhysAddr::new(ep_entry.object_paddr)) };
+    let reply_km = unsafe { KernelMut::<reply::ReplyObject>::from_paddr(PhysAddr::new(reply_entry.object_paddr)) };
+    Ok(endpoint::ipc_call(ep_km.raw_ptr(), reply_km.raw_ptr(), msg))
 }
 
 /// Non-blocking receive. Returns the IPC WouldBlock error if no sender is waiting.
@@ -99,7 +101,7 @@ pub fn wait_notification(
         Rights::from_bits(crate::cap::rights::RIGHT_READ),
         ObjectType::Notification,
     )?;
-    // SAFETY: type verified as Notification; KernelMut scoped to this call.
-    let mut km = unsafe { KernelMut::<notification::NotificationObject>::from_paddr(PhysAddr::new(entry.object_paddr)) };
-    Ok(notification::notification_wait(km.get_mut(), threshold))
+    // Blocking — pass raw pointer so no &mut T survives across block_current().
+    let km = unsafe { KernelMut::<notification::NotificationObject>::from_paddr(PhysAddr::new(entry.object_paddr)) };
+    Ok(notification::notification_wait(km.raw_ptr(), threshold))
 }

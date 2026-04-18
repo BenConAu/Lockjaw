@@ -1,9 +1,9 @@
 use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
 use crate::ipc::ep_queue;
 use crate::ipc::reply::{REPLY_STATE_BOUND, REPLY_STATE_FRESH, ReplyObject};
-use crate::mm::addr::{PhysAddr, paddr_of};
+use crate::mm::addr::{PhysAddr, paddr_of_raw};
 use crate::mm::kernel_ptr::KernelMut;
-use crate::sched::scheduler;
+use crate::sched::scheduler::{self, BlockToken, scoped_mut};
 use crate::sched::tcb::Tcb;
 use core::ptr;
 
@@ -91,76 +91,96 @@ pub enum IpcError {
 // implements the same transitions over live pointers.
 
 /// Send a message on an endpoint. Blocks the sender if no receiver is waiting.
+///
+/// Takes `*mut EndpointObject` instead of `&mut` because the slow path
+/// blocks via `block_current()`. A `&mut` parameter would create a Stacked
+/// Borrows tag that lives across the context switch; another thread
+/// accessing the same endpoint would invalidate it, producing UB. Raw
+/// pointers do not create tags, so scoped `&mut` references derived from
+/// them can be dropped before blocking without aliasing violations.
 pub fn ipc_send(
-    ep: &mut EndpointObject,
+    ep: *mut EndpointObject,
     msg: [u64; 4],
 ) -> Result<(), IpcError> {
-    debug_assert_eq!(ep.header.obj_type, ObjectType::Endpoint);
+    // Fast path: receiver is queued. Dequeue, transfer, unblock.
+    // Entirely within one scoped block — no blocking, returns early.
+    {
+        let ep_ref = unsafe { &mut *ep };
+        debug_assert_eq!(ep_ref.header.obj_type, ObjectType::Endpoint);
 
-    if ep.state == EP_HAS_RECEIVER {
-        // Fast path: receiver is queued. Dequeue, transfer, unblock.
-        let receiver = ep_queue::dequeue(ep)
-            .expect("HasReceiver without queued waiter");
-        // SAFETY: receiver paddr from the endpoint queue — enqueue contract
-        // guarantees it is a valid TCB.
-        let mut receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver) };
-        {
-            let r = receiver_tcb.get_mut();
-            r.ipc_msg = msg;
-            r.ipc_wait_kind = WAIT_KIND_NONE;
-            // Receiver's ipc_blocked_on was set when it queued itself; clear
-            // it so teardown/diagnostics never see a runnable thread that
-            // looks blocked on an endpoint.
-            r.ipc_blocked_on = 0;
+        if ep_ref.state == EP_HAS_RECEIVER {
+            let receiver = ep_queue::dequeue(ep_ref)
+                .expect("HasReceiver without queued waiter");
+            // SAFETY: receiver paddr from the endpoint queue — enqueue contract
+            // guarantees it is a valid TCB.
+            let mut receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver) };
+            {
+                let r = receiver_tcb.get_mut();
+                r.ipc_msg = msg;
+                r.ipc_wait_kind = WAIT_KIND_NONE;
+                // Receiver's ipc_blocked_on was set when it queued itself; clear
+                // it so teardown/diagnostics never see a runnable thread that
+                // looks blocked on an endpoint.
+                r.ipc_blocked_on = 0;
+            }
+            scheduler::unblock_thread(receiver);
+            ep_ref.state = EP_IDLE;
+            return Ok(());
         }
-        scheduler::unblock_thread(receiver);
-        ep.state = EP_IDLE;
-        return Ok(());
     }
 
     // Slow path: queue self as Send, block.
+    let mut tok = BlockToken::new();
     let sender_tcb_paddr = scheduler::current_tcb_paddr();
-    let ep_paddr = paddr_of(ep);
-    // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
-    let mut sender_tcb = unsafe { KernelMut::<Tcb>::from_paddr(sender_tcb_paddr) };
+    let ep_paddr = paddr_of_raw(ep);
     {
-        let s = sender_tcb.get_mut();
+        // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
+        let sender_tcb = unsafe { KernelMut::<Tcb>::from_paddr(sender_tcb_paddr) };
+        let s = unsafe { scoped_mut(sender_tcb.raw_ptr(), &mut tok) };
         s.ipc_msg = msg;
         s.ipc_wait_kind = WAIT_KIND_SEND;
         s.ipc_blocked_on = ep_paddr.as_u64();
     }
-    // SAFETY: sender_tcb_paddr is the current thread, not already queued.
-    unsafe { ep_queue::enqueue(ep, sender_tcb_paddr) };
-
-    let became_has_waiters = ep.state == EP_IDLE;
-    if became_has_waiters {
-        ep.state = EP_HAS_WAITERS;
-        wake_readiness_waiter_if_registered(ep);
+    {
+        let ep_ref = unsafe { scoped_mut(ep, &mut tok) };
+        // SAFETY: sender_tcb_paddr is the current thread, not already queued.
+        unsafe { ep_queue::enqueue(ep_ref, sender_tcb_paddr) };
+        let became_has_waiters = ep_ref.state == EP_IDLE;
+        if became_has_waiters {
+            ep_ref.state = EP_HAS_WAITERS;
+            wake_readiness_waiter_if_registered(ep_ref);
+        }
     }
-
-    scheduler::block_current();
+    // Token consumed — compiler proved no &mut references alive.
+    scheduler::block_current(tok);
     Ok(())
 }
 
 /// Receive a message from an endpoint. Blocks if the queue is empty of
 /// senders/callers. Returns the received 4-word message.
+///
+/// Takes `*mut EndpointObject` — see `ipc_send` doc for rationale.
 pub fn ipc_receive(
-    ep: &mut EndpointObject,
+    ep: *mut EndpointObject,
 ) -> Result<[u64; 4], IpcError> {
-    debug_assert_eq!(ep.header.obj_type, ObjectType::Endpoint);
     let receiver_tcb_paddr = scheduler::current_tcb_paddr();
-    // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
-    let mut receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr) };
 
     // Single-reply-slot rule: cannot Receive while holding an outstanding Reply.
-    if receiver_tcb.get().current_reply_paddr != 0 {
-        return Err(IpcError::EndpointBusy);
+    {
+        let receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr) };
+        if receiver_tcb.get().current_reply_paddr != 0 {
+            return Err(IpcError::EndpointBusy);
+        }
     }
 
-    match ep.state {
+    let state = unsafe { (*ep).state };
+    debug_assert_eq!(unsafe { (*ep).header.obj_type }, ObjectType::Endpoint);
+
+    match state {
         EP_HAS_WAITERS => {
-            // Dequeue head — either a Send or Call waiter.
-            let head = ep_queue::dequeue(ep)
+            // Non-blocking path — single scoped block for all mutations.
+            let ep_ref = unsafe { &mut *ep };
+            let head = ep_queue::dequeue(ep_ref)
                 .expect("HasWaiters without queued waiter");
             // SAFETY: head paddr from the endpoint queue — valid TCB.
             let mut head_tcb = unsafe { KernelMut::<Tcb>::from_paddr(head) };
@@ -179,14 +199,15 @@ pub fn ipc_receive(
                     // Reply object to THIS receiver's current_reply slot.
                     let reply_paddr = head_tcb.get().ipc_call_reply_paddr;
                     head_tcb.get_mut().ipc_call_reply_paddr = 0;
+                    let mut receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr) };
                     receiver_tcb.get_mut().current_reply_paddr = reply_paddr;
                 }
                 _ => unreachable!("HasWaiters queue only holds Send or Call"),
             }
 
             // If the queue is now empty, collapse back to Idle.
-            if ep.queue_head == 0 {
-                ep.state = EP_IDLE;
+            if ep_ref.queue_head == 0 {
+                ep_ref.state = EP_IDLE;
             }
             Ok(msg)
         }
@@ -196,19 +217,26 @@ pub fn ipc_receive(
         }
         EP_IDLE | _ => {
             // Slow path: queue self as Receive, block.
-            let ep_paddr = paddr_of(ep);
+            let mut tok = BlockToken::new();
+            let ep_paddr = paddr_of_raw(ep);
             {
-                let r = receiver_tcb.get_mut();
+                let receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr) };
+                let r = unsafe { scoped_mut(receiver_tcb.raw_ptr(), &mut tok) };
                 r.ipc_wait_kind = WAIT_KIND_RECEIVE;
                 r.ipc_blocked_on = ep_paddr.as_u64();
             }
-            // SAFETY: receiver_tcb_paddr is the current thread, not already queued.
-            unsafe { ep_queue::enqueue(ep, receiver_tcb_paddr) };
-            ep.state = EP_HAS_RECEIVER;
-            scheduler::block_current();
+            {
+                let ep_ref = unsafe { scoped_mut(ep, &mut tok) };
+                // SAFETY: receiver_tcb_paddr is the current thread, not already queued.
+                unsafe { ep_queue::enqueue(ep_ref, receiver_tcb_paddr) };
+                ep_ref.state = EP_HAS_RECEIVER;
+            }
+            // Token consumed — compiler proved no &mut references alive.
+            scheduler::block_current(tok);
 
             // On wake, msg + current_reply_paddr are already populated by
             // whichever sender/caller fast-pathed us.
+            let receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr) };
             Ok(receiver_tcb.get().ipc_msg)
         }
     }
@@ -217,36 +245,45 @@ pub fn ipc_receive(
 /// Send a message and block waiting for a reply (client call).
 /// The Reply object must be Fresh; on successful return the reply has
 /// been delivered and the object is Fresh again, ready for the next call.
+///
+/// Takes `*mut` for both endpoint and reply — see `ipc_send` doc for
+/// rationale. This function always blocks (both fast and slow paths
+/// converge to `block_current()`).
 pub fn ipc_call(
-    ep: &mut EndpointObject,
-    reply: &mut ReplyObject,
+    ep: *mut EndpointObject,
+    reply: *mut ReplyObject,
     msg: [u64; 4],
 ) -> Result<[u64; 4], IpcError> {
-    debug_assert_eq!(ep.header.obj_type, ObjectType::Endpoint);
-    debug_assert_eq!(reply.header.obj_type, ObjectType::Reply);
-
-    // Precondition: the Reply object must be Fresh.
-    if reply.state != REPLY_STATE_FRESH {
+    // Precondition checks via raw reads — no &mut created.
+    debug_assert_eq!(unsafe { (*ep).header.obj_type }, ObjectType::Endpoint);
+    debug_assert_eq!(unsafe { (*reply).header.obj_type }, ObjectType::Reply);
+    if unsafe { (*reply).state } != REPLY_STATE_FRESH {
         return Err(IpcError::ReplyBound);
     }
 
+    let mut tok = BlockToken::new();
     let caller_tcb_paddr = scheduler::current_tcb_paddr();
-    let ep_paddr = paddr_of(ep);
-    let reply_paddr = paddr_of(reply);
+    let ep_paddr = paddr_of_raw(ep);
+    let reply_paddr = paddr_of_raw(reply);
 
     // Bind the Reply to this caller before touching the endpoint. This
     // pairing is what the new model calls out: the caller's identity
     // lives on the Reply object, not on the endpoint.
-    reply.state = REPLY_STATE_BOUND;
-    reply.caller_tcb_paddr = caller_tcb_paddr.as_u64();
+    {
+        let reply_ref = unsafe { scoped_mut(reply, &mut tok) };
+        reply_ref.state = REPLY_STATE_BOUND;
+        reply_ref.caller_tcb_paddr = caller_tcb_paddr.as_u64();
+    }
 
-    // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
-    let mut caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_tcb_paddr) };
+    // Read state via raw pointer to avoid holding a scoped borrow across
+    // both branches (each branch borrows tok independently).
+    let ep_state = unsafe { (*ep).state };
 
-    if ep.state == EP_HAS_RECEIVER {
+    if ep_state == EP_HAS_RECEIVER {
         // Fast path: receiver queued. Dequeue, deliver msg + bind reply,
         // unblock server, block self.
-        let receiver = ep_queue::dequeue(ep)
+        let ep_ref = unsafe { scoped_mut(ep, &mut tok) };
+        let receiver = ep_queue::dequeue(ep_ref)
             .expect("HasReceiver without queued waiter");
         // SAFETY: receiver paddr from the endpoint queue — valid TCB.
         let mut receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver) };
@@ -259,29 +296,41 @@ pub fn ipc_call(
             r.ipc_blocked_on = 0;
         }
         scheduler::unblock_thread(receiver);
-        ep.state = EP_IDLE;
+        ep_ref.state = EP_IDLE;
     } else {
-        // Slow path: store msg in own TCB, queue as Call, block.
+        // Slow path: store msg in own TCB, then enqueue on endpoint.
         {
-            let c = caller_tcb.get_mut();
+            // SAFETY: scheduler guarantees current_tcb_paddr is valid.
+            let caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_tcb_paddr) };
+            let c = unsafe { scoped_mut(caller_tcb.raw_ptr(), &mut tok) };
             c.ipc_msg = msg;
             c.ipc_wait_kind = WAIT_KIND_CALL;
             c.ipc_call_reply_paddr = reply_paddr.as_u64();
         }
-        // SAFETY: caller_tcb_paddr is the current thread, not already queued.
-        unsafe { ep_queue::enqueue(ep, caller_tcb_paddr) };
-        let became_has_waiters = ep.state == EP_IDLE;
-        if became_has_waiters {
-            ep.state = EP_HAS_WAITERS;
-            wake_readiness_waiter_if_registered(ep);
+        {
+            let ep_ref = unsafe { scoped_mut(ep, &mut tok) };
+            // SAFETY: caller_tcb_paddr is the current thread, not already queued.
+            unsafe { ep_queue::enqueue(ep_ref, caller_tcb_paddr) };
+            let became_has_waiters = ep_ref.state == EP_IDLE;
+            if became_has_waiters {
+                ep_ref.state = EP_HAS_WAITERS;
+                wake_readiness_waiter_if_registered(ep_ref);
+            }
         }
     }
 
-    caller_tcb.get_mut().ipc_blocked_on = ep_paddr.as_u64();
-    scheduler::block_current();
+    // Set blocked-on (both paths) in its own scope.
+    {
+        let caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_tcb_paddr) };
+        let c = unsafe { scoped_mut(caller_tcb.raw_ptr(), &mut tok) };
+        c.ipc_blocked_on = ep_paddr.as_u64();
+    }
+    // Token consumed — compiler proved no &mut references alive.
+    scheduler::block_current(tok);
 
     // On wake, the reply has been written into our ipc_msg and the
     // Reply object has been returned to Fresh by the server's ipc_reply.
+    let caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_tcb_paddr) };
     Ok(caller_tcb.get().ipc_msg)
 }
 
@@ -292,8 +341,10 @@ pub fn ipc_receive_nb(ep: &mut EndpointObject) -> Result<[u64; 4], IpcError> {
     if ep.state != EP_HAS_WAITERS {
         return Err(IpcError::WouldBlock);
     }
-    // A Send or Call is queued — reuse the normal receive path (won't block).
-    ipc_receive(ep)
+    // A Send or Call is queued — reuse the normal receive path (won't block
+    // because ep.state == EP_HAS_WAITERS takes the non-blocking branch).
+    // SAFETY: ep is a valid &mut, cast to *mut for ipc_receive's raw-pointer signature.
+    ipc_receive(ep as *mut EndpointObject)
 }
 
 // ---------------------------------------------------------------------------

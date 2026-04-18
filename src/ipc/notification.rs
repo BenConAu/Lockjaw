@@ -1,7 +1,7 @@
 use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
-use crate::mm::addr::{PhysAddr, paddr_of};
+use crate::mm::addr::{PhysAddr, paddr_of_raw};
 use crate::mm::kernel_ptr::KernelMut;
-use crate::sched::scheduler;
+use crate::sched::scheduler::{self, BlockToken, scoped_mut};
 use crate::sched::tcb::Tcb;
 use lockjaw_types::notification_state::{NotificationState, SignalResult, WaitResult, NotificationError};
 use core::ptr;
@@ -75,31 +75,44 @@ pub fn notification_signal(
 /// Wait on a notification until the timeline value reaches the threshold.
 /// Returns immediately if the counter is already >= threshold.
 /// Otherwise blocks the calling thread.
+///
+/// Takes `*mut NotificationObject` — see `ipc_send` doc for rationale.
 pub fn notification_wait(
-    obj: &mut NotificationObject,
+    obj: *mut NotificationObject,
     threshold: u64,
 ) -> Result<u64, NotificationError> {
-    debug_assert_eq!(obj.header.obj_type, ObjectType::Notification);
+    // Check state in a scoped block — state.wait() mutates has_waiter.
+    let wait_result = {
+        let obj_ref = unsafe { &mut *obj };
+        debug_assert_eq!(obj_ref.header.obj_type, ObjectType::Notification);
+        obj_ref.state.wait(threshold)?
+    };
 
-    match obj.state.wait(threshold)? {
+    match wait_result {
         WaitResult::Ready => {
             // Counter already past threshold — return current value
-            Ok(obj.state.value)
+            Ok(unsafe { (*obj).state.value })
         }
         WaitResult::Block => {
             // Block until signaled
+            let mut tok = BlockToken::new();
             let caller_tcb_paddr = scheduler::current_tcb_paddr();
-            obj.blocked_tcb_paddr = caller_tcb_paddr.as_u64();
-
-            // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
-            let mut caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_tcb_paddr) };
-            let notif_paddr = paddr_of(obj);
-            caller_tcb.get_mut().ipc_blocked_on = notif_paddr.as_u64();
-
-            scheduler::block_current();
+            {
+                let obj_ref = unsafe { scoped_mut(obj, &mut tok) };
+                obj_ref.blocked_tcb_paddr = caller_tcb_paddr.as_u64();
+            }
+            {
+                // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
+                let caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_tcb_paddr) };
+                let notif_paddr = paddr_of_raw(obj);
+                let t = unsafe { scoped_mut(caller_tcb.raw_ptr(), &mut tok) };
+                t.ipc_blocked_on = notif_paddr.as_u64();
+            }
+            // Token consumed — compiler proved no &mut references alive.
+            scheduler::block_current(tok);
 
             // When we wake up, return the current value
-            Ok(obj.state.value)
+            Ok(unsafe { (*obj).state.value })
         }
     }
 }

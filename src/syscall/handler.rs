@@ -426,7 +426,7 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
             CurrentThread::store_wait_state(&paddrs, &thresholds, &type_bytes, count);
         }
 
-        scheduler::block_current();
+        scheduler::block_current(scheduler::BlockToken::new());
 
         // Woke up — unregister from all objects (only clear our own registration)
         let wc = CurrentThread::wait_count();

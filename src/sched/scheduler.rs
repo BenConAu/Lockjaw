@@ -166,7 +166,40 @@ pub fn try_current_tcb_paddr() -> Option<PhysAddr> {
 /// If no thread is Ready, halts via wfi until an interrupt wakes something.
 /// Saves/restores the DAIF mask around wfi to preserve the kernel's
 /// "single-threaded during syscall" invariant.
-pub fn block_current() {
+// ---------------------------------------------------------------------------
+// BlockToken — compile-time enforcement of scoped borrows before blocking
+// ---------------------------------------------------------------------------
+
+/// Zero-sized token that enforces the scoped-borrow discipline for blocking
+/// IPC paths. All temporary `&mut T` references to shared kernel objects
+/// must be derived via `scoped_mut(ptr, &mut token)`, which borrows the
+/// token. `block_current(token)` consumes the token by value. Rust's borrow
+/// checker prevents moving the token while it is borrowed, so any `&mut T`
+/// derived from it must be dropped before `block_current` can be called.
+///
+/// This turns the "no &mut references alive across block_current" invariant
+/// from a comment into a compiler error.
+pub struct BlockToken(());
+
+impl BlockToken {
+    /// Create a new token at the start of a potentially blocking path.
+    pub fn new() -> Self {
+        BlockToken(())
+    }
+}
+
+/// Derive a scoped `&mut T` from a raw pointer, tied to the BlockToken's
+/// lifetime. The returned reference borrows the token, so the token cannot
+/// be moved (consumed by `block_current`) until the reference is dropped.
+///
+/// # Safety
+/// `ptr` must point to a live, properly-initialized `T` in kernel memory.
+#[inline]
+pub unsafe fn scoped_mut<'a, T>(ptr: *mut T, _token: &'a mut BlockToken) -> &'a mut T {
+    &mut *ptr
+}
+
+pub fn block_current(_token: BlockToken) {
     // SAFETY: single-core, IRQs masked. Each &mut borrow is scoped to
     // avoid overlapping — we re-derive from the raw pointer after each
     // context switch because schedule() invalidates prior references.

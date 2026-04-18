@@ -50,20 +50,14 @@ impl ObjectInitPage {
     }
 }
 
-/// Derive the physical address of a kernel object from a reference.
-/// The reference must point into the kernel's direct-mapped VA region
-/// (i.e. obtained via KernelRef/KernelMut). Reverses the
+/// Derive the physical address of a kernel object from a raw pointer.
+/// The pointer must point into the kernel's direct-mapped VA region
+/// (i.e. obtained via KernelMut::raw_ptr()). Reverses the
 /// `paddr + KERNEL_VA_OFFSET` cast that KernelMut::from_paddr performs.
-#[inline]
-pub(crate) fn paddr_of<T>(r: &T) -> PhysAddr {
-    // SAFETY: r points into the kernel's direct-mapped VA region; subtracting
-    // KERNEL_VA_OFFSET reverses the KernelMut::from_paddr cast.
-    PhysAddr::new(r as *const T as usize as u64 - KERNEL_VA_OFFSET)
-}
-
-/// Like `paddr_of`, but from a raw pointer. Used in blocking IPC functions
-/// where the object is held as `*mut T` to avoid Stacked Borrows violations
-/// across context switches.
+///
+/// Takes `*const T` (not `&T`) because the primary callers are blocking
+/// IPC functions that hold objects as `*mut T` to avoid Stacked Borrows
+/// violations across context switches.
 #[inline]
 pub(crate) fn paddr_of_raw<T>(ptr: *const T) -> PhysAddr {
     // SAFETY: ptr points into the kernel's direct-mapped VA region; subtracting
