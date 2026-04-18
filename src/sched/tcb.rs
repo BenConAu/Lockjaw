@@ -1,5 +1,7 @@
 use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
-use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET, PAGE_SIZE};
+use crate::mm::addr::{PhysAddr, PAGE_SIZE};
+use crate::mm::kernel_ptr::KernelMut;
+use crate::sched::context::SavedContext;
 use core::ptr;
 
 // ---------------------------------------------------------------------------
@@ -97,39 +99,38 @@ pub unsafe fn create_tcb(
     info: &TcbCreateInfo,
     base_paddr: PhysAddr,
 ) -> Result<(), CreateError> {
-    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-    let tcb_va = (base_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut Tcb;
-    let stack_va = info.stack_paddr.as_u64() + KERNEL_VA_OFFSET;
+    let mut tcb_km = KernelMut::<Tcb>::from_paddr(base_paddr);
+    let mut stack_km = KernelMut::<u64>::from_paddr(info.stack_paddr);
+    // SAFETY: KernelMut pointer is the kernel VA of the stack page
+    let stack_va = stack_km.as_mut_ptr() as usize as u64;
     let stack_top = stack_va + PAGE_SIZE;
 
     // Write canary at stack bottom
-    // SAFETY: kernel stack address
-    let canary_ptr = stack_va as *mut u64;
-    ptr::write_volatile(canary_ptr, lockjaw_types::constants::STACK_CANARY);
+    ptr::write_volatile(stack_km.as_mut_ptr(), lockjaw_types::constants::STACK_CANARY);
 
     // Set up synthetic SavedContext at top of stack so context_switch
-    // can "return" into this thread. SavedContext is 12 x u64 = 96 bytes.
-    let saved_ctx_sp = stack_top - 96;
-    // SAFETY: kernel stack address
-    let ctx = saved_ctx_sp as *mut u64;
+    // can "return" into this thread. The SavedContext struct layout is
+    // tied to the assembly via compile-time offset assertions in context.rs.
+    let saved_ctx_sp = stack_top - core::mem::size_of::<SavedContext>() as u64;
 
-    // Zero all callee-saved regs
-    for i in 0..12 {
-        ptr::write(ctx.add(i), 0);
-    }
-
-    // x19 (offset 0) = entry function pointer — thread_entry trampoline reads this
-    ptr::write(ctx.add(0), info.entry as u64);
-
-    // LR (offset 11) = thread_entry trampoline address
     extern "C" {
         fn thread_entry();
     }
-    // SAFETY: function pointer to kernel code
-    ptr::write(ctx.add(11), thread_entry as *const () as u64);
+    // SAFETY: writing into the allocated stack page, above the canary.
+    let ctx_ptr = saved_ctx_sp as *mut SavedContext;
+    ptr::write(ctx_ptr, SavedContext {
+        // x19 = entry function pointer — thread_entry trampoline reads this
+        x19: info.entry as u64,
+        // LR = thread_entry trampoline address
+        // SAFETY: function pointer to kernel code
+        lr: thread_entry as *const () as u64,
+        // All other callee-saved regs start at zero
+        x20: 0, x21: 0, x22: 0, x23: 0, x24: 0,
+        x25: 0, x26: 0, x27: 0, x28: 0, x29: 0,
+    });
 
     // Write the TCB
-    ptr::write(tcb_va, Tcb {
+    ptr::write(tcb_km.as_mut_ptr(), Tcb {
         header: ObjectHeader {
             obj_type: ObjectType::ThreadControlBlock,
             page_count: 1,

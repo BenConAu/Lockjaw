@@ -334,9 +334,8 @@ pub extern "C" fn kmain() -> ! {
         ).expect("idle ht create");
 
         let idle_tcb_page = mm::page_alloc::alloc_page().expect("idle tcb alloc").start_addr();
-        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-        let idle_tcb_va = (idle_tcb_page.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut sched::tcb::Tcb;
-        core::ptr::write(idle_tcb_va, sched::tcb::Tcb {
+        let mut idle_tcb = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(idle_tcb_page);
+        core::ptr::write(idle_tcb.as_mut_ptr(), sched::tcb::Tcb {
             header: ObjectHeader { obj_type: ObjectType::ThreadControlBlock, page_count: 1 },
             saved_sp: 0,
             entry: idle_thread,
@@ -477,9 +476,8 @@ pub extern "C" fn kmain() -> ! {
         // Store the TTBR0 in the boot/idle thread's TCB so that syscalls
         // from the init process can find the caller's address space.
         let current_tcb_paddr = sched::scheduler::current_tcb_paddr();
-        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-        let current_tcb = (current_tcb_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET) as *mut sched::tcb::Tcb;
-        (*current_tcb).ttbr0_paddr = ttbr0.as_u64();
+        let mut current_tcb = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(current_tcb_paddr);
+        current_tcb.get_mut().ttbr0_paddr = ttbr0.as_u64();
 
         // Flush I-cache (we copied code into pages)
         core::arch::asm!(
