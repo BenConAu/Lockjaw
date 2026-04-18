@@ -211,20 +211,19 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     let virt_addr = ctx.gpr[1];
     let flags = ctx.gpr[2];
 
+    let addr_space = match CurrentThread::address_space() {
+        Some(a) => a,
+        None => return SyscallError::INVALID_PARAMETER,
+    };
+
+    // All mappings go through PageSets — no raw physical addresses accepted.
+    let (_count, header_paddr) = match crate::cap::pageset_table::get_pageset(pageset_id) {
+        Some(ps) => ps,
+        None => return SyscallError::INVALID_HANDLE,
+    };
     unsafe {
-        let ttbr0 = CurrentThread::ttbr0();
-
-        if ttbr0.as_u64() == 0 {
-            return SyscallError::INVALID_PARAMETER;
-        }
-
-        // All mappings go through PageSets — no raw physical addresses accepted.
-        let (_count, header_paddr) = match crate::cap::pageset_table::get_pageset(pageset_id) {
-            Some(ps) => ps,
-            None => return SyscallError::INVALID_HANDLE,
-        };
         let header = crate::cap::pageset_table::read_header(header_paddr);
-        match crate::arch::aarch64::vmem::map_pages_in_existing(ttbr0, virt_addr, header, flags) {
+        match crate::arch::aarch64::vmem::map_pages_in_existing(addr_space.ttbr0(), virt_addr, header, flags) {
             Ok(()) => SyscallError::OK,
             Err(_) => SyscallError::UNKNOWN,
         }
@@ -246,14 +245,16 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
     let parent_handle_to_copy = ctx.gpr[5];
     let name_va = ctx.gpr[6];
 
+    let addr_space = match CurrentThread::address_space() {
+        Some(a) => a,
+        None => return SyscallError::INVALID_PARAMETER,
+    };
+
+    // Read process name from user memory (16 bytes, NUL-padded)
+    let name: [u8; 16] = addr_space.read(name_va).unwrap_or([0u8; 16]);
+
     unsafe {
-        let caller_ttbr0 = CurrentThread::ttbr0();
-
-        // Read process name from user memory (16 bytes, NUL-padded)
-        let name: [u8; 16] = crate::mm::user_access::copy_from_user(caller_ttbr0, name_va)
-            .unwrap_or([0u8; 16]);
-
-        match crate::process::create_process(mappings_va, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy, caller_ttbr0, name) {
+        match crate::process::create_process(mappings_va, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy, addr_space.ttbr0(), name) {
             Ok(()) => SyscallError::OK,
             Err(_) => SyscallError::UNKNOWN,
         }
@@ -364,7 +365,6 @@ fn sys_recv_nb(ctx: &mut ExceptionContext) -> SyscallReturn {
 fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     use lockjaw_types::wait::{WaitEntry, MAX_WAIT_OBJECTS, validate_wait_count};
     use crate::ipc::notification;
-    use crate::mm::user_access::copy_from_user;
 
     let entries_va = ctx.gpr[0];
     let count = ctx.gpr[1] as usize;
@@ -373,9 +373,13 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         return Err(SyscallError::INVALID_PARAMETER);
     }
 
+    let addr_space = match CurrentThread::address_space() {
+        Some(a) => a,
+        None => return Err(SyscallError::INVALID_PARAMETER),
+    };
+
     unsafe {
         let tcb_paddr = CurrentThread::tcb_paddr();
-        let ttbr0 = CurrentThread::ttbr0();
         let ht = CurrentThread::handle_table();
 
         // Read WaitEntry array from user memory via page table walk (TTBR1).
@@ -386,7 +390,7 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 
         for i in 0..count {
             let user_va = entries_va + (i as u64) * core::mem::size_of::<WaitEntry>() as u64;
-            let entry: WaitEntry = match copy_from_user(ttbr0, user_va) {
+            let entry: WaitEntry = match addr_space.read(user_va) {
                 Some(e) => e,
                 None => return Err(SyscallError::INVALID_PARAMETER),
             };

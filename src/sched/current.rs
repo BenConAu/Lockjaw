@@ -49,6 +49,20 @@ impl CurrentThread {
         PhysAddr::new(tcb.get().ttbr0_paddr)
     }
 
+    /// Safe typed reference to the current thread's user address space.
+    /// Returns `None` for kernel threads (ttbr0 == 0).
+    /// Provides `read` (copy_from_user) without raw PhysAddr or unsafe
+    /// at the call site.
+    pub fn address_space() -> Option<crate::mm::user_access::UserAddressSpace> {
+        let ttbr0 = Self::ttbr0();
+        if ttbr0.as_u64() == 0 {
+            return None;
+        }
+        // SAFETY: ttbr0_paddr was set at thread creation from a valid L0
+        // page table, and we just checked it's non-zero.
+        Some(unsafe { crate::mm::user_access::UserAddressSpace::from_ttbr0(ttbr0) })
+    }
+
     /// The Reply paddr currently bound on this thread (set by sys_receive
     /// when dequeuing a Call waiter; read by sys_export_handle/sys_reply).
     pub fn current_reply_paddr() -> u64 {
