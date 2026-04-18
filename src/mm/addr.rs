@@ -60,3 +60,13 @@ pub(crate) fn paddr_of<T>(r: &T) -> PhysAddr {
     // KERNEL_VA_OFFSET reverses the KernelMut::from_paddr cast.
     PhysAddr::new(r as *const T as usize as u64 - KERNEL_VA_OFFSET)
 }
+
+/// Like `paddr_of`, but from a raw pointer. Used in blocking IPC functions
+/// where the object is held as `*mut T` to avoid Stacked Borrows violations
+/// across context switches.
+#[inline]
+pub(crate) fn paddr_of_raw<T>(ptr: *const T) -> PhysAddr {
+    // SAFETY: ptr points into the kernel's direct-mapped VA region; subtracting
+    // KERNEL_VA_OFFSET reverses the KernelMut::from_paddr cast.
+    PhysAddr::new(ptr as usize as u64 - KERNEL_VA_OFFSET)
+}

@@ -124,6 +124,20 @@ impl<'a, T> KernelMut<'a, T> {
         KernelRef { ptr: self.ptr as *const T, _marker: PhantomData }
     }
 
+    /// Raw `*mut T` without creating `&mut T`.
+    ///
+    /// Use this for blocking IPC paths where a `&mut T` reference must
+    /// not survive across `block_current()`. Raw pointers do not create
+    /// Stacked Borrows tags, so they are the correct representation for
+    /// kernel objects that may be accessed by other threads while this
+    /// thread is descheduled. Callers should derive short-lived scoped
+    /// `&mut T` references from this pointer only when needed, and drop
+    /// them before any blocking operation.
+    #[inline]
+    pub fn raw_ptr(&self) -> *mut T {
+        self.ptr
+    }
+
     /// Raw `*const` for legacy APIs.
     #[inline]
     pub fn as_ptr(&self) -> *const T {
