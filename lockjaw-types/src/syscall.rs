@@ -91,6 +91,7 @@ pub const SYS_GET_BOOT_INFO: u64 = 17;
 pub const SYS_REGISTER_DEVICE_PAGE: u64 = 18;
 pub const SYS_QUERY_PAGESET_PHYS: u64 = 19;
 pub const SYS_CREATE_REPLY: u64 = 20;
+pub const SYS_EXIT: u64 = 21;
 
 /// Flag for SYS_ALLOC_PAGES: allocated pages must be physically contiguous.
 pub const ALLOC_FLAG_CONTIGUOUS: u64 = 1 << 0;

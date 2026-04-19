@@ -7,7 +7,7 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
-use lockjaw_userlib::{puts, putc, sys_yield, sys_call_ret4, sys_alloc_pages, sys_create_reply};
+use lockjaw_userlib::{puts, putc, sys_exit, sys_call_ret4, sys_alloc_pages, sys_create_reply};
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -18,7 +18,7 @@ pub extern "C" fn _start() -> ! {
         Ok(h) => h,
         Err(_) => {
             puts("hello: create reply FAILED\n");
-            loop { sys_yield(); }
+            sys_exit();
         }
     };
 
@@ -29,7 +29,7 @@ pub extern "C" fn _start() -> ! {
         Ok(r) => r,
         Err(_) => {
             puts("hello: bootstrap FAILED\n");
-            loop { sys_yield(); }
+            sys_exit();
         }
     };
     puts("hello: got handle ");
@@ -37,9 +37,7 @@ pub extern "C" fn _start() -> ! {
     putc(b'\n');
 
     puts("child: alive\n");
-    loop {
-        sys_yield();
-    }
+    sys_exit();
 }
 
 #[panic_handler]

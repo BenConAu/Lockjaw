@@ -297,8 +297,8 @@ pub extern "C" fn _start() -> ! {
     }
     puts("ramfb: display configured\n");
 
-    // Idle -- the framebuffer is now being rendered by QEMU
-    loop { sys_yield(); }
+    // Framebuffer is now being rendered by QEMU. Nothing left to do.
+    sys_exit();
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +306,7 @@ pub extern "C" fn _start() -> ! {
 // ---------------------------------------------------------------------------
 
 fn halt() -> ! {
-    loop { unsafe { asm!("wfi"); } }
+    sys_exit();
 }
 
 #[panic_handler]

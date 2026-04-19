@@ -13,6 +13,10 @@ pub enum SchedThreadState {
     Ready,
     Running,
     Blocked,
+    /// Thread has exited. Permanently removed from scheduling — never
+    /// selected by select_next, never unblocked. The scheduler slot is
+    /// cleared to None by remove_thread after cleanup completes.
+    Exited,
 }
 
 /// Why scheduling was invoked.
@@ -24,6 +28,10 @@ pub enum SchedReason {
     /// Current thread just marked itself Blocked and MUST NOT resume
     /// until some other code path unblocks it.
     Block,
+    /// Current thread is exiting. Transitions Running -> Exited and
+    /// selects the next thread. The exiting thread is never scheduled
+    /// again. The kernel uses the returned exited index for teardown.
+    Exit,
 }
 
 /// Result of a scheduling decision.
@@ -38,6 +46,15 @@ pub enum SchedDecision {
     /// No runnable thread exists. Halt the CPU (wfi) until an interrupt
     /// wakes something up.
     WaitForInterrupt,
+    /// Thread exited and a new thread was selected. The kernel must:
+    /// 1. Store `exited` index + TCB paddr for deferred cleanup
+    /// 2. Context-switch to `next`
+    /// The exited thread is already marked Exited and will never run again.
+    ExitAndSwitch { exited: usize, next: usize },
+    /// Thread exited but no other thread is Ready. The kernel must store
+    /// the exited index for cleanup and halt (wfi) until an interrupt
+    /// wakes a thread.
+    ExitAndHalt { exited: usize },
 }
 
 /// Errors from scheduler state transitions.
@@ -78,7 +95,10 @@ where
         let mut next = (current + 1) % thread_count;
         loop {
             if get_state(next) == SchedThreadState::Ready {
-                return SchedDecision::SwitchTo(next);
+                return match reason {
+                    SchedReason::Exit => SchedDecision::ExitAndSwitch { exited: current, next },
+                    _ => SchedDecision::SwitchTo(next),
+                };
             }
             next = (next + 1) % thread_count;
             if next == current {
@@ -93,6 +113,7 @@ where
             _ => SchedDecision::WaitForInterrupt,
         },
         SchedReason::Block => SchedDecision::WaitForInterrupt,
+        SchedReason::Exit => SchedDecision::ExitAndHalt { exited: current },
     }
 }
 
@@ -172,10 +193,29 @@ impl SchedState {
 
     /// Mark a Blocked thread as Ready so the scheduler can pick it.
     /// Used by IPC endpoints and notifications when a partner arrives.
+    /// Rejects Exited threads — once exited, a thread cannot be woken.
     pub fn unblock(&mut self, idx: usize) -> Result<(), SchedError> {
         match self.get(idx) {
             Some(SchedThreadState::Blocked) => {
                 self.states[idx] = Some(SchedThreadState::Ready);
+                Ok(())
+            }
+            Some(_) => Err(SchedError::InvalidTransition),
+            None => Err(SchedError::InvalidIndex),
+        }
+    }
+
+    /// Remove an Exited thread from the scheduler, freeing its slot for
+    /// reuse by a future `add_thread`. Only valid for Exited threads
+    /// that are not the current thread (the kernel calls this from the
+    /// next thread's context after cleanup).
+    pub fn remove_thread(&mut self, idx: usize) -> Result<(), SchedError> {
+        if idx == self.current {
+            return Err(SchedError::InvalidTransition);
+        }
+        match self.get(idx) {
+            Some(SchedThreadState::Exited) => {
+                self.states[idx] = None;
                 Ok(())
             }
             Some(_) => Err(SchedError::InvalidTransition),
@@ -207,9 +247,16 @@ impl SchedState {
                 );
             }
             SchedReason::Block => {
+                let cur = self.get(self.current);
                 assert!(
-                    self.get(self.current) == Some(SchedThreadState::Blocked),
-                    "step(Block) requires current thread to be Blocked (call block_current first)"
+                    cur == Some(SchedThreadState::Blocked) || cur == Some(SchedThreadState::Exited),
+                    "step(Block) requires current thread to be Blocked or Exited"
+                );
+            }
+            SchedReason::Exit => {
+                assert!(
+                    self.get(self.current) == Some(SchedThreadState::Running),
+                    "step(Exit) requires current thread to be Running"
                 );
             }
         }
@@ -251,8 +298,9 @@ impl SchedState {
                     }
                     self.states[self.current] = Some(SchedThreadState::Ready);
                 } else {
-                    // Block: current must already be Blocked.
-                    if self.get(self.current) != Some(SchedThreadState::Blocked) {
+                    // Block: current must already be Blocked or Exited.
+                    let cur = self.get(self.current);
+                    if cur != Some(SchedThreadState::Blocked) && cur != Some(SchedThreadState::Exited) {
                         return Err(SchedError::InvalidTransition);
                     }
                 }
@@ -286,12 +334,40 @@ impl SchedState {
                 }
                 Ok(())
             }
+            SchedDecision::ExitAndSwitch { exited, next } => {
+                if reason != SchedReason::Exit {
+                    return Err(SchedError::InvalidTransition);
+                }
+                if self.get(exited) != Some(SchedThreadState::Running) {
+                    return Err(SchedError::InvalidTransition);
+                }
+                if self.get(next) != Some(SchedThreadState::Ready) {
+                    return Err(SchedError::InvalidTransition);
+                }
+                self.states[exited] = Some(SchedThreadState::Exited);
+                self.states[next] = Some(SchedThreadState::Running);
+                self.current = next;
+                Ok(())
+            }
+            SchedDecision::ExitAndHalt { exited } => {
+                if reason != SchedReason::Exit {
+                    return Err(SchedError::InvalidTransition);
+                }
+                if self.get(exited) != Some(SchedThreadState::Running) {
+                    return Err(SchedError::InvalidTransition);
+                }
+                self.states[exited] = Some(SchedThreadState::Exited);
+                // No thread to switch to. current stays pointing at the
+                // exited thread (the kernel will wfi until an interrupt).
+                Ok(())
+            }
         }
     }
 
     /// Invariants of a valid scheduler state:
     /// - `current < MAX_THREADS_MODEL` (in bounds)
-    /// - `states[current]` is registered (Some)
+    /// - `states[current]` is registered (Some) — may be Exited after
+    ///   ExitAndHalt when no other thread is Ready
     /// - At most one thread is Running
     /// - If any thread is Running, it is the current thread
     pub fn check_invariants(&self) -> bool {
@@ -643,6 +719,32 @@ mod tests {
             }
         }
 
+        // Event 5: current thread exits (if Running and not the only thread)
+        if s.get(s.current) == Some(SchedThreadState::Running)
+            && s.thread_count() >= 2
+        {
+            let mut s2 = s.clone();
+            let decision = s2.step(SchedReason::Exit);
+            match decision {
+                SchedDecision::ExitAndSwitch { exited, .. } => {
+                    // Also test remove_thread cleanup
+                    let mut s3 = s2.clone();
+                    let _ = s3.remove_thread(exited);
+                    out.push(("exit+remove".into(), s3));
+                    out.push(("exit".into(), s2));
+                }
+                SchedDecision::ExitAndHalt { .. } => {
+                    // Cannot remove: exited thread is still current
+                    // (no other thread to switch to). Cleanup deferred
+                    // until an interrupt wakes another thread.
+                    out.push(("exit_halt".into(), s2));
+                }
+                _ => {
+                    out.push(("exit".into(), s2));
+                }
+            }
+        }
+
         out
     }
 
@@ -671,6 +773,119 @@ mod tests {
 
         // We should explore at least a handful of states.
         assert!(explored >= 5, "BFS only explored {} states", explored);
+    }
+
+    // --- Exit tests ---
+
+    #[test]
+    fn step_exit_switches_to_ready() {
+        let mut s = SchedState::new();
+        s.add_thread().unwrap(); // idx 1 Ready
+        let d = s.step(SchedReason::Exit);
+        assert_eq!(d, SchedDecision::ExitAndSwitch { exited: 0, next: 1 });
+        assert_eq!(s.get(0), Some(SchedThreadState::Exited));
+        assert_eq!(s.get(1), Some(SchedThreadState::Running));
+        assert_eq!(s.current, 1);
+        assert!(s.check_invariants());
+    }
+
+    #[test]
+    fn step_exit_halts_when_alone() {
+        let mut s = SchedState::new();
+        let d = s.step(SchedReason::Exit);
+        assert_eq!(d, SchedDecision::ExitAndHalt { exited: 0 });
+        assert_eq!(s.get(0), Some(SchedThreadState::Exited));
+        assert!(s.check_invariants());
+    }
+
+    #[test]
+    fn exited_thread_never_selected() {
+        let mut s = SchedState::new();
+        s.add_thread().unwrap(); // idx 1 Ready
+        s.step(SchedReason::Exit); // exit thread 0, switch to 1
+        // Now thread 0 is Exited, thread 1 is Running
+        // Preempt should stay on current (no Ready threads)
+        let d = s.step(SchedReason::Preempt);
+        assert_eq!(d, SchedDecision::StayOnCurrent);
+    }
+
+    #[test]
+    fn unblock_rejects_exited() {
+        let mut s = SchedState::new();
+        s.add_thread().unwrap();
+        s.step(SchedReason::Exit); // thread 0 Exited
+        assert_eq!(s.unblock(0), Err(SchedError::InvalidTransition));
+    }
+
+    #[test]
+    fn remove_thread_on_exited_frees_slot() {
+        let mut s = SchedState::new();
+        s.add_thread().unwrap(); // idx 1
+        s.step(SchedReason::Exit); // exit thread 0
+        assert!(s.remove_thread(0).is_ok());
+        assert_eq!(s.get(0), None);
+        // Slot is reusable
+        let idx = s.add_thread().unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(s.get(0), Some(SchedThreadState::Ready));
+    }
+
+    #[test]
+    fn remove_thread_rejects_non_exited() {
+        let mut s = SchedState::new();
+        s.add_thread().unwrap();
+        assert_eq!(s.remove_thread(1), Err(SchedError::InvalidTransition));
+    }
+
+    #[test]
+    fn remove_thread_rejects_current() {
+        // ExitAndHalt leaves the exited thread as current. remove_thread
+        // must reject it — cleanup can only happen after switching to a
+        // different thread.
+        let mut s = SchedState::new();
+        s.step(SchedReason::Exit); // ExitAndHalt, current=0, states[0]=Exited
+        assert_eq!(s.remove_thread(0), Err(SchedError::InvalidTransition));
+    }
+
+    #[test]
+    fn exit_and_halt_then_unblock_schedules() {
+        // Regression: ExitAndHalt with blocked threads must not deadlock.
+        // After exit, an unblock + step(Block) should switch to the
+        // newly-Ready thread. Cleanup (remove_thread) must only succeed
+        // AFTER current has changed away from the exited thread.
+        let mut s = SchedState::new();
+        let idx1 = s.add_thread().unwrap(); // idx 1 Ready
+        s.states[idx1] = Some(SchedThreadState::Blocked); // force blocked
+
+        // Thread 0 exits — no Ready thread, so ExitAndHalt
+        let d = s.step(SchedReason::Exit);
+        assert_eq!(d, SchedDecision::ExitAndHalt { exited: 0 });
+        assert_eq!(s.get(0), Some(SchedThreadState::Exited));
+        assert_eq!(s.current, 0); // still current — can't remove yet
+
+        // remove_thread must fail while exited thread is still current
+        assert_eq!(s.remove_thread(0), Err(SchedError::InvalidTransition));
+
+        // Simulate interrupt unblocking thread 1
+        s.unblock(1).unwrap();
+
+        // step(Block) with Exited current should find Ready thread 1
+        let d2 = s.step(SchedReason::Block);
+        assert_eq!(d2, SchedDecision::SwitchTo(1));
+        assert_eq!(s.current, 1); // current changed — now remove works
+
+        // NOW remove_thread succeeds (exited thread is no longer current)
+        assert!(s.remove_thread(0).is_ok());
+        assert_eq!(s.get(0), None);
+        assert!(s.check_invariants());
+    }
+
+    #[test]
+    #[should_panic(expected = "step(Exit) requires current thread to be Running")]
+    fn step_exit_panics_if_current_not_running() {
+        let mut s = SchedState::new();
+        s.block_current().unwrap();
+        let _ = s.step(SchedReason::Exit);
     }
 
     #[test]

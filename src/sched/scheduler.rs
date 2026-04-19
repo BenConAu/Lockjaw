@@ -1,5 +1,6 @@
-use crate::mm::addr::PhysAddr;
-use crate::mm::kernel_ptr::KernelMut;
+use crate::mm::addr::{PhysAddr, PhysPage, KERNEL_VA_OFFSET};
+use crate::mm::kernel_ptr::{KernelMut, KernelRef};
+use crate::mm::page_alloc;
 use crate::sched::tcb::Tcb;
 use crate::sched::context::context_switch;
 use core::cell::UnsafeCell;
@@ -7,8 +8,30 @@ use core::ptr;
 use lockjaw_types::scheduler::{
     SchedDecision, SchedReason, SchedState, SchedThreadState,
 };
+use lockjaw_types::object::HandleTableHeader;
 
 const MAX_THREADS: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Pending exit — typed record for deferred thread cleanup
+// ---------------------------------------------------------------------------
+
+/// Captures the identity of an exited thread for deferred cleanup.
+/// Stored after exit_current() and consumed by finish_exit() on the
+/// next schedule() call from a different thread.
+struct PendingExit {
+    thread_idx: usize,
+    tcb_paddr: PhysAddr,
+}
+
+/// Cleanup slot for the most recently exited thread.
+/// Invariant: must be None before exit_current() stores a new value.
+/// finish_exit() drains this at the start of every schedule() call.
+struct PendingExitSlot(UnsafeCell<Option<PendingExit>>);
+/// SAFETY: single-core, IRQs masked during kernel execution.
+unsafe impl Sync for PendingExitSlot {}
+
+static PENDING_EXIT: PendingExitSlot = PendingExitSlot(UnsafeCell::new(None));
 
 // ---------------------------------------------------------------------------
 // Scheduler singleton — wraps all mutable globals behind safe methods
@@ -116,10 +139,18 @@ pub fn tick() {
         if !active || state.thread_count() < 2 {
             return;
         }
+        let current_state = state.get(state.current);
+        if current_state == Some(SchedThreadState::Exited) {
+            // ExitAndHalt case: current thread exited but no Ready thread
+            // was available. An interrupt may have just unblocked a thread.
+            // Use Block reason — step(Block) accepts Exited as current.
+            schedule(SchedReason::Block);
+            return;
+        }
         // Can only Preempt a Running thread. If current is Blocked (idle
         // loop in block_current), the timer tick has no work — return and
         // the block_current loop will re-evaluate.
-        if state.get(state.current) != Some(SchedThreadState::Running) {
+        if current_state != Some(SchedThreadState::Running) {
             return;
         }
         // schedule() performs context_switch (asm) — inherently unsafe.
@@ -251,6 +282,155 @@ pub fn unblock_thread(tcb_paddr: PhysAddr) {
     }
 }
 
+/// Exit the current thread permanently. Never returns.
+///
+/// 1. Asserts no pending exit (cleanup slot empty)
+/// 2. Calls step(Exit) which transitions Running → Exited and picks next
+/// 3. Stores PendingExit record for deferred cleanup by finish_exit()
+/// 4. Context-switches away, then loops in wfi forever
+pub fn exit_current() -> ! {
+    // SAFETY: single-core, IRQs masked — exclusive access.
+    unsafe {
+        // Invariant: no pending exit waiting for cleanup
+        assert!(
+            (*PENDING_EXIT.0.get()).is_none(),
+            "exit_current: previous exit not yet cleaned up"
+        );
+
+        let state = &mut *SCHEDULER.state_ptr();
+        let decision = state.step(SchedReason::Exit);
+
+        match decision {
+            SchedDecision::ExitAndSwitch { exited, next } => {
+                let tcb_paddr = (*SCHEDULER.threads_ptr())[exited].unwrap();
+                *PENDING_EXIT.0.get() = Some(PendingExit { thread_idx: exited, tcb_paddr });
+
+                let new_paddr = (*SCHEDULER.threads_ptr())[next].unwrap();
+                let new_tcb = KernelMut::<Tcb>::from_paddr(new_paddr);
+                let new_ttbr0 = new_tcb.get().ttbr0_paddr;
+
+                // Swap TTBR0 if the new thread has a user address space
+                if new_ttbr0 != 0 {
+                    core::arch::asm!(
+                        "msr TTBR0_EL1, {val}",
+                        "dsb ish",
+                        "tlbi vmalle1is",
+                        "dsb ish",
+                        "isb",
+                        val = in(reg) new_ttbr0,
+                    );
+                }
+
+                // We don't need to save our old SP properly since we
+                // will never be switched back to. But context_switch
+                // writes it anyway (harmless — the TCB page will be freed).
+                let old_paddr = (*SCHEDULER.threads_ptr())[exited].unwrap();
+                let mut old_tcb = KernelMut::<Tcb>::from_paddr(old_paddr);
+                // SAFETY: old_tcb is live; field reference is unique (exiting thread)
+                let old_sp_ptr = &mut old_tcb.get_mut().saved_sp as *mut u64;
+                // SAFETY: new_tcb is live; shared field reference
+                let new_sp_ptr = &new_tcb.get().saved_sp as *const u64;
+                context_switch(old_sp_ptr, new_sp_ptr);
+
+                // If we somehow get here, something is very wrong.
+                // The exited thread should never be scheduled again.
+                unreachable!("exit_current: exited thread resumed");
+            }
+            SchedDecision::ExitAndHalt { exited } => {
+                // No Ready thread right now, but Blocked threads may be
+                // woken by interrupts. Store PENDING_EXIT and loop like
+                // block_current: wfi until an interrupt unblocks a thread,
+                // then schedule(Block) picks it up. finish_exit() at the
+                // start of schedule() will clean up this thread's resources
+                // once we switch to the newly-Ready thread.
+                let tcb_paddr = (*SCHEDULER.threads_ptr())[exited].unwrap();
+                *PENDING_EXIT.0.get() = Some(PendingExit { thread_idx: exited, tcb_paddr });
+
+                loop {
+                    schedule(SchedReason::Block);
+                    // If we're somehow still here (no Ready thread yet),
+                    // wfi until the next interrupt.
+                    core::arch::asm!(
+                        "mrs x0, DAIF",
+                        "msr DAIFClr, #2",
+                        "wfi",
+                        "msr DAIF, x0",
+                        out("x0") _,
+                    );
+                }
+            }
+            _ => unreachable!("step(Exit) returned unexpected decision"),
+        }
+    }
+}
+
+/// Clean up the most recently exited thread's resources.
+/// Called at the start of schedule() before any state transitions.
+/// Common path (no pending exit) is a single pointer read.
+///
+/// Cleanup order (documented explicitly):
+///   1. Read all TCB fields we need before freeing anything
+///   2. Remove from scheduler (prevents re-selection during cleanup)
+///   3. Free handle table page(s) (extent from ObjectHeader.page_count)
+///   4. Free kernel stack page
+///   5. Free TCB page (last — we were reading from it)
+fn finish_exit() {
+    // SAFETY: single-core, IRQs masked — exclusive access.
+    let pending = unsafe { &*PENDING_EXIT.0.get() };
+    let pending = match pending {
+        Some(p) => p,
+        None => return, // common path — no pending exit
+    };
+
+    // Cannot clean up if the exited thread is still current (ExitAndHalt
+    // path — we haven't context-switched to a different thread yet).
+    // Cleanup will happen later when an interrupt unblocks a thread and
+    // schedule() runs from that thread's context.
+    let current_idx = unsafe { (*SCHEDULER.state_ptr()).current };
+    if pending.thread_idx == current_idx {
+        return;
+    }
+
+    // Safe to proceed — take ownership of the pending record.
+    let pending = unsafe { (*PENDING_EXIT.0.get()).take().unwrap() };
+
+    // Step 1: Read everything we need from the exiting TCB
+    let tcb = unsafe { KernelRef::<Tcb>::from_paddr(pending.tcb_paddr) };
+    // Invariant: stack_base is a direct-map VA of the kernel stack page
+    // (stack_base = phys + KERNEL_VA_OFFSET). This is set by create_tcb.
+    let stack_paddr = PhysAddr::new(tcb.get().stack_base - KERNEL_VA_OFFSET);
+    let ht_paddr = PhysAddr::new(tcb.get().handle_table_paddr);
+    // Read handle table page count from ObjectHeader
+    let ht_page_count = if ht_paddr.as_u64() != 0 {
+        let ht = unsafe { KernelRef::<HandleTableHeader>::from_paddr(ht_paddr) };
+        ht.get().header.page_count as usize
+    } else {
+        0
+    };
+
+    // Step 2: Remove from scheduler array + model
+    unsafe {
+        (&mut *SCHEDULER.state_ptr()).remove_thread(pending.thread_idx)
+            .expect("finish_exit: remove_thread failed");
+        (*SCHEDULER.threads_ptr())[pending.thread_idx] = None;
+    }
+
+    // Step 3: Free handle table page(s)
+    for i in 0..ht_page_count {
+        let page = PhysAddr::new(ht_paddr.as_u64() + (i as u64) * crate::mm::addr::PAGE_SIZE);
+        page_alloc::dealloc_page(PhysPage::containing(page));
+    }
+
+    // Step 4: Free kernel stack page
+    page_alloc::dealloc_page(PhysPage::containing(stack_paddr));
+
+    // Step 5: Free TCB page (last)
+    page_alloc::dealloc_page(PhysPage::containing(pending.tcb_paddr));
+
+    crate::kprintln!("[EXIT] Thread {} cleaned up ({} pages freed)",
+        pending.thread_idx, 2 + ht_page_count);
+}
+
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
@@ -269,6 +449,9 @@ fn thread_index_for(paddr: PhysAddr) -> Option<usize> {
 /// The actual context-switch path. Unsafe because it calls the asm
 /// context_switch trampoline and touches hardware registers (TTBR0).
 unsafe fn schedule(reason: SchedReason) {
+    // Clean up any previously exited thread before doing anything else.
+    finish_exit();
+
     let state = &mut *SCHEDULER.state_ptr();
     let old_idx = state.current;
     let old_paddr = (*SCHEDULER.threads_ptr())[old_idx].unwrap();
@@ -285,6 +468,10 @@ unsafe fn schedule(reason: SchedReason) {
             // No context switch needed. State has already been validated
             // and (for StayOnCurrent/WaitForInterrupt) not mutated.
             return;
+        }
+        SchedDecision::ExitAndSwitch { .. } | SchedDecision::ExitAndHalt { .. } => {
+            // Exit decisions are handled by exit_current(), not schedule().
+            unreachable!("schedule() should never see Exit decisions");
         }
     };
 

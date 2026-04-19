@@ -364,3 +364,15 @@ pub fn sys_query_pageset_phys(pageset_id: u64, page_index: u64) -> Result<u64, S
     }
     if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
 }
+
+/// Exit the current thread. Never returns. The kernel frees the thread's
+/// TCB, kernel stack, and handle table pages.
+pub fn sys_exit() -> ! {
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x8") SYS_EXIT,
+            options(noreturn),
+        );
+    }
+}

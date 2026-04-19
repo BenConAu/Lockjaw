@@ -65,6 +65,9 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_REGISTER_DEVICE_PAGE => SyscallReturn::Value(sys_register_device_page(ctx)),
         SYS_QUERY_PAGESET_PHYS => SyscallReturn::Value(sys_query_pageset_phys(ctx)),
         SYS_CREATE_REPLY => SyscallReturn::Value(sys_create_reply(ctx)),
+        SYS_EXIT => {
+            scheduler::exit_current(); // never returns
+        }
         _ => {
             crate::kprintln!("Unknown syscall {}", syscall_num);
             SyscallReturn::Void(SyscallError::INVALID_PARAMETER)
