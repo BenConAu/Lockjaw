@@ -92,6 +92,63 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
     }
 }
 
+/// Allocate `count` physically contiguous pages and register as a PageSet.
+/// The buddy allocator rounds up to the next power of two, so the PageSet
+/// tracks the full rounded allocation (no leaked tail pages). The caller
+/// gets at least `count` contiguous pages; extra pages are uninitialized.
+/// The header page is allocated separately (not contiguous with data).
+/// Returns the PageSet ID, or `None` if out of memory or table full.
+pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
+    if count == 0 || count > MAX_PAGES_PER_SET {
+        return None;
+    }
+
+    // The buddy allocator rounds up to 2^order. Track the full allocation
+    // so no pages are leaked between the buddy and the PageSet.
+    let order = lockjaw_types::buddy::BuddyAllocator::order_for_count(count);
+    let actual_count = 1 << order;
+    if actual_count > MAX_PAGES_PER_SET {
+        return None;
+    }
+
+    // Allocate the header page
+    let header_page = page_alloc::alloc_page()?;
+    let header_paddr = header_page.start_addr();
+    page_alloc::zero_page(header_paddr);
+
+    // Allocate contiguous data pages (actual_count, not count)
+    let first_data = match page_alloc::alloc_pages_contiguous(count) {
+        Some(page) => page,
+        None => {
+            page_alloc::dealloc_page(crate::mm::addr::PhysPage::containing(header_paddr));
+            return None;
+        }
+    };
+
+    // Write all actual_count sequential addresses into the header
+    // SAFETY: header_paddr is a freshly allocated, zeroed kernel page.
+    let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_paddr(header_paddr) };
+    let base = first_data.start_addr().as_u64();
+    for i in 0..actual_count {
+        header_ref.get_mut().pages[i] = base + (i as u64) * crate::mm::addr::PAGE_SIZE;
+    }
+    header_ref.get_mut().count = actual_count as u64;
+
+    // Insert into the table with actual_count
+    let entry = PageSetEntry { count: actual_count, header_paddr: header_paddr.as_u64() };
+    // SAFETY: single-core, IRQs masked — exclusive table access.
+    let result = unsafe { (*TABLE.ptr()).insert(entry) };
+    match result {
+        Ok(id) => Some(id as u64),
+        Err(_) => {
+            // Table full — free all pages
+            page_alloc::dealloc_pages_contiguous(first_data, count);
+            page_alloc::dealloc_page(crate::mm::addr::PhysPage::containing(header_paddr));
+            None
+        }
+    }
+}
+
 /// Register a PageSet for existing physical pages (not from the allocator).
 /// Used at boot to wrap the DTB pages placed by QEMU firmware.
 /// Allocates one extra page for the header.

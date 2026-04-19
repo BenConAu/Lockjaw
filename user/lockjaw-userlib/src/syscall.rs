@@ -30,7 +30,25 @@ pub fn sys_alloc_pages(count: u64) -> Result<u64, SyscallError> {
         asm!(
             "svc #0",
             inlateout("x0") count => err,
-            lateout("x1") val,
+            inlateout("x1") 0u64 => val,
+            in("x8") SYS_ALLOC_PAGES,
+        );
+    }
+    if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
+}
+
+/// Allocate physically contiguous pages. Returns a PageSet ID on success.
+/// The pages are guaranteed to be sequential in physical memory,
+/// suitable for DMA buffers. The block size is rounded up to the next
+/// power of two internally.
+pub fn sys_alloc_pages_contiguous(count: u64) -> Result<u64, SyscallError> {
+    let err: u64;
+    let val: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") count => err,
+            inlateout("x1") ALLOC_FLAG_CONTIGUOUS => val,
             in("x8") SYS_ALLOC_PAGES,
         );
     }

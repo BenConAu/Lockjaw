@@ -72,7 +72,6 @@ pub fn alloc_page() -> Option<PhysPage> {
     }
 }
 
-#[allow(dead_code)] // No callers yet — used by pageset_table contiguous path.
 /// Allocate `count` physically contiguous pages. Returns the first page
 /// of the contiguous block, or `None` if no sufficiently large block is
 /// available. The block size is rounded up to the next power of two.
@@ -97,7 +96,6 @@ pub fn dealloc_page(page: PhysPage) {
     }
 }
 
-#[allow(dead_code)] // No callers yet — used by pageset_table contiguous rollback.
 /// Free `count` contiguous pages starting at `first_page`. The count
 /// is rounded up to the same power-of-two order used by
 /// `alloc_pages_contiguous`.

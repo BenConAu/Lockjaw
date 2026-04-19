@@ -179,7 +179,7 @@ pub extern "C" fn _start() -> ! {
     puts("ramfb: found etc/ramfb\n");
 
     // Allocate framebuffer pages
-    let fb_ps = match sys_alloc_pages(FB_PAGES) {
+    let fb_ps = match sys_alloc_pages_contiguous(FB_PAGES) {
         Ok(id) => id,
         Err(_) => { puts("ramfb: alloc fb FAILED\n"); halt(); }
     };
@@ -192,12 +192,8 @@ pub extern "C" fn _start() -> ! {
     }
     puts("ramfb: fb mapped\n");
 
-    // Query the physical address of the first framebuffer page.
-    // ramfb needs contiguous physical memory. Our page allocator doesn't
-    // guarantee contiguity, but for a small 320x240 buffer on a fresh
-    // system the pages are likely sequential. We use page 0's address
-    // as the DMA base. If pages aren't contiguous, the display will
-    // show tearing -- a known limitation until contiguous alloc is added.
+    // Framebuffer pages are physically contiguous; page 0's address
+    // is the DMA base.
     let fb_phys = match sys_query_pageset_phys(fb_ps, 0) {
         Ok(addr) => addr,
         Err(_) => { puts("ramfb: query phys FAILED\n"); halt(); }

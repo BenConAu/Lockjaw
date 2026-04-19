@@ -190,13 +190,24 @@ fn sys_reply(ctx: &mut ExceptionContext) -> SyscallError {
     }
 }
 
-/// sys_alloc_pages(count) — allocate physical pages.
+/// sys_alloc_pages(count, flags) — allocate physical pages.
 /// x0 = number of pages to allocate.
+/// x1 = flags (ALLOC_FLAG_CONTIGUOUS for physically contiguous pages).
 /// Returns a PageSet ID in x1 on success.
 fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let count = ctx.gpr[0] as usize;
+    let flags = ctx.gpr[1];
 
-    match crate::cap::pageset_table::alloc_pages(count) {
+    if flags & !lockjaw_types::syscall::ALLOC_FLAG_CONTIGUOUS != 0 {
+        return Err(SyscallError::INVALID_PARAMETER);
+    }
+
+    let result = if flags & lockjaw_types::syscall::ALLOC_FLAG_CONTIGUOUS != 0 {
+        crate::cap::pageset_table::alloc_pages_contiguous(count)
+    } else {
+        crate::cap::pageset_table::alloc_pages(count)
+    };
+    match result {
         Some(id) => Ok(id),
         None => Err(SyscallError::OUT_OF_MEMORY),
     }
