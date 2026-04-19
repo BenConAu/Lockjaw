@@ -110,6 +110,7 @@ pub unsafe fn handle_insert(
         }
     }
 
+    crate::kprintln!("HANDLE TABLE FULL: {} slots, all occupied", slots.len());
     Err(HandleError::TableFull)
 }
 

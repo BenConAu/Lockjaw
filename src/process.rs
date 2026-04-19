@@ -121,7 +121,7 @@ pub fn create_process(
     // SAFETY: ht_page is a freshly allocated kernel page.
     unsafe {
         create_handle_table(
-            &HandleTableCreateInfo { slot_count: 8 },
+            &HandleTableCreateInfo { slot_count: 16 },
             ht_page.start_addr(),
         ).map_err(|_| "handle table create failed")?;
     }

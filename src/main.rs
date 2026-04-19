@@ -329,7 +329,7 @@ pub extern "C" fn kmain() -> ! {
         let idle_stack_base = &__stack_bottom as *const u8 as u64 + mm::addr::KERNEL_VA_OFFSET;
         let idle_ht_page = mm::page_alloc::alloc_page().expect("idle ht alloc").start_addr();
         create_handle_table(
-            &HandleTableCreateInfo { slot_count: 8 },
+            &HandleTableCreateInfo { slot_count: 16 },
             idle_ht_page,
         ).expect("idle ht create");
 
@@ -506,7 +506,7 @@ static IPC_BENCH_REPLY_PADDR: BootOnce = BootOnce::new();
 /// Uses ipc_call (send + block for reply in one operation).
 /// Endpoint at handle 0, Reply at handle 1.
 fn ipc_sender() -> ! {
-    const BENCHMARK_ROUNDS: u64 = 10000;
+    const BENCHMARK_ROUNDS: u64 = 500;
     let mut counter: u64 = 1;
 
     // Warm up

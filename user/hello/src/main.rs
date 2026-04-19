@@ -36,8 +36,8 @@ pub extern "C" fn _start() -> ! {
     putc(b'0' + msg[0] as u8);
     putc(b'\n');
 
+    puts("child: alive\n");
     loop {
-        puts("child: alive\n");
         sys_yield();
     }
 }

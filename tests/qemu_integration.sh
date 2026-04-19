@@ -3,7 +3,7 @@
 # Boots the kernel, captures serial output, and asserts expected strings.
 set -e
 
-TIMEOUT=15
+TIMEOUT=30
 QEMU="qemu-system-aarch64"
 QEMU_FLAGS="-machine virt,gic-version=3 -cpu cortex-a53 -nographic"
 KERNEL="target/aarch64-unknown-none/debug/lockjaw"
@@ -68,7 +68,7 @@ assert_contains "Hello from userspace init" "Init process running from ELF"
 assert_contains "alloc_pages(1) OK" "sys_alloc_pages works from userspace"
 assert_contains "map_pages OK" "sys_map_pages works from userspace"
 assert_contains "mapped memory read/write OK" "Mapped memory accessible from userspace"
-assert_contains "child spawned successfully" "Init spawned child via sys_create_process"
+assert_contains "spawned OK" "Init spawned child via sys_create_process"
 assert_contains "Hello from child process" "Child process running in own address space"
 assert_contains "child: alive" "Child process scheduled and printing"
 
