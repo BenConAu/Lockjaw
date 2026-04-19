@@ -33,10 +33,18 @@ const fn bitmap_offset(order: usize) -> usize {
 /// Total bytes for all order bitmaps (0..MAX_ORDER inclusive).
 const BITMAP_TOTAL: usize = bitmap_offset(MAX_ORDER + 1);
 
-/// Bitmap-per-order buddy allocator. All state is a flat byte array
-/// suitable for static allocation in kernel BSS (~8KB).
+/// Per-page allocated bitmap size in bytes.
+const ALLOC_BITMAP_SIZE: usize = (MAX_PAGES + 7) / 8;
+
+/// Bitmap-per-order buddy allocator. All state is flat byte arrays
+/// suitable for static allocation in kernel BSS (~12KB).
 pub struct BuddyAllocator {
+    /// Buddy free-block bitmaps. Order k starts at offset bitmap_offset(k).
     bitmap: [u8; BITMAP_TOTAL],
+    /// Per-page allocated tracking. Set bit = page is currently handed out
+    /// by alloc and not yet returned by free. Detects double-free even
+    /// after buddy merges.
+    allocated: [u8; ALLOC_BITMAP_SIZE],
     /// Actual number of pages managed (<= MAX_PAGES).
     total_pages: usize,
     /// Total free pages (an order-k block counts as 2^k pages).
@@ -49,6 +57,7 @@ impl BuddyAllocator {
     pub const fn new() -> Self {
         BuddyAllocator {
             bitmap: [0u8; BITMAP_TOTAL],
+            allocated: [0u8; ALLOC_BITMAP_SIZE],
             total_pages: 0,
             free_count: 0,
         }
@@ -61,6 +70,7 @@ impl BuddyAllocator {
         assert!(total_pages <= MAX_PAGES,
             "init: total_pages {} exceeds MAX_PAGES {}", total_pages, MAX_PAGES);
         self.bitmap = [0u8; BITMAP_TOTAL];
+        self.allocated = [0u8; ALLOC_BITMAP_SIZE];
         self.total_pages = total_pages;
         self.free_count = 0;
     }
@@ -71,11 +81,15 @@ impl BuddyAllocator {
     ///
     /// Panics if any page in the range is outside `total_pages`.
     pub fn add_range(&mut self, start_page: usize, count: usize) {
-        assert!(
-            start_page + count <= self.total_pages,
-            "add_range: {}..{} exceeds total_pages {}",
-            start_page, start_page + count, self.total_pages
-        );
+        let end = start_page.checked_add(count)
+            .expect("add_range: start + count overflows usize");
+        assert!(end <= self.total_pages,
+            "add_range: {}..{} exceeds total_pages {}", start_page, end, self.total_pages);
+        // Mark as allocated first so free() can clear them normally.
+        // One invariant, one code path — no special-case bypass.
+        for i in 0..count {
+            self.set_allocated(start_page + i);
+        }
         for i in 0..count {
             self.free(start_page + i, 0);
         }
@@ -87,56 +101,91 @@ impl BuddyAllocator {
         if order > MAX_ORDER {
             return None;
         }
-        let max_blocks = self.total_pages >> order;
 
-        // Try to find a free block at this order.
-        if let Some(block_idx) = self.find_free(order, max_blocks) {
-            self.clear_bit(order, block_idx);
-            self.free_count -= 1 << order;
-            return Some(block_idx << order);
+        // Search upward for the smallest order with a free block.
+        let mut found_order = order;
+        let page = loop {
+            let max_blocks = self.total_pages >> found_order;
+            if let Some(block_idx) = self.find_free(found_order, max_blocks) {
+                self.clear_bit(found_order, block_idx);
+                self.free_count -= 1 << found_order;
+                break block_idx << found_order;
+            }
+            found_order += 1;
+            if found_order > MAX_ORDER {
+                return None;
+            }
+        };
+
+        // Split downward from found_order to the requested order,
+        // putting the right half on the free bitmap at each level.
+        while found_order > order {
+            found_order -= 1;
+            let right_half = page + (1 << found_order);
+            self.set_bit(found_order, right_half >> found_order);
+            self.free_count += 1 << found_order;
         }
 
-        // No block at this order — split a larger one.
-        let parent_page = self.alloc(order + 1)?;
-        // Parent is a 2^(order+1) block. The left half is what we return;
-        // the right half goes on the free list for this order.
-        let right_half = parent_page + (1 << order);
-        self.set_bit(order, right_half >> order);
-        self.free_count += 1 << order; // right half is now free
-        Some(parent_page)
+        // Mark all pages in the block as allocated.
+        let block_size = 1 << order;
+        for i in 0..block_size {
+            self.set_allocated(page + i);
+        }
+
+        Some(page)
     }
 
     /// Free a 2^order block starting at `page`. Merges with the buddy
-    /// if the buddy is also free, recursively up the order tree.
+    /// if the buddy is also free, iteratively up the order tree.
     ///
-    /// Panics if the block extends beyond `total_pages`.
+    /// Panics on double-free (any page in the block not marked allocated)
+    /// or if the block extends beyond `total_pages`.
     pub fn free(&mut self, page: usize, order: usize) {
         assert!(order <= MAX_ORDER,
             "free: order {} exceeds MAX_ORDER {}", order, MAX_ORDER);
         assert!(page + (1 << order) <= self.total_pages,
             "free: page {} order {} exceeds total_pages {}", page, order, self.total_pages);
-        if order == MAX_ORDER {
-            // Top order — just mark free, no buddy to merge with.
-            self.set_bit(order, page >> order);
-            self.free_count += 1 << order;
-            return;
+        assert!(page % (1 << order) == 0,
+            "free: page {} not aligned to order {}", page, order);
+
+        // Double-free check via per-page allocated bitmap. Catches
+        // double-free even after buddy merges have moved the block
+        // to a higher order.
+        let block_size = 1 << order;
+        for i in 0..block_size {
+            assert!(self.is_allocated(page + i),
+                "free: page {} not allocated (double-free)", page + i);
+            self.clear_allocated(page + i);
         }
 
-        let block_idx = page >> order;
-        let buddy_idx = block_idx ^ 1;
+        let mut current_page = page;
+        let mut current_order = order;
 
-        // Check buddy is within bounds and free.
-        let buddy_page = buddy_idx << order;
-        if buddy_page < self.total_pages && self.is_free(order, buddy_idx) {
-            // Buddy is free — merge: remove buddy, free at order+1.
-            self.clear_bit(order, buddy_idx);
-            self.free_count -= 1 << order; // buddy removed from this level
-            let merged_page = page & !(1 << order); // align down
-            self.free(merged_page, order + 1);
-        } else {
-            // Buddy is allocated or out of bounds — just mark this free.
-            self.set_bit(order, block_idx);
-            self.free_count += 1 << order;
+        // Merge buddies upward iteratively.
+        loop {
+            if current_order == MAX_ORDER {
+                // Top order — no buddy to merge with.
+                self.set_bit(current_order, current_page >> current_order);
+                self.free_count += 1 << current_order;
+                return;
+            }
+
+            let block_idx = current_page >> current_order;
+            let buddy_idx = block_idx ^ 1;
+            let buddy_page = buddy_idx << current_order;
+
+            if buddy_page < self.total_pages && self.is_free(current_order, buddy_idx) {
+                // Buddy is free — merge: remove buddy, try next order.
+                self.clear_bit(current_order, buddy_idx);
+                self.free_count -= 1 << current_order;
+                current_page = current_page & !(1 << current_order);
+                current_order += 1;
+            } else {
+                // Buddy is allocated or out of bounds — mark this free.
+                self.set_bit(current_order, block_idx);
+                self.free_count += 1 << current_order;
+                return;
+            }
         }
     }
 
@@ -165,7 +214,21 @@ impl BuddyAllocator {
         order
     }
 
-    // --- Bitmap helpers ---
+    // --- Allocated bitmap helpers (per-page, for double-free detection) ---
+
+    fn is_allocated(&self, page: usize) -> bool {
+        self.allocated[page / 8] & (1 << (page % 8)) != 0
+    }
+
+    fn set_allocated(&mut self, page: usize) {
+        self.allocated[page / 8] |= 1 << (page % 8);
+    }
+
+    fn clear_allocated(&mut self, page: usize) {
+        self.allocated[page / 8] &= !(1 << (page % 8));
+    }
+
+    // --- Buddy free-block bitmap helpers ---
 
     fn is_free(&self, order: usize, block_idx: usize) -> bool {
         let offset = bitmap_offset(order) + block_idx / 8;
@@ -369,6 +432,29 @@ mod tests {
         assert_eq!(fb % 128, 0); // 128-page aligned
         // Verify contiguity: pages fb..fb+128 are the allocated block
         assert!(fb + 128 <= MAX_PAGES);
+    }
+
+    #[test]
+    #[should_panic(expected = "double-free")]
+    fn double_free_simple() {
+        let mut b = make_small();
+        let p = b.alloc(0).unwrap();
+        b.free(p, 0);
+        b.free(p, 0); // should panic
+    }
+
+    #[test]
+    #[should_panic(expected = "double-free")]
+    fn double_free_after_merge() {
+        let mut b = make_small();
+        let p0 = b.alloc(0).unwrap();
+        let p1 = b.alloc(0).unwrap();
+        // Free both — they merge into an order-1 block
+        b.free(p0, 0);
+        b.free(p1, 0);
+        // Double-free p0 — should panic even though the order-0
+        // buddy bitmap bit is clear (merged to higher order)
+        b.free(p0, 0);
     }
 
     #[test]

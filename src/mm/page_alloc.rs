@@ -1,25 +1,19 @@
 use crate::mm::addr::{PhysAddr, PhysPage, RAM_START, TOTAL_PAGES, PAGE_SIZE};
 use crate::mm::kernel_ptr::KernelMut;
 use core::cell::UnsafeCell;
-
-/// Bitmap size in bytes: 32768 pages / 8 bits per byte = 4096 bytes.
-const BITMAP_SIZE: usize = (TOTAL_PAGES + 7) / 8;
+use lockjaw_types::buddy::BuddyAllocator;
 
 // ---------------------------------------------------------------------------
-// FrameAllocator singleton
+// FrameAllocator singleton — backed by a buddy allocator
 // ---------------------------------------------------------------------------
 
-/// The kernel's physical page allocator. A bitmap tracks which of the
-/// 32768 pages in RAM are allocated/reserved. A next-fit hint accelerates
-/// allocation. All state lives in `UnsafeCell`; the single `unsafe impl
-/// Sync` documents the "single-core, IRQs masked" invariant in one place.
+/// The kernel's physical page allocator. A buddy allocator tracks which
+/// of the 32768 pages in RAM are free, supporting both single-page and
+/// contiguous multi-page allocation. All state lives in `UnsafeCell`;
+/// the single `unsafe impl Sync` documents the "single-core, IRQs
+/// masked" invariant in one place.
 struct FrameAllocator {
-    /// A set bit means allocated/reserved. Lives in BSS, zeroed at boot.
-    bitmap: UnsafeCell<[u8; BITMAP_SIZE]>,
-    /// Next-fit allocation hint — index of the next page to check.
-    next_free_hint: UnsafeCell<usize>,
-    /// Number of pages currently marked as reserved or allocated.
-    allocated_count: UnsafeCell<usize>,
+    buddy: UnsafeCell<BuddyAllocator>,
 }
 
 /// SAFETY: single-core kernel. Kernel entry masks IRQs; no concurrent
@@ -30,9 +24,7 @@ unsafe impl Sync for FrameAllocator {}
 impl FrameAllocator {
     const fn new() -> Self {
         FrameAllocator {
-            bitmap: UnsafeCell::new([0u8; BITMAP_SIZE]),
-            next_free_hint: UnsafeCell::new(0),
-            allocated_count: UnsafeCell::new(0),
+            buddy: UnsafeCell::new(BuddyAllocator::new()),
         }
     }
 }
@@ -44,86 +36,78 @@ static ALLOCATOR: FrameAllocator = FrameAllocator::new();
 // ---------------------------------------------------------------------------
 
 /// Initialize the page allocator. Marks firmware, kernel image, and stack
-/// pages as reserved. Must be called exactly once during boot.
+/// pages as reserved by only freeing pages above the kernel. Must be
+/// called exactly once during boot.
 ///
 /// # Safety
 /// `kernel_start` and `kernel_end` must be valid physical addresses bounding
 /// the kernel image (including stack). Typically derived from linker symbols.
-pub unsafe fn init(kernel_start: PhysAddr, kernel_end: PhysAddr) {
-    // Reserve pages below the kernel load address (firmware, DTB, etc.)
-    let firmware_end_page = page_index(kernel_start);
-    mark_range_reserved(0, firmware_end_page);
+pub unsafe fn init(_kernel_start: PhysAddr, kernel_end: PhysAddr) {
+    let buddy = &mut *ALLOCATOR.buddy.get();
+    buddy.init(TOTAL_PAGES);
 
-    // Reserve kernel image + stack pages
-    let kernel_start_page = page_index(kernel_start);
-    let kernel_end_page = page_index(kernel_end);
-    // Round up in case kernel_end is not page-aligned
-    let kernel_end_page = if kernel_end.as_u64() & (PAGE_SIZE - 1) != 0 {
-        kernel_end_page + 1
-    } else {
-        kernel_end_page
+    // Round kernel_end up to the next page boundary.
+    let kernel_end_page = {
+        let idx = page_index(kernel_end);
+        if kernel_end.as_u64() & (PAGE_SIZE - 1) != 0 { idx + 1 } else { idx }
     };
-    mark_range_reserved(kernel_start_page, kernel_end_page);
 
-    // Set hint past all reserved pages
-    *ALLOCATOR.next_free_hint.get() = kernel_end_page;
+    // Free all pages above the kernel. Pages below (firmware, DTB,
+    // kernel image, stack) stay allocated (never added to the buddy).
+    let free_start = kernel_end_page;
+    let free_count = TOTAL_PAGES - free_start;
+    buddy.add_range(free_start, free_count);
 
-    let reserved = *ALLOCATOR.allocated_count.get();
+    let reserved = TOTAL_PAGES - buddy.free_count();
     crate::kprintln!("  Page allocator: {} reserved, {} free",
-        reserved, TOTAL_PAGES - reserved);
+        reserved, buddy.free_count());
 }
 
 /// Allocate a single physical page. Returns `None` if out of memory.
 pub fn alloc_page() -> Option<PhysPage> {
     // SAFETY: single-core, IRQs masked — exclusive access to allocator state.
     unsafe {
-        let hint = ALLOCATOR.next_free_hint.get();
-        let count = ALLOCATOR.allocated_count.get();
-        let start = *hint;
-
-        // Scan from hint to end
-        for i in start..TOTAL_PAGES {
-            if !is_set(i) {
-                set_bit(i);
-                *count += 1;
-                *hint = i + 1;
-                return Some(index_to_page(i));
-            }
-        }
-
-        // Wrap around: scan from 0 to hint
-        for i in 0..start {
-            if !is_set(i) {
-                set_bit(i);
-                *count += 1;
-                *hint = i + 1;
-                return Some(index_to_page(i));
-            }
-        }
-
-        None
+        let buddy = &mut *ALLOCATOR.buddy.get();
+        buddy.alloc(0).map(index_to_page)
     }
 }
 
-/// Free a previously allocated page. Returns false on double-free
-/// (page was not allocated). Callers should treat double-free as a
-/// kernel bug and panic — but the decision is theirs.
-pub fn dealloc_page(page: PhysPage) -> bool {
+#[allow(dead_code)] // No callers yet — used by pageset_table contiguous path.
+/// Allocate `count` physically contiguous pages. Returns the first page
+/// of the contiguous block, or `None` if no sufficiently large block is
+/// available. The block size is rounded up to the next power of two.
+pub fn alloc_pages_contiguous(count: usize) -> Option<PhysPage> {
+    if count == 0 {
+        return None;
+    }
+    let order = BuddyAllocator::order_for_count(count);
     // SAFETY: single-core, IRQs masked — exclusive access to allocator state.
     unsafe {
-        let idx = page_index(page.start_addr());
-        if !is_set(idx) {
-            return false;
-        }
-        clear_bit(idx);
-        *ALLOCATOR.allocated_count.get() -= 1;
+        let buddy = &mut *ALLOCATOR.buddy.get();
+        buddy.alloc(order).map(index_to_page)
+    }
+}
 
-        // Update hint if this page is lower
-        let hint = ALLOCATOR.next_free_hint.get();
-        if idx < *hint {
-            *hint = idx;
-        }
-        true
+/// Free a previously allocated single page. Panics on double-free.
+pub fn dealloc_page(page: PhysPage) {
+    // SAFETY: single-core, IRQs masked — exclusive access to allocator state.
+    unsafe {
+        let buddy = &mut *ALLOCATOR.buddy.get();
+        buddy.free(page_index(page.start_addr()), 0);
+    }
+}
+
+#[allow(dead_code)] // No callers yet — used by pageset_table contiguous rollback.
+/// Free `count` contiguous pages starting at `first_page`. The count
+/// is rounded up to the same power-of-two order used by
+/// `alloc_pages_contiguous`.
+pub fn dealloc_pages_contiguous(first_page: PhysPage, count: usize) {
+    if count == 0 { return; }
+    let order = BuddyAllocator::order_for_count(count);
+    // SAFETY: single-core, IRQs masked — exclusive access to allocator state.
+    unsafe {
+        let buddy = &mut *ALLOCATOR.buddy.get();
+        buddy.free(page_index(first_page.start_addr()), order);
     }
 }
 
@@ -148,30 +132,4 @@ fn page_index(addr: PhysAddr) -> usize {
 /// Convert a page index back to a PhysPage.
 fn index_to_page(idx: usize) -> PhysPage {
     PhysPage::containing(PhysAddr::new(RAM_START.as_u64() + (idx as u64) * PAGE_SIZE))
-}
-
-/// Set a bit in the allocator bitmap. Must be called inside an unsafe block
-/// that has established exclusive access to ALLOCATOR.
-unsafe fn set_bit(idx: usize) {
-    (*ALLOCATOR.bitmap.get())[idx / 8] |= 1 << (idx % 8);
-}
-
-/// Clear a bit in the allocator bitmap.
-unsafe fn clear_bit(idx: usize) {
-    (*ALLOCATOR.bitmap.get())[idx / 8] &= !(1 << (idx % 8));
-}
-
-/// Test whether a bit is set in the allocator bitmap.
-unsafe fn is_set(idx: usize) -> bool {
-    (*ALLOCATOR.bitmap.get())[idx / 8] & (1 << (idx % 8)) != 0
-}
-
-/// Mark a range of page indices as reserved.
-unsafe fn mark_range_reserved(start: usize, end_exclusive: usize) {
-    for i in start..end_exclusive {
-        if !is_set(i) {
-            set_bit(i);
-            *ALLOCATOR.allocated_count.get() += 1;
-        }
-    }
 }
