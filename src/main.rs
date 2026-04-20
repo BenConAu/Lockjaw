@@ -295,43 +295,49 @@ pub extern "C" fn kmain() -> ! {
         ipc::reply::create_reply(mm::addr::ObjectInitPage::new(bench_reply_page)).expect("create bench reply");
         IPC_BENCH_REPLY_PADDR.set(bench_reply_page.as_u64());
 
-        // Create handle table for sender (Thread A)
-        let ht_a_page = mm::page_alloc::alloc_page().expect("ht alloc").start_addr();
-        let ht_info = cap::object::HandleTableCreateInfo { slot_count: 8 };
-        cap::object::create_handle_table(&ht_info, ht_a_page).expect("create ht a");
-        handle_table::handle_insert(ht_a_page, ep_page, ObjectType::Endpoint,
-            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE)).expect("insert ep handle");
-        handle_table::handle_insert(ht_a_page, bench_reply_page, ObjectType::Reply,
-            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE)).expect("insert reply handle");
-
-        // Create handle table for receiver (Thread B) — also needs RW for ping-pong
-        let ht_b_page = mm::page_alloc::alloc_page().expect("ht alloc").start_addr();
-        cap::object::create_handle_table(&ht_info, ht_b_page).expect("create ht b");
-        handle_table::handle_insert(ht_b_page, ep_page, ObjectType::Endpoint,
-            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE)).expect("insert ep handle");
-
-        // Thread A (sender) — sends messages on the endpoint
-        let stack_a = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
-        let tcb_a_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
-        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, handle_table_paddr: ht_a_page, ttbr0_paddr: mm::addr::PhysAddr::new(0), user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_page)
-            .expect("create tcb a");
-
-        // Thread B (receiver) — receives and prints messages
-        let stack_b = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
-        let tcb_b_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
-        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, handle_table_paddr: ht_b_page, ttbr0_paddr: mm::addr::PhysAddr::new(0), user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_page)
-            .expect("create tcb b");
-
-        // Register idle thread (index 0 = this boot thread, uses the boot stack).
-        // This thread drops to EL0 and becomes the init process, so it needs
-        // a handle table for init's syscalls (create_endpoint, etc).
-        // SAFETY: linker symbol
-        let idle_stack_base = &__stack_bottom as *const u8 as u64 + mm::addr::KERNEL_VA_OFFSET;
-        let idle_ht_page = mm::page_alloc::alloc_page().expect("idle ht alloc").start_addr();
+        // Create kernel process — immortal, ttbr0=0, owns all kernel threads.
+        let kernel_ht_page = mm::page_alloc::alloc_page().expect("kernel ht alloc").start_addr();
         create_handle_table(
             &HandleTableCreateInfo { slot_count: 16 },
-            idle_ht_page,
-        ).expect("idle ht create");
+            kernel_ht_page,
+        ).expect("kernel ht create");
+
+        let kernel_proc_page = mm::page_alloc::alloc_page().expect("kernel proc alloc").start_addr();
+        cap::process_obj::create_process_object(
+            kernel_proc_page,
+            0, // ttbr0 = 0 (kernel process)
+            kernel_ht_page.as_u64(),
+            true, // immortal
+            b"kernel\0\0\0\0\0\0\0\0\0\0",
+        );
+
+        // Insert endpoint + reply handles into kernel handle table
+        handle_table::handle_insert(kernel_ht_page, ep_page, ObjectType::Endpoint,
+            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE)).expect("insert ep handle");
+        handle_table::handle_insert(kernel_ht_page, bench_reply_page, ObjectType::Reply,
+            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE)).expect("insert reply handle");
+
+        // Thread A (sender) — kernel thread in the kernel process
+        cap::process_obj::process_inc_thread_count(kernel_proc_page);
+        let stack_a = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
+        let tcb_a_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
+        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, process_paddr: kernel_proc_page, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_page)
+            .expect("create tcb a");
+
+        // Thread B (receiver) — kernel thread in the kernel process
+        cap::process_obj::process_inc_thread_count(kernel_proc_page);
+        let stack_b = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
+        let tcb_b_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
+        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, process_paddr: kernel_proc_page, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_page)
+            .expect("create tcb b");
+
+        // Register idle/init thread (index 0 = this boot thread).
+        // This thread drops to EL0 and becomes the init process, so it
+        // gets its own user process (created later in the ELF loading path).
+        // For now it belongs to the kernel process.
+        // SAFETY: linker symbol
+        let idle_stack_base = &__stack_bottom as *const u8 as u64 + mm::addr::KERNEL_VA_OFFSET;
+        cap::process_obj::process_inc_thread_count(kernel_proc_page);
 
         let idle_tcb_page = mm::page_alloc::alloc_page().expect("idle tcb alloc").start_addr();
         let mut idle_tcb = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(idle_tcb_page);
@@ -340,8 +346,7 @@ pub extern "C" fn kmain() -> ! {
             saved_sp: 0,
             entry: idle_thread,
             stack_base: idle_stack_base,
-            handle_table_paddr: idle_ht_page.as_u64(),
-            ttbr0_paddr: 0,
+            process_paddr: kernel_proc_page.as_u64(),
             ipc_blocked_on: 0,
             ipc_msg: [0; 4],
             ipc_queue_next: 0,
@@ -471,11 +476,39 @@ pub extern "C" fn kmain() -> ! {
             .expect("failed to create address space");
         kprintln!("  Address space created: TTBR0 = {:#x}", ttbr0.as_u64());
 
-        // Store the TTBR0 in the boot/idle thread's TCB so that syscalls
-        // from the init process can find the caller's address space.
+        // Create init user process with its own handle table and address
+        // space. Init's handle table starts empty — init creates its own
+        // handles via syscalls from userspace (sys_create_endpoint, etc.).
+        let init_ht_page = mm::page_alloc::alloc_page().expect("init ht alloc").start_addr();
+        cap::object::create_handle_table(
+            &cap::object::HandleTableCreateInfo { slot_count: 16 },
+            init_ht_page,
+        ).expect("init ht create");
+
+        let init_proc_page = mm::page_alloc::alloc_page().expect("init proc alloc").start_addr();
+        cap::process_obj::create_process_object(
+            init_proc_page,
+            ttbr0.as_u64(),
+            init_ht_page.as_u64(),
+            false, // not immortal
+            b"init\0\0\0\0\0\0\0\0\0\0\0\0",
+        );
+        cap::process_obj::process_inc_thread_count(init_proc_page);
+
+        // Decrement kernel process thread count (this thread is leaving)
+        {
+            let current_tcb_paddr = sched::scheduler::current_tcb_paddr();
+            let old_process = mm::addr::PhysAddr::new(
+                mm::kernel_ptr::KernelRef::<sched::tcb::Tcb>::from_paddr(current_tcb_paddr)
+                    .get().process_paddr
+            );
+            cap::process_obj::process_dec_thread_count(old_process);
+        }
+
+        // Re-point TCB to the init process
         let current_tcb_paddr = sched::scheduler::current_tcb_paddr();
         let mut current_tcb = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(current_tcb_paddr);
-        current_tcb.get_mut().ttbr0_paddr = ttbr0.as_u64();
+        current_tcb.get_mut().process_paddr = init_proc_page.as_u64();
 
         // Flush I-cache (we copied code into pages)
         core::arch::asm!(

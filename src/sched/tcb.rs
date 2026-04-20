@@ -23,8 +23,10 @@ pub struct Tcb {
     pub saved_sp: u64,
     pub entry: fn() -> !,
     pub stack_base: u64,
-    pub handle_table_paddr: u64,
-    pub ttbr0_paddr: u64,
+    /// Physical address of the owning ProcessObject. Every thread belongs
+    /// to a process. The process owns the address space (TTBR0) and handle
+    /// table. Access via process_ops narrow accessors.
+    pub process_paddr: u64,
     pub ipc_blocked_on: u64,
     /// Kernel-internal IPC mailbox. The IPC state machine writes received
     /// messages here; the syscall handler copies them to the exception
@@ -80,8 +82,7 @@ const _: () = assert!(core::mem::size_of::<Tcb>() <= PAGE_SIZE as usize);
 pub struct TcbCreateInfo {
     pub entry: fn() -> !,
     pub stack_paddr: PhysAddr,
-    pub handle_table_paddr: PhysAddr,
-    pub ttbr0_paddr: PhysAddr,
+    pub process_paddr: PhysAddr,
     pub user_entry_point: u64,
     pub user_stack_base: u64,
     pub user_stack_top: u64,
@@ -137,8 +138,7 @@ pub unsafe fn create_tcb(
         saved_sp: saved_ctx_sp,
         entry: info.entry,
         stack_base: stack_va,
-        handle_table_paddr: info.handle_table_paddr.as_u64(),
-        ttbr0_paddr: info.ttbr0_paddr.as_u64(),
+        process_paddr: info.process_paddr.as_u64(),
         ipc_blocked_on: 0,
         ipc_msg: [0; 4],
         ipc_queue_next: 0,

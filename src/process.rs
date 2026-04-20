@@ -126,8 +126,19 @@ pub fn create_process(
         ).map_err(|_| "handle table create failed")?;
     }
 
+    // Create ProcessObject — owns address space + handle table
+    let proc_page = page_alloc::alloc_page().ok_or("out of pages for process")?;
+    crate::cap::process_obj::create_process_object(
+        proc_page.start_addr(),
+        ttbr0.as_u64(),
+        ht_page.start_addr().as_u64(),
+        false, // not immortal
+        &name,
+    );
+    // First thread — increment via narrow op (count 0 → 1)
+    crate::cap::process_obj::process_inc_thread_count(proc_page.start_addr());
+
     // Copy a handle from the parent's table into the child's table.
-    // This is the simplest form of capability transfer at process creation.
     if parent_handle_to_copy != u64::MAX {
         let parent_ht = CurrentThread::handle_table();
         let entry = parent_ht.lookup_any(
@@ -144,7 +155,7 @@ pub fn create_process(
         ).map_err(|_| "child handle insert failed")?;
     }
 
-    // Create TCB
+    // Create TCB — first thread in this process
     let tcb_stack = page_alloc::alloc_page().ok_or("out of pages for TCB stack")?;
     let tcb_page = page_alloc::alloc_page().ok_or("out of pages for TCB")?;
 
@@ -154,8 +165,7 @@ pub fn create_process(
             &TcbCreateInfo {
                 entry: process_entry,
                 stack_paddr: tcb_stack.start_addr(),
-                handle_table_paddr: ht_page.start_addr(),
-                ttbr0_paddr: ttbr0,
+                process_paddr: proc_page.start_addr(),
                 user_entry_point: entry_point,
                 user_stack_top: stack_va + (stack_ps.count() as u64) * PAGE_SIZE,
                 user_stack_base: stack_va,
@@ -181,7 +191,9 @@ fn process_entry() -> ! {
         let t = tcb.get();
         let entry = t.user_entry_point;
         let stack_top = t.user_stack_top;
-        let ttbr0 = PhysAddr::new(t.ttbr0_paddr);
+        let ttbr0 = PhysAddr::new(
+            crate::cap::process_obj::process_ttbr0(PhysAddr::new(t.process_paddr))
+        );
 
         crate::arch::aarch64::mmu::drop_to_el0_with_ttbr0(ttbr0, entry, stack_top);
     }

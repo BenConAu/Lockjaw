@@ -9,6 +9,7 @@ use lockjaw_types::scheduler::{
     SchedDecision, SchedReason, SchedState, SchedThreadState,
 };
 use lockjaw_types::object::HandleTableHeader;
+use lockjaw_types::process::ProcessLifecycle;
 
 const MAX_THREADS: usize = 8;
 
@@ -307,7 +308,9 @@ pub fn exit_current() -> ! {
 
                 let new_paddr = (*SCHEDULER.threads_ptr())[next].unwrap();
                 let new_tcb = KernelMut::<Tcb>::from_paddr(new_paddr);
-                let new_ttbr0 = new_tcb.get().ttbr0_paddr;
+                let new_ttbr0 = crate::cap::process_obj::process_ttbr0(
+                    PhysAddr::new(new_tcb.get().process_paddr)
+                );
 
                 // Swap TTBR0 if the new thread has a user address space
                 if new_ttbr0 != 0 {
@@ -399,14 +402,7 @@ fn finish_exit() {
     // Invariant: stack_base is a direct-map VA of the kernel stack page
     // (stack_base = phys + KERNEL_VA_OFFSET). This is set by create_tcb.
     let stack_paddr = PhysAddr::new(tcb.get().stack_base - KERNEL_VA_OFFSET);
-    let ht_paddr = PhysAddr::new(tcb.get().handle_table_paddr);
-    // Read handle table page count from ObjectHeader
-    let ht_page_count = if ht_paddr.as_u64() != 0 {
-        let ht = unsafe { KernelRef::<HandleTableHeader>::from_paddr(ht_paddr) };
-        ht.get().header.page_count as usize
-    } else {
-        0
-    };
+    let process_paddr = PhysAddr::new(tcb.get().process_paddr);
 
     // Step 2: Remove from scheduler array + model
     unsafe {
@@ -415,20 +411,41 @@ fn finish_exit() {
         (*SCHEDULER.threads_ptr())[pending.thread_idx] = None;
     }
 
-    // Step 3: Free handle table page(s)
-    for i in 0..ht_page_count {
-        let page = PhysAddr::new(ht_paddr.as_u64() + (i as u64) * crate::mm::addr::PAGE_SIZE);
-        page_alloc::dealloc_page(PhysPage::containing(page));
-    }
-
-    // Step 4: Free kernel stack page
+    // Step 3: Free per-thread resources (kernel stack, TCB)
     page_alloc::dealloc_page(PhysPage::containing(stack_paddr));
-
-    // Step 5: Free TCB page (last)
+    // Free TCB page (after reading all fields we need from it)
     page_alloc::dealloc_page(PhysPage::containing(pending.tcb_paddr));
 
+    // Step 4: Decrement process thread count via narrow op + pure model
+    let lifecycle = crate::cap::process_obj::process_dec_thread_count(process_paddr);
+    let mut pages_freed = 2u32; // stack + TCB
+
+    match lifecycle {
+        ProcessLifecycle::LastThread => {
+            // Last thread in this process — free process resources
+            let ht_paddr = crate::cap::process_obj::process_handle_table(process_paddr);
+            let ht_page_count = if ht_paddr.as_u64() != 0 {
+                let ht = unsafe { KernelRef::<HandleTableHeader>::from_paddr(ht_paddr) };
+                ht.get().header.page_count as usize
+            } else {
+                0
+            };
+            for i in 0..ht_page_count {
+                let page = PhysAddr::new(ht_paddr.as_u64() + (i as u64) * crate::mm::addr::PAGE_SIZE);
+                page_alloc::dealloc_page(PhysPage::containing(page));
+            }
+            pages_freed += ht_page_count as u32;
+            // Free ProcessObject page (last)
+            page_alloc::dealloc_page(PhysPage::containing(process_paddr));
+            pages_freed += 1;
+        }
+        ProcessLifecycle::ThreadsRemaining(_) | ProcessLifecycle::Immortal(_) => {
+            // Process stays alive — other threads still running, or immortal
+        }
+    }
+
     crate::kprintln!("[EXIT] Thread {} cleaned up ({} pages freed)",
-        pending.thread_idx, 2 + ht_page_count);
+        pending.thread_idx, pages_freed);
 }
 
 // ---------------------------------------------------------------------------
@@ -481,12 +498,12 @@ unsafe fn schedule(reason: SchedReason) {
     // Check stack canary of the thread we're switching away from
     check_thread_canary(old_tcb.get());
 
-    // Swap TTBR0 if the new thread has a different address space.
-    // TTBR0 is irrelevant during kernel execution (all kernel code
-    // accessed via TTBR1), so swapping before context_switch is safe.
-    // When the new thread eventually erets to EL0, TTBR0 is already set.
-    let new_ttbr0 = new_tcb.get().ttbr0_paddr;
-    if new_ttbr0 != 0 {
+    // Swap TTBR0 if the new thread is in a different process.
+    // Same-process switches skip the TLB flush (threads share address space).
+    let old_process = old_tcb.get().process_paddr;
+    let new_process = new_tcb.get().process_paddr;
+    let new_ttbr0 = crate::cap::process_obj::process_ttbr0(PhysAddr::new(new_process));
+    if new_ttbr0 != 0 && new_process != old_process {
         core::arch::asm!(
             "msr TTBR0_EL1, {val}",           // Install new process page table
             "dsb ish",                          // Ensure TTBR0 write completes

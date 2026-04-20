@@ -520,7 +520,8 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 
         // Insert into the caller's handle table (cross-table operation).
         let caller_tcb = KernelRef::<Tcb>::from_paddr(PhysAddr::new(caller_tcb_paddr_u64));
-        let caller_ht = handle_table::HandleTableRef::from_paddr(PhysAddr::new(caller_tcb.get().handle_table_paddr));
+        let caller_ht_paddr = crate::cap::process_obj::process_handle_table(PhysAddr::new(caller_tcb.get().process_paddr));
+        let caller_ht = handle_table::HandleTableRef::from_paddr(caller_ht_paddr);
         caller_ht.insert(
             PhysAddr::new(export_entry.object_paddr),
             export_entry.obj_type,

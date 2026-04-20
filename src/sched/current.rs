@@ -28,38 +28,43 @@ impl CurrentThread {
 
     // --- Read-only field accessors ---
 
-    /// Physical address of the current thread's handle table.
-    pub fn handle_table_paddr() -> PhysAddr {
+    /// Physical address of the current thread's owning process.
+    pub fn process_paddr() -> PhysAddr {
         let tcb = Self::ref_();
-        PhysAddr::new(tcb.get().handle_table_paddr)
+        PhysAddr::new(tcb.get().process_paddr)
+    }
+
+    /// Physical address of the current thread's handle table.
+    /// Two hops: TCB → process → handle table, via narrow process_ops.
+    pub fn handle_table_paddr() -> PhysAddr {
+        crate::cap::process_obj::process_handle_table(Self::process_paddr())
     }
 
     /// Safe typed reference to the current thread's handle table.
     /// Provides lookup/insert/remove without raw PhysAddr or unsafe.
     pub fn handle_table() -> HandleTableRef {
         let paddr = Self::handle_table_paddr();
-        // SAFETY: the TCB's handle_table_paddr was set at thread creation
-        // and always points to a valid HandleTable in a kernel-owned page.
+        // SAFETY: the process's handle_table_paddr was set at process
+        // creation and always points to a valid HandleTable.
         unsafe { HandleTableRef::from_paddr(paddr) }
     }
 
     /// Physical address of the current thread's TTBR0 (user page table).
+    /// Two hops: TCB → process → ttbr0, via narrow process_ops.
     pub fn ttbr0() -> PhysAddr {
-        let tcb = Self::ref_();
-        PhysAddr::new(tcb.get().ttbr0_paddr)
+        let ttbr0 = crate::cap::process_obj::process_ttbr0(Self::process_paddr());
+        PhysAddr::new(ttbr0)
     }
 
     /// Safe typed reference to the current thread's user address space.
     /// Returns `None` for kernel threads (ttbr0 == 0).
-    /// Provides `read` (copy_from_user) without raw PhysAddr or unsafe
-    /// at the call site.
     pub fn address_space() -> Option<crate::mm::user_access::UserAddressSpace> {
         let ttbr0 = Self::ttbr0();
         if ttbr0.as_u64() == 0 {
             return None;
         }
-        // SAFETY: ttbr0_paddr was set at thread creation from a valid L0
-        // page table, and we just checked it's non-zero.
+        // SAFETY: process ttbr0 was set at process creation from a valid
+        // L0 page table, and we just checked it's non-zero.
         Some(unsafe { crate::mm::user_access::UserAddressSpace::from_ttbr0(ttbr0) })
     }
 
