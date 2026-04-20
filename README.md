@@ -18,7 +18,7 @@ The design follows a few core principles:
 
 ## What works today
 
-Lockjaw boots on QEMU, manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads, serves 21 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects, runs five isolated userspace processes loaded from ELF binaries, has a device manager that discovers hardware from the DTB, a UART driver, and a ramfb display driver that renders to a framebuffer via DMA.
+Lockjaw boots on QEMU, manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads, serves 22 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects, runs five isolated userspace processes loaded from ELF binaries, has a device manager that discovers hardware from the DTB, a UART driver, and a ramfb display driver that renders to a framebuffer via DMA.
 
 ```
 === Lockjaw Microkernel v0.1.0 ===
@@ -82,11 +82,10 @@ Three layers of automated testing run on every build:
 
 | Layer | Count | What it tests |
 |-------|-------|---------------|
-| Unit tests (host) | 214 | Address types, PTE bitfields, rights, IPC state machine, buddy allocator, PageSet table, page table walk/map, FDT parser, wait readiness, waiter identity |
-| Integration tests (QEMU) | 32 | Full boot through all phases, expected serial output |
+| Unit tests (host) | 230 | Scheduler model (BFS), IPC state machine (exhaustive), process lifecycle, buddy allocator, page tables, FDT parser, notifications, wait readiness |
+| Integration tests (QEMU) | 39 | Full boot through 9 phases, scheduler/MMU integration, IPC bootstrap, thread exit cleanup |
 | Stack analysis | 3 | No recursion, depth within budget, all indirect calls annotated |
-| Pointer cast lint | 48 | Every `as *const` / `as *mut` in kernel code has a SAFETY comment |
-| **Total** | **297** | `make test` runs unit + integration + stack |
+| Pointer cast lint | 50 | Every `as *const` / `as *mut` in kernel code has a SAFETY comment |
 
 The IPC state machine test exhaustively explores all reachable system states (endpoint state x per-client reply state x thread states) via BFS with a 3-thread model and verifies: no kernel-caused deadlocks, all 8 invariants hold, all effect orderings correct (BlockCurrent always last, UnblockThread before ClearReply).
 
