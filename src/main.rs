@@ -185,6 +185,28 @@ pub extern "C" fn kmain() -> ! {
     percpu::init_percpu(0);
     kprintln!("CPU {} initialized (TPIDR_EL1)", percpu::cpu_id());
 
+    // Boot secondary CPUs via PSCI CPU_ON
+    {
+        extern "C" { fn _secondary_start(); }
+        // SAFETY: _secondary_start is the assembly entry point for secondaries.
+        // It is a physical address (identity-mapped) that sets up the per-CPU
+        // stack and calls secondary_main(cpu_id).
+        // SAFETY: _secondary_start is the assembly entry point symbol
+        let entry = _secondary_start as *const () as u64;
+        for cpu in 1..arch::aarch64::platform::MAX_CPUS {
+            let ret = unsafe { arch::aarch64::psci::cpu_on(cpu as u64, entry, cpu as u64) };
+            if ret == 0 {
+                kprintln!("[SMP] CPU {} started (PSCI OK)", cpu);
+            } else {
+                kprintln!("[SMP] CPU {} PSCI failed: {}", cpu, ret);
+            }
+        }
+        // Brief delay for secondaries to print their online messages
+        // before boot continues. Not correctness-critical — just keeps
+        // serial output readable.
+        for _ in 0..100_000 { core::hint::spin_loop(); }
+    }
+
     // Install exception vector table
     kprintln!();
     unsafe { arch::aarch64::exceptions::init(); }
@@ -659,6 +681,38 @@ fn ipc_receiver() -> ! {
 }
 
 fn idle_thread() -> ! {
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Secondary CPU boot
+// ---------------------------------------------------------------------------
+
+/// Rust entry point for secondary CPUs, called from _secondary_start assembly.
+/// Sets up MMU, per-CPU state, exception vectors, and stack canary, then
+/// halts in wfi. Interrupts are NOT unmasked here — that happens in
+/// commit 3 (GKL) when secondaries are activated for scheduling.
+#[no_mangle]
+pub extern "C" fn secondary_main(cpu_id: u64) -> ! {
+    // Enable MMU with the same page tables CPU 0 built
+    unsafe { arch::aarch64::mmu::enable_mmu_secondary(); }
+
+    // Initialize per-CPU data (TPIDR_EL1)
+    percpu::init_percpu(cpu_id as u32);
+
+    // Install exception vectors (per-CPU VBAR_EL1)
+    unsafe { arch::aarch64::exceptions::init(); }
+
+    // Initialize stack canary for this CPU
+    unsafe { mm::stack::init_canary_for_cpu(cpu_id as u32); }
+
+    // No kprintln here — UART is not synchronized. Secondaries stay
+    // silent until the GKL lands (commit 3). CPU 0 confirms boot via
+    // PSCI return code.
+
+    // Halt until GKL activation (commit 3) unmasks interrupts
     loop {
         unsafe { core::arch::asm!("wfi") };
     }

@@ -4,6 +4,7 @@ pub mod gic;
 pub mod irq_bind;
 pub mod mmu;
 pub mod platform;
+pub mod psci;
 pub mod timer;
 pub mod uart;
 pub mod vmem;

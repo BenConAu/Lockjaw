@@ -227,6 +227,64 @@ pub unsafe fn enable_higher_half() {
 }
 
 // ---------------------------------------------------------------------------
+// Secondary CPU MMU init
+// ---------------------------------------------------------------------------
+
+/// Enable MMU on a secondary CPU using the page tables already built by
+/// CPU 0. Installs TTBR0 (identity map), TTBR1 (higher-half with guard
+/// pages), programs MAIR/TCR/SCTLR, and transitions SP to higher-half.
+///
+/// # Safety
+/// CPU 0 must have completed init_boot_page_tables(), enable_mmu(),
+/// enable_higher_half(), and setup_guard_pages() before any secondary
+/// calls this. The page tables are shared read-only across all cores.
+pub unsafe fn enable_mmu_secondary() {
+    // MAIR — same memory attributes as primary
+    asm!("msr MAIR_EL1, {val}", val = in(reg) MAIR_EL1_VALUE);
+
+    // TCR — same translation control as primary
+    let tcr: u64 = (16 << 0)           // T0SZ
+        | (0b01 << 8)                  // IRGN0
+        | (0b01 << 10)                 // ORGN0
+        | (0b11 << 12)                 // SH0
+        | (0b00 << 14)                 // TG0
+        | (16 << 16)                   // T1SZ
+        | (0b01 << 24)                 // IRGN1
+        | (0b01 << 26)                 // ORGN1
+        | (0b11 << 28)                 // SH1
+        | (0b10u64 << 30)             // TG1
+        | (0b001u64 << 32);           // IPS = 36-bit PA
+    asm!("msr TCR_EL1, {val}", val = in(reg) tcr);
+
+    // TTBR0 — identity map (same L0 table as primary)
+    let ttbr0 = &raw const BOOT_L0 as u64;
+    asm!("msr TTBR0_EL1, {val}", val = in(reg) ttbr0);
+
+    // TTBR1 — higher-half (same L0 table, already has guard page refinements)
+    let ttbr1 = &raw const KERNEL_L0 as u64;
+    asm!("msr TTBR1_EL1, {val}", val = in(reg) ttbr1);
+
+    // TLB invalidate + barriers
+    asm!("tlbi vmalle1is", "dsb ish", "isb");
+
+    // Enable MMU + caches
+    let mut sctlr: u64;
+    asm!("mrs {val}, SCTLR_EL1", val = out(reg) sctlr);
+    sctlr |= (1 << 0) | (1 << 2) | (1 << 12); // M + C + I
+    asm!("msr SCTLR_EL1, {val}", val = in(reg) sctlr);
+    asm!("isb");
+
+    // Transition SP to higher-half VA
+    asm!(
+        "mov {tmp}, sp",
+        "add {tmp}, {tmp}, {offset}",
+        "mov sp, {tmp}",
+        tmp = out(reg) _,
+        offset = in(reg) KERNEL_VA_OFFSET,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Guard page setup (Milestone 2.6)
 // ---------------------------------------------------------------------------
 

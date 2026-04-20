@@ -53,5 +53,58 @@ _start:
 .Lhalt:
     wfi                              // Wait for interrupt (low-power idle)
     b       .Lhalt                   // Loop forever
+
+// ---------------------------------------------------------------------------
+// Secondary CPU entry point — called by PSCI CPU_ON
+// ---------------------------------------------------------------------------
+// PSCI delivers x0 = context_id (we pass the cpu_id here).
+// The secondary must: mask exceptions, drop to EL1 if at EL2, enable
+// FP/NEON, set its per-CPU stack, and call secondary_main(cpu_id).
+// No BSS zeroing — CPU 0 already did that.
+
+.global _secondary_start
+_secondary_start:
+    msr     DAIFSet, #0xf            // Mask all exceptions
+
+    // x0 = cpu_id (from PSCI context_id), preserve across EL2 drop
+    mov     x19, x0                  // Save cpu_id in callee-saved register
+
+    // --- EL2 → EL1 drop (same as primary) ---
+    mrs     x1, CurrentEL            // Read CurrentEL
+    lsr     x1, x1, #2              // EL number in bits [1:0]
+    cmp     x1, #2                   // At EL2?
+    b.ne    .Lsec_el1               // Already at EL1, skip
+
+    mov     x1, #(1 << 31)          // HCR_EL2.RW = AArch64 EL1
+    msr     HCR_EL2, x1
+    mov     x1, #0x3c5              // SPSR_EL2: EL1h, DAIF masked
+    msr     SPSR_EL2, x1
+    adr     x1, .Lsec_el1
+    msr     ELR_EL2, x1
+    eret
+
+.Lsec_el1:
+    // --- Enable FP/NEON ---
+    mov     x1, #(3 << 20)          // CPACR_EL1.FPEN = 0b11
+    msr     CPACR_EL1, x1
+    isb
+
+    // --- Set per-CPU stack ---
+    // Stack layout: __per_cpu_stacks + cpu_id * 8192 + 4096 (skip guard) + 4096 (stack top)
+    // = __per_cpu_stacks + cpu_id * 8192 + 8192
+    // = __per_cpu_stacks + (cpu_id + 1) * 8192
+    ldr     x1, =__per_cpu_stacks    // Base of all per-CPU stacks
+    add     x2, x19, #1             // cpu_id + 1
+    lsl     x2, x2, #13             // × 8192
+    add     sp, x1, x2              // SP = stack top for this CPU
+
+    // --- Call Rust secondary_main(cpu_id) ---
+    mov     x0, x19                  // Restore cpu_id as first argument
+    bl      secondary_main           // Never returns
+
+    // --- Halt if secondary_main ever returns ---
+.Lsec_halt:
+    wfi
+    b       .Lsec_halt
 "#
 );
