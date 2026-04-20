@@ -45,18 +45,58 @@ SECTIONS
     __kernel_end = .;
 
     /*
-     * Stack layout (grows downward on AArch64):
-     *   [guard page — 4 KB, unmapped in Phase 2]
-     *   [stack — 4 KB, budget: 3072 normal + 1024 interrupt]
+     * Per-CPU stacks (4 CPUs × 8 KB each = 32 KB total).
+     * Each CPU gets a guard page (4 KB, unmapped) + stack (4 KB).
+     * Stack budget: 3072 normal + 1024 interrupt = 4 KB.
      *
-     * __stack_bottom = lowest usable stack byte
-     * __stack_top    = initial SP value
+     * CPU 0's symbols are aliased to the legacy names so existing
+     * code referencing __guard_page/__stack_bottom/__stack_top
+     * continues to work without modification.
+     *
+     * The entire 32 KB block is 2 MB-aligned to guarantee all guard
+     * pages fall within a single L2 region. setup_guard_pages() uses
+     * one L3 table for the containing 2 MB block; straddling a 2 MB
+     * boundary would require two L3 tables. The gap between
+     * __kernel_end and __per_cpu_stacks is freed to the page
+     * allocator via init_with_gap() — no physical memory is wasted.
      */
-    __guard_page = .;
+    . = ALIGN(2M);
+    __per_cpu_stacks = .;
+
+    /* CPU 0 */
+    __guard_page_0 = .;
     . = . + 4K;
-    __stack_bottom = .;
+    __stack_bottom_0 = .;
     . = . + 4K;
-    __stack_top = .;
+    __stack_top_0 = .;
+
+    /* CPU 1 */
+    __guard_page_1 = .;
+    . = . + 4K;
+    __stack_bottom_1 = .;
+    . = . + 4K;
+    __stack_top_1 = .;
+
+    /* CPU 2 */
+    __guard_page_2 = .;
+    . = . + 4K;
+    __stack_bottom_2 = .;
+    . = . + 4K;
+    __stack_top_2 = .;
+
+    /* CPU 3 */
+    __guard_page_3 = .;
+    . = . + 4K;
+    __stack_bottom_3 = .;
+    . = . + 4K;
+    __stack_top_3 = .;
+
+    __per_cpu_stacks_end = .;
+
+    /* Legacy aliases for CPU 0 (boot code, existing references) */
+    __guard_page = __guard_page_0;
+    __stack_bottom = __stack_bottom_0;
+    __stack_top = __stack_top_0;
 
     /DISCARD/ : {
         *(.comment)

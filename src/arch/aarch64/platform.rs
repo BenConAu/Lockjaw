@@ -27,3 +27,8 @@ pub const DEVICE_MMIO_BASE: u64 = 0x0800_0000;
 /// Virtual timer PPI interrupt ID on GICv3.
 /// Note: INTID 27 is the virtual timer, INTID 30 is the physical timer.
 pub const VIRTUAL_TIMER_INTID: u32 = 27;
+
+/// Maximum number of CPUs supported. Matches the per-CPU stack count
+/// in the linker script. QEMU virt supports up to 512 CPUs, but 4 is
+/// a reasonable default for initial SMP bring-up.
+pub const MAX_CPUS: usize = 4;

@@ -3,22 +3,44 @@ use core::ptr;
 use lockjaw_types::constants::{STACK_CANARY, STACK_FILL_PATTERN};
 
 extern "C" {
-    static __stack_bottom: u8;
-    static __stack_top: u8;
+    static __stack_bottom_0: u8;
+    static __stack_top_0: u8;
+    static __per_cpu_stacks: u8;
 }
 
-/// Write the stack canary at `__stack_bottom` and fill the rest of the stack
+/// Per-CPU stack size: guard page (4 KB) + stack (4 KB) = 8 KB stride.
+/// Used by init_canary_for_cpu (secondary core boot, commit 2).
+#[allow(dead_code)]
+const PER_CPU_STACK_STRIDE: u64 = 8192;
+
+/// Write the stack canary at the bottom of CPU 0's stack and fill the rest
 /// with a known pattern for high-water-mark analysis.
 ///
 /// # Safety
-/// Must be called after MMU and guard page are set up, but before any deep
-/// call chains. The stack must not have grown past `__stack_bottom + 8`.
+/// Must be called after MMU and guard pages are set up, but before any deep
+/// call chains. The stack must not have grown past `__stack_bottom_0 + 8`.
 pub unsafe fn init_canary() {
-    // SAFETY: linker symbol
-    let bottom = &raw const __stack_bottom as u64;
-    // SAFETY: linker symbol
-    let top = &raw const __stack_top as u64;
+    init_canary_at(
+        &raw const __stack_bottom_0 as u64,
+        &raw const __stack_top_0 as u64,
+    );
+}
 
+/// Write the stack canary for a secondary CPU's stack.
+///
+/// # Safety
+/// Must be called after the secondary's guard page is unmapped and MMU is
+/// active. The secondary must not be using its stack yet (or only minimally).
+#[allow(dead_code)] // Used by secondary core boot (commit 2)
+pub unsafe fn init_canary_for_cpu(cpu_id: u32) {
+    let base = &raw const __per_cpu_stacks as u64;
+    let bottom = base + (cpu_id as u64) * PER_CPU_STACK_STRIDE + 4096; // skip guard
+    let top = bottom + 4096;
+    init_canary_at(bottom, top);
+}
+
+/// Write canary and fill pattern for a stack bounded by [bottom, top).
+unsafe fn init_canary_at(bottom: u64, top: u64) {
     // Write canary at the very bottom of the stack (first 8 bytes)
     // SAFETY: kernel stack address
     ptr::write_volatile(bottom as *mut u64, STACK_CANARY);
@@ -34,12 +56,12 @@ pub unsafe fn init_canary() {
     }
 }
 
-/// Check that the stack canary is intact. Panics if corrupted.
+/// Check that the CPU 0 stack canary is intact. Panics if corrupted.
 /// Called on context switch and from the panic handler.
 pub fn check_canary() {
     unsafe {
         // SAFETY: linker symbol
-        let canary_ptr = &raw const __stack_bottom as *const u64;
+        let canary_ptr = &raw const __stack_bottom_0 as *const u64;
         let value = ptr::read_volatile(canary_ptr);
         if value != STACK_CANARY {
             panic!(
@@ -59,7 +81,7 @@ pub fn check_canary_report(prefix: &str) {
     let mut uart = crate::arch::aarch64::uart::Uart::new();
     unsafe {
         // SAFETY: linker symbol
-        let canary_ptr = &raw const __stack_bottom as *const u64;
+        let canary_ptr = &raw const __stack_bottom_0 as *const u64;
         let value = ptr::read_volatile(canary_ptr);
         if value == STACK_CANARY {
             let _ = writeln!(uart, "{}  Kernel stack canary: INTACT", prefix);

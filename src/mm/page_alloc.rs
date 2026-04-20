@@ -35,28 +35,46 @@ static ALLOCATOR: FrameAllocator = FrameAllocator::new();
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Initialize the page allocator. Marks firmware, kernel image, and stack
-/// pages as reserved by only freeing pages above the kernel. Must be
-/// called exactly once during boot.
+/// Initialize the page allocator with a gap between the kernel image and
+/// the per-CPU stacks. The 2 MB alignment of stacks creates a gap that
+/// must be freed explicitly to avoid wasting physical memory.
+///
+/// Freed regions:
+///   1. [kernel_end, stacks_start) — the alignment gap
+///   2. [stacks_end, RAM_END)      — everything after the stacks
+///
+/// Reserved regions (never freed):
+///   - [RAM_START, kernel_start)   — firmware, DTB
+///   - [kernel_start, kernel_end)  — kernel image
+///   - [stacks_start, stacks_end)  — per-CPU guard pages + stacks
 ///
 /// # Safety
-/// `kernel_start` and `kernel_end` must be valid physical addresses bounding
-/// the kernel image (including stack). Typically derived from linker symbols.
-pub unsafe fn init(_kernel_start: PhysAddr, kernel_end: PhysAddr) {
+/// All addresses must be valid physical addresses from linker symbols.
+pub unsafe fn init_with_gap(
+    _kernel_start: PhysAddr,
+    kernel_end: PhysAddr,
+    stacks_start: PhysAddr,
+    stacks_end: PhysAddr,
+) {
     let buddy = &mut *ALLOCATOR.buddy.get();
     buddy.init(TOTAL_PAGES);
 
-    // Round kernel_end up to the next page boundary.
-    let kernel_end_page = {
-        let idx = page_index(kernel_end);
-        if kernel_end.as_u64() & (PAGE_SIZE - 1) != 0 { idx + 1 } else { idx }
-    };
+    // Round up to next page boundary
+    let kernel_end_page = round_up_page(kernel_end);
+    let stacks_start_page = page_index(stacks_start);
+    let stacks_end_page = round_up_page(stacks_end);
 
-    // Free all pages above the kernel. Pages below (firmware, DTB,
-    // kernel image, stack) stay allocated (never added to the buddy).
-    let free_start = kernel_end_page;
-    let free_count = TOTAL_PAGES - free_start;
-    buddy.add_range(free_start, free_count);
+    // Region 1: gap between kernel end and stacks start
+    if stacks_start_page > kernel_end_page {
+        let gap_count = stacks_start_page - kernel_end_page;
+        buddy.add_range(kernel_end_page, gap_count);
+    }
+
+    // Region 2: everything after the stacks
+    if TOTAL_PAGES > stacks_end_page {
+        let post_count = TOTAL_PAGES - stacks_end_page;
+        buddy.add_range(stacks_end_page, post_count);
+    }
 
     let reserved = TOTAL_PAGES - buddy.free_count();
     crate::kprintln!("  Page allocator: {} reserved, {} free",
@@ -125,6 +143,12 @@ pub fn zero_page(paddr: PhysAddr) {
 /// Convert a physical address to a page index relative to RAM_START.
 fn page_index(addr: PhysAddr) -> usize {
     ((addr.as_u64() - RAM_START.as_u64()) / PAGE_SIZE) as usize
+}
+
+/// Page index rounded up (for end-of-region addresses).
+fn round_up_page(addr: PhysAddr) -> usize {
+    let idx = page_index(addr);
+    if addr.as_u64() & (PAGE_SIZE - 1) != 0 { idx + 1 } else { idx }
 }
 
 /// Convert a page index back to a PhysPage.

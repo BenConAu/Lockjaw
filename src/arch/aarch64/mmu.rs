@@ -231,17 +231,21 @@ pub unsafe fn enable_higher_half() {
 // ---------------------------------------------------------------------------
 
 /// Refine the TTBR1 RAM mapping from a single 1 GB block into 2 MB blocks
-/// and 4 KB pages around the stack, leaving the guard page unmapped.
+/// and 4 KB pages around the stacks, leaving guard pages unmapped.
 ///
 /// Before: KERNEL_L1[1] = 1 GB block covering all RAM
 /// After:  KERNEL_L1[1] → L2 table of 2 MB blocks
 ///         One L2 entry  → L3 table of 4 KB pages
-///         Guard page L3 entry = invalid (unmapped)
+///         Guard page L3 entries = invalid (unmapped)
+///
+/// All guard pages must be within the same 2 MB L2 region (true when
+/// they are contiguous in the linker script, adjacent to the kernel image).
 ///
 /// # Safety
-/// Higher-half mapping must be active. `guard_page_phys` must be the
-/// physical address of the guard page (from linker symbol `__guard_page`).
-pub unsafe fn setup_guard_page(guard_page_phys: PhysAddr) {
+/// Higher-half mapping must be active. Each element in `guard_pages`
+/// must be a valid guard page physical address from a linker symbol.
+pub unsafe fn setup_guard_pages(guard_pages: &[PhysAddr]) {
+    assert!(!guard_pages.is_empty(), "need at least one guard page");
     let ram_base: u64 = 0x4000_0000;
 
     // Step 1: Fill L2 with 2 MB block descriptors covering the 1 GB RAM region
@@ -255,9 +259,10 @@ pub unsafe fn setup_guard_page(guard_page_phys: PhysAddr) {
         );
     }
 
-    // Step 2: Find the 2 MB block containing the guard page
-    let guard_offset = guard_page_phys.as_u64() - ram_base;
-    let l2_index = (guard_offset >> 21) as usize; // 2 MB = 1 << 21
+    // Step 2: Find the 2 MB block containing the first guard page.
+    // All guard pages must be in the same 2 MB region (asserted below).
+    let first_offset = guard_pages[0].as_u64() - ram_base;
+    let l2_index = (first_offset >> 21) as usize; // 2 MB = 1 << 21
     let l3_base_phys = ram_base + (l2_index as u64) * (2 * 1024 * 1024);
 
     // Step 3: Fill L3 with 4 KB page descriptors for that 2 MB region
@@ -271,9 +276,14 @@ pub unsafe fn setup_guard_page(guard_page_phys: PhysAddr) {
         );
     }
 
-    // Step 4: Unmap the guard page — set its L3 entry to invalid
-    let l3_index = ((guard_offset & 0x001F_FFFF) >> 12) as usize;
-    KERNEL_L3_GUARD.entries[l3_index] = PageTableEntry::empty();
+    // Step 4: Unmap each guard page — set its L3 entry to invalid
+    for &gp in guard_pages {
+        let guard_offset = gp.as_u64() - ram_base;
+        let gp_l2_index = (guard_offset >> 21) as usize;
+        assert_eq!(gp_l2_index, l2_index, "guard pages must be in same 2 MB region");
+        let l3_index = ((guard_offset & 0x001F_FFFF) >> 12) as usize;
+        KERNEL_L3_GUARD.entries[l3_index] = PageTableEntry::empty();
+    }
 
     // Step 5: Replace the L2 block entry with a table descriptor to L3
     KERNEL_L2_RAM.entries[l2_index] = PageTableEntry::new_table(

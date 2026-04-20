@@ -9,6 +9,7 @@ pub mod crash;
 mod elf;
 mod ipc;
 mod mm;
+pub mod percpu;
 mod print;
 mod process;
 mod sched;
@@ -20,9 +21,14 @@ extern "C" {
     static __bss_start: u8;
     static __bss_end: u8;
     static __kernel_end: u8;
-    static __guard_page: u8;
+    static __guard_page_0: u8;
+    static __guard_page_1: u8;
+    static __guard_page_2: u8;
+    static __guard_page_3: u8;
     static __stack_bottom: u8;
     static __stack_top: u8;
+    static __per_cpu_stacks: u8;
+    static __per_cpu_stacks_end: u8;
 }
 
 /// A value set exactly once during boot, read-only after. Replaces
@@ -96,12 +102,19 @@ pub extern "C" fn kmain() -> ! {
         mm::addr::RAM_END.as_u64(),
         mm::addr::TOTAL_PAGES);
 
-    // Initialize page allocator — reserve firmware + kernel + stack pages
+    // Initialize page allocator — reserve firmware + kernel + per-CPU stacks.
+    // The 2 MB alignment of __per_cpu_stacks creates a gap between
+    // __kernel_end and the stacks. We must free that gap explicitly so
+    // those pages aren't silently wasted.
     unsafe {
         let kernel_start = mm::addr::PhysAddr::new(arch::aarch64::platform::KERNEL_LOAD_ADDR);
-        // SAFETY: linker symbol
-        let stack_top = mm::addr::PhysAddr::new(&__stack_top as *const u8 as u64);
-        mm::page_alloc::init(kernel_start, stack_top);
+        // SAFETY: linker symbols
+        let kernel_end = mm::addr::PhysAddr::new(&__kernel_end as *const u8 as u64);
+        // SAFETY: linker symbol — 2 MB-aligned start of per-CPU stacks
+        let stacks_start = mm::addr::PhysAddr::new(&__per_cpu_stacks as *const u8 as u64);
+        // SAFETY: linker symbol — end of all per-CPU stacks
+        let stacks_end = mm::addr::PhysAddr::new(&__per_cpu_stacks_end as *const u8 as u64);
+        mm::page_alloc::init_with_gap(kernel_start, kernel_end, stacks_start, stacks_end);
     }
 
     // Enable MMU with identity mapping
@@ -146,19 +159,31 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("DTB PageSet registered: id={}", dtb_ps_id);
     }
 
-    // Set up guard page (unmapped) and stack canary
+    // Set up guard pages (unmapped) for all per-CPU stacks and init canary
     kprintln!();
     unsafe {
-        // SAFETY: linker symbol
-        let guard_phys = mm::addr::PhysAddr::new(&__guard_page as *const u8 as u64);
-        kprintln!("Setting up guard page at phys {:#x}...", guard_phys.as_u64());
-        arch::aarch64::mmu::setup_guard_page(guard_phys);
-        kprintln!("Guard page active (unmapped).");
+        let guard_pages = [
+            // SAFETY: linker symbol — per-CPU guard page physical address
+            mm::addr::PhysAddr::new(&__guard_page_0 as *const u8 as u64),
+            // SAFETY: linker symbol — per-CPU guard page physical address
+            mm::addr::PhysAddr::new(&__guard_page_1 as *const u8 as u64),
+            // SAFETY: linker symbol — per-CPU guard page physical address
+            mm::addr::PhysAddr::new(&__guard_page_2 as *const u8 as u64),
+            // SAFETY: linker symbol — per-CPU guard page physical address
+            mm::addr::PhysAddr::new(&__guard_page_3 as *const u8 as u64),
+        ];
+        kprintln!("Setting up {} guard pages...", guard_pages.len());
+        arch::aarch64::mmu::setup_guard_pages(&guard_pages);
+        kprintln!("Guard pages active (unmapped).");
 
         mm::stack::init_canary();
     }
     mm::stack::check_canary();
     kprintln!("Stack canary intact.");
+
+    // Initialize per-CPU data for the boot CPU (CPU 0)
+    percpu::init_percpu(0);
+    kprintln!("CPU {} initialized (TPIDR_EL1)", percpu::cpu_id());
 
     // Install exception vector table
     kprintln!();

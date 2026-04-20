@@ -34,7 +34,7 @@ assert_contains "Page allocator:" "Page allocator initialized"
 echo "Phase 2 — Memory Management:"
 assert_contains "MMU enabled" "MMU enabled with identity map"
 assert_contains "Higher-half active" "Higher-half kernel mapping"
-assert_contains "Guard page active" "Guard page unmapped"
+assert_contains "Guard pages active" "Guard pages unmapped"
 assert_contains "Stack canary intact" "Stack canary written and verified"
 
 echo "Phase 3 — Exceptions and Interrupts:"
