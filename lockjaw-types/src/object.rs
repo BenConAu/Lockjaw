@@ -13,6 +13,7 @@ pub enum ObjectType {
     Endpoint = 2,
     Notification = 3,
     Reply = 4,
+    Process = 5,
 }
 
 /// Header written at the start of every kernel object's donated memory.
