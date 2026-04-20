@@ -5,6 +5,7 @@ use crate::sched::tcb::Tcb;
 use crate::sched::context::context_switch;
 use core::cell::UnsafeCell;
 use core::ptr;
+use core::sync::atomic::{AtomicU32, Ordering};
 use lockjaw_types::scheduler::{
     SchedDecision, SchedReason, SchedState, SchedThreadState,
 };
@@ -12,6 +13,23 @@ use lockjaw_types::object::HandleTableHeader;
 use lockjaw_types::process::ProcessLifecycle;
 
 const MAX_THREADS: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Scheduler observability counters
+// ---------------------------------------------------------------------------
+// AtomicU32 (not UnsafeCell) — clean bridge into SMP. Relaxed ordering
+// is sufficient for observability-only counters on single-core.
+
+static CONTEXT_SWITCH_COUNT: AtomicU32 = AtomicU32::new(0);
+static TTBR0_WRITE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Read the scheduler counters: (context_switches, ttbr0_writes).
+pub fn scheduler_stats() -> (u32, u32) {
+    (
+        CONTEXT_SWITCH_COUNT.load(Ordering::Relaxed),
+        TTBR0_WRITE_COUNT.load(Ordering::Relaxed),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Pending exit — typed record for deferred thread cleanup
@@ -504,6 +522,7 @@ unsafe fn schedule(reason: SchedReason) {
     let new_process = new_tcb.get().process_paddr;
     let new_ttbr0 = crate::cap::process_obj::process_ttbr0(PhysAddr::new(new_process));
     if new_ttbr0 != 0 && new_process != old_process {
+        TTBR0_WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
         core::arch::asm!(
             "msr TTBR0_EL1, {val}",           // Install new process page table
             "dsb ish",                          // Ensure TTBR0 write completes
@@ -513,6 +532,8 @@ unsafe fn schedule(reason: SchedReason) {
             val = in(reg) new_ttbr0,
         );
     }
+
+    CONTEXT_SWITCH_COUNT.fetch_add(1, Ordering::Relaxed);
 
     // Context switch: save old SP, load new SP, swap callee-saved regs.
     // context_switch is extern "C" and takes raw pointers; coerce the

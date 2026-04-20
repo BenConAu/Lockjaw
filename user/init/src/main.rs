@@ -292,7 +292,7 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("init: export FAILED\n"); loop { sys_yield(); } }
     };
     sys_reply(exported_idx, 0, 0, 0);
-    puts("init: hello bootstrapped\n");
+    puts("[BOOTSTRAP] hello\n");
 
     // Bootstrap device-manager: export devmgr_ep so it can serve device claims.
     puts("init: waiting for devmgr bootstrap...\n");
@@ -302,7 +302,7 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("init: export devmgr_ep FAILED\n"); loop { sys_yield(); } }
     };
     sys_reply(devmgr_ep_idx, 0, 0, 0);
-    puts("init: devmgr bootstrapped\n");
+    puts("[BOOTSTRAP] devmgr\n");
 
     // Bootstrap UART driver: export ep_handle (its IPC server) and devmgr_ep (its client).
     puts("init: waiting for uart bootstrap...\n");
@@ -316,7 +316,7 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("init: export devmgr to uart FAILED\n"); loop { sys_yield(); } }
     };
     sys_reply(uart_ep_idx, uart_devmgr_idx, 0, 0);
-    puts("init: uart bootstrapped\n");
+    puts("[BOOTSTRAP] uart\n");
 
     // Bootstrap ramfb driver: export devmgr_ep so it can claim fw_cfg.
     puts("init: waiting for ramfb bootstrap...\n");
@@ -326,7 +326,7 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("init: export devmgr to ramfb FAILED\n"); loop { sys_yield(); } }
     };
     sys_reply(ramfb_devmgr_idx, 0, 0, 0);
-    puts("init: ramfb bootstrapped\n");
+    puts("[BOOTSTRAP] ramfb\n");
 
     // Allocate a Reply object for init's own outbound calls (ipc_puts to
     // the uart server). Each client that issues sys_call needs one.

@@ -558,6 +558,12 @@ pub extern "C" fn kmain() -> ! {
             "isb",
         );
 
+        // Scheduler/MMU integration check. Right before EL0 drop, all
+        // threads are kernel threads (ttbr0=0). No TTBR0 writes should
+        // have occurred. This is the last kernel-only observation point.
+        let (ctx_switches, ttbr0_writes) = sched::scheduler::scheduler_stats();
+        kprintln!("[SCHED-KERNEL-PHASE] {} context switches, TTBR0 writes: {}", ctx_switches, ttbr0_writes);
+
         kprintln!("Dropping to EL0...");
         arch::aarch64::mmu::drop_to_el0_with_ttbr0(
             ttbr0,
