@@ -11,6 +11,7 @@ pub mod pageset_table;
 pub mod process;
 pub mod scheduler;
 pub mod syscall;
+pub mod ticket_lock;
 pub mod user_pod;
 pub mod device;
 pub mod fdt;

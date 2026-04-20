@@ -74,6 +74,10 @@ context_switch:
 // ---------------------------------------------------------------------------
 .global thread_entry
 thread_entry:
+    // GKL is held here (inherited from the scheduling handler that
+    // context-switched to us). The entry function is responsible for
+    // releasing it — process_entry releases before eret, kernel threads
+    // release before their first blocking call or idle loop.
     msr     DAIFClr, #2                 // Unmask IRQ (new threads start with IRQs masked)
     blr     x19                          // Call the entry function via fn pointer in x19
     // entry function is fn() -> ! so we should never reach here
