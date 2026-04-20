@@ -273,6 +273,47 @@ pub extern "C" fn kmain() -> ! {
     let empty = unsafe { handle_lookup(ht_paddr, h0, Rights::none()) };
     kprintln!("  Lookup h{} after remove: {:?}", h0, empty.err().unwrap());
 
+    // --- Process lifecycle test ---
+    // Exercises the core new semantic: thread_count > 1, exit one
+    // (process stays alive), exit the other (process freed).
+    {
+        use lockjaw_types::process::ProcessLifecycle;
+
+        let test_ht = mm::page_alloc::alloc_page().expect("test ht").start_addr();
+        unsafe {
+            cap::object::create_handle_table(
+                &cap::object::HandleTableCreateInfo { slot_count: 8 },
+                test_ht,
+            ).expect("test ht create");
+        }
+        let test_proc = mm::page_alloc::alloc_page().expect("test proc").start_addr();
+        cap::process_obj::create_process_object(
+            test_proc, 0, test_ht.as_u64(), false, b"test-process\0\0\0\0",
+        );
+        // Simulate 2 threads
+        cap::process_obj::process_inc_thread_count(test_proc); // 0 → 1
+        cap::process_obj::process_inc_thread_count(test_proc); // 1 → 2
+
+        // First thread exits — process stays alive
+        let r1 = cap::process_obj::process_dec_thread_count(test_proc);
+        match r1 {
+            ProcessLifecycle::ThreadsRemaining(1) => {}
+            other => panic!("expected ThreadsRemaining(1), got {:?}", other),
+        }
+
+        // Second thread exits — process should be freed
+        let r2 = cap::process_obj::process_dec_thread_count(test_proc);
+        match r2 {
+            ProcessLifecycle::LastThread => {}
+            other => panic!("expected LastThread, got {:?}", other),
+        }
+
+        // Clean up test pages (process would normally be freed by finish_exit)
+        mm::page_alloc::dealloc_page(mm::addr::PhysPage::containing(test_ht));
+        mm::page_alloc::dealloc_page(mm::addr::PhysPage::containing(test_proc));
+        kprintln!("Process lifecycle test passed.");
+    }
+
     // --- Phase 5: Threads & Scheduling ---
     kprintln!();
     kprintln!("Starting threads...");
