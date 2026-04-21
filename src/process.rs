@@ -186,6 +186,8 @@ pub fn create_process(
 /// from TCB, then drops to EL0.
 fn process_entry() -> ! {
     unsafe {
+        // GKL held + IRQs masked (inherited from thread_entry).
+        // Read TCB fields under the lock, then release before eret.
         let tcb_paddr = scheduler::current_tcb_paddr();
         let tcb = KernelRef::<Tcb>::from_paddr(tcb_paddr);
         let t = tcb.get();
@@ -194,6 +196,10 @@ fn process_entry() -> ! {
         let ttbr0 = PhysAddr::new(
             crate::cap::process_obj::process_ttbr0(PhysAddr::new(t.process_paddr))
         );
+
+        // Release GKL before dropping to EL0. eret restores user
+        // SPSR with IRQs enabled — no explicit unmask needed.
+        crate::sched::gkl::gkl_unlock();
 
         crate::arch::aarch64::mmu::drop_to_el0_with_ttbr0(ttbr0, entry, stack_top);
     }

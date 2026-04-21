@@ -134,7 +134,7 @@ pub struct SchedState {
 
 /// Maximum threads tracked by the model. The kernel's MAX_THREADS (8)
 /// should be <= this. Fixed-size array for no_std compatibility.
-pub const MAX_THREADS_MODEL: usize = 8;
+pub const MAX_THREADS_MODEL: usize = 16;
 
 /// Maximum CPUs tracked by the model. Must match platform::MAX_CPUS.
 pub const MAX_CPUS_MODEL: usize = 4;

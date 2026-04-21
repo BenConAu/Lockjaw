@@ -22,8 +22,6 @@ const GICD_IPRIORITYR: u64 = 0x0400;   // Interrupt Priority Registers (one byte
 /// SGI/PPI region is at GICR_BASE + 0x10000 (64KB offset for RD_base, then SGI_base)
 const GICR_WAKER: u64 = 0x0014;
 const GICR_SGI_BASE: u64 = 0x10000;
-const GICR_IGROUPR0: u64 = GICR_SGI_BASE + 0x0080;
-const GICR_ISENABLER0: u64 = GICR_SGI_BASE + 0x0100;
 
 const TIMER_PPI_INTID: u32 = platform::VIRTUAL_TIMER_INTID;
 
@@ -103,62 +101,70 @@ unsafe fn mmio_write32(addr: u64, val: u32) {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Initialize the GICv3 distributor, redistributor, and CPU interface.
-/// Enables the virtual timer PPI (INTID 30).
+/// Initialize the GICv3 distributor. Called once by CPU 0 at boot.
 ///
 /// # Safety
 /// Must be called after MMU + higher-half mapping is active.
-/// Initialize the GICv3 distributor, redistributor, and CPU interface.
-///
-/// Enables Group 1 interrupts, wakes the redistributor, sets the timer
-/// PPI (INTID from platform::VIRTUAL_TIMER_INTID) to Group 1, enables
-/// system register access, and sets priority mask to allow all priorities.
-///
-/// # Safety
-/// Must be called after MMU + higher-half mapping is active (GIC MMIO
-/// addresses are accessed via KERNEL_VA_OFFSET).
-pub unsafe fn init() {
-    // --- Distributor init ---
-
+pub unsafe fn init_distributor() {
     let typer = mmio_read32(gicd_addr() + GICD_TYPER);
     let irq_lines = ((typer & 0x1F) + 1) * 32;
     crate::kprintln!("  GIC distributor: {} IRQ lines", irq_lines);
 
     // Enable distributor: Group 1 non-secure interrupts
     mmio_write32(gicd_addr() + GICD_CTLR, 1 << 1); // EnableGrp1NS
+}
 
-    // --- Redistributor init ---
+/// GICv3 redistributor stride: each CPU's redistributor occupies
+/// 128 KB (64 KB RD_base + 64 KB SGI_base).
+const GICR_STRIDE: u64 = 0x20000;
 
-    // Wake up the redistributor
-    let mut waker = mmio_read32(gicr_addr() + GICR_WAKER);
+/// Initialize the GICv3 redistributor and CPU interface for this CPU.
+/// Called by every CPU (including CPU 0) during boot.
+///
+/// # Safety
+/// Must be called after MMU + higher-half mapping is active.
+/// `cpu_id` must match the physical CPU that is executing this code.
+pub unsafe fn init_redistributor(cpu_id: u32) {
+    let gicr_base = gicr_addr() + (cpu_id as u64) * GICR_STRIDE;
+
+    // Wake up this CPU's redistributor
+    let mut waker = mmio_read32(gicr_base + GICR_WAKER);
     waker &= !(1 << 1); // Clear ProcessorSleep bit
-    mmio_write32(gicr_addr() + GICR_WAKER, waker);
+    mmio_write32(gicr_base + GICR_WAKER, waker);
 
     // Wait until ChildrenAsleep clears
-    while mmio_read32(gicr_addr() + GICR_WAKER) & (1 << 2) != 0 {
+    while mmio_read32(gicr_base + GICR_WAKER) & (1 << 2) != 0 {
         core::hint::spin_loop();
     }
 
-    // Set timer PPI (INTID 30) to Group 1
-    let grp = mmio_read32(gicr_addr() + GICR_IGROUPR0);
-    mmio_write32(gicr_addr() + GICR_IGROUPR0, grp | (1 << TIMER_PPI_INTID));
+    // Set timer PPI to Group 1
+    let sgi_base = gicr_base + GICR_SGI_BASE;
+    let grp = mmio_read32(sgi_base + 0x0080); // GICR_IGROUPR0
+    mmio_write32(sgi_base + 0x0080, grp | (1 << TIMER_PPI_INTID));
 
-    // Enable timer PPI (INTID 30)
-    mmio_write32(gicr_addr() + GICR_ISENABLER0, 1 << TIMER_PPI_INTID);
+    // Enable timer PPI
+    mmio_write32(sgi_base + 0x0100, 1 << TIMER_PPI_INTID); // GICR_ISENABLER0
 
-    // --- CPU interface init (system registers) ---
-
-    // Enable system register access
+    // --- CPU interface init (system registers, per-CPU) ---
     let sre = icc_sre_el1_read();
     icc_sre_el1_write(sre | 1); // SRE bit
-    asm!("isb"); // Sync before using other ICC regs
+    asm!("isb");
 
     // Set priority mask to allow all priorities
     icc_pmr_el1_write(0xFF);
 
     // Enable Group 1 interrupts
     icc_igrpen1_el1_write(1);
+}
 
+/// Convenience: init distributor + redistributor for CPU 0.
+/// Backwards-compatible with the old single init() call.
+///
+/// # Safety
+/// Must be called after MMU + higher-half mapping is active.
+pub unsafe fn init() {
+    init_distributor();
+    init_redistributor(0);
     crate::kprintln!("  GIC initialized, timer PPI {} enabled", TIMER_PPI_INTID);
 }
 

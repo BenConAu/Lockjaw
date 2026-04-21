@@ -12,7 +12,7 @@ use lockjaw_types::scheduler::{
 use lockjaw_types::object::HandleTableHeader;
 use lockjaw_types::process::ProcessLifecycle;
 
-const MAX_THREADS: usize = 8;
+const MAX_THREADS: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Scheduler observability counters
@@ -133,6 +133,30 @@ pub fn add_thread(tcb_paddr: PhysAddr) -> bool {
             return false;
         }
         (*SCHEDULER.threads_ptr())[idx] = Some(tcb_paddr);
+        true
+    }
+}
+
+/// Register a thread and immediately assign it as the initial current
+/// thread for `cpu_id`. This is scheduler-state initialization for
+/// secondary CPUs — not a normal scheduling decision. The thread is
+/// added as Ready then transitioned to Running on the specified CPU.
+///
+/// Must be called from CPU 0 during boot, before the target CPU's
+/// timer is active (so it won't race with tick()).
+pub fn add_thread_for_cpu(tcb_paddr: PhysAddr, cpu_id: usize) -> bool {
+    // SAFETY: GKL held (or boot-time single-core) — exclusive access.
+    unsafe {
+        let state = &mut *SCHEDULER.state_ptr();
+        let idx = match state.add_thread() {
+            Some(i) => i,
+            None => return false,
+        };
+        if idx >= MAX_THREADS {
+            return false;
+        }
+        (*SCHEDULER.threads_ptr())[idx] = Some(tcb_paddr);
+        state.set_initial_current(cpu_id, idx);
         true
     }
 }
@@ -291,17 +315,18 @@ pub fn block_current(_token: BlockToken) {
                 return;
             }
         }
-        // All blocked. Wait for an IRQ, preserving DAIF around wfi so
-        // we return to the caller with the same IRQ mask we had on entry.
+        // All blocked. Release GKL + unmask IRQs so other cores can run
+        // and this core can receive the interrupt that will unblock a
+        // thread. Re-mask + re-acquire after waking.
+        crate::sched::gkl::gkl_unlock();
         unsafe {
             core::arch::asm!(
-                "mrs x0, DAIF",            // Save current IRQ mask
-                "msr DAIFClr, #2",         // Unmask IRQ (bit 1) so wfi can wake
+                "msr DAIFClr, #2",         // Unmask IRQ so wfi can wake
                 "wfi",                      // Halt until an IRQ arrives
-                "msr DAIF, x0",            // Restore original mask
-                out("x0") _,
+                "msr DAIFSet, #2",         // Re-mask IRQ
             );
         }
+        crate::sched::gkl::gkl_lock();
     }
 }
 
@@ -392,15 +417,15 @@ pub fn exit_current() -> ! {
 
                 loop {
                     schedule(SchedReason::Block);
-                    // If we're somehow still here (no Ready thread yet),
-                    // wfi until the next interrupt.
+                    // Release GKL + unmask IRQs around wfi (same as
+                    // block_current). Re-acquire after waking.
+                    crate::sched::gkl::gkl_unlock();
                     core::arch::asm!(
-                        "mrs x0, DAIF",
                         "msr DAIFClr, #2",
                         "wfi",
-                        "msr DAIF, x0",
-                        out("x0") _,
+                        "msr DAIFSet, #2",
                     );
+                    crate::sched::gkl::gkl_lock();
                 }
             }
             _ => unreachable!("step(Exit) returned unexpected decision"),

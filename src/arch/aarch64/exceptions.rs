@@ -227,29 +227,35 @@ extern "C" fn handle_exception_sync(ctx: &ExceptionContext) {
 }
 
 /// Synchronous exception from lower EL (userspace).
-/// Dispatches SVC (syscalls) and prints faults.
+/// GKL acquired before dispatch, released before eret to EL0.
 #[no_mangle]
 extern "C" fn handle_exception_sync_lower(ctx: &mut ExceptionContext) {
-    let ec = (ctx.esr >> 26) & 0x3F;
+    crate::sched::gkl::gkl_lock();
 
+    let ec = (ctx.esr >> 26) & 0x3F;
     match ec {
         0x15 => {
             // SVC from AArch64 — syscall dispatch
             crate::syscall::handler::handle_syscall(ctx);
         }
         _ => {
-            // Userspace fault
+            // Userspace fault — halt with lock held (kernel is dead anyway)
             print_fault("[FAULT:USER]", ctx, true);
             loop { unsafe { core::arch::asm!("wfi") }; }
         }
     }
+
+    crate::sched::gkl::gkl_unlock();
 }
 
+/// IRQ exception handler. GKL acquired before dispatch, released before eret.
+/// Timer ticks, device IRQs, and SGIs all enter here.
 #[no_mangle]
 extern "C" fn handle_exception_irq(ctx: &ExceptionContext) {
-    // Dispatch to the IRQ handler (GIC + timer, added in 3.2/3.3)
+    crate::sched::gkl::gkl_lock();
     crate::arch::aarch64::irq_dispatch();
-    let _ = ctx; // context available if needed later
+    crate::sched::gkl::gkl_unlock();
+    let _ = ctx;
 }
 
 #[no_mangle]

@@ -5,18 +5,25 @@
 /// touching kernel state. The lock is released on kernel exit (eret to
 /// EL0) or before wfi in block_current.
 ///
+/// The GKL is only held with IRQs masked. Code that needs IRQs (wfi,
+/// EL0) must release the GKL first. This prevents deadlock: a timer
+/// tick on a core holding the GKL would re-lock and spin forever.
+///
 /// Context switch transfers the lock obligation: the old thread stops
 /// running (its handler frame stays on its kernel stack), the new thread
 /// resumes inside its handler and eventually releases the lock.
 ///
 /// Proof obligations (one per kernel path):
 ///   Path 1 — Syscall, no block: lock → dispatch → unlock. 1:1.
-///   Path 2 — Syscall with block: lock → block_current (unlock → wfi →
-///            lock → schedule → context_switch) → resumed thread unlocks.
-///   Path 3 — Timer preemption: lock → tick → schedule → context_switch →
-///            resumed thread unlocks. 1:1 across threads.
-///   Path 4 — Thread first run: thread_entry inherits lock → entry fn →
-///            (user: unlock before eret) or (kernel: unlock via block_current).
+///   Path 2 — Syscall with block: lock → block_current (unlock+unmask
+///            → wfi → mask+lock → schedule → context_switch) → resumed
+///            thread unlocks. 1:1 across threads.
+///   Path 3 — Timer preemption: lock → tick → schedule → context_switch
+///            → resumed thread unlocks. 1:1 across threads.
+///   Path 4 — Thread first run: thread_entry inherits lock+masked →
+///            entry fn decides: process_entry unlocks before eret,
+///            idle_thread unlocks+unmasks before wfi, kernel threads
+///            run under lock until they block.
 
 use lockjaw_types::ticket_lock::TicketLock;
 
@@ -24,20 +31,12 @@ static GKL: TicketLock = TicketLock::new();
 
 /// Acquire the Giant Kernel Lock.
 #[inline]
-#[allow(dead_code)] // Used when handler integration lands (commit 4)
 pub fn gkl_lock() {
     GKL.lock();
 }
 
 /// Release the Giant Kernel Lock.
 #[inline]
-#[allow(dead_code)] // Used when handler integration lands (commit 4)
 pub fn gkl_unlock() {
     GKL.unlock();
-}
-
-/// C-callable unlock for the thread_entry assembly trampoline.
-#[no_mangle]
-pub extern "C" fn gkl_unlock_from_trampoline() {
-    gkl_unlock();
 }

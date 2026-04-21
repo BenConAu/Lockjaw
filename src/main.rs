@@ -453,13 +453,68 @@ pub extern "C" fn kmain() -> ! {
             name: *b"init\0\0\0\0\0\0\0\0\0\0\0\0",
         });
 
-        sched::scheduler::add_thread(idle_tcb_page);  // index 0: idle/boot
+        sched::scheduler::add_thread(idle_tcb_page);  // index 0: idle/boot (CPU 0)
         sched::scheduler::add_thread(tcb_a_page);      // index 1: thread A
         sched::scheduler::add_thread(tcb_b_page);      // index 2: thread B
-        sched::scheduler::start();
+
+        // Per-CPU idle threads for secondary CPUs. Constructed manually
+        // (not via create_tcb) because secondary_main IS the idle thread:
+        // the TCB uses the per-CPU boot stack from the linker script, and
+        // saved_sp=0 (same as the boot thread — never been switched out).
+        // When the scheduler first context-switches away from a secondary,
+        // it saves the real SP (which is on the per-CPU boot stack) into
+        // saved_sp. When switched back, it resumes in secondary_main's
+        // wfi loop.
+        {
+            let stack_bottoms = [
+                // SAFETY: linker symbol — per-CPU stack bottom for CPU 1
+                &__guard_page_1 as *const u8 as u64 + 4096 + mm::addr::KERNEL_VA_OFFSET,
+                // SAFETY: linker symbol — per-CPU stack bottom for CPU 2
+                &__guard_page_2 as *const u8 as u64 + 4096 + mm::addr::KERNEL_VA_OFFSET,
+                // SAFETY: linker symbol — per-CPU stack bottom for CPU 3
+                &__guard_page_3 as *const u8 as u64 + 4096 + mm::addr::KERNEL_VA_OFFSET,
+            ];
+            for (i, &stack_base) in stack_bottoms.iter().enumerate() {
+                let cpu = i + 1;
+                cap::process_obj::process_inc_thread_count(kernel_proc_page);
+                let tcb_page = mm::page_alloc::alloc_page().expect("secondary idle tcb").start_addr();
+                let mut tcb_km = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(tcb_page);
+                let mut name = *b"idle-cpu0\0\0\0\0\0\0\0";
+                name[8] = b'0' + cpu as u8;
+                core::ptr::write(tcb_km.as_mut_ptr(), sched::tcb::Tcb {
+                    header: ObjectHeader { obj_type: ObjectType::ThreadControlBlock, page_count: 1 },
+                    saved_sp: 0,
+                    entry: idle_thread,
+                    stack_base,
+                    process_paddr: kernel_proc_page.as_u64(),
+                    ipc_blocked_on: 0,
+                    ipc_msg: [0; 4],
+                    ipc_queue_next: 0,
+                    ipc_wait_kind: 0,
+                    current_reply_paddr: 0,
+                    ipc_call_reply_paddr: 0,
+                    user_entry_point: 0,
+                    user_stack_top: 0,
+                    user_stack_base: 0,
+                    wait_objects: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+                    wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+                    wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+                    wait_count: 0,
+                    current_syscall: u64::MAX,
+                    current_syscall_args: [0; 4],
+                    name,
+                });
+                sched::scheduler::add_thread_for_cpu(tcb_page, cpu);
+            }
+        }
+
+        // Do NOT call scheduler::start() here. CPU 0 still has kernel
+        // setup work to do (ELF loading, process creation) outside the
+        // GKL. Secondaries have timers armed — if start() flips active
+        // now, their timer ticks would begin scheduling while CPU 0 is
+        // unsynchronized. start() is called right before drop_to_el0.
     }
 
-    kprintln!("Scheduler started.");
     kprintln!();
 
     // --- Phase 8: Load init process from embedded ELF ---
@@ -605,6 +660,12 @@ pub extern "C" fn kmain() -> ! {
             "isb",
         );
 
+        // Activate the scheduler. All kernel setup is complete. After
+        // this, secondary timer ticks will begin scheduling. CPU 0 is
+        // about to drop to EL0 — the GKL discipline takes over.
+        sched::scheduler::start();
+        kprintln!("Scheduler started.");
+
         // Scheduler/MMU integration check. Right before EL0 drop, all
         // threads are kernel threads (ttbr0=0). No TTBR0 writes should
         // have occurred. This is the last kernel-only observation point.
@@ -681,6 +742,10 @@ fn ipc_receiver() -> ! {
 }
 
 fn idle_thread() -> ! {
+    // Release GKL inherited from thread_entry. Idle thread touches no
+    // shared state — just wfi. Timer ticks acquire GKL in the handler.
+    sched::gkl::gkl_unlock();
+    unsafe { core::arch::asm!("msr DAIFClr, #2"); } // Unmask IRQs
     loop {
         unsafe { core::arch::asm!("wfi") };
     }
@@ -691,9 +756,9 @@ fn idle_thread() -> ! {
 // ---------------------------------------------------------------------------
 
 /// Rust entry point for secondary CPUs, called from _secondary_start assembly.
-/// Sets up MMU, per-CPU state, exception vectors, and stack canary, then
-/// halts in wfi. Interrupts are NOT unmasked here — that happens in
-/// commit 3 (GKL) when secondaries are activated for scheduling.
+/// Sets up MMU, per-CPU state, exception vectors, stack canary, GIC, and
+/// timer. Then enters the idle loop with IRQs enabled — timer ticks will
+/// call schedule() via the GKL.
 #[no_mangle]
 pub extern "C" fn secondary_main(cpu_id: u64) -> ! {
     // Enable MMU with the same page tables CPU 0 built
@@ -708,11 +773,22 @@ pub extern "C" fn secondary_main(cpu_id: u64) -> ! {
     // Initialize stack canary for this CPU
     unsafe { mm::stack::init_canary_for_cpu(cpu_id as u32); }
 
-    // No kprintln here — UART is not synchronized. Secondaries stay
-    // silent until the GKL lands (commit 3). CPU 0 confirms boot via
-    // PSCI return code.
+    // Initialize this CPU's GIC redistributor + CPU interface (silent —
+    // no kprintln, UART not serialized during secondary bring-up).
+    unsafe { arch::aarch64::gic::init_redistributor(cpu_id as u32); }
 
-    // Halt until GKL activation (commit 3) unmasks interrupts
+    // Arm this CPU's virtual timer (silent variant)
+    unsafe { arch::aarch64::timer::init_secondary(); }
+
+    // This CPU IS the idle thread. CPU 0 registered a TCB for us
+    // with saved_sp=0 and stack_base pointing at our per-CPU boot
+    // stack. When the scheduler context-switches away from us, it
+    // saves our real SP into that TCB. When switched back, we
+    // resume here in the wfi loop.
+    //
+    // No GKL to release (we never held it — booted fresh from PSCI).
+    // Unmask IRQs so timer ticks can preempt us into the scheduler.
+    unsafe { core::arch::asm!("msr DAIFClr, #2"); }
     loop {
         unsafe { core::arch::asm!("wfi") };
     }

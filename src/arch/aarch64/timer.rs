@@ -41,6 +41,12 @@ pub unsafe fn init() {
     crate::kprintln!("  Timer armed (10ms interval)");
 }
 
+/// Arm the timer on a secondary CPU. No printing — UART is not
+/// serialized during secondary bring-up (GKL not yet held).
+pub unsafe fn init_secondary() {
+    arm_timer(lockjaw_types::constants::TIMER_TICK_MS);
+}
+
 /// Called from the IRQ handler when INTID 27 fires.
 /// Increments the tick counter, rearms the timer, and triggers the scheduler.
 pub fn handle_tick() {
