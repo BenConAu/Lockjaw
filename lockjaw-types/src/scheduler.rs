@@ -121,12 +121,14 @@ where
 // State transitions (the model owns these)
 // ---------------------------------------------------------------------------
 
-/// The scheduler's abstract state: which thread is current, and each
+/// The scheduler's abstract state: per-CPU current thread and each
 /// thread's state. The kernel's real state (a static array of Option<PhysAddr>
 /// TCBs) is a concrete realization of this.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchedState {
-    pub current: usize,
+    /// Per-CPU current thread index. `Some(idx)` means this CPU is running
+    /// thread `idx`. `None` means the CPU has no thread assigned yet.
+    pub current_per_cpu: [Option<usize>; MAX_CPUS_MODEL],
     pub states: [Option<SchedThreadState>; MAX_THREADS_MODEL],
 }
 
@@ -134,22 +136,31 @@ pub struct SchedState {
 /// should be <= this. Fixed-size array for no_std compatibility.
 pub const MAX_THREADS_MODEL: usize = 8;
 
+/// Maximum CPUs tracked by the model. Must match platform::MAX_CPUS.
+pub const MAX_CPUS_MODEL: usize = 4;
+
 impl SchedState {
     /// Create an empty state with no threads registered. Const-fn so it
     /// can be used for static initialization in the kernel.
     pub const fn new_const() -> Self {
         Self {
-            current: 0,
+            current_per_cpu: [None; MAX_CPUS_MODEL],
             states: [None; MAX_THREADS_MODEL],
         }
     }
 
-    /// Create an initial state with one Running thread at index 0.
+    /// Create an initial state with one Running thread at index 0 on CPU 0.
     /// Kept for tests and simple callers.
     pub fn new() -> Self {
         let mut s = Self::new_const();
         s.states[0] = Some(SchedThreadState::Running);
+        s.current_per_cpu[0] = Some(0);
         s
+    }
+
+    /// Return the current thread index for a CPU, or panic if none assigned.
+    pub fn current_for(&self, cpu_id: usize) -> usize {
+        self.current_per_cpu[cpu_id].expect("no current thread for this CPU")
     }
 
     /// Add a new thread as Ready. Returns its index, or None if full.
@@ -163,10 +174,12 @@ impl SchedState {
         None
     }
 
-    /// Mark the current thread (typically the boot thread) as Running.
-    /// Used once at boot when the first thread is already executing.
-    pub fn mark_initial_running(&mut self) {
-        self.states[self.current] = Some(SchedThreadState::Running);
+    /// Mark the current thread on `cpu_id` as Running. Used once at boot
+    /// when the first thread is already executing, and for secondary CPUs
+    /// when their idle thread is assigned.
+    pub fn mark_initial_running(&mut self, cpu_id: usize) {
+        let idx = self.current_for(cpu_id);
+        self.states[idx] = Some(SchedThreadState::Running);
     }
 
     /// Number of registered threads.
@@ -179,12 +192,13 @@ impl SchedState {
         self.states.get(idx).copied().flatten()
     }
 
-    /// Transition the current thread to Blocked. Must be called before
-    /// schedule(Block). Fails if the thread isn't Running.
-    pub fn block_current(&mut self) -> Result<(), SchedError> {
-        match self.get(self.current) {
+    /// Transition the current thread on `cpu_id` to Blocked. Must be called
+    /// before step(cpu_id, Block). Fails if the thread isn't Running.
+    pub fn block_current(&mut self, cpu_id: usize) -> Result<(), SchedError> {
+        let current = self.current_for(cpu_id);
+        match self.get(current) {
             Some(SchedThreadState::Running) => {
-                self.states[self.current] = Some(SchedThreadState::Blocked);
+                self.states[current] = Some(SchedThreadState::Blocked);
                 Ok(())
             }
             _ => Err(SchedError::InvalidTransition),
@@ -207,11 +221,12 @@ impl SchedState {
 
     /// Remove an Exited thread from the scheduler, freeing its slot for
     /// reuse by a future `add_thread`. Only valid for Exited threads
-    /// that are not the current thread (the kernel calls this from the
-    /// next thread's context after cleanup).
+    /// that are not current on ANY CPU.
     pub fn remove_thread(&mut self, idx: usize) -> Result<(), SchedError> {
-        if idx == self.current {
-            return Err(SchedError::InvalidTransition);
+        for cpu_current in &self.current_per_cpu {
+            if *cpu_current == Some(idx) {
+                return Err(SchedError::InvalidTransition);
+            }
         }
         match self.get(idx) {
             Some(SchedThreadState::Exited) => {
@@ -237,17 +252,18 @@ impl SchedState {
     ///
     /// Returns a SchedDecision describing the action taken. The model
     /// state has already been updated to reflect the decision.
-    pub fn step(&mut self, reason: SchedReason) -> SchedDecision {
+    pub fn step(&mut self, cpu_id: usize, reason: SchedReason) -> SchedDecision {
+        let current = self.current_for(cpu_id);
         // Validate entry preconditions for the reason.
         match reason {
             SchedReason::Preempt => {
                 assert!(
-                    self.get(self.current) == Some(SchedThreadState::Running),
+                    self.get(current) == Some(SchedThreadState::Running),
                     "step(Preempt) requires current thread to be Running"
                 );
             }
             SchedReason::Block => {
-                let cur = self.get(self.current);
+                let cur = self.get(current);
                 assert!(
                     cur == Some(SchedThreadState::Blocked) || cur == Some(SchedThreadState::Exited),
                     "step(Block) requires current thread to be Blocked or Exited"
@@ -255,14 +271,14 @@ impl SchedState {
             }
             SchedReason::Exit => {
                 assert!(
-                    self.get(self.current) == Some(SchedThreadState::Running),
+                    self.get(current) == Some(SchedThreadState::Running),
                     "step(Exit) requires current thread to be Running"
                 );
             }
         }
 
-        let decision = self.decide(reason);
-        self.apply_decision(reason, decision)
+        let decision = self.decide(cpu_id, reason);
+        self.apply_decision(cpu_id, reason, decision)
             .expect("internal: decide() produced a decision rejected by apply_decision");
 
         // Post-condition: invariants must hold.
@@ -282,9 +298,11 @@ impl SchedState {
     /// For WaitForInterrupt: validates no thread is Ready.
     fn apply_decision(
         &mut self,
+        cpu_id: usize,
         reason: SchedReason,
         decision: SchedDecision,
     ) -> Result<(), SchedError> {
+        let current = self.current_for(cpu_id);
         match decision {
             SchedDecision::SwitchTo(new_idx) => {
                 if self.get(new_idx) != Some(SchedThreadState::Ready) {
@@ -293,32 +311,32 @@ impl SchedState {
                 // Demote current Running -> Ready (only on Preempt;
                 // on Block the caller already set it to Blocked).
                 if reason == SchedReason::Preempt {
-                    if self.get(self.current) != Some(SchedThreadState::Running) {
+                    if self.get(current) != Some(SchedThreadState::Running) {
                         return Err(SchedError::InvalidTransition);
                     }
-                    self.states[self.current] = Some(SchedThreadState::Ready);
+                    self.states[current] = Some(SchedThreadState::Ready);
                 } else {
                     // Block: current must already be Blocked or Exited.
-                    let cur = self.get(self.current);
+                    let cur = self.get(current);
                     if cur != Some(SchedThreadState::Blocked) && cur != Some(SchedThreadState::Exited) {
                         return Err(SchedError::InvalidTransition);
                     }
                 }
                 self.states[new_idx] = Some(SchedThreadState::Running);
-                self.current = new_idx;
+                self.current_per_cpu[cpu_id] = Some(new_idx);
                 Ok(())
             }
             SchedDecision::StayOnCurrent => {
                 if reason != SchedReason::Preempt {
                     return Err(SchedError::InvalidTransition);
                 }
-                if self.get(self.current) != Some(SchedThreadState::Running) {
+                if self.get(current) != Some(SchedThreadState::Running) {
                     return Err(SchedError::InvalidTransition);
                 }
                 // No other thread may be Ready (StayOnCurrent must only
                 // be chosen when there's no one to switch to).
                 for (i, s) in self.states.iter().enumerate() {
-                    if i != self.current && *s == Some(SchedThreadState::Ready) {
+                    if i != current && *s == Some(SchedThreadState::Ready) {
                         return Err(SchedError::InvalidTransition);
                     }
                 }
@@ -346,7 +364,7 @@ impl SchedState {
                 }
                 self.states[exited] = Some(SchedThreadState::Exited);
                 self.states[next] = Some(SchedThreadState::Running);
-                self.current = next;
+                self.current_per_cpu[cpu_id] = Some(next);
                 Ok(())
             }
             SchedDecision::ExitAndHalt { exited } => {
@@ -357,51 +375,87 @@ impl SchedState {
                     return Err(SchedError::InvalidTransition);
                 }
                 self.states[exited] = Some(SchedThreadState::Exited);
-                // No thread to switch to. current stays pointing at the
-                // exited thread (the kernel will wfi until an interrupt).
+                // No thread to switch to. current_per_cpu stays pointing
+                // at the exited thread until an interrupt wakes one.
                 Ok(())
             }
         }
     }
 
     /// Invariants of a valid scheduler state:
-    /// - `current < MAX_THREADS_MODEL` (in bounds)
-    /// - `states[current]` is registered (Some) — may be Exited after
-    ///   ExitAndHalt when no other thread is Ready
-    /// - At most one thread is Running
-    /// - If any thread is Running, it is the current thread
+    /// - For each active CPU (current_per_cpu[c] = Some(idx)):
+    ///   - idx < MAX_THREADS_MODEL (in bounds)
+    ///   - states[idx] is registered (Some)
+    /// - No two CPUs have the same current thread
+    /// - Every Running thread is current on exactly one CPU
+    /// - Running thread count == number of CPUs with Running current
     pub fn check_invariants(&self) -> bool {
-        if self.current >= MAX_THREADS_MODEL {
-            return false;
+        // Check each active CPU's current is valid
+        for (c, cpu_current) in self.current_per_cpu.iter().enumerate() {
+            if let Some(idx) = cpu_current {
+                if *idx >= MAX_THREADS_MODEL {
+                    return false;
+                }
+                if self.states[*idx].is_none() {
+                    return false;
+                }
+                // No two CPUs share the same current
+                for (c2, other) in self.current_per_cpu.iter().enumerate() {
+                    if c2 != c && *other == *cpu_current {
+                        return false;
+                    }
+                }
+            }
         }
-        if self.states[self.current].is_none() {
-            return false;
-        }
-        let mut running_count = 0;
-        let mut running_idx = None;
+
+        // Every Running thread must be current on exactly one CPU
         for (i, s) in self.states.iter().enumerate() {
             if *s == Some(SchedThreadState::Running) {
-                running_count += 1;
-                running_idx = Some(i);
+                let cpu_count = self.current_per_cpu.iter()
+                    .filter(|c| **c == Some(i))
+                    .count();
+                if cpu_count != 1 {
+                    return false;
+                }
             }
         }
-        if running_count > 1 {
-            return false;
-        }
-        if let Some(idx) = running_idx {
-            if idx != self.current {
-                return false;
-            }
-        }
+
         true
     }
 
     /// Compute the scheduling decision for a given reason without mutating.
     /// Private — callers use `step` instead, which computes + applies atomically.
-    fn decide(&self, reason: SchedReason) -> SchedDecision {
-        select_next(self.current, MAX_THREADS_MODEL, reason, |i| {
-            self.get(i).unwrap_or(SchedThreadState::Blocked)
+    fn decide(&self, cpu_id: usize, reason: SchedReason) -> SchedDecision {
+        let current = self.current_for(cpu_id);
+        select_next(current, MAX_THREADS_MODEL, reason, |i| {
+            let state = self.get(i).unwrap_or(SchedThreadState::Blocked);
+            // A Ready thread that is Running on another CPU must be
+            // skipped — it cannot be selected by this CPU.
+            if state == SchedThreadState::Running && i != current {
+                return SchedThreadState::Blocked; // treat as unavailable
+            }
+            state
         })
+    }
+
+    /// Assign a thread as the initial current for a CPU. Used during
+    /// secondary CPU initialization — this is scheduler state initialization,
+    /// not a normal scheduling decision. The thread must be Ready; it is
+    /// transitioned to Running and set as current_per_cpu[cpu_id].
+    ///
+    /// Panics if the CPU already has a current thread or the thread is
+    /// not Ready.
+    pub fn set_initial_current(&mut self, cpu_id: usize, thread_idx: usize) {
+        assert!(
+            self.current_per_cpu[cpu_id].is_none(),
+            "CPU {} already has a current thread", cpu_id
+        );
+        assert!(
+            self.get(thread_idx) == Some(SchedThreadState::Ready),
+            "thread {} is not Ready", thread_idx
+        );
+        self.states[thread_idx] = Some(SchedThreadState::Running);
+        self.current_per_cpu[cpu_id] = Some(thread_idx);
     }
 }
 
@@ -461,7 +515,7 @@ mod tests {
     fn new_state_has_one_running() {
         let s = SchedState::new();
         assert_eq!(s.get(0), Some(SchedThreadState::Running));
-        assert_eq!(s.current, 0);
+        assert_eq!(s.current_for(0), 0);
         assert!(s.check_invariants());
     }
 
@@ -476,7 +530,7 @@ mod tests {
     #[test]
     fn block_current_valid_from_running() {
         let mut s = SchedState::new();
-        assert!(s.block_current().is_ok());
+        assert!(s.block_current(0).is_ok());
         assert_eq!(s.get(0), Some(SchedThreadState::Blocked));
         assert!(s.check_invariants());
     }
@@ -484,8 +538,8 @@ mod tests {
     #[test]
     fn block_current_invalid_when_not_running() {
         let mut s = SchedState::new();
-        s.block_current().unwrap();
-        assert_eq!(s.block_current(), Err(SchedError::InvalidTransition));
+        s.block_current(0).unwrap();
+        assert_eq!(s.block_current(0), Err(SchedError::InvalidTransition));
     }
 
     #[test]
@@ -509,19 +563,19 @@ mod tests {
     fn apply_switch_to_preserves_one_running() {
         let mut s = SchedState::new();
         s.add_thread().unwrap(); // idx 1 Ready
-        let d = s.decide(SchedReason::Preempt);
+        let d = s.decide(0, SchedReason::Preempt);
         assert_eq!(d, SchedDecision::SwitchTo(1));
-        s.apply_decision(SchedReason::Preempt, d).unwrap();
+        s.apply_decision(0, SchedReason::Preempt, d).unwrap();
         assert_eq!(s.get(0), Some(SchedThreadState::Ready));
         assert_eq!(s.get(1), Some(SchedThreadState::Running));
-        assert_eq!(s.current, 1);
+        assert_eq!(s.current_for(0), 1);
         assert!(s.check_invariants());
     }
 
     #[test]
     fn apply_stay_on_current_rejects_block_reason() {
         let mut s = SchedState::new();
-        let r = s.apply_decision(SchedReason::Block, SchedDecision::StayOnCurrent);
+        let r = s.apply_decision(0, SchedReason::Block, SchedDecision::StayOnCurrent);
         assert_eq!(r, Err(SchedError::InvalidTransition));
     }
 
@@ -530,7 +584,7 @@ mod tests {
         let mut s = SchedState::new();
         s.add_thread().unwrap();
         s.states[1] = Some(SchedThreadState::Blocked);
-        let r = s.apply_decision(SchedReason::Preempt, SchedDecision::SwitchTo(1));
+        let r = s.apply_decision(0, SchedReason::Preempt, SchedDecision::SwitchTo(1));
         assert_eq!(r, Err(SchedError::InvalidTransition));
     }
 
@@ -540,17 +594,17 @@ mod tests {
     fn step_preempt_switches_to_ready() {
         let mut s = SchedState::new();
         s.add_thread().unwrap();
-        let d = s.step(SchedReason::Preempt);
+        let d = s.step(0, SchedReason::Preempt);
         assert_eq!(d, SchedDecision::SwitchTo(1));
         assert_eq!(s.get(0), Some(SchedThreadState::Ready));
         assert_eq!(s.get(1), Some(SchedThreadState::Running));
-        assert_eq!(s.current, 1);
+        assert_eq!(s.current_for(0), 1);
     }
 
     #[test]
     fn step_preempt_stays_when_alone_running() {
         let mut s = SchedState::new();
-        let d = s.step(SchedReason::Preempt);
+        let d = s.step(0, SchedReason::Preempt);
         assert_eq!(d, SchedDecision::StayOnCurrent);
         assert_eq!(s.get(0), Some(SchedThreadState::Running));
     }
@@ -559,19 +613,19 @@ mod tests {
     fn step_block_switches_to_ready() {
         let mut s = SchedState::new();
         s.add_thread().unwrap();
-        s.block_current().unwrap();
-        let d = s.step(SchedReason::Block);
+        s.block_current(0).unwrap();
+        let d = s.step(0, SchedReason::Block);
         assert_eq!(d, SchedDecision::SwitchTo(1));
         assert_eq!(s.get(0), Some(SchedThreadState::Blocked));
         assert_eq!(s.get(1), Some(SchedThreadState::Running));
-        assert_eq!(s.current, 1);
+        assert_eq!(s.current_for(0), 1);
     }
 
     #[test]
     fn step_block_waits_when_no_ready() {
         let mut s = SchedState::new();
-        s.block_current().unwrap();
-        let d = s.step(SchedReason::Block);
+        s.block_current(0).unwrap();
+        let d = s.step(0, SchedReason::Block);
         assert_eq!(d, SchedDecision::WaitForInterrupt);
         // State unchanged
         assert_eq!(s.get(0), Some(SchedThreadState::Blocked));
@@ -581,9 +635,9 @@ mod tests {
     #[should_panic(expected = "step(Preempt) requires current thread to be Running")]
     fn step_preempt_panics_if_current_not_running() {
         let mut s = SchedState::new();
-        s.block_current().unwrap();
+        s.block_current(0).unwrap();
         // current is Blocked, Preempt precondition violated
-        let _ = s.step(SchedReason::Preempt);
+        let _ = s.step(0, SchedReason::Preempt);
     }
 
     #[test]
@@ -591,7 +645,7 @@ mod tests {
     fn step_block_panics_if_current_not_blocked() {
         let mut s = SchedState::new();
         // current is Running, Block precondition violated
-        let _ = s.step(SchedReason::Block);
+        let _ = s.step(0, SchedReason::Block);
     }
 
     #[test]
@@ -602,9 +656,9 @@ mod tests {
         // requires current=Running. The kernel returns early; the model
         // is unchanged.
         let mut s = SchedState::new();
-        s.block_current().unwrap();
+        s.block_current(0).unwrap();
         // Verify: current is Blocked
-        assert_eq!(s.get(s.current), Some(SchedThreadState::Blocked));
+        assert_eq!(s.get(s.current_for(0)), Some(SchedThreadState::Blocked));
         // Verify: calling step(Preempt) in this state would panic
         // (we don't actually call it; the kernel's tick() guard prevents it)
         // But check_invariants still holds (even with Blocked current).
@@ -636,7 +690,7 @@ mod tests {
     #[test]
     fn invariants_reject_current_not_registered() {
         let mut s = SchedState::new();
-        s.current = 5; // points at unregistered slot
+        s.current_per_cpu[0] = Some(5); // points at unregistered slot
         assert!(!s.check_invariants());
     }
 
@@ -652,7 +706,7 @@ mod tests {
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     struct ReachableState {
-        current: usize,
+        current_cpu0: Option<usize>,
         states: [Option<SchedThreadState>; 4], // bounded to 4 for BFS
     }
 
@@ -662,15 +716,7 @@ mod tests {
             for i in 0..4 {
                 states[i] = s.get(i);
             }
-            Self { current: s.current, states }
-        }
-
-        fn to_sched(&self) -> SchedState {
-            let mut states = [None; MAX_THREADS_MODEL];
-            for i in 0..4 {
-                states[i] = self.states[i];
-            }
-            SchedState { current: self.current, states }
+            Self { current_cpu0: s.current_per_cpu[0], states }
         }
     }
 
@@ -686,11 +732,11 @@ mod tests {
         }
 
         // Event 2: current thread blocks itself (if Running)
-        if s.get(s.current) == Some(SchedThreadState::Running) {
+        if s.current_per_cpu[0].is_some() && s.get(s.current_for(0)) == Some(SchedThreadState::Running) {
             let mut s2 = s.clone();
-            if s2.block_current().is_ok() {
+            if s2.block_current(0).is_ok() {
                 // Follow up with step(Block) which must complete
-                let _ = s2.step(SchedReason::Block);
+                let _ = s2.step(0, SchedReason::Block);
                 out.push(("block".into(), s2));
             }
         }
@@ -702,8 +748,8 @@ mod tests {
         // models the real-world interrupt-while-idling case.
         {
             let mut s2 = s.clone();
-            if s.get(s.current) == Some(SchedThreadState::Running) {
-                let _ = s2.step(SchedReason::Preempt);
+            if s.current_per_cpu[0].is_some() && s.get(s.current_for(0)) == Some(SchedThreadState::Running) {
+                let _ = s2.step(0, SchedReason::Preempt);
             }
             // Otherwise no-op (kernel's tick() returns early)
             out.push(("timer_irq".into(), s2));
@@ -720,11 +766,11 @@ mod tests {
         }
 
         // Event 5: current thread exits (if Running and not the only thread)
-        if s.get(s.current) == Some(SchedThreadState::Running)
+        if s.current_per_cpu[0].is_some() && s.get(s.current_for(0)) == Some(SchedThreadState::Running)
             && s.thread_count() >= 2
         {
             let mut s2 = s.clone();
-            let decision = s2.step(SchedReason::Exit);
+            let decision = s2.step(0, SchedReason::Exit);
             match decision {
                 SchedDecision::ExitAndSwitch { exited, .. } => {
                     // Also test remove_thread cleanup
@@ -781,18 +827,18 @@ mod tests {
     fn step_exit_switches_to_ready() {
         let mut s = SchedState::new();
         s.add_thread().unwrap(); // idx 1 Ready
-        let d = s.step(SchedReason::Exit);
+        let d = s.step(0, SchedReason::Exit);
         assert_eq!(d, SchedDecision::ExitAndSwitch { exited: 0, next: 1 });
         assert_eq!(s.get(0), Some(SchedThreadState::Exited));
         assert_eq!(s.get(1), Some(SchedThreadState::Running));
-        assert_eq!(s.current, 1);
+        assert_eq!(s.current_for(0), 1);
         assert!(s.check_invariants());
     }
 
     #[test]
     fn step_exit_halts_when_alone() {
         let mut s = SchedState::new();
-        let d = s.step(SchedReason::Exit);
+        let d = s.step(0, SchedReason::Exit);
         assert_eq!(d, SchedDecision::ExitAndHalt { exited: 0 });
         assert_eq!(s.get(0), Some(SchedThreadState::Exited));
         assert!(s.check_invariants());
@@ -802,10 +848,10 @@ mod tests {
     fn exited_thread_never_selected() {
         let mut s = SchedState::new();
         s.add_thread().unwrap(); // idx 1 Ready
-        s.step(SchedReason::Exit); // exit thread 0, switch to 1
+        s.step(0, SchedReason::Exit); // exit thread 0, switch to 1
         // Now thread 0 is Exited, thread 1 is Running
         // Preempt should stay on current (no Ready threads)
-        let d = s.step(SchedReason::Preempt);
+        let d = s.step(0, SchedReason::Preempt);
         assert_eq!(d, SchedDecision::StayOnCurrent);
     }
 
@@ -813,7 +859,7 @@ mod tests {
     fn unblock_rejects_exited() {
         let mut s = SchedState::new();
         s.add_thread().unwrap();
-        s.step(SchedReason::Exit); // thread 0 Exited
+        s.step(0, SchedReason::Exit); // thread 0 Exited
         assert_eq!(s.unblock(0), Err(SchedError::InvalidTransition));
     }
 
@@ -821,7 +867,7 @@ mod tests {
     fn remove_thread_on_exited_frees_slot() {
         let mut s = SchedState::new();
         s.add_thread().unwrap(); // idx 1
-        s.step(SchedReason::Exit); // exit thread 0
+        s.step(0, SchedReason::Exit); // exit thread 0
         assert!(s.remove_thread(0).is_ok());
         assert_eq!(s.get(0), None);
         // Slot is reusable
@@ -843,7 +889,7 @@ mod tests {
         // must reject it — cleanup can only happen after switching to a
         // different thread.
         let mut s = SchedState::new();
-        s.step(SchedReason::Exit); // ExitAndHalt, current=0, states[0]=Exited
+        s.step(0, SchedReason::Exit); // ExitAndHalt, current=0, states[0]=Exited
         assert_eq!(s.remove_thread(0), Err(SchedError::InvalidTransition));
     }
 
@@ -858,10 +904,10 @@ mod tests {
         s.states[idx1] = Some(SchedThreadState::Blocked); // force blocked
 
         // Thread 0 exits — no Ready thread, so ExitAndHalt
-        let d = s.step(SchedReason::Exit);
+        let d = s.step(0, SchedReason::Exit);
         assert_eq!(d, SchedDecision::ExitAndHalt { exited: 0 });
         assert_eq!(s.get(0), Some(SchedThreadState::Exited));
-        assert_eq!(s.current, 0); // still current — can't remove yet
+        assert_eq!(s.current_for(0), 0); // still current — can't remove yet
 
         // remove_thread must fail while exited thread is still current
         assert_eq!(s.remove_thread(0), Err(SchedError::InvalidTransition));
@@ -870,9 +916,9 @@ mod tests {
         s.unblock(1).unwrap();
 
         // step(Block) with Exited current should find Ready thread 1
-        let d2 = s.step(SchedReason::Block);
+        let d2 = s.step(0, SchedReason::Block);
         assert_eq!(d2, SchedDecision::SwitchTo(1));
-        assert_eq!(s.current, 1); // current changed — now remove works
+        assert_eq!(s.current_for(0), 1); // current changed — now remove works
 
         // NOW remove_thread succeeds (exited thread is no longer current)
         assert!(s.remove_thread(0).is_ok());
@@ -884,8 +930,8 @@ mod tests {
     #[should_panic(expected = "step(Exit) requires current thread to be Running")]
     fn step_exit_panics_if_current_not_running() {
         let mut s = SchedState::new();
-        s.block_current().unwrap();
-        let _ = s.step(SchedReason::Exit);
+        s.block_current(0).unwrap();
+        let _ = s.step(0, SchedReason::Exit);
     }
 
     #[test]
@@ -896,9 +942,9 @@ mod tests {
         let mut s = SchedState::new();
         s.add_thread().unwrap(); // thread 1 Ready
         s.states[1] = Some(SchedThreadState::Blocked); // force both not runnable
-        s.block_current().unwrap();
+        s.block_current(0).unwrap();
         let before = s.clone();
-        let d = s.step(SchedReason::Block);
+        let d = s.step(0, SchedReason::Block);
         assert_eq!(d, SchedDecision::WaitForInterrupt);
         assert_eq!(s, before, "WaitForInterrupt must not mutate state");
     }

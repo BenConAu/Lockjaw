@@ -43,14 +43,19 @@ struct PendingExit {
     tcb_paddr: PhysAddr,
 }
 
-/// Cleanup slot for the most recently exited thread.
-/// Invariant: must be None before exit_current() stores a new value.
-/// finish_exit() drains this at the start of every schedule() call.
-struct PendingExitSlot(UnsafeCell<Option<PendingExit>>);
-/// SAFETY: single-core, IRQs masked during kernel execution.
-unsafe impl Sync for PendingExitSlot {}
+/// Per-CPU cleanup slots for exited threads. Each CPU has its own slot
+/// so two CPUs can have independent pending exits. A CPU only drains
+/// its own slot in finish_exit() — no cross-CPU cleanup.
+struct PendingExitSlots(UnsafeCell<[Option<PendingExit>; MAX_CPUS]>);
+/// SAFETY: GKL held during all access. Per-CPU indexing prevents
+/// cross-CPU slot corruption even without the lock.
+unsafe impl Sync for PendingExitSlots {}
 
-static PENDING_EXIT: PendingExitSlot = PendingExitSlot(UnsafeCell::new(None));
+const MAX_CPUS: usize = crate::arch::aarch64::platform::MAX_CPUS;
+
+static PENDING_EXITS: PendingExitSlots = PendingExitSlots(UnsafeCell::new(
+    [None, None, None, None]
+));
 
 // ---------------------------------------------------------------------------
 // Scheduler singleton — wraps all mutable globals behind safe methods
@@ -67,11 +72,10 @@ pub struct Scheduler {
     active: UnsafeCell<bool>,
 }
 
-/// SAFETY: single-core kernel. Kernel entry (exception vectors) masks
-/// IRQs before touching scheduler state; the only preemption point is
-/// the timer tick handler, which calls `tick()` — a leaf that does not
-/// re-enter any scheduler method. When SMP lands, replace this with a
-/// proper SpinMutex.
+/// SAFETY: All scheduler state access is serialized by the Giant Kernel
+/// Lock (GKL). The GKL is held during exception handlers and kernel
+/// thread execution. Per-CPU fields (current_per_cpu, PENDING_EXITS)
+/// are additionally partitioned by cpu_id.
 unsafe impl Sync for Scheduler {}
 
 impl Scheduler {
@@ -112,17 +116,18 @@ pub static SCHEDULER: Scheduler = Scheduler::new();
 /// Subsequent threads are added as Ready.
 /// Returns `false` if the run queue is full (MAX_THREADS = 8 reached).
 pub fn add_thread(tcb_paddr: PhysAddr) -> bool {
-    // SAFETY: single-core, IRQs masked — exclusive access to state + threads.
+    // SAFETY: GKL held — exclusive access to state + threads.
     unsafe {
         let state = &mut *SCHEDULER.state_ptr();
         let idx = match state.add_thread() {
             Some(i) => i,
             None => return false,
         };
-        // First add_thread is the boot/init thread — model puts it in Ready
-        // but it's actually already running. Mark it Running.
+        // First add_thread is the boot thread on CPU 0. add_thread sets
+        // it Ready; set_initial_current transitions Ready → Running and
+        // assigns it as CPU 0's current.
         if idx == 0 {
-            state.mark_initial_running();
+            state.set_initial_current(0, idx);
         }
         if idx >= MAX_THREADS {
             return false;
@@ -135,7 +140,7 @@ pub fn add_thread(tcb_paddr: PhysAddr) -> bool {
 /// Activate the scheduler. After this call, timer ticks trigger scheduling.
 /// Must be called after all initial threads are registered via add_thread().
 pub fn start() {
-    // SAFETY: single-core, called once during boot.
+    // SAFETY: called once during boot, before secondaries are active.
     unsafe { *SCHEDULER.active.get() = true; }
 }
 
@@ -151,14 +156,21 @@ pub fn start() {
 /// notifications or deliver messages) set other threads to Ready, and
 /// the block_current loop picks them up via step(Block).
 pub fn tick() {
-    // SAFETY: single-core, IRQs masked — exclusive access.
+    // SAFETY: GKL held — exclusive access to scheduler state.
     unsafe {
         let active = *SCHEDULER.active.get();
         let state = &*SCHEDULER.state_ptr();
         if !active || state.thread_count() < 2 {
             return;
         }
-        let current_state = state.get(state.current);
+        let cpu_id = crate::percpu::cpu_id() as usize;
+        // Secondary CPUs that haven't been assigned a current thread yet
+        // (set_initial_current not called) must not touch the scheduler.
+        let current = match state.current_per_cpu.get(cpu_id).copied().flatten() {
+            Some(idx) => idx,
+            None => return,
+        };
+        let current_state = state.get(current);
         if current_state == Some(SchedThreadState::Exited) {
             // ExitAndHalt case: current thread exited but no Ready thread
             // was available. An interrupt may have just unblocked a thread.
@@ -180,18 +192,28 @@ pub fn tick() {
 /// Return the physical address of the currently running thread's TCB.
 /// Used by syscall handlers to look up the caller's handle table and TTBR0.
 pub fn current_tcb_paddr() -> PhysAddr {
-    // SAFETY: single-core, IRQs masked — read-only access, no aliasing.
+    // SAFETY: GKL held — exclusive access to scheduler state.
     unsafe {
-        let idx = (*SCHEDULER.state_ptr()).current;
-        (*SCHEDULER.threads_ptr())[idx].unwrap()
+        let cpu_id = crate::percpu::cpu_id() as usize;
+        let idx = (*SCHEDULER.state_ptr()).current_for(cpu_id);
+        (*SCHEDULER.threads_ptr())[idx]
+            .expect("current_tcb_paddr: no TCB for current thread")
     }
 }
 
 /// Return the index of the currently running thread in the run queue.
-/// Used by crash diagnostics to identify the faulting thread.
+/// Used by crash diagnostics — must never panic (called from panic handler).
 pub fn current_thread_index() -> usize {
-    // SAFETY: single-core, IRQs masked — read-only access.
-    unsafe { (*SCHEDULER.state_ptr()).current }
+    // SAFETY: raw pointer reads for crash-robustness (no bounds checks).
+    unsafe {
+        let cpu_id = crate::percpu::cpu_id() as usize;
+        // SAFETY: UnsafeCell interior pointer for crash-safe read
+        let state_ptr = SCHEDULER.state.get() as *const SchedState;
+        match (*state_ptr).current_per_cpu.get(cpu_id) {
+            Some(Some(idx)) => *idx,
+            _ => 0,
+        }
+    }
 }
 
 /// Like current_tcb_paddr but returns None instead of panicking.
@@ -200,8 +222,13 @@ pub fn current_thread_index() -> usize {
 pub fn try_current_tcb_paddr() -> Option<PhysAddr> {
     // SAFETY: raw pointer reads for crash-robustness (no bounds checks).
     unsafe {
+        let cpu_id = crate::percpu::cpu_id() as usize;
+        // SAFETY: UnsafeCell interior pointer for crash-safe volatile read
         let state_ptr = SCHEDULER.state.get() as *const SchedState;
-        let idx = (*state_ptr).current;
+        let idx = match (*state_ptr).current_per_cpu.get(cpu_id) {
+            Some(Some(i)) => *i,
+            _ => return None,
+        };
         if idx >= MAX_THREADS { return None; }
         // SAFETY: raw pointer to UnsafeCell interior for crash-safe volatile read
         let threads_ptr = SCHEDULER.threads.get() as *const [Option<PhysAddr>; MAX_THREADS];
@@ -250,21 +277,17 @@ pub unsafe fn scoped_mut<'a, T>(ptr: *mut T, _token: &'a mut BlockToken) -> &'a 
 }
 
 pub fn block_current(_token: BlockToken) {
-    // SAFETY: single-core, IRQs masked. Each &mut borrow is scoped to
-    // avoid overlapping — we re-derive from the raw pointer after each
-    // context switch because schedule() invalidates prior references.
+    let cpu_id = crate::percpu::cpu_id() as usize;
+    // SAFETY: GKL held — exclusive access to scheduler state.
     unsafe {
-        (&mut *SCHEDULER.state_ptr()).block_current().expect("block_current: not Running");
+        (&mut *SCHEDULER.state_ptr()).block_current(cpu_id).expect("block_current: not Running");
     }
     loop {
-        // schedule() performs context_switch (asm) — inherently unsafe.
         unsafe { schedule(SchedReason::Block); }
-        // Re-read: schedule may have switched us out and back in.
-        // If we're Running again, an unblock_thread + schedule decided
-        // to pick us, so we resume.
         unsafe {
             let state = &*SCHEDULER.state_ptr();
-            if state.get(state.current) == Some(SchedThreadState::Running) {
+            let current = state.current_for(cpu_id);
+            if state.get(current) == Some(SchedThreadState::Running) {
                 return;
             }
         }
@@ -294,7 +317,7 @@ pub fn block_current(_token: BlockToken) {
 pub fn unblock_thread(tcb_paddr: PhysAddr) {
     let idx = thread_index_for(tcb_paddr)
         .expect("unblock_thread: TCB paddr not registered in scheduler");
-    // SAFETY: single-core, IRQs masked — exclusive access.
+    // SAFETY: GKL held — exclusive access to scheduler state.
     unsafe {
         (&mut *SCHEDULER.state_ptr()).unblock(idx)
             .expect("unblock_thread: thread not in Blocked state");
@@ -308,21 +331,21 @@ pub fn unblock_thread(tcb_paddr: PhysAddr) {
 /// 3. Stores PendingExit record for deferred cleanup by finish_exit()
 /// 4. Context-switches away, then loops in wfi forever
 pub fn exit_current() -> ! {
-    // SAFETY: single-core, IRQs masked — exclusive access.
+    // SAFETY: GKL held — exclusive access to scheduler state.
     unsafe {
-        // Invariant: no pending exit waiting for cleanup
+        let cpu_id = crate::percpu::cpu_id() as usize;
+        // Invariant: this CPU's pending exit slot must be empty
         assert!(
-            (*PENDING_EXIT.0.get()).is_none(),
+            (*PENDING_EXITS.0.get())[cpu_id].is_none(),
             "exit_current: previous exit not yet cleaned up"
         );
-
         let state = &mut *SCHEDULER.state_ptr();
-        let decision = state.step(SchedReason::Exit);
+        let decision = state.step(cpu_id, SchedReason::Exit);
 
         match decision {
             SchedDecision::ExitAndSwitch { exited, next } => {
                 let tcb_paddr = (*SCHEDULER.threads_ptr())[exited].unwrap();
-                *PENDING_EXIT.0.get() = Some(PendingExit { thread_idx: exited, tcb_paddr });
+                (*PENDING_EXITS.0.get())[cpu_id] = Some(PendingExit { thread_idx: exited, tcb_paddr });
 
                 let new_paddr = (*SCHEDULER.threads_ptr())[next].unwrap();
                 let new_tcb = KernelMut::<Tcb>::from_paddr(new_paddr);
@@ -365,7 +388,7 @@ pub fn exit_current() -> ! {
                 // start of schedule() will clean up this thread's resources
                 // once we switch to the newly-Ready thread.
                 let tcb_paddr = (*SCHEDULER.threads_ptr())[exited].unwrap();
-                *PENDING_EXIT.0.get() = Some(PendingExit { thread_idx: exited, tcb_paddr });
+                (*PENDING_EXITS.0.get())[cpu_id] = Some(PendingExit { thread_idx: exited, tcb_paddr });
 
                 loop {
                     schedule(SchedReason::Block);
@@ -396,24 +419,23 @@ pub fn exit_current() -> ! {
 ///   4. Free kernel stack page
 ///   5. Free TCB page (last — we were reading from it)
 fn finish_exit() {
-    // SAFETY: single-core, IRQs masked — exclusive access.
-    let pending = unsafe { &*PENDING_EXIT.0.get() };
+    let cpu_id = crate::percpu::cpu_id() as usize;
+    // SAFETY: GKL held — exclusive access. Only drain this CPU's slot.
+    let pending = unsafe { &(*PENDING_EXITS.0.get())[cpu_id] };
     let pending = match pending {
         Some(p) => p,
-        None => return, // common path — no pending exit
+        None => return, // common path — no pending exit on this CPU
     };
 
-    // Cannot clean up if the exited thread is still current (ExitAndHalt
-    // path — we haven't context-switched to a different thread yet).
-    // Cleanup will happen later when an interrupt unblocks a thread and
-    // schedule() runs from that thread's context.
-    let current_idx = unsafe { (*SCHEDULER.state_ptr()).current };
+    // Cannot clean up if the exited thread is still current on this CPU
+    // (ExitAndHalt path — haven't context-switched to a different thread).
+    let current_idx = unsafe { (*SCHEDULER.state_ptr()).current_for(cpu_id) };
     if pending.thread_idx == current_idx {
         return;
     }
 
-    // Safe to proceed — take ownership of the pending record.
-    let pending = unsafe { (*PENDING_EXIT.0.get()).take().unwrap() };
+    // Safe to proceed — take ownership of this CPU's pending record.
+    let pending = unsafe { (*PENDING_EXITS.0.get())[cpu_id].take().unwrap() };
 
     // Step 1: Read everything we need from the exiting TCB
     let tcb = unsafe { KernelRef::<Tcb>::from_paddr(pending.tcb_paddr) };
@@ -471,7 +493,7 @@ fn finish_exit() {
 // ---------------------------------------------------------------------------
 
 fn thread_index_for(paddr: PhysAddr) -> Option<usize> {
-    // SAFETY: single-core, IRQs masked — read-only access.
+    // SAFETY: GKL held — read-only access.
     let threads = unsafe { &*SCHEDULER.threads_ptr() };
     for i in 0..MAX_THREADS {
         if threads[i] == Some(paddr) {
@@ -487,15 +509,13 @@ unsafe fn schedule(reason: SchedReason) {
     // Clean up any previously exited thread before doing anything else.
     finish_exit();
 
+    let cpu_id = crate::percpu::cpu_id() as usize;
     let state = &mut *SCHEDULER.state_ptr();
-    let old_idx = state.current;
+    let old_idx = state.current_for(cpu_id);
     let old_paddr = (*SCHEDULER.threads_ptr())[old_idx].unwrap();
     let mut old_tcb = KernelMut::<Tcb>::from_paddr(old_paddr);
 
-    // step() validates preconditions, computes the decision, applies it,
-    // and returns the action for the kernel to execute. No separate
-    // decide/apply_decision calls — the model owns the transition.
-    let decision = state.step(reason);
+    let decision = state.step(cpu_id, reason);
 
     let next_idx = match decision {
         SchedDecision::SwitchTo(idx) => idx,
