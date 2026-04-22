@@ -18,7 +18,7 @@ The design follows a few core principles:
 
 ## What works today
 
-Lockjaw boots on QEMU, manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads, serves 22 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects, runs five isolated userspace processes loaded from ELF binaries, has a device manager that discovers hardware from the DTB, a UART driver, and a ramfb display driver that renders to a framebuffer via DMA.
+Lockjaw boots on QEMU with up to 4 cores (`-smp 4`), manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads across multiple CPUs with a Giant Kernel Lock, serves 22 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects, runs five isolated userspace processes loaded from ELF binaries, has a device manager that discovers hardware from the DTB, a UART driver, and a ramfb display driver that renders to a framebuffer via DMA.
 
 ```
 === Lockjaw Microkernel v0.1.0 ===
@@ -66,6 +66,8 @@ ramfb: display configured
 
 **Phase 10 -- Device Manager and Display Driver.** Device manager process parses the Flattened Device Tree (DTB) at boot to discover hardware. Serves CMD_CLAIM_DEVICE requests from drivers via IPC. Creates tracked MMIO PageSets so drivers can map device memory without knowing physical addresses. ramfb display driver claims fw_cfg from the device manager, allocates a contiguous DMA framebuffer via the buddy allocator, configures the display via the fw_cfg DMA protocol, and renders a test pattern.
 
+**Phase 11 -- SMP.** Secondary CPUs booted via PSCI CPU_ON. Per-CPU stacks in the linker script (2MB-aligned, 4 guard+stack pairs). Per-CPU data via TPIDR_EL1 with narrow accessors. Giant Kernel Lock (ticket lock from lockjaw-types, host-testable with multi-threaded tests) serializes all kernel execution. Scheduler model adapted for per-CPU current threads. Exception handlers acquire/release GKL. Kernel threads run cooperatively under the GKL with IRQs masked. Idle threads release GKL and halt in wfi. Process entry releases GKL before eret to EL0. INTID 0 reserved for future cross-core reschedule SGI (parked until fine-grained locking).
+
 ### Unsafe reduction
 
 The kernel's unsafe usage has been systematically hardened through a multi-round review process with a second AI reviewer (Codex):
@@ -82,10 +84,10 @@ Three layers of automated testing run on every build:
 
 | Layer | Count | What it tests |
 |-------|-------|---------------|
-| Unit tests (host) | 230 | Scheduler model (BFS), IPC state machine (exhaustive), process lifecycle, buddy allocator, page tables, FDT parser, notifications, wait readiness |
+| Unit tests (host) | 235 | Scheduler model (BFS, per-CPU), IPC state machine (exhaustive), process lifecycle, buddy allocator, page tables, FDT parser, notifications, wait readiness, ticket lock (multi-threaded) |
 | Integration tests (QEMU) | 39 | Full boot through 9 phases, scheduler/MMU integration, IPC bootstrap, thread exit cleanup |
 | Stack analysis | 3 | No recursion, depth within budget, all indirect calls annotated |
-| Pointer cast lint | 50 | Every `as *const` / `as *mut` in kernel code has a SAFETY comment |
+| Pointer cast lint | 60 | Every `as *const` / `as *mut` in kernel code has a SAFETY comment |
 
 The IPC state machine test exhaustively explores all reachable system states (endpoint state x per-client reply state x thread states) via BFS with a 3-thread model and verifies: no kernel-caused deadlocks, all 8 invariants hold, all effect orderings correct (BlockCurrent always last, UnblockThread before ClearReply).
 
@@ -136,10 +138,12 @@ src/
   main.rs                    # kmain, panic handler, boot banner, init ELF loading
   print.rs                   # kprintln! macro
   crash.rs                   # Crash diagnostics (syscall breadcrumb, thread context)
+  percpu.rs                  # Per-CPU data via TPIDR_EL1 (narrow accessors)
   process.rs                 # sys_create_process kernel-side implementation
   elf.rs                     # ELF section lookup for build hash verification
   arch/aarch64/
-    boot.rs                  # _start entry point (EL2 to EL1, FP enable, stack, BSS)
+    boot.rs                  # _start and _secondary_start entry points (EL2→EL1, stack, BSS)
+    psci.rs                  # PSCI CPU_ON for secondary core boot (HVC #0)
     uart.rs                  # PL011 UART driver (kernel debug on UART0)
     mmu.rs                   # Boot page tables, MMU enable, higher-half, guard page
     vmem.rs                  # Dynamic per-process page table management
@@ -165,7 +169,8 @@ src/
   sched/
     tcb.rs                   # Thread Control Block, SavedContext struct
     context.rs               # context_switch assembly, SavedContext offset assertions
-    scheduler.rs             # Round-robin scheduler, BlockToken, scoped_mut
+    scheduler.rs             # Per-CPU round-robin scheduler, BlockToken, scoped_mut
+    gkl.rs                   # Giant Kernel Lock (wraps TicketLock from lockjaw-types)
     current.rs               # CurrentThread safe facade (narrow per-field accessors)
   ipc/
     endpoint.rs              # Endpoint object, send/receive/call with scoped borrows
@@ -227,7 +232,7 @@ tests/
 | Phase | Status | Description |
 |-------|--------|-------------|
 | 1-10 | Done | Boot, memory, exceptions, objects, threads, syscalls, IPC, processes, drivers, device manager, display |
-| 11. SMP | Planned | Multi-core support: per-CPU scheduler, spinlocks replacing UnsafeCell singletons, IPI for cross-core wakeup, per-CPU idle threads |
+| 11. SMP | Done | Per-CPU stacks, PSCI secondary boot, Giant Kernel Lock (ticket lock), per-CPU scheduler, per-CPU idle threads, GKL-serialized exception handlers |
 | 12. Real Hardware | Planned | Bring-up on a simple AArch64 board (Raspberry Pi 4 or similar). UART, interrupts, and memory map without QEMU training wheels |
 | 13. POSIX Compatibility | Planned | POSIX personality server in userspace, musl libc port, enough to run simple C programs |
 
