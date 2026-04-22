@@ -65,6 +65,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_REGISTER_DEVICE_PAGE => SyscallReturn::Value(sys_register_device_page(ctx)),
         SYS_QUERY_PAGESET_PHYS => SyscallReturn::Value(sys_query_pageset_phys(ctx)),
         SYS_CREATE_REPLY => SyscallReturn::Value(sys_create_reply(ctx)),
+        SYS_CREATE_THREAD => SyscallReturn::Void(sys_create_thread(ctx)),
         SYS_EXIT => {
             scheduler::exit_current(); // never returns
         }
@@ -561,6 +562,87 @@ fn sys_query_pageset_phys(ctx: &mut ExceptionContext) -> Result<u64, SyscallErro
     pageset.page(page_index)
         .map(|p| p.as_u64())
         .ok_or(SyscallError::INVALID_PARAMETER)
+}
+
+/// sys_create_thread(entry, stack_top, stack_base, arg) — create a new thread
+/// in the calling process. The new thread shares the caller's address space
+/// and handle table. Starts at `entry` with SP=stack_top and x0=arg.
+///
+/// x0 = user entry point VA, x1 = stack top VA (16-byte aligned),
+/// x2 = stack base VA (< stack_top), x3 = argument (passed in x0).
+///
+/// Kernel policy: VA range is validated (must be in user range), but mapping
+/// existence is NOT checked. A thread with unmapped entry/stack faults at EL0.
+fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
+    let entry_point = ctx.gpr[0];
+    let stack_top = ctx.gpr[1];
+    let stack_base = ctx.gpr[2];
+    let user_arg = ctx.gpr[3];
+
+    // Validate VAs are in user range
+    const USER_VA_END: u64 = lockjaw_types::constants::USER_VA_END;
+    if entry_point >= USER_VA_END || stack_top >= USER_VA_END || stack_base >= USER_VA_END {
+        return SyscallError::INVALID_PARAMETER;
+    }
+    if stack_base >= stack_top {
+        return SyscallError::INVALID_PARAMETER;
+    }
+    if stack_top & 0xF != 0 {
+        return SyscallError::INVALID_PARAMETER; // AArch64 ABI: SP must be 16-byte aligned
+    }
+
+    // Get caller's process (returns PhysAddr)
+    let process_paddr = crate::sched::current::CurrentThread::process_paddr();
+
+    // Allocate kernel stack + TCB pages
+    let kernel_stack = match crate::mm::page_alloc::alloc_page() {
+        Some(p) => p,
+        None => return SyscallError::OUT_OF_MEMORY,
+    };
+    let tcb_page = match crate::mm::page_alloc::alloc_page() {
+        Some(p) => p,
+        None => {
+            crate::mm::page_alloc::dealloc_page(kernel_stack);
+            return SyscallError::OUT_OF_MEMORY;
+        }
+    };
+
+    // Create TCB — reuses process_entry which reads TTBR0 from the
+    // shared ProcessObject and drops to EL0.
+    unsafe {
+        if crate::sched::tcb::create_tcb(
+            &crate::sched::tcb::TcbCreateInfo {
+                entry: crate::process::process_entry,
+                stack_paddr: kernel_stack.start_addr(),
+                process_paddr,
+                user_entry_point: entry_point,
+                user_stack_top: stack_top,
+                user_stack_base: stack_base,
+                user_arg,
+                name: *b"thread\0\0\0\0\0\0\0\0\0\0",
+            },
+            tcb_page.start_addr(),
+        ).is_err() {
+            crate::mm::page_alloc::dealloc_page(tcb_page);
+            crate::mm::page_alloc::dealloc_page(kernel_stack);
+            return SyscallError::UNKNOWN;
+        }
+    }
+
+    // Increment process thread count
+    crate::cap::process_obj::process_inc_thread_count(process_paddr);
+
+    // Register with scheduler
+    if !scheduler::add_thread(tcb_page.start_addr()) {
+        // Rollback: dealloc pages, then dec thread count.
+        // Invariant: caller is still alive, so dec cannot return LastThread.
+        crate::mm::page_alloc::dealloc_page(tcb_page);
+        crate::mm::page_alloc::dealloc_page(kernel_stack);
+        crate::cap::process_obj::process_dec_thread_count(process_paddr);
+        return SyscallError::OUT_OF_MEMORY;
+    }
+
+    SyscallError::OK
 }
 
 fn obj_type_from_u8(v: u8) -> ObjectType {

@@ -18,7 +18,7 @@ The design follows a few core principles:
 
 ## What works today
 
-Lockjaw boots on QEMU with up to 4 cores (`-smp 4`), manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads across multiple CPUs with a Giant Kernel Lock, serves 22 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects, runs five isolated userspace processes loaded from ELF binaries, has a device manager that discovers hardware from the DTB, a UART driver, and a ramfb display driver that renders to a framebuffer via DMA.
+Lockjaw boots on QEMU with up to 4 cores (`-smp 4`), manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads across multiple CPUs with a Giant Kernel Lock, serves 23 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects, runs five isolated userspace processes loaded from ELF binaries, has a device manager that discovers hardware from the DTB, a UART driver, and a ramfb display driver that renders to a framebuffer via DMA.
 
 ```
 === Lockjaw Microkernel v0.1.0 ===

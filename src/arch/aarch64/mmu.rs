@@ -372,7 +372,9 @@ pub unsafe fn setup_guard_pages(guard_pages: &[PhysAddr]) {
 ///
 /// # Safety
 /// `ttbr0_paddr` must point to a valid L0 page table with user mappings.
-pub unsafe fn drop_to_el0_with_ttbr0(ttbr0_paddr: PhysAddr, entry_va: u64, stack_top: u64) -> ! {
+pub unsafe fn drop_to_el0_with_ttbr0(
+    ttbr0_paddr: PhysAddr, entry_va: u64, stack_top: u64, user_arg: u64,
+) -> ! {
     let ttbr0 = ttbr0_paddr.as_u64();
 
     asm!(
@@ -383,12 +385,46 @@ pub unsafe fn drop_to_el0_with_ttbr0(ttbr0_paddr: PhysAddr, entry_va: u64, stack
         "isb",                                // Sync pipeline
         "msr SP_EL0, {sp}",                  // Set user stack pointer
         "msr ELR_EL1, {pc}",                 // Set user entry point
-        "mov x0, #0",                         // SPSR = 0: EL0t mode, all DAIF clear (IRQs on)
-        "msr SPSR_EL1, x0",                  // Write Saved Program Status Register
+        "msr SPSR_EL1, xzr",                 // SPSR = 0: EL0t, IRQs on
+        // Set x0 = user_arg FIRST (before zeroing, since {arg} may
+        // be in any register that the zeroing would clobber).
+        "mov x0, {arg}",
+        // Zero x1-x30 to prevent kernel register leakage to EL0.
+        "mov x1, xzr",
+        "mov x2, xzr",
+        "mov x3, xzr",
+        "mov x4, xzr",
+        "mov x5, xzr",
+        "mov x6, xzr",
+        "mov x7, xzr",
+        "mov x8, xzr",
+        "mov x9, xzr",
+        "mov x10, xzr",
+        "mov x11, xzr",
+        "mov x12, xzr",
+        "mov x13, xzr",
+        "mov x14, xzr",
+        "mov x15, xzr",
+        "mov x16, xzr",
+        "mov x17, xzr",
+        "mov x18, xzr",
+        "mov x19, xzr",
+        "mov x20, xzr",
+        "mov x21, xzr",
+        "mov x22, xzr",
+        "mov x23, xzr",
+        "mov x24, xzr",
+        "mov x25, xzr",
+        "mov x26, xzr",
+        "mov x27, xzr",
+        "mov x28, xzr",
+        "mov x29, xzr",
+        "mov x30, xzr",
         "eret",                               // Drop to EL0
         ttbr0 = in(reg) ttbr0,
         sp = in(reg) stack_top,
         pc = in(reg) entry_va,
+        arg = in(reg) user_arg,
         options(noreturn),
     );
 }

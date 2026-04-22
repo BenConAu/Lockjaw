@@ -409,14 +409,14 @@ pub extern "C" fn kmain() -> ! {
         cap::process_obj::process_inc_thread_count(kernel_proc_page);
         let stack_a = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
         let tcb_a_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
-        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, process_paddr: kernel_proc_page, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_page)
+        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, process_paddr: kernel_proc_page, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_page)
             .expect("create tcb a");
 
         // Thread B (receiver) — kernel thread in the kernel process
         cap::process_obj::process_inc_thread_count(kernel_proc_page);
         let stack_b = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
         let tcb_b_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
-        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, process_paddr: kernel_proc_page, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_page)
+        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, process_paddr: kernel_proc_page, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_page)
             .expect("create tcb b");
 
         // Register idle/init thread (index 0 = this boot thread).
@@ -444,6 +444,7 @@ pub extern "C" fn kmain() -> ! {
             user_entry_point: 0,
             user_stack_top: 0,
             user_stack_base: 0,
+            user_arg: 0,
             wait_objects: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
             wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
             wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
@@ -496,6 +497,7 @@ pub extern "C" fn kmain() -> ! {
                     user_entry_point: 0,
                     user_stack_top: 0,
                     user_stack_base: 0,
+                    user_arg: 0,
                     wait_objects: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
                     wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
                     wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
@@ -677,6 +679,7 @@ pub extern "C" fn kmain() -> ! {
             ttbr0,
             elf_info.entry_point,
             user_stack_top,
+            0, // user_arg: 0 for init process first thread
         );
     }
 }

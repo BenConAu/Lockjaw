@@ -107,3 +107,4 @@ Without yield, a thread waiting for something would spin-wait (burning CPU) unti
 | 19 | query_pageset_phys | x0=PageSet ID, x1=page index | x1=phys addr | Query physical address of a page |
 | 20 | create_reply | x0=PageSet ID | x1=handle | Create Reply object for call/reply IPC |
 | 21 | exit | — | (never returns) | Exit current thread, free resources |
+| 22 | create_thread | x0=entry, x1=stack_top, x2=stack_base, x3=arg | — | Create thread in calling process (shares address space). VA range validated; mapping not checked (faults at EL0 if unmapped). stack_top must be 16-byte aligned. |

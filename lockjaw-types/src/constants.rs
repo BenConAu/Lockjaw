@@ -13,3 +13,7 @@ pub const USER_STACK_BASE: u64 = 0x0080_0000;
 
 /// Timer tick interval in milliseconds.
 pub const TIMER_TICK_MS: u64 = 10;
+
+/// End of user virtual address range. VAs at or above this are kernel-only.
+/// Matches the 48-bit split: user space is [0, 0x4000_0000).
+pub const USER_VA_END: u64 = 0x4000_0000;

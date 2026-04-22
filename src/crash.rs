@@ -32,6 +32,9 @@ pub fn syscall_name(num: u64) -> &'static str {
         17 => "sys_get_boot_info",
         18 => "sys_register_device_page",
         19 => "sys_query_pageset_phys",
+        20 => "sys_create_reply",
+        21 => "sys_exit",
+        22 => "sys_create_thread",
         _  => "unknown",
     }
 }

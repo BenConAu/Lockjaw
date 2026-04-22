@@ -169,6 +169,7 @@ pub fn create_process(
                 user_entry_point: entry_point,
                 user_stack_top: stack_va + (stack_ps.count() as u64) * PAGE_SIZE,
                 user_stack_base: stack_va,
+                user_arg: 0,
                 name,
             },
             tcb_page.start_addr(),
@@ -184,7 +185,7 @@ pub fn create_process(
 
 /// Kernel-mode entry for new user processes. Reads entry point and stack
 /// from TCB, then drops to EL0.
-fn process_entry() -> ! {
+pub fn process_entry() -> ! {
     unsafe {
         // GKL held + IRQs masked (inherited from thread_entry).
         // Read TCB fields under the lock, then release before eret.
@@ -193,6 +194,7 @@ fn process_entry() -> ! {
         let t = tcb.get();
         let entry = t.user_entry_point;
         let stack_top = t.user_stack_top;
+        let user_arg = t.user_arg;
         let ttbr0 = PhysAddr::new(
             crate::cap::process_obj::process_ttbr0(PhysAddr::new(t.process_paddr))
         );
@@ -201,6 +203,6 @@ fn process_entry() -> ! {
         // SPSR with IRQs enabled — no explicit unmask needed.
         crate::sched::gkl::gkl_unlock();
 
-        crate::arch::aarch64::mmu::drop_to_el0_with_ttbr0(ttbr0, entry, stack_top);
+        crate::arch::aarch64::mmu::drop_to_el0_with_ttbr0(ttbr0, entry, stack_top, user_arg);
     }
 }

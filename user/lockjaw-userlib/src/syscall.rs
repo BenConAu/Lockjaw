@@ -367,6 +367,24 @@ pub fn sys_query_pageset_phys(pageset_id: u64, page_index: u64) -> Result<u64, S
 
 /// Exit the current thread. Never returns. The kernel frees the thread's
 /// TCB, kernel stack, and handle table pages.
+/// Create a new thread in the calling process. The thread shares the
+/// caller's address space and handle table. Starts at `entry` with
+/// SP=stack_top and x0=arg.
+pub fn sys_create_thread(entry: u64, stack_top: u64, stack_base: u64, arg: u64) -> Result<(), SyscallError> {
+    let err: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") entry => err,
+            in("x1") stack_top,
+            in("x2") stack_base,
+            in("x3") arg,
+            in("x8") SYS_CREATE_THREAD,
+        );
+    }
+    if err == 0 { Ok(()) } else { Err(SyscallError(err)) }
+}
+
 pub fn sys_exit() -> ! {
     unsafe {
         asm!(

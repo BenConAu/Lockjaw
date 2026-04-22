@@ -84,6 +84,15 @@ echo "Phase 9 — Thread Exit:"
 assert_contains "\[EXIT\] Thread" "Thread cleanup ran (finish_exit)"
 assert_contains "pages freed" "Thread exit freed resources"
 
+echo "Phase 10 — Thread Creation:"
+assert_contains "\[THREAD-TEST\] child wrote marker" "sys_create_thread works (shared memory + exit)"
+
+# Fail explicitly if the thread test reported failure
+if echo "$OUTPUT" | grep -q "\[THREAD-TEST\] FAILED"; then
+    echo "  FAIL: Thread test reported failure"
+    FAILED=$((FAILED + 1))
+fi
+
 echo
 echo "=== Results: $PASSED passed, $FAILED failed ==="
 

@@ -54,6 +54,8 @@ pub struct Tcb {
     pub user_stack_top: u64,
     /// User stack base VA (lowest mapped page) for overflow detection (0 for kernel threads).
     pub user_stack_base: u64,
+    /// Argument passed to the new thread's entry point in x0 (0 for process first thread).
+    pub user_arg: u64,
     /// Objects this thread is waiting on via sys_wait_any (paddrs, 0 = unused).
     pub wait_objects: [u64; lockjaw_types::wait::MAX_WAIT_OBJECTS],
     /// Per-object thresholds for the wait (notification target values).
@@ -86,6 +88,7 @@ pub struct TcbCreateInfo {
     pub user_entry_point: u64,
     pub user_stack_base: u64,
     pub user_stack_top: u64,
+    pub user_arg: u64,
     pub name: [u8; 16],
 }
 
@@ -148,6 +151,7 @@ pub unsafe fn create_tcb(
         user_entry_point: info.user_entry_point,
         user_stack_top: info.user_stack_top,
         user_stack_base: info.user_stack_base,
+        user_arg: info.user_arg,
         wait_objects: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
         wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
         wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
