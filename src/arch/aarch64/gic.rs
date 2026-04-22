@@ -221,3 +221,4 @@ pub unsafe fn enable_spi(intid: u32) {
     let en_addr = gicd_addr() + GICD_ISENABLER + reg * 4;
     mmio_write32(en_addr, 1 << bit);
 }
+

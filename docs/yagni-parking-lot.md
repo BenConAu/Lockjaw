@@ -47,6 +47,20 @@ Note: `AP_RW_ALL` was restored in Phase 6.
 
 ---
 
+## SGI broadcast for cross-core wakeup (removed from `src/arch/aarch64/gic.rs`)
+
+**What:** `send_sgi_broadcast()` — writes ICC_SGI1_EL1 (system register encoding `S3_0_C12_C11_5`) with IRM=1 (all other PEs), INTID=0. Plus SGI 0 dispatch in `irq_dispatch()` calling `tick()`, and SGI 0 Group 1 + enable in `init_redistributor()`.
+
+**When needed:** Phase E (fine-grained locking). Currently kernel threads hold the GKL with IRQs masked (cooperative scheduling). An SGI from `unblock_thread()` wakes secondaries that spin on the GKL until the kernel thread releases, starving user threads on the boot CPU. Once kernel threads are preemptible or use fine-grained locks, SGI wakeup in `unblock_thread()` becomes safe and necessary for cross-core latency.
+
+**Key details:**
+- INTID 0 is reserved for this purpose — `irq_bind.rs` rejects userspace binding of INTID 0
+- `init_redistributor()` must add `| (1 << 0)` to GICR_IGROUPR0 and GICR_ISENABLER0
+- `irq_dispatch()` must handle INTID 0 → `scheduler::tick()`
+- `unblock_thread()` calls `gic::send_sgi_broadcast()` after marking Ready
+
+---
+
 ## SH_OUTER (removed from `src/mm/page_table.rs`)
 
 **What:** `SH_OUTER = 0b10` — Outer Shareable memory attribute.

@@ -29,9 +29,13 @@ static BINDINGS: IrqBindings = IrqBindings(UnsafeCell::new([None; MAX_BINDINGS])
 /// Bind a hardware INTID to a Notification object.
 /// When the IRQ fires, the kernel will signal this notification.
 /// Returns false if the INTID is out of range or already bound.
+/// Reserved INTIDs that cannot be bound by userspace.
+/// INTID 0 = kernel reschedule SGI (cross-core wakeup).
+const RESERVED_INTID_SGI_RESCHED: u32 = 0;
+
 pub fn bind(intid: u32, notification_paddr: PhysAddr) -> bool {
     let idx = intid as usize;
-    if idx >= MAX_BINDINGS {
+    if idx >= MAX_BINDINGS || intid == RESERVED_INTID_SGI_RESCHED {
         return false;
     }
     // SAFETY: single-core, IRQs masked — exclusive access.
