@@ -385,6 +385,25 @@ pub fn sys_create_thread(entry: u64, stack_top: u64, stack_base: u64, arg: u64) 
     if err == 0 { Ok(()) } else { Err(SyscallError(err)) }
 }
 
+/// Query the mapping state at a page-aligned user VA.
+/// Returns `(mapped, run_pages)`: whether the page is mapped and how
+/// many consecutive pages share the same mapped/unmapped state.
+pub fn sys_query_mapping(va: u64) -> Result<(bool, u64), SyscallError> {
+    let err: u64;
+    let mapped: u64;
+    let run_pages: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") va => err,
+            lateout("x1") mapped,
+            lateout("x2") run_pages,
+            in("x8") SYS_QUERY_MAPPING,
+        );
+    }
+    if err == 0 { Ok((mapped != 0, run_pages)) } else { Err(SyscallError(err)) }
+}
+
 pub fn sys_exit() -> ! {
     unsafe {
         asm!(

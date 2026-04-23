@@ -35,6 +35,7 @@ pub fn syscall_name(num: u64) -> &'static str {
         20 => "sys_create_reply",
         21 => "sys_exit",
         22 => "sys_create_thread",
+        23 => "sys_query_mapping",
         _  => "unknown",
     }
 }

@@ -66,6 +66,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_QUERY_PAGESET_PHYS => SyscallReturn::Value(sys_query_pageset_phys(ctx)),
         SYS_CREATE_REPLY => SyscallReturn::Value(sys_create_reply(ctx)),
         SYS_CREATE_THREAD => SyscallReturn::Void(sys_create_thread(ctx)),
+        SYS_QUERY_MAPPING => sys_query_mapping(ctx),
         SYS_EXIT => {
             scheduler::exit_current(); // never returns
         }
@@ -643,6 +644,23 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
     }
 
     SyscallError::OK
+}
+
+/// sys_query_mapping(va) — query the mapping state at a user VA.
+/// x0 = VA (page-aligned). Returns x0=0, x1=mapped (0/1),
+/// x2=run_pages (consecutive pages with same state).
+fn sys_query_mapping(ctx: &mut ExceptionContext) -> SyscallReturn {
+    let va = ctx.gpr[0];
+    if va >= lockjaw_types::constants::USER_VA_END || va & 0xFFF != 0 {
+        return SyscallReturn::Value(Err(SyscallError::INVALID_PARAMETER));
+    }
+    let ttbr0 = CurrentThread::ttbr0();
+    let (mapped, run_pages) = unsafe {
+        crate::arch::aarch64::vmem::query_mapping_run(ttbr0, va)
+    };
+    ctx.gpr[1] = if mapped { 1 } else { 0 };
+    ctx.gpr[2] = run_pages as u64;
+    SyscallReturn::Message(SyscallError::OK)
 }
 
 fn obj_type_from_u8(v: u8) -> ObjectType {

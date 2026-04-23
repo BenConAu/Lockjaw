@@ -256,3 +256,22 @@ pub unsafe fn map_pages_in_existing(
     }
 }
 
+/// Query the mapping state at a user VA and count consecutive pages
+/// with the same state. Uses the pure MappingQuery state machine from
+/// lockjaw-types (host-testable); the kernel only does memory reads.
+///
+/// # Safety
+/// `ttbr0_paddr` must be a valid L0 page table base.
+/// `start_va` must be page-aligned and < USER_VA_END.
+pub unsafe fn query_mapping_run(ttbr0_paddr: PhysAddr, start_va: u64) -> (bool, usize) {
+    lockjaw_types::page_table::query_mapping_run(
+        ttbr0_paddr.as_u64(),
+        start_va,
+        |pte_paddr| {
+            // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
+            let pte_va = pte_paddr + KERNEL_VA_OFFSET;
+            core::ptr::read_volatile(pte_va as *const u64)
+        },
+    )
+}
+

@@ -367,6 +367,111 @@ impl MapWalk {
 }
 
 // ---------------------------------------------------------------------------
+// Mapping query — pure index arithmetic + PTE interpretation
+// ---------------------------------------------------------------------------
+
+/// Query consecutive mapped/unmapped pages starting at `start_va`.
+/// The `read_pte` closure reads a u64 from a physical address (the
+/// kernel provides this via TTBR1 direct-map).
+///
+/// Returns `(is_mapped, run_pages)`:
+/// - `is_mapped`: whether the page at `start_va` is mapped
+/// - `run_pages`: count of consecutive pages with the same state
+///
+/// All PTE interpretation lives here (host-testable). The kernel
+/// only provides the memory-read closure.
+pub fn query_mapping_run<F: Fn(u64) -> u64>(
+    ttbr0_paddr: u64,
+    start_va: u64,
+    read_pte: F,
+) -> (bool, usize) {
+    let user_va_end = crate::constants::USER_VA_END;
+    if start_va >= user_va_end {
+        return (false, 0);
+    }
+
+    // Walk L0 → L1. User VA < 1GB, so L0[0] and L1[0].
+    let l0_raw = read_pte(ttbr0_paddr);
+    let l0 = PageTableEntry::from_raw(l0_raw);
+    if !l0.is_valid() || !l0.is_table() {
+        return (false, ((user_va_end - start_va) / 4096) as usize);
+    }
+
+    let l1_table = l0.output_addr().as_u64();
+    let l1_idx = ((start_va >> 30) & 0x1FF) as u64;
+    let l1_raw = read_pte(l1_table + l1_idx * 8);
+    let l1 = PageTableEntry::from_raw(l1_raw);
+
+    if !l1.is_valid() {
+        let end = ((l1_idx + 1) << 30).min(user_va_end);
+        return (false, ((end - start_va) / 4096) as usize);
+    }
+    if l1.is_block() {
+        let end = ((l1_idx + 1) << 30).min(user_va_end);
+        return (true, ((end - start_va) / 4096) as usize);
+    }
+
+    // L1 is a table → scan L2 entries
+    let l2_table = l1.output_addr().as_u64();
+
+    // Determine initial state
+    let first_l2_idx = (start_va >> 21) & 0x1FF;
+    let first_l2_raw = read_pte(l2_table + first_l2_idx * 8);
+    let first_l2 = PageTableEntry::from_raw(first_l2_raw);
+
+    let first_mapped = if !first_l2.is_valid() {
+        false
+    } else if first_l2.is_block() {
+        true
+    } else {
+        let l3_table = first_l2.output_addr().as_u64();
+        let l3_idx = ((start_va >> 12) & 0x1FF) as u64;
+        let l3_raw = read_pte(l3_table + l3_idx * 8);
+        PageTableEntry::from_raw(l3_raw).is_valid()
+    };
+
+    // Count consecutive pages with same state
+    let mut va = start_va;
+    let mut count: usize = 0;
+
+    while va < user_va_end {
+        let l2_idx = (va >> 21) & 0x1FF;
+        if l2_idx >= 512 { break; }
+
+        let l2_raw = read_pte(l2_table + l2_idx * 8);
+        let l2 = PageTableEntry::from_raw(l2_raw);
+
+        if !l2.is_valid() {
+            if first_mapped { break; }
+            let end = (((va >> 21) + 1) << 21).min(user_va_end);
+            count += ((end - va) / 4096) as usize;
+            va = end;
+        } else if l2.is_block() {
+            if !first_mapped { break; }
+            let end = (((va >> 21) + 1) << 21).min(user_va_end);
+            count += ((end - va) / 4096) as usize;
+            va = end;
+        } else {
+            // L3 table — scan entries
+            let l3_table = l2.output_addr().as_u64();
+            let l3_start = ((va >> 12) & 0x1FF) as u64;
+            for l3_idx in l3_start..512 {
+                if va >= user_va_end { break; }
+                let l3_raw = read_pte(l3_table + l3_idx * 8);
+                let mapped = PageTableEntry::from_raw(l3_raw).is_valid();
+                if mapped != first_mapped {
+                    return (first_mapped, count);
+                }
+                count += 1;
+                va += 4096;
+            }
+        }
+    }
+
+    (first_mapped, count)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -681,5 +786,178 @@ mod tests {
             MapWalkResult::ReachedL2 { l3_start, .. } => assert_eq!(l3_start, 3),
             _ => panic!("expected ReachedL2"),
         }
+    }
+
+    // --- query_mapping_run tests ---
+
+    extern crate std;
+
+    /// Fake page table storage for host-side testing.
+    /// Stores PTE values at fake physical addresses.
+    struct FakePT {
+        entries: std::collections::HashMap<u64, u64>,
+    }
+
+    impl FakePT {
+        fn new() -> Self {
+            Self { entries: std::collections::HashMap::new() }
+        }
+
+        fn set(&mut self, paddr: u64, raw: u64) {
+            self.entries.insert(paddr, raw);
+        }
+
+        fn read(&self, paddr: u64) -> u64 {
+            *self.entries.get(&paddr).unwrap_or(&0)
+        }
+
+        /// Set a table descriptor at table[idx] pointing to next_table.
+        fn set_table_entry(&mut self, table_paddr: u64, idx: usize, next_table_paddr: u64) {
+            let pte = PageTableEntry::new_table(PhysAddr::new(next_table_paddr));
+            self.set(table_paddr + (idx as u64) * 8, pte.raw());
+        }
+
+        /// Set a valid page entry at table[idx].
+        fn set_page_entry(&mut self, table_paddr: u64, idx: usize) {
+            let phys = 0x8000_0000 + (idx as u64) * 4096; // arbitrary phys
+            let pte = PageTableEntry::new_page(
+                PhysAddr::new(phys), MAIR_NORMAL, AP_RW_ALL, SH_INNER,
+            );
+            self.set(table_paddr + (idx as u64) * 8, pte.raw());
+        }
+    }
+
+    /// Build a minimal 4-level page table with L0→L1→L2→L3.
+    /// Maps `page_count` pages starting at VA 0x400000 (L2[2], L3[0..N]).
+    fn build_basic_pt(page_count: usize) -> (FakePT, u64) {
+        let mut pt = FakePT::new();
+        let l0: u64 = 0x1_0000;
+        let l1: u64 = 0x2_0000;
+        let l2: u64 = 0x3_0000;
+        let l3: u64 = 0x4_0000; // L3 for L2[2] (VA 0x400000..0x5FFFFF)
+
+        pt.set_table_entry(l0, 0, l1);  // L0[0] → L1
+        pt.set_table_entry(l1, 0, l2);  // L1[0] → L2
+        pt.set_table_entry(l2, 2, l3);  // L2[2] → L3 (VA 0x400000)
+
+        for i in 0..page_count {
+            pt.set_page_entry(l3, i);
+        }
+
+        (pt, l0)
+    }
+
+    #[test]
+    fn query_mapped_run_at_start() {
+        let (pt, l0) = build_basic_pt(4);
+        let (mapped, run) = query_mapping_run(l0, 0x40_0000, |a| pt.read(a));
+        assert!(mapped);
+        assert_eq!(run, 4);
+    }
+
+    #[test]
+    fn query_unmapped_before_image() {
+        let (pt, l0) = build_basic_pt(4);
+        // VA 0x200000 is in L2[1] which has no L3 table → unmapped
+        let (mapped, run) = query_mapping_run(l0, 0x20_0000, |a| pt.read(a));
+        assert!(!mapped);
+        // Should count unmapped pages from 0x200000 to 0x400000 (512 pages in L2[1])
+        assert_eq!(run, 512);
+    }
+
+    #[test]
+    fn query_unmapped_after_mapped() {
+        let (pt, l0) = build_basic_pt(4);
+        // VA 0x404000 = L2[2], L3[4] — not mapped (only 0..3 are)
+        let (mapped, run) = query_mapping_run(l0, 0x40_4000, |a| pt.read(a));
+        assert!(!mapped);
+        // 508 remaining in L3, then all remaining L2 entries through
+        // to USER_VA_END are also unmapped. Total:
+        // (USER_VA_END - 0x404000) / 4096 = (0x4000_0000 - 0x40_4000) / 4096
+        let expected = ((0x4000_0000u64 - 0x40_4000) / 4096) as usize;
+        assert_eq!(run, expected);
+    }
+
+    #[test]
+    fn query_entirely_unmapped_l0() {
+        let pt = FakePT::new(); // empty — L0[0] is invalid
+        let (mapped, run) = query_mapping_run(0x1_0000, 0x0, |a| pt.read(a));
+        assert!(!mapped);
+        // USER_VA_END / 4096 = 0x4000_0000 / 4096 = 262144 pages
+        assert_eq!(run, 262144);
+    }
+
+    #[test]
+    fn query_past_user_va_end() {
+        let pt = FakePT::new();
+        let (mapped, run) = query_mapping_run(0x1_0000, 0x4000_0000, |a| pt.read(a));
+        assert!(!mapped);
+        assert_eq!(run, 0);
+    }
+
+    #[test]
+    fn query_mapped_run_mid_l3() {
+        // Map L3 entries 10..20 (10 pages), query from entry 10
+        let mut pt = FakePT::new();
+        let l0: u64 = 0x1_0000;
+        let l1: u64 = 0x2_0000;
+        let l2: u64 = 0x3_0000;
+        let l3: u64 = 0x4_0000;
+
+        pt.set_table_entry(l0, 0, l1);
+        pt.set_table_entry(l1, 0, l2);
+        pt.set_table_entry(l2, 2, l3);
+
+        for i in 10..20 {
+            pt.set_page_entry(l3, i);
+        }
+
+        // Query at L3[10] = VA 0x400000 + 10*4096 = 0x40A000
+        let (mapped, run) = query_mapping_run(l0, 0x40_A000, |a| pt.read(a));
+        assert!(mapped);
+        assert_eq!(run, 10);
+    }
+
+    #[test]
+    fn query_unmapped_before_mapped_in_same_l3() {
+        // Map L3[10..20], query from L3[0] — should see 10 unmapped
+        let mut pt = FakePT::new();
+        let l0: u64 = 0x1_0000;
+        let l1: u64 = 0x2_0000;
+        let l2: u64 = 0x3_0000;
+        let l3: u64 = 0x4_0000;
+
+        pt.set_table_entry(l0, 0, l1);
+        pt.set_table_entry(l1, 0, l2);
+        pt.set_table_entry(l2, 2, l3);
+
+        for i in 10..20 {
+            pt.set_page_entry(l3, i);
+        }
+
+        let (mapped, run) = query_mapping_run(l0, 0x40_0000, |a| pt.read(a));
+        assert!(!mapped);
+        assert_eq!(run, 10);
+    }
+
+    #[test]
+    fn query_crossing_l2_boundary_unmapped() {
+        // L2[2] has an L3 with no valid entries, L2[3..511] entirely absent.
+        // Query from start of L2[2] — should count all unmapped pages through
+        // to USER_VA_END since nothing is mapped after this point.
+        let mut pt = FakePT::new();
+        let l0: u64 = 0x1_0000;
+        let l1: u64 = 0x2_0000;
+        let l2: u64 = 0x3_0000;
+        let l3: u64 = 0x4_0000;
+
+        pt.set_table_entry(l0, 0, l1);
+        pt.set_table_entry(l1, 0, l2);
+        pt.set_table_entry(l2, 2, l3); // L3 exists but all entries invalid
+
+        let (mapped, run) = query_mapping_run(l0, 0x40_0000, |a| pt.read(a));
+        assert!(!mapped);
+        let expected = ((0x4000_0000u64 - 0x40_0000) / 4096) as usize;
+        assert_eq!(run, expected);
     }
 }
