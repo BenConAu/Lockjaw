@@ -14,8 +14,8 @@ use lockjaw_types::fdt::parse_fdt;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// User VA where we map the DTB pages.
-const DTB_VA: u64 = 0x0010_0000;
+/// Maximum DTB pages (must match kernel cap in main.rs).
+const DTB_MAX_PAGES: usize = 16;
 
 
 /// UART0 physical address — reserved for kernel debug output.
@@ -55,25 +55,23 @@ pub extern "C" fn _start() -> ! {
         Ok(id) => id,
         Err(_) => { puts("devmgr: get_boot_info FAILED\n"); halt(); }
     };
-    if !sys_map_pages(dtb_ps, DTB_VA, 0).is_ok() {
+    let dtb_va = VMEM.alloc(DTB_MAX_PAGES).expect("VA exhausted for DTB");
+    if !sys_map_pages(dtb_ps, dtb_va, 0).is_ok() {
         puts("devmgr: DTB map FAILED\n");
         halt();
     }
     puts("devmgr: DTB mapped\n");
 
     // Step 2: Parse the DTB to discover devices.
-    // Compute actual DTB content size from header (shared logic in
-    // lockjaw_types::fdt::dtb_content_size). The kernel mapped exactly
-    // this many pages worth of content.
     let dtb_content_end = {
-        let header = unsafe { core::slice::from_raw_parts(DTB_VA as *const u8, 40) };
+        let header = unsafe { core::slice::from_raw_parts(dtb_va as *const u8, 40) };
         match lockjaw_types::fdt::dtb_content_size(header) {
             Ok(size) => size,
             Err(_) => { puts("devmgr: DTB header invalid\n"); halt(); }
         }
     };
     let dtb_slice = unsafe {
-        core::slice::from_raw_parts(DTB_VA as *const u8, dtb_content_end)
+        core::slice::from_raw_parts(dtb_va as *const u8, dtb_content_end)
     };
     let mut devices = match parse_fdt(dtb_slice) {
         Ok(d) => d,

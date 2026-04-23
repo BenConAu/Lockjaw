@@ -50,49 +50,34 @@ const FOURCC_XRGB8888: u32 = 0x34325258;
 // User VA layout
 // ---------------------------------------------------------------------------
 
-/// fw_cfg MMIO page (1 page)
-const FWCFG_VA: u64 = 0x0020_0000;
-
-/// Framebuffer VA (must be L2-aligned for large mapping).
-/// Chosen above the driver's text (0x400000) and data (up to ~0x440000)
-/// segments and above the user stack region (~0x800000) to avoid overlap.
-const FB_VA: u64 = 0x1000_0000;
-
-/// One-page scratch region for the FWCfgDmaAccess header + the 28-byte
-/// RAMFBConfig it references. Lives in guest RAM so QEMU can read both.
-const DMA_VA: u64 = 0x0030_0000;
 
 // ---------------------------------------------------------------------------
 // fw_cfg MMIO helpers
 // ---------------------------------------------------------------------------
 
-unsafe fn fwcfg_select(selector: u16) {
-    // Selector register is 16-bit big-endian
-    ptr::write_volatile((FWCFG_VA + FWCFG_SEL) as *mut u16, selector.to_be());
+unsafe fn fwcfg_select(base: u64, selector: u16) {
+    ptr::write_volatile((base + FWCFG_SEL) as *mut u16, selector.to_be());
 }
 
-unsafe fn fwcfg_read8() -> u8 {
-    ptr::read_volatile((FWCFG_VA + FWCFG_DATA) as *const u8)
+unsafe fn fwcfg_read8(base: u64) -> u8 {
+    ptr::read_volatile((base + FWCFG_DATA) as *const u8)
 }
 
-/// Read N bytes from the currently selected fw_cfg item.
-unsafe fn fwcfg_read_bytes(buf: &mut [u8]) {
+unsafe fn fwcfg_read_bytes(base: u64, buf: &mut [u8]) {
     for b in buf.iter_mut() {
-        *b = fwcfg_read8();
+        *b = fwcfg_read8(base);
     }
 }
 
-/// Read a big-endian u32 from the current fw_cfg item.
-unsafe fn fwcfg_read_be32() -> u32 {
+unsafe fn fwcfg_read_be32(base: u64) -> u32 {
     let mut buf = [0u8; 4];
-    fwcfg_read_bytes(&mut buf);
+    fwcfg_read_bytes(base, &mut buf);
     u32::from_be_bytes(buf)
 }
 
-/// Read a big-endian u16 from the current fw_cfg item.
-unsafe fn fwcfg_read_be16() -> u16 {
+unsafe fn fwcfg_read_be16(base: u64) -> u16 {
     let mut buf = [0u8; 2];
-    fwcfg_read_bytes(&mut buf);
+    fwcfg_read_bytes(base, &mut buf);
     u16::from_be_bytes(buf)
 }
 
@@ -102,21 +87,18 @@ unsafe fn fwcfg_read_be16() -> u16 {
 
 /// Find the selector for a named fw_cfg file by enumerating the directory.
 /// Returns the selector value, or 0 if not found.
-unsafe fn fwcfg_find_file(name: &[u8]) -> u16 {
-    fwcfg_select(FW_CFG_FILE_DIR);
+unsafe fn fwcfg_find_file(base: u64, name: &[u8]) -> u16 {
+    fwcfg_select(base, FW_CFG_FILE_DIR);
 
-    // Directory header: 4-byte big-endian count
-    let count = fwcfg_read_be32();
+    let count = fwcfg_read_be32(base);
 
-    // Each entry: 4 bytes size + 2 bytes selector + 2 bytes reserved + 56 bytes name
     for _ in 0..count {
-        let _size = fwcfg_read_be32();
-        let selector = fwcfg_read_be16();
-        let _reserved = fwcfg_read_be16();
+        let _size = fwcfg_read_be32(base);
+        let selector = fwcfg_read_be16(base);
+        let _reserved = fwcfg_read_be16(base);
 
-        // Read the 56-byte name
         let mut entry_name = [0u8; 56];
-        fwcfg_read_bytes(&mut entry_name);
+        fwcfg_read_bytes(base, &mut entry_name);
 
         // Compare (NUL-terminated)
         let entry_len = entry_name.iter().position(|&b| b == 0).unwrap_or(56);
@@ -164,14 +146,15 @@ pub extern "C" fn _start() -> ! {
     puts("ramfb: claimed fw_cfg\n");
 
     // Map fw_cfg MMIO page
-    if !sys_map_pages(fwcfg_pageset, FWCFG_VA, MAP_FLAG_DEVICE).is_ok() {
+    let fwcfg_va = VMEM.alloc(1).expect("VA exhausted for fw_cfg");
+    if !sys_map_pages(fwcfg_pageset, fwcfg_va, MAP_FLAG_DEVICE).is_ok() {
         puts("ramfb: map fw_cfg FAILED\n");
         halt();
     }
     puts("ramfb: fw_cfg mapped\n");
 
     // Find the "etc/ramfb" selector
-    let ramfb_sel = unsafe { fwcfg_find_file(b"etc/ramfb") };
+    let ramfb_sel = unsafe { fwcfg_find_file(fwcfg_va, b"etc/ramfb") };
     if ramfb_sel == 0 {
         puts("ramfb: etc/ramfb not found in fw_cfg\n");
         halt();
@@ -186,7 +169,8 @@ pub extern "C" fn _start() -> ! {
     puts("ramfb: fb allocated\n");
 
     // Map framebuffer into our address space (normal memory, not device)
-    if !sys_map_pages(fb_ps, FB_VA, 0).is_ok() {
+    let fb_va = VMEM.alloc(FB_PAGES as usize).expect("VA exhausted for framebuffer");
+    if !sys_map_pages(fb_ps, fb_va, 0).is_ok() {
         puts("ramfb: map fb FAILED\n");
         halt();
     }
@@ -202,7 +186,7 @@ pub extern "C" fn _start() -> ! {
 
     // Fill framebuffer with a test pattern: vertical color gradient
     unsafe {
-        let fb = FB_VA as *mut u8;
+        let fb = fb_va as *mut u8;
         for y in 0..FB_HEIGHT {
             for x in 0..FB_WIDTH {
                 let offset = (y * FB_STRIDE + x * FB_BPP) as usize;
@@ -226,7 +210,8 @@ pub extern "C" fn _start() -> ! {
         Ok(id) => id,
         Err(_) => { puts("ramfb: alloc dma FAILED\n"); halt(); }
     };
-    if !sys_map_pages(dma_ps, DMA_VA, 0).is_ok() {
+    let dma_va = VMEM.alloc(1).expect("VA exhausted for DMA");
+    if !sys_map_pages(dma_ps, dma_va, 0).is_ok() {
         puts("ramfb: map dma FAILED\n");
         halt();
     }
@@ -238,8 +223,8 @@ pub extern "C" fn _start() -> ! {
     // Layout inside the DMA page:
     //   [0..16]   FWCfgDmaAccess header (control, length, address — all BE)
     //   [16..44]  RAMFBConfig  (addr, fourcc, flags, width, height, stride — all BE)
-    let header_va = DMA_VA as *mut u8;
-    let config_va = (DMA_VA + 16) as *mut u8;
+    let header_va = dma_va as *mut u8;
+    let config_va = (dma_va + 16) as *mut u8;
     let config_phys = dma_phys + 16;
 
     unsafe {
@@ -274,7 +259,7 @@ pub extern "C" fn _start() -> ! {
 
         // Trigger DMA: write the guest-physical address of the header,
         // big-endian, to the 64-bit DMA address register.
-        ptr::write_volatile((FWCFG_VA + FWCFG_DMA) as *mut u64, dma_phys.to_be());
+        ptr::write_volatile((fwcfg_va + FWCFG_DMA) as *mut u64, dma_phys.to_be());
 
         // Poll the control field. QEMU clears the READ/SKIP/SELECT/WRITE
         // bits when the transfer finishes; ERROR (bit 0) means failure.

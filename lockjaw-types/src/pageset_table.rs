@@ -5,7 +5,7 @@
 /// what to do. Tests can create instances and verify behavior directly.
 
 /// Maximum number of PageSets tracked in a table.
-pub const MAX_PAGESETS: usize = 32;
+pub const MAX_PAGESETS: usize = 128;
 
 /// Maximum data pages per PageSet. Each PageSet uses one additional page
 /// as a header storing the physical addresses of all data pages. The header

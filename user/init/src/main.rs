@@ -192,10 +192,11 @@ pub extern "C" fn _start() -> ! {
             putc(b'\n');
 
             // Test sys_map_pages
-            if sys_map_pages(test_ps, 0x0060_0000, 0).is_ok() {
+            let test_va = VMEM.alloc(1).expect("VA exhausted for test page");
+            if sys_map_pages(test_ps, test_va, 0).is_ok() {
                 puts("init: map_pages OK\n");
                 unsafe {
-                    let ptr = 0x0060_0000 as *mut u64;
+                    let ptr = test_va as *mut u64;
                     core::ptr::write_volatile(ptr, 0xDEAD_CAFE);
                     let readback = core::ptr::read_volatile(ptr);
                     if readback == 0xDEAD_CAFE {
@@ -237,7 +238,7 @@ pub extern "C" fn _start() -> ! {
         Ok(id) => id,
         Err(_) => { puts("init: get_boot_info FAILED\n"); loop { sys_yield(); } }
     };
-    let dtb_va: u64 = 0x0010_0000;
+    let dtb_va = VMEM.alloc(16).expect("VA exhausted for DTB"); // 16 pages max
     if sys_map_pages(dtb_ps, dtb_va, 0).is_ok() {
         let magic = unsafe {
             let p = dtb_va as *const u8;
@@ -271,10 +272,17 @@ pub extern "C" fn _start() -> ! {
     let ramfb_boot_ep = alloc_endpoint("ramfb boot");
 
     // Spawn child processes.
-    spawn_elf(HELLO_ELF, "hello", 0x0070_0000, 0x00A0_0000, scratch_ps, hello_boot_ep, 1);
-    spawn_elf(DEVMGR_ELF, "device-manager", 0x0072_0000, 0x00E0_0000, scratch_ps, devmgr_boot_ep, 8);
-    spawn_elf(UART_ELF, "uart-driver", 0x0071_0000, 0x00C0_0000, scratch_ps, uart_boot_ep, 4);
-    spawn_elf(RAMFB_ELF, "ramfb-driver", 0x0073_0000, 0x0100_0000, scratch_ps, ramfb_boot_ep, 4);
+    // Allocate temp VAs for ELF loading. Each spawn needs:
+    // - 1 page for the mapping array
+    // - N pages for temporary segment mappings (generous: 128 pages = 512KB)
+    // These are reused across spawns since spawn_elf completes before returning.
+    let map_array_va = VMEM.alloc(1).expect("VA exhausted for map array");
+    let temp_base_va = VMEM.alloc(128).expect("VA exhausted for temp pages");
+
+    spawn_elf(HELLO_ELF, "hello", map_array_va, temp_base_va, scratch_ps, hello_boot_ep, 1);
+    spawn_elf(DEVMGR_ELF, "device-manager", map_array_va, temp_base_va, scratch_ps, devmgr_boot_ep, 8);
+    spawn_elf(UART_ELF, "uart-driver", map_array_va, temp_base_va, scratch_ps, uart_boot_ep, 4);
+    spawn_elf(RAMFB_ELF, "ramfb-driver", map_array_va, temp_base_va, scratch_ps, ramfb_boot_ep, 4);
 
     // Bootstrap hello: export a test notification into its handle table.
     puts("init: waiting for hello bootstrap...\n");

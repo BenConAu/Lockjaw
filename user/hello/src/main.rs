@@ -7,7 +7,7 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
-use lockjaw_userlib::{puts, putc, sys_exit, sys_call_ret4, sys_alloc_pages, sys_map_pages, sys_create_reply, sys_create_thread, sys_yield};
+use lockjaw_userlib::{puts, putc, sys_exit, sys_call_ret4, sys_alloc_pages, sys_map_pages, sys_create_reply, sys_create_thread, sys_yield, VMEM};
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -40,7 +40,7 @@ pub extern "C" fn _start() -> ! {
 
     // --- Thread creation smoke test ---
     // Allocate a shared page for the child thread to write a marker.
-    let shared_va: u64 = 0x0050_0000;
+    let shared_va = VMEM.alloc(1).expect("VA exhausted for shared page");
     let shared_ps = match sys_alloc_pages(1) {
         Ok(id) => id,
         Err(_) => { puts("[THREAD-TEST] alloc FAILED\n"); sys_exit(); }
@@ -53,7 +53,7 @@ pub extern "C" fn _start() -> ! {
     unsafe { core::ptr::write_volatile(shared_va as *mut u64, 0); }
 
     // Allocate a stack page for the child thread
-    let thread_stack_va: u64 = 0x0060_0000;
+    let thread_stack_va = VMEM.alloc(1).expect("VA exhausted for thread stack");
     let stack_ps = match sys_alloc_pages(1) {
         Ok(id) => id,
         Err(_) => { puts("[THREAD-TEST] stack alloc FAILED\n"); sys_exit(); }

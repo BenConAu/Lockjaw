@@ -26,37 +26,34 @@ const UARTIMSC_RXIM: u32 = 1 << 4; // RX interrupt mask
 // Constants
 // ---------------------------------------------------------------------------
 
-/// User VA where we map the UART MMIO page. L2[1] (0x0020_0000) avoids
-/// conflict with L2[4] (kernel device MMIO block) and L2[2] (user code).
-const UART_VA: u64 = 0x0020_0000;
 
 // ---------------------------------------------------------------------------
 // UART MMIO helpers
 // ---------------------------------------------------------------------------
 
-unsafe fn uart_read32(offset: u64) -> u32 {
-    ptr::read_volatile((UART_VA + offset) as *const u32)
+unsafe fn uart_read32(base: u64, offset: u64) -> u32 {
+    ptr::read_volatile((base + offset) as *const u32)
 }
 
-unsafe fn uart_write32(offset: u64, val: u32) {
-    ptr::write_volatile((UART_VA + offset) as *mut u32, val);
+unsafe fn uart_write32(base: u64, offset: u64, val: u32) {
+    ptr::write_volatile((base + offset) as *mut u32, val);
 }
 
 /// Write a byte to the UART, spinning while TX FIFO is full.
-unsafe fn uart_putc(c: u8) {
-    while uart_read32(UARTFR) & UARTFR_TXFF != 0 {
+unsafe fn uart_putc(base: u64, c: u8) {
+    while uart_read32(base, UARTFR) & UARTFR_TXFF != 0 {
         core::hint::spin_loop();
     }
-    uart_write32(UARTDR, c as u32);
+    uart_write32(base, UARTDR, c as u32);
 }
 
 /// Write a string to the UART, converting \n to \r\n.
-unsafe fn uart_puts(s: &str) {
+unsafe fn uart_puts(base: u64, s: &str) {
     for b in s.bytes() {
         if b == b'\n' {
-            uart_putc(b'\r');
+            uart_putc(base, b'\r');
         }
-        uart_putc(b);
+        uart_putc(base, b);
     }
 }
 
@@ -98,8 +95,9 @@ pub extern "C" fn _start() -> ! {
     }
     puts("uart-driver: claimed PL011\n");
 
-    // Step 1: Map UART MMIO page into our address space (via PageSet ID)
-    if !sys_map_pages(mmio_pageset, UART_VA, MAP_FLAG_DEVICE).is_ok() {
+    // Step 1: Map UART MMIO page into our address space
+    let uart_va = VMEM.alloc(1).expect("VA exhausted for UART MMIO");
+    if !sys_map_pages(mmio_pageset, uart_va, MAP_FLAG_DEVICE).is_ok() {
         puts("uart-driver: map MMIO FAILED\n");
         loop { unsafe { asm!("wfi"); } }
     }
@@ -125,12 +123,12 @@ pub extern "C" fn _start() -> ! {
 
     // Step 4: Enable PL011 RX interrupt via mapped MMIO
     unsafe {
-        let imsc = uart_read32(UARTIMSC);
-        uart_write32(UARTIMSC, imsc | UARTIMSC_RXIM);
+        let imsc = uart_read32(uart_va, UARTIMSC);
+        uart_write32(uart_va, UARTIMSC, imsc | UARTIMSC_RXIM);
     }
 
     // Print banner via UART1 (our own mapped UART)
-    unsafe { uart_puts("uart-driver: UART1 active\n"); }
+    unsafe { uart_puts(uart_va, "uart-driver: UART1 active\n"); }
     // Also confirm via kernel UART0
     puts("uart-driver: server ready\n");
 
@@ -153,7 +151,7 @@ pub extern "C" fn _start() -> ! {
         // Bit 0: endpoint ready — IPC TX request
         if mask & 1 != 0 {
             if let Ok(ch) = sys_receive(uart_srv_ep) {
-                unsafe { uart_putc(ch as u8); }
+                unsafe { uart_putc(uart_va, ch as u8); }
             }
             sys_reply(0, 0, 0, 0);
         }
@@ -162,13 +160,13 @@ pub extern "C" fn _start() -> ! {
         if mask & 2 != 0 {
             unsafe {
                 // Drain the RX FIFO
-                while uart_read32(UARTFR) & UARTFR_RXFE == 0 {
-                    let ch = (uart_read32(UARTDR) & 0xFF) as u8;
+                while uart_read32(uart_va, UARTFR) & UARTFR_RXFE == 0 {
+                    let ch = (uart_read32(uart_va, UARTDR) & 0xFF) as u8;
                     // Echo the character back
-                    uart_putc(ch);
+                    uart_putc(uart_va, ch);
                     // Echo newline as \r\n
                     if ch == b'\r' {
-                        uart_putc(b'\n');
+                        uart_putc(uart_va, b'\n');
                     }
                 }
             }
