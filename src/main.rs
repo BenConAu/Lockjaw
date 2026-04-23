@@ -148,15 +148,26 @@ pub extern "C" fn kmain() -> ! {
 
     // Register DTB pages as a PageSet so userspace can map them normally.
     // This avoids the MAIR_DEVICE aliasing problem (DTB is normal RAM, not MMIO).
+    // Compute page count from the DTB header's totalsize field instead of
+    // hardcoding — the DTB size varies with -smp and -device flags.
     {
-        let dtb_pages = [
-            mm::addr::PhysAddr::new(dtb_paddr),
-            mm::addr::PhysAddr::new(dtb_paddr + mm::addr::PAGE_SIZE),
-        ];
-        let dtb_ps_id = cap::pageset_table::register_existing(2, &dtb_pages)
+        let dtb_content_end = unsafe {
+            // SAFETY: kernel VA, DTB header validated above
+            let h = (dtb_paddr + mm::addr::KERNEL_VA_OFFSET) as *const u8;
+            let header = core::slice::from_raw_parts(h, 40);
+            lockjaw_types::fdt::dtb_content_size(header)
+                .expect("DTB header invalid") as u64
+        };
+        let dtb_page_count = ((dtb_content_end + mm::addr::PAGE_SIZE - 1) / mm::addr::PAGE_SIZE) as usize;
+        assert!(dtb_page_count <= 16, "DTB content too large: {} pages", dtb_page_count);
+        let mut dtb_pages = [mm::addr::PhysAddr::new(0); 16];
+        for i in 0..dtb_page_count {
+            dtb_pages[i] = mm::addr::PhysAddr::new(dtb_paddr + (i as u64) * mm::addr::PAGE_SIZE);
+        }
+        let dtb_ps_id = cap::pageset_table::register_existing(dtb_page_count, &dtb_pages[..dtb_page_count])
             .expect("DTB PageSet registration failed");
         DTB_PAGESET_ID.set(dtb_ps_id);
-        kprintln!("DTB PageSet registered: id={}", dtb_ps_id);
+        kprintln!("DTB PageSet registered: id={}, {} pages ({} bytes content)", dtb_ps_id, dtb_page_count, dtb_content_end);
     }
 
     // Set up guard pages (unmapped) for all per-CPU stacks and init canary

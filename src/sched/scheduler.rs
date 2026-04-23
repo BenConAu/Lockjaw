@@ -358,6 +358,11 @@ pub fn unblock_thread(tcb_paddr: PhysAddr) {
 pub fn exit_current() -> ! {
     // SAFETY: GKL held — exclusive access to scheduler state.
     unsafe {
+        // Clean up any previous exit on this CPU before proceeding.
+        // This handles the case where two threads exit on the same CPU
+        // without an intervening schedule() (which normally calls finish_exit).
+        finish_exit();
+
         let cpu_id = crate::percpu::cpu_id() as usize;
         // Invariant: this CPU's pending exit slot must be empty
         assert!(

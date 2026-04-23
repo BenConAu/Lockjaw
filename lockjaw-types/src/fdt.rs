@@ -38,6 +38,25 @@ pub struct FdtDevices {
     pub count: usize,
 }
 
+/// Compute the actual content size of a DTB from its header.
+/// Returns `off_dt_strings + size_dt_strings` — the end of the last
+/// content block. QEMU pads `totalsize` to 1MB, so this is the
+/// reliable way to determine how much of the DTB is real content.
+///
+/// `header` must be at least 40 bytes (the FDT header size).
+pub fn dtb_content_size(header: &[u8]) -> Result<usize, FdtError> {
+    if header.len() < 40 {
+        return Err(FdtError::TooSmall);
+    }
+    let magic = read_u32_be(header, 0);
+    if magic != FDT_MAGIC {
+        return Err(FdtError::BadMagic);
+    }
+    let off_dt_strings = read_u32_be(header, 12) as usize;
+    let size_dt_strings = read_u32_be(header, 32) as usize;
+    Ok(off_dt_strings + size_dt_strings)
+}
+
 /// Parse an FDT blob and extract device information.
 /// Returns a list of devices with their compatible hashes, MMIO addresses,
 /// and interrupt IDs.
@@ -196,6 +215,9 @@ fn align4(pos: usize) -> usize {
 /// Read a null-terminated string starting at `offset`. Returns the byte slice
 /// up to (not including) the null terminator.
 fn read_string(data: &[u8], offset: usize) -> &[u8] {
+    if offset >= data.len() {
+        return &[];
+    }
     let mut end = offset;
     while end < data.len() && data[end] != 0 {
         end += 1;

@@ -17,8 +17,6 @@ use lockjaw_types::fdt::parse_fdt;
 /// User VA where we map the DTB pages.
 const DTB_VA: u64 = 0x0010_0000;
 
-/// Number of DTB pages to map (actual content is ~8KB).
-const DTB_PAGES: u64 = 2;
 
 /// UART0 physical address — reserved for kernel debug output.
 const KERNEL_UART0_PHYS: u64 = 0x0900_0000;
@@ -64,8 +62,18 @@ pub extern "C" fn _start() -> ! {
     puts("devmgr: DTB mapped\n");
 
     // Step 2: Parse the DTB to discover devices.
+    // Compute actual DTB content size from header (shared logic in
+    // lockjaw_types::fdt::dtb_content_size). The kernel mapped exactly
+    // this many pages worth of content.
+    let dtb_content_end = {
+        let header = unsafe { core::slice::from_raw_parts(DTB_VA as *const u8, 40) };
+        match lockjaw_types::fdt::dtb_content_size(header) {
+            Ok(size) => size,
+            Err(_) => { puts("devmgr: DTB header invalid\n"); halt(); }
+        }
+    };
     let dtb_slice = unsafe {
-        core::slice::from_raw_parts(DTB_VA as *const u8, (DTB_PAGES * PAGE_SIZE) as usize)
+        core::slice::from_raw_parts(DTB_VA as *const u8, dtb_content_end)
     };
     let mut devices = match parse_fdt(dtb_slice) {
         Ok(d) => d,
