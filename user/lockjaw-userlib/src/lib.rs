@@ -3,6 +3,7 @@
 pub mod syscall;
 pub mod print;
 pub mod process;
+pub mod virtual_memory;
 
 // Re-export the ELF parser from lockjaw-types (no duplicate).
 pub use lockjaw_types::elf;
@@ -17,6 +18,7 @@ pub use lockjaw_types::device::{PL011_HASH, FW_CFG_HASH, CMD_CLAIM_DEVICE};
 pub use syscall::*;
 pub use print::*;
 pub use process::{ProcessMapping, FLAG_EXECUTABLE};
+pub use virtual_memory::VMEM;
 
 /// Zero a page at the given virtual address.
 /// Unsafe: caller must ensure the VA points to a valid mapped page.
