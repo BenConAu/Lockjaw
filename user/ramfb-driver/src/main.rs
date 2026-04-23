@@ -63,18 +63,21 @@ unsafe fn fwcfg_read8(base: u64) -> u8 {
     ptr::read_volatile((base + FWCFG_DATA) as *const u8)
 }
 
+/// Read N bytes from the currently selected fw_cfg item.
 unsafe fn fwcfg_read_bytes(base: u64, buf: &mut [u8]) {
     for b in buf.iter_mut() {
         *b = fwcfg_read8(base);
     }
 }
 
+/// Read a big-endian u32 from the current fw_cfg item.
 unsafe fn fwcfg_read_be32(base: u64) -> u32 {
     let mut buf = [0u8; 4];
     fwcfg_read_bytes(base, &mut buf);
     u32::from_be_bytes(buf)
 }
 
+/// Read a big-endian u16 from the current fw_cfg item.
 unsafe fn fwcfg_read_be16(base: u64) -> u16 {
     let mut buf = [0u8; 2];
     fwcfg_read_bytes(base, &mut buf);
@@ -90,8 +93,10 @@ unsafe fn fwcfg_read_be16(base: u64) -> u16 {
 unsafe fn fwcfg_find_file(base: u64, name: &[u8]) -> u16 {
     fwcfg_select(base, FW_CFG_FILE_DIR);
 
+    // Directory header: 4-byte big-endian count
     let count = fwcfg_read_be32(base);
 
+    // Each entry: 4 bytes size + 2 bytes selector + 2 bytes reserved + 56 bytes name
     for _ in 0..count {
         let _size = fwcfg_read_be32(base);
         let selector = fwcfg_read_be16(base);

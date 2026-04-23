@@ -48,6 +48,8 @@ static ALLOCATOR: FrameAllocator = FrameAllocator::new();
 ///   - [kernel_start, kernel_end)  — kernel image
 ///   - [stacks_start, stacks_end)  — per-CPU guard pages + stacks
 ///
+/// Must be called exactly once during boot.
+///
 /// # Safety
 /// All addresses must be valid physical addresses from linker symbols.
 pub unsafe fn init_with_gap(

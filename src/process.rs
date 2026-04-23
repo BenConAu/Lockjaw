@@ -139,6 +139,7 @@ pub fn create_process(
     crate::cap::process_obj::process_inc_thread_count(proc_page.start_addr());
 
     // Copy a handle from the parent's table into the child's table.
+    // This is the simplest form of capability transfer at process creation.
     if parent_handle_to_copy != u64::MAX {
         let parent_ht = CurrentThread::handle_table();
         let entry = parent_ht.lookup_any(

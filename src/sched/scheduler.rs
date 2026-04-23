@@ -46,6 +46,9 @@ struct PendingExit {
 /// Per-CPU cleanup slots for exited threads. Each CPU has its own slot
 /// so two CPUs can have independent pending exits. A CPU only drains
 /// its own slot in finish_exit() — no cross-CPU cleanup.
+/// Invariant: a CPU's slot must be None before exit_current() stores
+/// a new value. finish_exit() drains the slot at the start of every
+/// schedule() call.
 struct PendingExitSlots(UnsafeCell<[Option<PendingExit>; MAX_CPUS]>);
 /// SAFETY: GKL held during all access. Per-CPU indexing prevents
 /// cross-CPU slot corruption even without the lock.
@@ -303,9 +306,16 @@ pub unsafe fn scoped_mut<'a, T>(ptr: *mut T, _token: &'a mut BlockToken) -> &'a 
 pub fn block_current(_token: BlockToken) {
     let cpu_id = crate::percpu::cpu_id() as usize;
     // SAFETY: GKL held — exclusive access to scheduler state.
+    // We re-derive references from the raw pointer after each context
+    // switch because schedule() invalidates prior references (the
+    // context switch may have mutated scheduler state on another path).
     unsafe {
         (&mut *SCHEDULER.state_ptr()).block_current(cpu_id).expect("block_current: not Running");
     }
+    // schedule() performs context_switch — when we resume here, another
+    // thread ran and eventually switched back to us. If we're Running
+    // again, an unblock_thread + schedule decided to pick us, so we
+    // return to the caller. Otherwise we loop and wait again.
     loop {
         unsafe { schedule(SchedReason::Block); }
         unsafe {
@@ -567,6 +577,9 @@ unsafe fn schedule(reason: SchedReason) {
     check_thread_canary(old_tcb.get());
 
     // Swap TTBR0 if the new thread is in a different process.
+    // TTBR0 is irrelevant during kernel execution (all kernel code
+    // accessed via TTBR1), so swapping before context_switch is safe —
+    // when the new thread eventually erets to EL0, TTBR0 is already set.
     // Same-process switches skip the TLB flush (threads share address space).
     let old_process = old_tcb.get().process_paddr;
     let new_process = new_tcb.get().process_paddr;

@@ -63,6 +63,9 @@ pub extern "C" fn _start() -> ! {
     puts("devmgr: DTB mapped\n");
 
     // Step 2: Parse the DTB to discover devices.
+    // Read only the 40-byte FDT header first to compute the actual content
+    // size (off_dt_strings + size_dt_strings). The kernel mapped exactly
+    // this many pages worth of content via dtb_content_size().
     let dtb_content_end = {
         let header = unsafe { core::slice::from_raw_parts(dtb_va as *const u8, 40) };
         match lockjaw_types::fdt::dtb_content_size(header) {

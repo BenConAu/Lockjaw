@@ -365,8 +365,6 @@ pub fn sys_query_pageset_phys(pageset_id: u64, page_index: u64) -> Result<u64, S
     if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
 }
 
-/// Exit the current thread. Never returns. The kernel frees the thread's
-/// TCB, kernel stack, and handle table pages.
 /// Create a new thread in the calling process. The thread shares the
 /// caller's address space and handle table. Starts at `entry` with
 /// SP=stack_top and x0=arg.
@@ -404,6 +402,8 @@ pub fn sys_query_mapping(va: u64) -> Result<(bool, u64), SyscallError> {
     if err == 0 { Ok((mapped != 0, run_pages)) } else { Err(SyscallError(err)) }
 }
 
+/// Exit the current thread. Never returns. The kernel frees the thread's
+/// TCB, kernel stack, and handle table pages.
 pub fn sys_exit() -> ! {
     unsafe {
         asm!(
