@@ -33,13 +33,22 @@ pub struct ModeInfo {
 /// Display DDI error codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayError {
+    /// Mode index out of range.
     InvalidMode,
+    /// Session ID does not match the active session.
     InvalidSession,
+    /// Buffer handle not recognized.
     InvalidBuffer,
+    /// Buffer or resource allocation failed.
     AllocFailed,
+    /// Operation requires a mode to be set first.
     NotConfigured,
+    /// Another session is already active.
     SessionBusy,
+    /// Unrecognized command tag.
     UnknownCommand,
+    /// IPC transport failure (bad endpoint, server unreachable, etc.)
+    IpcFailed,
 }
 
 impl DisplayError {
@@ -53,6 +62,7 @@ impl DisplayError {
             Self::NotConfigured => 5,
             Self::SessionBusy => 6,
             Self::UnknownCommand => 7,
+            Self::IpcFailed => 8,
         }
     }
 
@@ -67,6 +77,7 @@ impl DisplayError {
             5 => Some(Self::NotConfigured),
             6 => Some(Self::SessionBusy),
             7 => Some(Self::UnknownCommand),
+            8 => Some(Self::IpcFailed),
             _ => None,
         }
     }
@@ -108,12 +119,19 @@ const CMD_RELEASE_SESSION: u64 = 7;
 /// Display DDI request (client -> driver).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayRequest {
+    /// Query the number of supported display modes.
     ListModes,
+    /// Get mode details by index (0 = preferred).
     GetMode { index: u32 },
+    /// Create a display session.
     CreateSession,
+    /// Allocate a scanout-compatible buffer.
     AllocBuffer { session: u32, width: u32, height: u32, format: u32 },
+    /// Full modeset: set resolution and start scanning a buffer.
     SetMode { session: u32, mode_index: u32, buffer: u32 },
+    /// Page flip: change the displayed buffer without a modeset.
     SetScanout { session: u32, buffer: u32 },
+    /// Release the display session.
     ReleaseSession { session: u32 },
 }
 
@@ -194,11 +212,17 @@ impl DisplayRequest {
 /// msg[0] = 0 on success, nonzero error code on failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayResponse {
+    /// Reply to ListModes: number of supported modes.
     ModeCount(u32),
+    /// Reply to GetMode: mode descriptor.
     Mode(ModeInfo),
+    /// Reply to CreateSession: session ID.
     Session { id: u32 },
+    /// Reply to AllocBuffer: exported handle, stride, and size.
     Buffer { handle: u32, stride: u32, size: u32 },
+    /// Generic success (SetMode, SetScanout, ReleaseSession).
     Ok,
+    /// Error response for any command.
     Err(DisplayError),
 }
 
@@ -310,6 +334,7 @@ mod tests {
             DisplayError::NotConfigured,
             DisplayError::SessionBusy,
             DisplayError::UnknownCommand,
+            DisplayError::IpcFailed,
         ];
         for e in errors {
             let code = e.code();
@@ -338,6 +363,7 @@ mod tests {
             DisplayError::NotConfigured,
             DisplayError::SessionBusy,
             DisplayError::UnknownCommand,
+            DisplayError::IpcFailed,
         ];
         for i in 0..errors.len() {
             for j in (i + 1)..errors.len() {

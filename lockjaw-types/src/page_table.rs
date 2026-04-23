@@ -194,19 +194,23 @@ pub enum WalkResult {
 /// Pure page table walk state machine. The kernel feeds raw PTE values
 /// read from memory; this module handles all PTE interpretation.
 ///
-/// Usage:
-/// ```ignore
-/// let (mut walk, mut result) = PageTableWalk::start(ttbr0_paddr, user_va);
-/// loop {
-///     match result {
-///         WalkResult::Continue(pte_paddr) => {
-///             let pte_raw = read_phys(pte_paddr); // kernel reads via TTBR1
-///             result = walk.step(pte_raw);
-///         }
-///         WalkResult::Done(phys_addr) => return Some(phys_addr),
-///         WalkResult::Fault => return None,
-///     }
-/// }
+/// ```
+/// use lockjaw_types::page_table::*;
+/// use lockjaw_types::addr::PhysAddr;
+///
+/// // Walk VA 0x0040_2234 through 4 levels of page tables.
+/// let va = 0x0040_2234u64;
+/// let (mut walk, mut result) = PageTableWalk::start(0x1_0000, va);
+///
+/// // Feed table descriptors for L0, L1, L2, then a page entry at L3.
+/// result = walk.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+/// result = walk.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
+/// result = walk.step(PageTableEntry::new_table(PhysAddr::new(0x4_0000)).raw());
+/// result = walk.step(PageTableEntry::new_page(
+///     PhysAddr::new(0x5_0000), MAIR_NORMAL, AP_RW_ALL, SH_INNER,
+/// ).raw());
+///
+/// assert_eq!(result, WalkResult::Done(0x5_0000 + 0x234));
 /// ```
 pub struct PageTableWalk {
     level: u8,

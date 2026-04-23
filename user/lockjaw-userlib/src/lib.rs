@@ -4,6 +4,7 @@ pub mod syscall;
 pub mod print;
 pub mod process;
 pub mod virtual_memory;
+pub mod display;
 
 // Re-export the ELF parser from lockjaw-types (no duplicate).
 pub use lockjaw_types::elf;

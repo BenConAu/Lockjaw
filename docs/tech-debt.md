@@ -171,3 +171,15 @@ The eventual design is a **device manager** process that:
 **Why:** Low-priority cleanup. None of these cause bugs.
 
 **Fix:** Move `ProcessMapping` to lockjaw-types. Add doc comment. Clean up Cargo.toml. Standardize re-exports.
+
+---
+
+## Display DDI mode index race with hotplug displays
+
+**Where:** `lockjaw-types/src/display.rs` (DisplayRequest::SetMode, GetMode)
+
+**What:** The DDI identifies modes by list index. If the display is hotpluggable (e.g., HDMI), the mode list can change between `list_modes`/`get_mode` and `set_mode`. A client could request mode index 2 while the list has shifted, setting the wrong resolution.
+
+**Why:** QEMU ramfb has a static mode list. No hotplug, no race.
+
+**Fix:** Stable mode IDs (e.g., hash of width+height+refresh+format), or a generation counter the client passes with `set_mode` so the driver can reject stale requests.
