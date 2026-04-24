@@ -4,7 +4,8 @@
 /// `run_display_server()` handles IPC dispatch, session state, and
 /// buffer export. Clients use `DisplayClient` for typed access.
 
-use lockjaw_types::display::*;
+// Re-export DDI types so drivers and clients can import from one place.
+pub use lockjaw_types::display::*;
 use crate::syscall::*;
 
 // ---------------------------------------------------------------------------
@@ -166,7 +167,9 @@ pub trait DisplayEngine {
         -> Result<(), DisplayError>;
 
     /// Free a previously allocated buffer. Called by the server loop
-    /// to clean up on export failure.
+    /// on export failure or session teardown. Implementations should
+    /// release internal tracking. Physical page deallocation depends
+    /// on kernel support (sys_free_pages does not yet exist).
     fn free_buffer(&mut self, buffer_handle: u64);
 
     /// Release the session. Display keeps showing the last buffer.

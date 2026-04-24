@@ -266,6 +266,7 @@ pub extern "C" fn _start() -> ! {
     // hello_boot_ep, devmgr_boot_ep, uart_boot_ep: bootstrap endpoints (used once each)
     let ep_handle = alloc_endpoint("uart srv");
     let devmgr_ep = alloc_endpoint("devmgr srv");
+    let display_ep = alloc_endpoint("display srv");
     let hello_boot_ep = alloc_endpoint("hello boot");
     let devmgr_boot_ep = alloc_endpoint("devmgr boot");
     let uart_boot_ep = alloc_endpoint("uart boot");
@@ -326,14 +327,19 @@ pub extern "C" fn _start() -> ! {
     sys_reply(uart_ep_idx, uart_devmgr_idx, 0, 0);
     puts("[BOOTSTRAP] uart\n");
 
-    // Bootstrap ramfb driver: export devmgr_ep so it can claim fw_cfg.
+    // Bootstrap ramfb driver: export devmgr_ep (to claim fw_cfg) and
+    // display_ep (to serve DDI clients) into its handle table.
     puts("init: waiting for ramfb bootstrap...\n");
     let _ = sys_receive(ramfb_boot_ep);
     let ramfb_devmgr_idx = match sys_export_handle(devmgr_ep) {
         Ok(idx) => idx,
         Err(_) => { puts("init: export devmgr to ramfb FAILED\n"); loop { sys_yield(); } }
     };
-    sys_reply(ramfb_devmgr_idx, 0, 0, 0);
+    let ramfb_display_idx = match sys_export_handle(display_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export display_ep to ramfb FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(ramfb_devmgr_idx, ramfb_display_idx, 0, 0);
     puts("[BOOTSTRAP] ramfb\n");
 
     // Allocate a Reply object for init's own outbound calls (ipc_puts to
