@@ -18,7 +18,7 @@ QEMU_DISPLAY_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -m 128M \
 	-device ramfb -display cocoa \
 	-kernel
 
-USER_CRATES := user/hello user/uart-driver user/device-manager user/ramfb-driver user/init
+USER_CRATES := user/hello user/uart-driver user/device-manager user/ramfb-driver user/display-test user/init
 
 .PHONY: build build-release build-user build-hash clean-all run run-release run-display objdump nm check-stack check-pointers test test-unit test-qemu clean
 
