@@ -35,7 +35,7 @@ static RAMFB_ELF: &[u8] = include_bytes!("../../ramfb-driver/target/aarch64-unkn
 /// `map_array_va` is a user VA where the mapping array will be mapped (must be free).
 /// `temp_base_va` is a base VA for temporary segment page mappings (must be free).
 /// Returns true on success.
-fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, scratch_ps: u64, handle_to_copy: u64, stack_pages: u64) -> bool {
+fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, scratch_ps: PageSetHandle, handle_to_copy: EndpointHandle, stack_pages: u64) -> bool {
     puts("init: parsing ");
     puts(name);
     puts(" ELF...\n");
@@ -114,7 +114,7 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
             unsafe {
                 core::ptr::write(map_array.add(mapping_count), ProcessMapping {
                     virt_addr: seg.vaddr + seg_page_offset,
-                    pageset_id: ps_id,
+                    pageset_id: ps_id.0,
                     page_index: 0,
                     flags: if seg.executable { FLAG_EXECUTABLE } else { 0 },
                 });
@@ -144,7 +144,7 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
         elf_info.entry_point,
         stack_ps,
         scratch_ps,
-        handle_to_copy,
+        handle_to_copy.raw(),
         name_buf.as_ptr() as u64,
     );
 
@@ -165,7 +165,7 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn alloc_endpoint(label: &str) -> u64 {
+fn alloc_endpoint(label: &str) -> EndpointHandle {
     let ps = match sys_alloc_pages(1) {
         Ok(id) => id,
         Err(_) => { puts("init: alloc "); puts(label); puts(" FAILED\n"); loop { sys_yield(); } }
@@ -188,7 +188,7 @@ pub extern "C" fn _start() -> ! {
     match sys_alloc_pages(1) {
         Ok(test_ps) => {
             puts("init: alloc_pages(1) OK, id=");
-            putc(b'0' + test_ps as u8);
+            putc(b'0' + test_ps.0 as u8);
             putc(b'\n');
 
             // Test sys_map_pages

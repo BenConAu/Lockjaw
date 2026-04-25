@@ -7,7 +7,7 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
-use lockjaw_userlib::{puts, putc, sys_exit, sys_call_ret4, sys_alloc_pages, sys_map_pages, sys_create_reply, sys_create_thread, sys_yield, VMEM};
+use lockjaw_userlib::{puts, putc, sys_exit, sys_call_ret4, sys_alloc_pages, sys_map_pages, sys_create_reply, sys_create_thread, sys_yield, VMEM, bootstrap_endpoint};
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -25,7 +25,7 @@ pub extern "C" fn _start() -> ! {
     // Bootstrap: call init on handle 0 to receive our handles.
     // Init exports handles into our table and replies with indices.
     puts("hello: bootstrapping...\n");
-    let msg = match sys_call_ret4(0, reply, 0, 0, 0, 0) {
+    let msg = match sys_call_ret4(bootstrap_endpoint(), reply, 0, 0, 0, 0) {
         Ok(r) => r,
         Err(_) => {
             puts("hello: bootstrap FAILED\n");

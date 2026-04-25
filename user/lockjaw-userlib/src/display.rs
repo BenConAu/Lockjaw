@@ -7,6 +7,7 @@
 // Re-export DDI types so drivers and clients can import from one place.
 pub use lockjaw_types::display::*;
 use crate::syscall::*;
+use crate::handle::{EndpointHandle, ReplyHandle, PageSetHandle, Exportable};
 
 // ---------------------------------------------------------------------------
 // BufferInfo (client-side result from alloc_buffer)
@@ -15,9 +16,9 @@ use crate::syscall::*;
 /// Buffer allocation result returned to clients.
 #[derive(Clone, Copy, Debug)]
 pub struct BufferInfo {
-    /// Exported handle in the client's handle table (for sys_map_pages
-    /// and for referencing in set_mode/set_scanout).
-    pub handle: u32,
+    /// Exported PageSet handle (for sys_map_pages and for referencing
+    /// in set_mode/set_scanout).
+    pub handle: PageSetHandle,
     /// Bytes per row.
     pub stride: u32,
     /// Total buffer size in bytes.
@@ -78,7 +79,7 @@ struct BufferTracker {
 #[derive(Clone, Copy)]
 struct BufferSlot {
     client_handle: u32,
-    engine_handle: u64,
+    engine_handle: PageSetHandle,
 }
 
 impl BufferTracker {
@@ -87,7 +88,7 @@ impl BufferTracker {
     }
 
     /// Record a new buffer mapping. Returns false if full.
-    fn track(&mut self, client_handle: u32, engine_handle: u64) -> bool {
+    fn track(&mut self, client_handle: u32, engine_handle: PageSetHandle) -> bool {
         for slot in self.slots.iter_mut() {
             if slot.is_none() {
                 *slot = Some(BufferSlot { client_handle, engine_handle });
@@ -114,7 +115,7 @@ impl BufferTracker {
     }
 
     /// Translate a client handle to the engine handle.
-    fn translate(&self, client_handle: u32) -> Option<u64> {
+    fn translate(&self, client_handle: u32) -> Option<PageSetHandle> {
         for slot in self.slots.iter() {
             if let Some(s) = slot {
                 if s.client_handle == client_handle {
@@ -151,26 +152,25 @@ pub trait DisplayEngine {
 
     /// Allocate a scanout-compatible buffer.
     /// Returns (pageset_handle, stride, size_bytes).
-    /// The pageset_handle is the driver's kernel handle (u64).
     fn alloc_buffer(&mut self, session: u32, width: u32, height: u32, format: u32)
-        -> Result<(u64, u32, u32), DisplayError>;
+        -> Result<(PageSetHandle, u32, u32), DisplayError>;
 
     /// Full modeset: set display timing/resolution and start scanning
     /// the given buffer. buffer_handle is in engine-space (translated
     /// by the server loop).
-    fn set_mode(&mut self, session: u32, mode_index: u32, buffer_handle: u64)
+    fn set_mode(&mut self, session: u32, mode_index: u32, buffer_handle: PageSetHandle)
         -> Result<(), DisplayError>;
 
     /// Page flip: change which buffer is displayed at the current mode.
     /// No modeset. Returns NotConfigured if no mode has been set.
-    fn set_scanout(&mut self, session: u32, buffer_handle: u64)
+    fn set_scanout(&mut self, session: u32, buffer_handle: PageSetHandle)
         -> Result<(), DisplayError>;
 
     /// Free a previously allocated buffer. Called by the server loop
     /// on export failure or session teardown. Implementations should
     /// release internal tracking. Physical page deallocation depends
     /// on kernel support (sys_free_pages does not yet exist).
-    fn free_buffer(&mut self, buffer_handle: u64);
+    fn free_buffer(&mut self, buffer_handle: PageSetHandle);
 
     /// Release the session. Display keeps showing the last buffer.
     fn release_session(&mut self, session: u32) -> Result<(), DisplayError>;
@@ -189,7 +189,7 @@ pub trait DisplayEngine {
 /// is bound to this server thread.
 pub fn run_display_server(
     engine: &mut impl DisplayEngine,
-    client_ep: u64,
+    client_ep: EndpointHandle,
 ) -> ! {
     let mut session = SessionState::new();
     let mut buffers = BufferTracker::new();
@@ -342,14 +342,14 @@ pub fn run_display_server(
 /// Client-side display wrapper. Hides IPC message packing behind
 /// typed methods. Each method does one synchronous IPC call.
 pub struct DisplayClient {
-    endpoint: u64,
-    reply: u64,
+    endpoint: EndpointHandle,
+    reply: ReplyHandle,
 }
 
 impl DisplayClient {
     /// Create a new display client targeting the given endpoint.
     /// `reply` is a Reply handle allocated by the client thread.
-    pub fn new(endpoint: u64, reply: u64) -> Self {
+    pub fn new(endpoint: EndpointHandle, reply: ReplyHandle) -> Self {
         Self { endpoint, reply }
     }
 
@@ -380,23 +380,23 @@ impl DisplayClient {
     {
         let req = DisplayRequest::AllocBuffer { session, width, height, format }.encode();
         let msg = self.call(req)?;
-        let (handle, stride, size) = DisplayResponse::decode_buffer(msg)?;
-        Ok(BufferInfo { handle, stride, size })
+        let (handle_raw, stride, size) = DisplayResponse::decode_buffer(msg)?;
+        Ok(BufferInfo { handle: PageSetHandle(handle_raw as u64), stride, size })
     }
 
     /// Full modeset: set display timing/resolution and start scanning
     /// the given buffer.
-    pub fn set_mode(&self, session: u32, mode_index: u32, buffer: u32)
+    pub fn set_mode(&self, session: u32, mode_index: u32, buffer: PageSetHandle)
         -> Result<(), DisplayError>
     {
-        let req = DisplayRequest::SetMode { session, mode_index, buffer }.encode();
+        let req = DisplayRequest::SetMode { session, mode_index, buffer: buffer.0 as u32 }.encode();
         let msg = self.call(req)?;
         DisplayResponse::decode_ok(msg)
     }
 
     /// Page flip: change which buffer is displayed at the current mode.
-    pub fn set_scanout(&self, session: u32, buffer: u32) -> Result<(), DisplayError> {
-        let req = DisplayRequest::SetScanout { session, buffer }.encode();
+    pub fn set_scanout(&self, session: u32, buffer: PageSetHandle) -> Result<(), DisplayError> {
+        let req = DisplayRequest::SetScanout { session, buffer: buffer.0 as u32 }.encode();
         let msg = self.call(req)?;
         DisplayResponse::decode_ok(msg)
     }

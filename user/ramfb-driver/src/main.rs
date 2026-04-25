@@ -205,7 +205,7 @@ const MAX_ENGINE_BUFFERS: usize = 8;
 
 #[derive(Clone, Copy)]
 struct EngineBuffer {
-    ps_handle: u64,
+    ps_handle: PageSetHandle,
     phys_addr: u64,
 }
 
@@ -220,10 +220,10 @@ struct RamfbEngine {
 }
 
 impl RamfbEngine {
-    fn find_buffer(&self, ps_handle: u64) -> Option<&EngineBuffer> {
+    fn find_buffer(&self, ps_handle: PageSetHandle) -> Option<&EngineBuffer> {
         self.buffers.iter()
             .filter_map(|s| s.as_ref())
-            .find(|b| b.ps_handle == ps_handle)
+            .find(|b| b.ps_handle.0 == ps_handle.0)
     }
 }
 
@@ -246,7 +246,7 @@ impl DisplayEngine for RamfbEngine {
     }
 
     fn alloc_buffer(&mut self, _session: u32, width: u32, height: u32, format: u32)
-        -> Result<(u64, u32, u32), DisplayError>
+        -> Result<(PageSetHandle, u32, u32), DisplayError>
     {
         if format != PIXEL_FORMAT_XRGB8888 {
             return Err(DisplayError::InvalidMode);
@@ -279,7 +279,7 @@ impl DisplayEngine for RamfbEngine {
     }
 
     /// Full modeset: program fw_cfg with mode dimensions and buffer physical address.
-    fn set_mode(&mut self, _session: u32, mode_index: u32, buffer_handle: u64)
+    fn set_mode(&mut self, _session: u32, mode_index: u32, buffer_handle: PageSetHandle)
         -> Result<(), DisplayError>
     {
         let mode = MODES.get(mode_index as usize)
@@ -306,7 +306,7 @@ impl DisplayEngine for RamfbEngine {
 
     /// Page flip: reprogram fw_cfg with the current mode dimensions but a
     /// new buffer physical address. No modeset — just changes the scanout source.
-    fn set_scanout(&mut self, _session: u32, buffer_handle: u64)
+    fn set_scanout(&mut self, _session: u32, buffer_handle: PageSetHandle)
         -> Result<(), DisplayError>
     {
         let mode_idx = self.current_mode.ok_or(DisplayError::NotConfigured)?;
@@ -333,10 +333,10 @@ impl DisplayEngine for RamfbEngine {
     /// on export failure or session teardown. Note: the underlying
     /// physical pages cannot be freed — Lockjaw has no sys_free_pages
     /// syscall. Only the engine's internal tracking is cleared.
-    fn free_buffer(&mut self, buffer_handle: u64) {
+    fn free_buffer(&mut self, buffer_handle: PageSetHandle) {
         for slot in self.buffers.iter_mut() {
             if let Some(b) = slot {
-                if b.ps_handle == buffer_handle {
+                if b.ps_handle.0 == buffer_handle.0 {
                     *slot = None;
                     return;
                 }
@@ -431,12 +431,12 @@ pub extern "C" fn _start() -> ! {
 
     // Bootstrap: get devmgr_ep + display_ep from init
     puts("ramfb: bootstrapping...\n");
-    let reply = match sys_call_ret4(0, reply_obj, 0, 0, 0, 0) {
+    let reply = match sys_call_ret4(bootstrap_endpoint(), reply_obj, 0, 0, 0, 0) {
         Ok(r) => r,
         Err(_) => { puts("ramfb: bootstrap FAILED\n"); halt(); }
     };
-    let devmgr_client = reply[0];
-    let display_ep = reply[1];
+    let devmgr_client = EndpointHandle(reply[0]);
+    let display_ep = EndpointHandle(reply[1]);
     puts("ramfb: bootstrapped\n");
 
     // Claim fw_cfg device from device manager
@@ -444,8 +444,8 @@ pub extern "C" fn _start() -> ! {
         Ok(r) => r,
         Err(_) => { puts("ramfb: claim FAILED\n"); halt(); }
     };
-    let fwcfg_pageset = claim[0];
-    if fwcfg_pageset == 0 {
+    let fwcfg_pageset = PageSetHandle(claim[0]);
+    if claim[0] == 0 {
         puts("ramfb: no fw_cfg device\n");
         halt();
     }

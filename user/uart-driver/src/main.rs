@@ -74,12 +74,13 @@ pub extern "C" fn _start() -> ! {
 
     // Bootstrap: call init on handle 0 to receive our handles.
     puts("uart-driver: bootstrapping...\n");
-    let reply = match sys_call_ret4(0, reply_obj, 0, 0, 0, 0) {
+    let reply = match sys_call_ret4(bootstrap_endpoint(), reply_obj, 0, 0, 0, 0) {
         Ok(r) => r,
         Err(_) => { puts("uart-driver: bootstrap FAILED\n"); loop { unsafe { asm!("wfi"); } } }
     };
-    let uart_srv_ep = reply[0];    // IPC server endpoint (character requests from init)
-    let devmgr_client = reply[1];  // device-manager client endpoint
+    // Bootstrap reply words are raw handle indices exported by init.
+    let uart_srv_ep = EndpointHandle(reply[0]);
+    let devmgr_client = EndpointHandle(reply[1]);
     puts("uart-driver: bootstrapped\n");
 
     // Claim a PL011 device from the device manager.
@@ -87,9 +88,9 @@ pub extern "C" fn _start() -> ! {
         Ok(r) => r,
         Err(_) => { puts("uart-driver: claim call FAILED\n"); loop { unsafe { asm!("wfi"); } } }
     };
-    let mmio_pageset = claim[0];
+    let mmio_pageset = PageSetHandle(claim[0]);
     let uart_intid = claim[1];
-    if mmio_pageset == 0 {
+    if claim[0] == 0 {
         puts("uart-driver: no PL011 available\n");
         loop { unsafe { asm!("wfi"); } }
     }
@@ -104,11 +105,7 @@ pub extern "C" fn _start() -> ! {
     puts("uart-driver: MMIO mapped\n");
 
     // Step 2: Create a notification for the UART RX interrupt
-    let notif_ps = match sys_alloc_pages(1) {
-        Ok(id) => id,
-        Err(_) => { puts("uart-driver: alloc FAILED\n"); loop { unsafe { asm!("wfi"); } } }
-    };
-    let notif_handle = match sys_create_notification(notif_ps) {
+    let notif_handle = match sys_alloc_pages(1).and_then(sys_create_notification) {
         Ok(h) => h,
         Err(_) => { puts("uart-driver: create notif FAILED\n"); loop { unsafe { asm!("wfi"); } } }
     };
@@ -136,10 +133,11 @@ pub extern "C" fn _start() -> ! {
     // uart_srv_ep = IPC endpoint for character requests from init.
     // notif_handle = notification bound to the UART RX IRQ.
     // The thread sleeps until either an IPC message or an IRQ arrives.
+    // WaitEntry.handle is raw u64 because wait_any accepts mixed types.
     let mut irq_threshold: u64 = 1;
     let mut entries = [
-        WaitEntry { handle: uart_srv_ep, threshold: 0 },                       // endpoint
-        WaitEntry { handle: notif_handle, threshold: irq_threshold },           // notification
+        WaitEntry { handle: uart_srv_ep.0, threshold: 0 },
+        WaitEntry { handle: notif_handle.0, threshold: irq_threshold },
     ];
 
     loop {

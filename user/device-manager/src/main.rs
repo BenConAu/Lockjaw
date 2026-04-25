@@ -38,13 +38,13 @@ pub extern "C" fn _start() -> ! {
 
     // Bootstrap: call init on handle 0 to receive our server endpoint.
     puts("devmgr: bootstrapping...\n");
-    let reply = match sys_call_ret4(0, reply_obj, 0, 0, 0, 0) {
+    let reply = match sys_call_ret4(bootstrap_endpoint(), reply_obj, 0, 0, 0, 0) {
         Ok(r) => r,
         Err(_) => { puts("devmgr: bootstrap FAILED\n"); halt(); }
     };
-    let server_ep = reply[0];
+    let server_ep = EndpointHandle(reply[0]);
     puts("devmgr: bootstrapped, server_ep=");
-    put_decimal(server_ep);
+    put_decimal(reply[0]);
     putc(b'\n');
 
     // Step 1: Get the DTB PageSet from the kernel and map it.
