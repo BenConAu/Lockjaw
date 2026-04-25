@@ -402,6 +402,20 @@ pub fn sys_query_mapping(va: u64) -> Result<(bool, u64), SyscallError> {
     if err == 0 { Ok((mapped != 0, run_pages)) } else { Err(SyscallError(err)) }
 }
 
+/// Close a handle, freeing the slot for reuse. Does not free the
+/// backing kernel object or its pages (no refcounting yet).
+pub fn sys_close_handle(handle: u64) -> SyscallError {
+    let err: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") handle => err,
+            in("x8") SYS_CLOSE_HANDLE,
+        );
+    }
+    SyscallError(err)
+}
+
 /// Exit the current thread. Never returns. The kernel frees the thread's
 /// TCB, kernel stack, and handle table pages.
 pub fn sys_exit() -> ! {

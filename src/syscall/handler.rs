@@ -67,6 +67,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_CREATE_REPLY => SyscallReturn::Value(sys_create_reply(ctx)),
         SYS_CREATE_THREAD => SyscallReturn::Void(sys_create_thread(ctx)),
         SYS_QUERY_MAPPING => sys_query_mapping(ctx),
+        SYS_CLOSE_HANDLE => SyscallReturn::Void(sys_close_handle(ctx)),
         SYS_EXIT => {
             scheduler::exit_current(); // never returns
         }
@@ -728,6 +729,21 @@ fn sys_query_mapping(ctx: &mut ExceptionContext) -> SyscallReturn {
     ctx.gpr[1] = if mapped { 1 } else { 0 };
     ctx.gpr[2] = run_pages as u64;
     SyscallReturn::Message(SyscallError::OK)
+}
+
+/// sys_close_handle(handle) — remove a handle from the caller's table.
+/// x0 = handle index to close.
+/// Reclaims the handle slot for reuse. Does NOT free the backing kernel
+/// object or its pages — without refcounting, mapping tracking, or
+/// revocation, freeing would be use-after-free if other handles or
+/// mappings to the same object exist.
+fn sys_close_handle(ctx: &mut ExceptionContext) -> SyscallError {
+    let handle = ctx.gpr[0] as u32;
+    let ht = CurrentThread::handle_table();
+    match ht.remove(handle) {
+        Ok(_) => SyscallError::OK,
+        Err(e) => e,
+    }
 }
 
 fn obj_type_from_u8(v: u8) -> ObjectType {

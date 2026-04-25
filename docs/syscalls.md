@@ -81,7 +81,7 @@ Without yield, a thread waiting for something would spin-wait (burning CPU) unti
 - **Polling patterns** where a thread checks a condition and yields between attempts
 - **Fairness** between threads with different workloads
 
-## Current syscalls (22)
+## Current syscalls (25)
 
 | # | Name | Arguments | Returns | Description |
 |---|------|-----------|---------|-------------|
@@ -91,20 +91,22 @@ Without yield, a thread waiting for something would spin-wait (burning CPU) unti
 | 3 | receive | x0=ep handle | x1-x4=msg | Receive message (blocks if queue empty) |
 | 4 | call | x0=ep handle, x1=reply handle, x2-x5=msg | x1-x4=reply | Send + block for reply (call/reply IPC) |
 | 5 | reply | x0-x3=msg | — | Reply to current bound caller |
-| 6 | alloc_pages | x0=count, x1=flags | x1=PageSet ID | Allocate physical pages (flag 1 = contiguous) |
-| 7 | map_pages | x0=PageSet ID, x1=VA, x2=flags | — | Map pages into caller's address space |
-| 8 | create_process | x0=mappings ptr, x1=count, x2=entry, x3=stack ps, x4=scratch ps, x5=handle, x6=name ptr | — | Create new process from mapping list |
-| 9 | create_notification | x0=PageSet ID | x1=handle | Create notification (timeline semaphore) |
+| 6 | alloc_pages | x0=count, x1=flags | x1=handle | Allocate physical pages, return PageSet handle (flag 1 = contiguous) |
+| 7 | map_pages | x0=handle, x1=VA, x2=flags | — | Map PageSet pages into caller's address space |
+| 8 | create_process | x0=mappings ptr, x1=count, x2=entry, x3=stack handle, x4=scratch handle, x5=handle, x6=name ptr | — | Create new process from mapping list |
+| 9 | create_notification | x0=PageSet handle | x1=handle | Create notification (timeline semaphore) |
 | 10 | signal_notification | x0=handle, x1=value | — | Signal notification (must be monotonic) |
 | 11 | wait_notification | x0=handle, x1=threshold | x1=value | Wait until counter >= threshold |
 | 12 | bind_irq | x0=INTID, x1=notif handle | — | Bind hardware IRQ to notification |
-| 13 | create_endpoint | x0=PageSet ID | x1=handle | Create IPC endpoint |
+| 13 | create_endpoint | x0=PageSet handle | x1=handle | Create IPC endpoint |
 | 14 | recv_nb | x0=ep handle | x1-x4=msg | Non-blocking receive (WOULD_BLOCK if empty) |
 | 15 | wait_any | x0=entries ptr, x1=count | x1=ready bitmask | Wait on multiple endpoints/notifications |
 | 16 | export_handle | x0=handle | x1=new index | Duplicate handle into bound caller's table |
-| 17 | get_boot_info | — | x1=DTB PageSet ID | Get boot information (DTB location) |
-| 18 | register_device_page | x0=phys addr | x1=PageSet ID | Register MMIO page as tracked PageSet |
-| 19 | query_pageset_phys | x0=PageSet ID, x1=page index | x1=phys addr | Query physical address of a page |
-| 20 | create_reply | x0=PageSet ID | x1=handle | Create Reply object for call/reply IPC |
+| 17 | get_boot_info | — | x1=PageSet handle | Get boot information (DTB PageSet handle) |
+| 18 | register_device_page | x0=phys addr | x1=PageSet handle | Register MMIO page as tracked PageSet |
+| 19 | query_pageset_phys | x0=PageSet handle, x1=page index | x1=phys addr | Query physical address of a page |
+| 20 | create_reply | x0=PageSet handle | x1=handle | Create Reply object for call/reply IPC |
 | 21 | exit | — | (never returns) | Exit current thread, free resources |
 | 22 | create_thread | x0=entry, x1=stack_top, x2=stack_base, x3=arg | — | Create thread in calling process (shares address space). VA range validated; mapping not checked (faults at EL0 if unmapped). stack_top must be 16-byte aligned. |
+| 23 | query_mapping | x0=VA (page-aligned) | x1=mapped (0/1), x2=run_pages | Query mapping state at a user VA. Returns whether the page is mapped and how many consecutive pages share the same state. |
+| 24 | close_handle | x0=handle | — | Remove a handle from caller's table, freeing the slot. Does NOT free backing object or pages (no refcounting). |

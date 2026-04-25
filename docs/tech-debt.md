@@ -200,15 +200,15 @@ The eventual design is a **device manager** process that:
 
 ---
 
-## No sys_close_handle / sys_free_pages
+## sys_close_handle is slot-only — no backing memory freed
 
-**Where:** All userspace programs, `user/device-manager/src/main.rs` (export failure path)
+**Where:** `src/syscall/handler.rs` (sys_close_handle), all userspace programs
 
-**What:** There is no syscall to close a handle or free a PageSet's backing pages. Once a handle is inserted into a process's table, it stays until the process exits. Once pages are allocated, they stay allocated. This means any error path that creates a handle or PageSet but can't use it leaks resources for the lifetime of the process.
+**What:** `sys_close_handle(handle)` reclaims the handle table slot but does NOT free the backing kernel object or its physical pages. Without refcounting, mapping tracking, or capability revocation, freeing pages on close would be use-after-free: other processes may hold exported handles or active VA mappings to the same physical memory.
 
-**Why:** The kernel has no handle removal syscall or page deallocation syscall exposed to userspace. Kernel-internal `dealloc_page` exists but is not callable from EL0.
+**Current state:** Handle slots are the scarce resource (255 per process). Closing reclaims the slot. The backing object and pages leak for the process lifetime. This is bounded and rare in practice (only on error paths like device manager export failure).
 
-**Fix:** Add `sys_close_handle(handle)` — removes a handle from the caller's table. For PageSet handles, also free the backing pages (header + data). For other object types, decrement refcount or mark for cleanup.
+**Fix:** Add refcounting or generation-based revocation, then a `sys_free_pageset(handle)` that validates no mappings or exports exist before freeing. Alternatively, track all mappings per-PageSet so the kernel can unmap before freeing.
 
 ---
 

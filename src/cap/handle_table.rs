@@ -51,6 +51,13 @@ impl HandleTableRef {
             .map_err(|_| SyscallError::HANDLE_TABLE_FULL)
     }
 
+    /// Remove a single handle by index. Returns the removed entry.
+    pub fn remove(&self, handle: u32) -> Result<HandleEntry, SyscallError> {
+        // SAFETY: self.0 was validated at construction.
+        unsafe { handle_remove(self.0, handle) }
+            .map_err(|_| SyscallError::INVALID_HANDLE)
+    }
+
     /// Remove ALL handles pointing at a given object physical address.
     /// Used when consuming a PageSet for object creation — invalidates
     /// any duplicate handles in the same table to prevent stale access.

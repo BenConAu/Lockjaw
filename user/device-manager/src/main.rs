@@ -138,8 +138,9 @@ pub extern "C" fn _start() -> ! {
                     let exported = match sys_export_handle(mmio_ps) {
                         Ok(idx) => idx,
                         Err(_) => {
-                            // mmio_ps handle + backing PageSet leak here —
-                            // no sys_close_handle exists yet to reclaim them.
+                            // Reclaim the handle slot. Backing PageSet pages
+                            // still leak (no refcount-aware free yet).
+                            sys_close_handle(mmio_ps);
                             puts("devmgr: export MMIO handle FAILED\n");
                             sys_reply(0, 0, 0, 0);
                             found = true;
