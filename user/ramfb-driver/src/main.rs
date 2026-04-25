@@ -382,19 +382,19 @@ fn self_test(fwcfg_va: u64, dma_va: u64, dma_pa: u64, ramfb_sel: u16) {
         Err(_) => { puts("ramfb: self-test query phys FAILED\n"); return; }
     };
 
-    // Fill framebuffer with a test pattern: vertical color gradient
+    // Fill framebuffer with a 16-pixel checkerboard so the self-test
+    // pattern is visually distinct from the DDI client's gradient.
     unsafe {
         let fb = fb_va as *mut u8;
         for y in 0..SELFTEST_HEIGHT {
             for x in 0..SELFTEST_WIDTH {
                 let offset = (y * SELFTEST_STRIDE + x * SELFTEST_BPP) as usize;
-                let r = (x * 255 / SELFTEST_WIDTH) as u8;
-                let g = (y * 255 / SELFTEST_HEIGHT) as u8;
-                let b = 128u8;
+                let white = ((x / 16) + (y / 16)) % 2 == 0;
+                let val = if white { 0xFF } else { 0x40 };
                 // XRGB8888: byte order is B, G, R, X (little-endian pixel)
-                *fb.add(offset) = b;
-                *fb.add(offset + 1) = g;
-                *fb.add(offset + 2) = r;
+                *fb.add(offset) = val;
+                *fb.add(offset + 1) = val;
+                *fb.add(offset + 2) = val;
                 *fb.add(offset + 3) = 0xFF;
             }
         }
