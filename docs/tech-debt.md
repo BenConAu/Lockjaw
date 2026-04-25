@@ -183,3 +183,49 @@ The eventual design is a **device manager** process that:
 **Why:** QEMU ramfb has a static mode list. No hotplug, no race.
 
 **Fix:** Stable mode IDs (e.g., hash of width+height+refresh+format), or a generation counter the client passes with `set_mode` so the driver can reject stale requests.
+
+---
+
+## No cross-process handle revocation
+
+**Where:** `src/syscall/handler.rs` (create_kernel_object), `src/cap/handle_table.rs` (remove_all_by_object)
+
+**What:** When a PageSet is consumed to create a kernel object (endpoint, notification, reply), all handles to it in the *caller's* table are invalidated. But if the PageSet handle was exported to another process via `sys_export_handle`, those cross-process handles remain live and stale — they still point at the old header page, which has been repurposed as a different object type.
+
+**Why:** No revocation infrastructure exists. seL4 uses a Capability Derivation Tree (CDT) to track all copies of a capability and revoke them atomically. Lockjaw's handle model is flat copies with no provenance tracking.
+
+**Current mitigation:** The header page is zeroed on consumption, making stale handles inert (they read count=0 and cannot map, query, or re-donate). This prevents use-after-repurpose of the data page. However, the stale handle entry itself persists in the remote process's handle table, occupying a slot and passing type checks as ObjectType::PageSet — it's just operationally dead. In practice, donation-target pagesets (1-page allocations for endpoints/notifications/replies) are never exported cross-process, so stale exported handles don't arise on the current boot path.
+
+**Fix:** Capability revocation — either a CDT (seL4-style) or a simpler generation-counter scheme where each handle carries a generation number that must match the object's current generation.
+
+---
+
+## No sys_close_handle / sys_free_pages
+
+**Where:** All userspace programs, `user/device-manager/src/main.rs` (export failure path)
+
+**What:** There is no syscall to close a handle or free a PageSet's backing pages. Once a handle is inserted into a process's table, it stays until the process exits. Once pages are allocated, they stay allocated. This means any error path that creates a handle or PageSet but can't use it leaks resources for the lifetime of the process.
+
+**Why:** The kernel has no handle removal syscall or page deallocation syscall exposed to userspace. Kernel-internal `dealloc_page` exists but is not callable from EL0.
+
+**Fix:** Add `sys_close_handle(handle)` — removes a handle from the caller's table. For PageSet handles, also free the backing pages (header + data). For other object types, decrement refcount or mark for cleanup.
+
+---
+
+## Audit: drop guards for resource cleanup
+
+**Where:** `src/process.rs` (create_process), `src/syscall/handler.rs` (sys_create_thread), and any kernel path that allocates multiple resources and rolls back manually on failure.
+
+**What:** Many kernel functions allocate pages, TCBs, or other resources and use explicit multi-step rollback on error. This is fragile — new error paths can miss cleanup. The `HeaderPageGuard` pattern in `src/cap/pageset_table.rs` shows the fix: RAII guards that free resources on drop unless explicitly taken.
+
+**Fix:** Audit all kernel allocation paths for manual rollback chains. Replace with drop guards where the pattern applies.
+
+---
+
+## Audit: push kernel state into lockjaw-types
+
+**Where:** Kernel-side modules in `src/` that contain pure state machines, data structures, or decision logic with no hardware or `unsafe` dependencies.
+
+**What:** Code that is pure logic but lives in the kernel crate cannot be tested on the host. Moving it to lockjaw-types enables host-side unit tests (like scheduler, page table walk, buddy allocator). The kernel crate should contain only hardware interaction, unsafe glue, and the syscall dispatch layer.
+
+**Fix:** Audit `src/cap/`, `src/ipc/`, `src/sched/`, and `src/process.rs` for types and functions that could move to lockjaw-types. Candidates include handle table entry layout (done), process mapping validation, and any state machine that doesn't touch hardware.

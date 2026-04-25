@@ -130,12 +130,27 @@ pub extern "C" fn _start() -> ! {
                             break;
                         }
                     };
+                    // Export the MMIO PageSet handle into the claiming
+                    // driver's handle table (the caller blocked on our
+                    // endpoint). Reply with the exported index + INTID.
+                    // Mark claimed AFTER export succeeds — if export fails,
+                    // the device stays available for a future claim attempt.
+                    let exported = match sys_export_handle(mmio_ps) {
+                        Ok(idx) => idx,
+                        Err(_) => {
+                            // mmio_ps handle + backing PageSet leak here —
+                            // no sys_close_handle exists yet to reclaim them.
+                            puts("devmgr: export MMIO handle FAILED\n");
+                            sys_reply(0, 0, 0, 0);
+                            found = true;
+                            break;
+                        }
+                    };
                     devices.devices[i].claimed = true;
                     puts("devmgr: claimed device at ");
                     put_hex(dev.mmio_addr);
                     putc(b'\n');
-                    // Reply with PageSet ID (not raw address) + INTID
-                    sys_reply(mmio_ps, dev.intid as u64, 0, 0);
+                    sys_reply(exported, dev.intid as u64, 0, 0);
                     found = true;
                     break;
                 }

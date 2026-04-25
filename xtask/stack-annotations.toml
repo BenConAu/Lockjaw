@@ -24,3 +24,7 @@
 # Thread entry trampoline calls the thread's entry function via blr x19.
 # All possible targets listed here:
 "thread_entry" = ["ipc_sender", "ipc_receiver", "idle_thread", "process_entry"]
+
+# create_kernel_object calls init_fn (function pointer) for the specific
+# object type being created. All possible targets:
+"lockjaw::syscall::handler::create_kernel_object" = ["lockjaw::ipc::endpoint::create_endpoint", "lockjaw::ipc::notification::create_notification", "lockjaw::ipc::reply::create_reply"]

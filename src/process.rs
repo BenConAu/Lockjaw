@@ -17,7 +17,7 @@ use crate::sched::scheduler;
 pub struct ProcessMapping {
     /// Virtual address in the new process's address space.
     pub virt_addr: u64,
-    /// PageSet ID (from sys_alloc_pages) containing the physical page.
+    /// PageSet handle (from sys_alloc_pages) containing the physical page.
     pub pageset_id: u64,
     /// Index of the page within the PageSet (0 for single-page sets).
     pub page_index: u64,
@@ -52,9 +52,15 @@ pub fn create_process(
     parent_handle_to_copy: u64,
     name: [u8; 16],
 ) -> Result<(), &'static str> {
-    // Look up stack PageSet early so we can validate total mapping count
-    let stack_ps = PageSetRef::from_id(stack_pageset_id)
-        .ok_or("invalid stack pageset")?;
+    // Look up stack and scratch PageSets from handle table.
+    // These are handle indices, not raw pageset IDs.
+    let ht = CurrentThread::handle_table();
+    let stack_entry = ht.lookup(stack_pageset_id as u32,
+        crate::cap::rights::Rights::from_bits(crate::cap::rights::RIGHT_READ),
+        crate::cap::object::ObjectType::PageSet)
+        .map_err(|_| "invalid stack handle")?;
+    // SAFETY: object_paddr from a PageSet handle — valid header page.
+    let stack_ps = unsafe { PageSetRef::from_header_paddr(stack_entry.object_paddr) };
 
     // Validate that user mappings + stack pages fit in the scratch buffer
     if !lockjaw_types::vmem::validate_process_mappings(mapping_count, stack_ps.count(), MAPPINGS_PER_PAGE) {
@@ -62,8 +68,11 @@ pub fn create_process(
     }
 
     // Use the caller-provided scratch page as the Mapping buffer.
-    let scratch_ps = PageSetRef::from_id(scratch_pageset_id)
-        .ok_or("invalid scratch pageset")?;
+    let scratch_entry = ht.lookup(scratch_pageset_id as u32,
+        crate::cap::rights::Rights::from_bits(crate::cap::rights::RIGHT_READ),
+        crate::cap::object::ObjectType::PageSet)
+        .map_err(|_| "invalid scratch handle")?;
+    let scratch_ps = unsafe { PageSetRef::from_header_paddr(scratch_entry.object_paddr) };
     if scratch_ps.count() != 1 {
         return Err("scratch must be 1 page");
     }
@@ -81,9 +90,13 @@ pub fn create_process(
         let user_mapping: ProcessMapping = addr_space.read(entry_va)
             .ok_or("unmapped user mapping pointer")?;
 
-        // Resolve the PageSet ID to a physical address
-        let ps = PageSetRef::from_id(user_mapping.pageset_id)
-            .ok_or("invalid pageset ID")?;
+        // Resolve the PageSet handle to a physical address
+        let ps_entry = ht.lookup(user_mapping.pageset_id as u32,
+            crate::cap::rights::Rights::from_bits(crate::cap::rights::RIGHT_READ),
+            crate::cap::object::ObjectType::PageSet)
+            .map_err(|_| "invalid pageset handle")?;
+        // SAFETY: object_paddr from a PageSet handle — valid header page.
+        let ps = unsafe { PageSetRef::from_header_paddr(ps_entry.object_paddr) };
         let page_idx = user_mapping.page_index as usize;
         let phys = ps.page(page_idx).ok_or("page index out of range")?;
 
@@ -121,7 +134,7 @@ pub fn create_process(
     // SAFETY: ht_page is a freshly allocated kernel page.
     unsafe {
         create_handle_table(
-            &HandleTableCreateInfo { slot_count: 16 },
+            &HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
             ht_page.start_addr(),
         ).map_err(|_| "handle table create failed")?;
     }

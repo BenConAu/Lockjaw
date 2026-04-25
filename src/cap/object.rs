@@ -40,7 +40,7 @@ pub unsafe fn create_handle_table(
     // Zero all handle slots (empty = object_paddr 0)
     // SAFETY: slots immediately follow the header in the donated page(s)
     let slots_ptr = (header_km.as_ptr() as u64 + core::mem::size_of::<HandleTableHeader>() as u64)
-        as *mut crate::cap::handle_table::HandleEntry;
+        as *mut lockjaw_types::object::HandleEntry;
     ptr::write_bytes(slots_ptr, 0, info.slot_count as usize);
 
     Ok(())

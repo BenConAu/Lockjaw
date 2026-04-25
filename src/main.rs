@@ -291,9 +291,9 @@ pub extern "C" fn kmain() -> ! {
     use cap::handle_table::*;
     use cap::rights::*;
 
-    let ht_info = HandleTableCreateInfo { slot_count: 8 };
+    let ht_info = HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE };
     let ht_size = query_handle_table_size(&ht_info);
-    kprintln!("  HandleTable(8 slots) needs {} page(s)", ht_size.pages);
+    kprintln!("  HandleTable({} slots) needs {} page(s)", ht_info.slot_count, ht_size.pages);
 
     // Allocate a pageset and donate it for the handle table
     let ps = pageset::alloc_pages(ht_size.pages).expect("alloc_pages failed");
@@ -340,7 +340,7 @@ pub extern "C" fn kmain() -> ! {
         let test_ht = mm::page_alloc::alloc_page().expect("test ht").start_addr();
         unsafe {
             cap::object::create_handle_table(
-                &cap::object::HandleTableCreateInfo { slot_count: 8 },
+                &cap::object::HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
                 test_ht,
             ).expect("test ht create");
         }
@@ -397,7 +397,7 @@ pub extern "C" fn kmain() -> ! {
         // Create kernel process — immortal, ttbr0=0, owns all kernel threads.
         let kernel_ht_page = mm::page_alloc::alloc_page().expect("kernel ht alloc").start_addr();
         create_handle_table(
-            &HandleTableCreateInfo { slot_count: 16 },
+            &HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
             kernel_ht_page,
         ).expect("kernel ht create");
 
@@ -637,7 +637,7 @@ pub extern "C" fn kmain() -> ! {
         // handles via syscalls from userspace (sys_create_endpoint, etc.).
         let init_ht_page = mm::page_alloc::alloc_page().expect("init ht alloc").start_addr();
         cap::object::create_handle_table(
-            &cap::object::HandleTableCreateInfo { slot_count: 16 },
+            &cap::object::HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
             init_ht_page,
         ).expect("init ht create");
 

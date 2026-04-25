@@ -45,6 +45,10 @@ impl SyscallError {
     /// must complete (receive reply) before reusing.
     pub const REPLY_BOUND: Self = SyscallError(11);
 
+    /// The caller's handle table is full. Distinct from OUT_OF_MEMORY
+    /// (which means the page allocator is exhausted).
+    pub const HANDLE_TABLE_FULL: Self = SyscallError(12);
+
     /// An unknown or unrecoverable error occurred.
     pub const UNKNOWN: Self = SyscallError(u64::MAX);
 

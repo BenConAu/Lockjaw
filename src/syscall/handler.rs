@@ -2,7 +2,7 @@ use crate::arch::aarch64::exceptions::ExceptionContext;
 use crate::arch::aarch64::uart::Uart;
 use crate::cap::handle_table;
 use crate::cap::object::ObjectType;
-use crate::cap::rights::Rights;
+use crate::cap::rights::{Rights, RIGHT_READ, RIGHT_WRITE};
 use crate::ipc::endpoint;
 use crate::mm::addr::PhysAddr;
 use crate::mm::kernel_ptr::KernelRef;
@@ -61,7 +61,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_RECV_NB => sys_recv_nb(ctx),
         SYS_WAIT_ANY => SyscallReturn::Value(sys_wait_any(ctx)),
         SYS_EXPORT_HANDLE => SyscallReturn::Value(sys_export_handle(ctx)),
-        SYS_GET_BOOT_INFO => SyscallReturn::Value(Ok(sys_get_boot_info())),
+        SYS_GET_BOOT_INFO => SyscallReturn::Value(sys_get_boot_info()),
         SYS_REGISTER_DEVICE_PAGE => SyscallReturn::Value(sys_register_device_page(ctx)),
         SYS_QUERY_PAGESET_PHYS => SyscallReturn::Value(sys_query_pageset_phys(ctx)),
         SYS_CREATE_REPLY => SyscallReturn::Value(sys_create_reply(ctx)),
@@ -99,23 +99,53 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
 }
 
 /// Common logic for sys_create_notification, sys_create_endpoint, etc.
-/// Validates the PageSet is 1 page, calls the safe init function, then
-/// consumes the PageSet and inserts a handle into the caller's table.
+/// Takes a PageSet handle, validates it's 1 page, calls the init function,
+/// consumes the PageSet, and inserts a new handle for the created object.
+///
+/// After consumption, the header page is zeroed so that any stale handles
+/// (local duplicates or cross-process exports) become inert: they read
+/// count=0 from the zeroed header and cannot map, query, or re-donate.
 fn create_kernel_object(
-    pageset_id: u64,
+    ps_handle: u32,
     obj_type: ObjectType,
     init_fn: fn(crate::mm::addr::ObjectInitPage) -> Result<(), crate::cap::object::CreateError>,
 ) -> Result<u64, SyscallError> {
-    let page = crate::cap::pageset_table::donate_single_page(pageset_id)?;
-    let paddr = page.paddr();
+    let ht = CurrentThread::handle_table();
+    // Require WRITE rights — this is a destructive operation that consumes
+    // the PageSet and repurposes its page.
+    let entry = ht.lookup(ps_handle, Rights::from_bits(RIGHT_WRITE), ObjectType::PageSet)?;
+    let header_paddr = entry.object_paddr;
+
+    // Read header, validate exactly 1 data page. Must read BEFORE zeroing.
+    let header = unsafe { crate::cap::pageset_table::read_header(header_paddr) };
+    if header.data_page_count() != 1 {
+        return Err(SyscallError::INVALID_PARAMETER);
+    }
+    let page_paddr = header.get_page(0).ok_or(SyscallError::INVALID_HANDLE)?;
+    // SAFETY: page came from a registered PageSet — valid kernel page.
+    let page = unsafe { crate::mm::addr::ObjectInitPage::new(PhysAddr::new(page_paddr)) };
+
     if init_fn(page).is_err() {
         return Err(SyscallError::UNKNOWN);
     }
-    // Consume only after successful initialization — preserves rollback
-    // semantics if init_fn ever fails.
-    crate::cap::pageset_table::consume_pageset(pageset_id);
-    let ht = CurrentThread::handle_table();
-    ht.insert(paddr, obj_type, Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE))
+
+    // Zero the header page BEFORE removing handles. This makes any stale
+    // handle (local duplicate or cross-process export) read count=0 from
+    // the zeroed header — they become inert without needing revocation.
+    // The header page is separate from the data page (which now holds the
+    // new kernel object), so zeroing doesn't affect the object.
+    crate::mm::page_alloc::zero_page(PhysAddr::new(header_paddr));
+
+    // Consume the backing global pageset table entry.
+    if !crate::cap::pageset_table::consume_by_header_paddr(header_paddr) {
+        crate::kprintln!("WARNING: PageSet consumption failed for header {:#x}", header_paddr);
+    }
+
+    // Remove ALL handles in this table that point at the consumed PageSet.
+    ht.remove_all_by_object(header_paddr);
+
+    // Insert a new handle for the created object.
+    ht.insert(PhysAddr::new(page_paddr), obj_type, Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
         .map(|h| h as u64)
 }
 
@@ -198,7 +228,7 @@ fn sys_reply(ctx: &mut ExceptionContext) -> SyscallError {
 /// sys_alloc_pages(count, flags) — allocate physical pages.
 /// x0 = number of pages to allocate.
 /// x1 = flags (ALLOC_FLAG_CONTIGUOUS for physically contiguous pages).
-/// Returns a PageSet ID in x1 on success.
+/// Returns a PageSet handle in x1 on success.
 fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let count = ctx.gpr[0] as usize;
     let flags = ctx.gpr[1];
@@ -207,23 +237,37 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         return Err(SyscallError::INVALID_PARAMETER);
     }
 
-    let result = if flags & lockjaw_types::syscall::ALLOC_FLAG_CONTIGUOUS != 0 {
+    let id = if flags & lockjaw_types::syscall::ALLOC_FLAG_CONTIGUOUS != 0 {
         crate::cap::pageset_table::alloc_pages_contiguous(count)
     } else {
         crate::cap::pageset_table::alloc_pages(count)
-    };
-    match result {
-        Some(id) => Ok(id),
-        None => Err(SyscallError::OUT_OF_MEMORY),
+    }.ok_or(SyscallError::OUT_OF_MEMORY)?;
+
+    // Insert a PageSet handle into the caller's handle table.
+    // The handle points to the header page so sys_export_handle can
+    // transfer it to other processes.
+    let (_, header_paddr) = crate::cap::pageset_table::get_pageset(id)
+        .ok_or(SyscallError::UNKNOWN)?;
+    let ht = CurrentThread::handle_table();
+    match ht.insert(PhysAddr::new(header_paddr), ObjectType::PageSet,
+        Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
+    {
+        Ok(h) => Ok(h as u64),
+        Err(e) => {
+            // Handle table full — free the pageset (global table slot,
+            // data pages, and header page) to avoid leaking memory.
+            crate::cap::pageset_table::free_by_header_paddr(header_paddr);
+            Err(e)
+        }
     }
 }
 
-/// sys_map_pages(pageset_id, virt_addr, flags) — map pages into the caller's address space.
-/// x0 = PageSet ID (from sys_alloc_pages or sys_register_device_page).
+/// sys_map_pages(handle, virt_addr, flags) — map pages into the caller's address space.
+/// x0 = PageSet handle (from sys_alloc_pages or sys_register_device_page).
 /// x1 = virtual address to map at (must be page-aligned, in user range).
 /// x2 = flags (MAP_FLAG_DEVICE for MMIO memory attributes).
 fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
-    let pageset_id = ctx.gpr[0];
+    let handle = ctx.gpr[0] as u32;
     let virt_addr = ctx.gpr[1];
     let flags = ctx.gpr[2];
 
@@ -232,25 +276,28 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
         None => return SyscallError::INVALID_PARAMETER,
     };
 
-    // All mappings go through PageSets — no raw physical addresses accepted.
-    let pageset = match crate::cap::pageset_table::PageSetRef::from_id(pageset_id) {
-        Some(ps) => ps,
-        None => return SyscallError::INVALID_HANDLE,
+    // Look up PageSet via handle table — enforces capability model.
+    let ht = CurrentThread::handle_table();
+    let entry = match ht.lookup(handle, Rights::from_bits(RIGHT_READ), ObjectType::PageSet) {
+        Ok(e) => e,
+        Err(e) => return e,
     };
+    // SAFETY: object_paddr came from a PageSet handle — valid header page.
+    let header = unsafe { crate::cap::pageset_table::read_header(entry.object_paddr) };
     unsafe {
-        match crate::arch::aarch64::vmem::map_pages_in_existing(addr_space.ttbr0(), virt_addr, pageset.header(), flags) {
+        match crate::arch::aarch64::vmem::map_pages_in_existing(addr_space.ttbr0(), virt_addr, header, flags) {
             Ok(()) => SyscallError::OK,
             Err(_) => SyscallError::UNKNOWN,
         }
     }
 }
 
-/// sys_create_process(mappings_ptr, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id)
+/// sys_create_process(mappings_ptr, mapping_count, entry_point, stack_handle, scratch_handle)
 /// x0 = pointer to ProcessMapping array in caller's memory
 /// x1 = number of mappings
 /// x2 = entry point VA for the new process
-/// x3 = PageSet ID for the stack page
-/// x4 = PageSet ID for a scratch page (kernel uses as Mapping buffer, caller keeps)
+/// x3 = PageSet handle for the stack page(s)
+/// x4 = PageSet handle for a scratch page (kernel uses as Mapping buffer, caller keeps)
 fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
     let mappings_va = ctx.gpr[0];
     let mapping_count = ctx.gpr[1] as usize;
@@ -274,11 +321,11 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
     }
 }
 
-/// sys_create_notification(pageset_id) — create a Notification from a donated page.
-/// x0 = PageSet ID (must be a 1-page PageSet).
+/// sys_create_notification(handle) — create a Notification from a donated page.
+/// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_notification(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(ctx.gpr[0], ObjectType::Notification, crate::ipc::notification::create_notification)
+    create_kernel_object(ctx.gpr[0] as u32, ObjectType::Notification, crate::ipc::notification::create_notification)
 }
 
 /// sys_signal_notification(handle, value) — signal a notification.
@@ -338,18 +385,18 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
     }
 }
 
-/// sys_create_endpoint(pageset_id) — create an Endpoint from a donated page.
-/// x0 = PageSet ID (must be a 1-page PageSet).
+/// sys_create_endpoint(handle) — create an Endpoint from a donated page.
+/// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_endpoint(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(ctx.gpr[0], ObjectType::Endpoint, endpoint::create_endpoint)
+    create_kernel_object(ctx.gpr[0] as u32, ObjectType::Endpoint, endpoint::create_endpoint)
 }
 
-/// sys_create_reply(pageset_id) — create a Reply object from a donated page.
-/// x0 = PageSet ID (must be a 1-page PageSet).
+/// sys_create_reply(handle) — create a Reply object from a donated page.
+/// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_reply(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(ctx.gpr[0], ObjectType::Reply, crate::ipc::reply::create_reply)
+    create_kernel_object(ctx.gpr[0] as u32, ObjectType::Reply, crate::ipc::reply::create_reply)
 }
 
 /// sys_recv_nb(handle) — non-blocking receive on an endpoint.
@@ -533,35 +580,55 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 }
 
 /// sys_get_boot_info() — returns boot information.
-/// DTB PageSet ID returned in x1.
-fn sys_get_boot_info() -> u64 {
-    crate::dtb_pageset_id()
+/// Inserts a PageSet handle for the DTB into the caller's handle table.
+/// Returns the handle index in x1.
+fn sys_get_boot_info() -> Result<u64, SyscallError> {
+    let dtb_id = crate::dtb_pageset_id();
+    let (_, header_paddr) = crate::cap::pageset_table::get_pageset(dtb_id)
+        .ok_or(SyscallError::UNKNOWN)?;
+    let ht = CurrentThread::handle_table();
+    ht.insert(PhysAddr::new(header_paddr), ObjectType::PageSet,
+        Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
+        .map(|h| h as u64)
 }
 
 /// sys_register_device_page(phys_addr) — wrap a physical address as a tracked PageSet.
 /// x0 = physical MMIO address (page-aligned).
-/// Returns the PageSet ID. Used by the device manager to create MMIO PageSets
-/// for drivers. Drivers then map via sys_map_pages with the PageSet ID.
+/// Returns a PageSet handle. Used by the device manager to create MMIO
+/// PageSets for drivers. Drivers then map via sys_map_pages with the handle.
 fn sys_register_device_page(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let phys_addr = ctx.gpr[0];
-    match crate::cap::pageset_table::register_device_page(phys_addr) {
-        Some(id) => Ok(id),
-        None => Err(SyscallError::OUT_OF_MEMORY),
+    let id = crate::cap::pageset_table::register_device_page(phys_addr)
+        .ok_or(SyscallError::OUT_OF_MEMORY)?;
+    let (_, header_paddr) = crate::cap::pageset_table::get_pageset(id)
+        .ok_or(SyscallError::UNKNOWN)?;
+    let ht = CurrentThread::handle_table();
+    match ht.insert(PhysAddr::new(header_paddr), ObjectType::PageSet,
+        Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
+    {
+        Ok(h) => Ok(h as u64),
+        Err(e) => {
+            // Handle table full — free the tracking entry + header page.
+            // The MMIO page itself is not freed (it's device memory).
+            crate::cap::pageset_table::free_header_page(header_paddr);
+            Err(e)
+        }
     }
 }
 
-/// sys_query_pageset_phys(pageset_id, page_index) — query a page's physical address.
-/// x0 = PageSet ID, x1 = page index within the set.
+/// sys_query_pageset_phys(handle, page_index) — query a page's physical address.
+/// x0 = PageSet handle, x1 = page index within the set.
 /// Returns the physical address of that page. Used by drivers that need
 /// to program DMA controllers or configure hardware with physical addresses.
 fn sys_query_pageset_phys(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    let pageset_id = ctx.gpr[0];
+    let handle = ctx.gpr[0] as u32;
     let page_index = ctx.gpr[1] as usize;
 
-    let pageset = crate::cap::pageset_table::PageSetRef::from_id(pageset_id)
-        .ok_or(SyscallError::INVALID_HANDLE)?;
-    pageset.page(page_index)
-        .map(|p| p.as_u64())
+    let ht = CurrentThread::handle_table();
+    let entry = ht.lookup(handle, Rights::from_bits(RIGHT_READ), ObjectType::PageSet)?;
+    // SAFETY: object_paddr came from a PageSet handle — valid header page.
+    let header = unsafe { crate::cap::pageset_table::read_header(entry.object_paddr) };
+    header.get_page(page_index)
         .ok_or(SyscallError::INVALID_PARAMETER)
 }
 

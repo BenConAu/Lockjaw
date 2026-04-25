@@ -1,8 +1,39 @@
-use crate::mm::addr::PhysAddr;
+use crate::mm::addr::{PhysAddr, PhysPage};
 use crate::mm::kernel_ptr::KernelMut;
 use crate::mm::page_alloc;
 use core::cell::UnsafeCell;
 use lockjaw_types::pageset_table::{PageSetTable, PageSetEntry, PageSetHeader, MAX_PAGES_PER_SET};
+
+// ---------------------------------------------------------------------------
+// HeaderPageGuard — RAII cleanup for allocated header pages
+// ---------------------------------------------------------------------------
+
+/// Owns a freshly allocated header page. Frees it on drop unless
+/// `take()` is called to claim ownership. Prevents header page leaks
+/// when PageSet table insertion or later steps fail.
+struct HeaderPageGuard {
+    paddr: Option<PhysAddr>,
+}
+
+impl HeaderPageGuard {
+    fn new(paddr: PhysAddr) -> Self {
+        Self { paddr: Some(paddr) }
+    }
+
+    /// Claim the header page, preventing it from being freed on drop.
+    /// Returns the physical address.
+    fn take(&mut self) -> PhysAddr {
+        self.paddr.take().expect("HeaderPageGuard already taken")
+    }
+}
+
+impl Drop for HeaderPageGuard {
+    fn drop(&mut self) {
+        if let Some(paddr) = self.paddr {
+            page_alloc::dealloc_page(PhysPage::containing(paddr));
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PageSetTable singleton
@@ -32,6 +63,36 @@ impl PageSetTableWrapper {
 
 static TABLE: PageSetTableWrapper = PageSetTableWrapper::new();
 
+/// Insert an already-initialized header page into the global table.
+/// Does NOT own the header page — the caller is responsible for cleanup
+/// on failure (typically via HeaderPageGuard).
+fn insert_into_table(count: usize, header_paddr: PhysAddr) -> Option<u64> {
+    let entry = PageSetEntry { count, header_paddr: header_paddr.as_u64() };
+    // SAFETY: single-core, IRQs masked — exclusive table access.
+    unsafe { (*TABLE.ptr()).insert(entry).ok().map(|id| id as u64) }
+}
+
+/// Allocate a header page, initialize it with the given page addresses,
+/// and insert into the global table. On failure, the header page is freed
+/// via the drop guard. Returns the PageSet table slot ID.
+fn alloc_and_insert_header(page_addrs: &[u64], count: usize) -> Option<u64> {
+    let header_page = page_alloc::alloc_page()?;
+    let mut guard = HeaderPageGuard::new(header_page.start_addr());
+
+    // SAFETY: header_paddr is a freshly allocated kernel page.
+    let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_paddr(header_page.start_addr()) };
+    unsafe { core::ptr::write_bytes(header_ref.as_mut_ptr(), 0, 1); }
+    header_ref.get_mut().init(page_addrs);
+
+    let entry = PageSetEntry { count, header_paddr: header_page.start_addr().as_u64() };
+    // SAFETY: single-core, IRQs masked — exclusive table access.
+    let id = unsafe { (*TABLE.ptr()).insert(entry).ok()? };
+
+    // Success — header page now belongs to the pageset table.
+    guard.take();
+    Some(id as u64)
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -45,13 +106,12 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
         return None;
     }
 
-    // Allocate the header page first
     let header_page = page_alloc::alloc_page()?;
-    let header_paddr = header_page.start_addr();
-    page_alloc::zero_page(header_paddr);
+    let mut guard = HeaderPageGuard::new(header_page.start_addr());
+    page_alloc::zero_page(header_page.start_addr());
 
     // SAFETY: header_paddr is a freshly allocated, zeroed kernel page.
-    let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_paddr(header_paddr) };
+    let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_paddr(header_page.start_addr()) };
 
     // Allocate data pages one at a time, writing each address directly into the header
     for i in 0..count {
@@ -60,36 +120,22 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
                 header_ref.get_mut().pages[i] = page.start_addr().as_u64();
             }
             None => {
-                // Roll back: free data pages allocated so far + header
+                // Roll back: free data pages allocated so far.
+                // Header page freed by guard on return.
                 for j in 0..i {
                     page_alloc::dealloc_page(
-                        crate::mm::addr::PhysPage::containing(PhysAddr::new(header_ref.get().pages[j]))
+                        PhysPage::containing(PhysAddr::new(header_ref.get().pages[j]))
                     );
                 }
-                page_alloc::dealloc_page(crate::mm::addr::PhysPage::containing(header_paddr));
                 return None;
             }
         }
     }
     header_ref.get_mut().count = count as u64;
 
-    // Insert thin entry into the table
-    let entry = PageSetEntry { count, header_paddr: header_paddr.as_u64() };
-    // SAFETY: single-core, IRQs masked — exclusive table access.
-    let result = unsafe { (*TABLE.ptr()).insert(entry) };
-    match result {
-        Ok(id) => Some(id as u64),
-        Err(_) => {
-            // Table full — free all pages (data + header)
-            for j in 0..count {
-                page_alloc::dealloc_page(
-                    crate::mm::addr::PhysPage::containing(PhysAddr::new(header_ref.get().pages[j]))
-                );
-            }
-            page_alloc::dealloc_page(crate::mm::addr::PhysPage::containing(header_paddr));
-            None
-        }
-    }
+    let id = insert_into_table(count, header_page.start_addr())?;
+    guard.take(); // success — table owns the header page now
+    Some(id)
 }
 
 /// Allocate `count` physically contiguous pages and register as a PageSet.
@@ -111,39 +157,33 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
         return None;
     }
 
-    // Allocate the header page
     let header_page = page_alloc::alloc_page()?;
-    let header_paddr = header_page.start_addr();
-    page_alloc::zero_page(header_paddr);
+    let mut guard = HeaderPageGuard::new(header_page.start_addr());
+    page_alloc::zero_page(header_page.start_addr());
 
     // Allocate contiguous data pages (actual_count, not count)
     let first_data = match page_alloc::alloc_pages_contiguous(count) {
         Some(page) => page,
-        None => {
-            page_alloc::dealloc_page(crate::mm::addr::PhysPage::containing(header_paddr));
-            return None;
-        }
+        None => return None, // guard frees header page
     };
 
     // Write all actual_count sequential addresses into the header
     // SAFETY: header_paddr is a freshly allocated, zeroed kernel page.
-    let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_paddr(header_paddr) };
+    let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_paddr(header_page.start_addr()) };
     let base = first_data.start_addr().as_u64();
     for i in 0..actual_count {
         header_ref.get_mut().pages[i] = base + (i as u64) * crate::mm::addr::PAGE_SIZE;
     }
     header_ref.get_mut().count = actual_count as u64;
 
-    // Insert into the table with actual_count
-    let entry = PageSetEntry { count: actual_count, header_paddr: header_paddr.as_u64() };
-    // SAFETY: single-core, IRQs masked — exclusive table access.
-    let result = unsafe { (*TABLE.ptr()).insert(entry) };
-    match result {
-        Ok(id) => Some(id as u64),
-        Err(_) => {
-            // Table full — free all pages
+    match insert_into_table(actual_count, header_page.start_addr()) {
+        Some(id) => {
+            guard.take(); // success — table owns the header page now
+            Some(id)
+        }
+        None => {
+            // Table full — free data pages. Header freed by guard.
             page_alloc::dealloc_pages_contiguous(first_data, count);
-            page_alloc::dealloc_page(crate::mm::addr::PhysPage::containing(header_paddr));
             None
         }
     }
@@ -157,14 +197,6 @@ pub fn register_existing(count: usize, pages: &[PhysAddr]) -> Option<u64> {
         return None;
     }
 
-    // Allocate a header page
-    let header_page = page_alloc::alloc_page()?;
-    let header_paddr = header_page.start_addr();
-
-    // SAFETY: header_paddr is a freshly allocated kernel page.
-    let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_paddr(header_paddr) };
-    // Zero the header before init
-    unsafe { core::ptr::write_bytes(header_ref.as_mut_ptr(), 0, 1); }
     // SAFETY: PhysAddr is repr(transparent) over u64, same layout.
     let addrs: &[u64] = unsafe {
         core::slice::from_raw_parts(
@@ -173,44 +205,74 @@ pub fn register_existing(count: usize, pages: &[PhysAddr]) -> Option<u64> {
             count,
         )
     };
-    header_ref.get_mut().init(addrs);
-
-    let entry = PageSetEntry { count, header_paddr: header_paddr.as_u64() };
-    // SAFETY: single-core, IRQs masked — exclusive table access.
-    unsafe {
-        (*TABLE.ptr()).insert(entry).ok().map(|id| id as u64)
-    }
+    // Header page freed by guard on insert failure.
+    // Data pages are firmware-placed — not ours to free.
+    alloc_and_insert_header(addrs, count)
 }
 
 /// Wrap a physical MMIO address as a 1-page PageSet (no allocation from pool, just tracking).
 /// Allocates one header page to store the MMIO address.
+/// Header page freed by guard on insert failure. The MMIO data page is
+/// device memory and is never freed.
 pub fn register_device_page(phys_addr: u64) -> Option<u64> {
-    let header_page = page_alloc::alloc_page()?;
-    let header_paddr = header_page.start_addr();
+    alloc_and_insert_header(&[phys_addr], 1)
+}
 
-    // SAFETY: header_paddr is a freshly allocated kernel page.
-    let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_paddr(header_paddr) };
-    unsafe { core::ptr::write_bytes(header_ref.as_mut_ptr(), 0, 1); }
-    header_ref.get_mut().init(&[phys_addr]);
+/// Free only the header page for a PageSet (not its data pages).
+/// Used to roll back device page registration when the handle table is
+/// full — MMIO data pages are device memory and must not be freed.
+pub fn free_header_page(header_paddr: u64) {
+    consume_by_header_paddr(header_paddr);
+    page_alloc::dealloc_page(
+        crate::mm::addr::PhysPage::containing(PhysAddr::new(header_paddr))
+    );
+}
 
-    let entry = PageSetEntry { count: 1, header_paddr: header_paddr.as_u64() };
+/// Remove a PageSet from the table by its header physical address.
+/// Used when consuming via a handle (which stores header_paddr, not the
+/// global table slot ID). Does NOT free physical pages — use
+/// free_by_header_paddr for full cleanup.
+pub fn consume_by_header_paddr(header_paddr: u64) -> bool {
     // SAFETY: single-core, IRQs masked — exclusive table access.
     unsafe {
-        (*TABLE.ptr()).insert(entry).ok().map(|id| id as u64)
+        let table = &mut *TABLE.ptr();
+        match table.find_by_header_paddr(header_paddr) {
+            Some(id) => table.remove(id).is_ok(),
+            None => false,
+        }
     }
 }
 
-/// Remove a PageSet from the table, preventing reuse.
-/// Called after a PageSet's pages are donated to a kernel object.
-pub fn consume_pageset(id: u64) -> bool {
-    // SAFETY: single-core, IRQs masked — exclusive table access.
-    unsafe {
-        (*TABLE.ptr()).remove(id as usize).is_ok()
+/// Remove a PageSet from the table AND free all its physical pages
+/// (data pages + header page). Used to roll back a failed sys_alloc_pages
+/// when the handle table is full.
+pub fn free_by_header_paddr(header_paddr: u64) {
+    // Read the header to find data pages before removing from table.
+    // SAFETY: header_paddr is a valid header page (caller just allocated it).
+    let header = unsafe { read_header(header_paddr) };
+    let count = header.data_page_count();
+
+    // Free data pages
+    for i in 0..count {
+        if let Some(paddr) = header.get_page(i) {
+            page_alloc::dealloc_page(
+                crate::mm::addr::PhysPage::containing(PhysAddr::new(paddr))
+            );
+        }
     }
+
+    // Remove from global table
+    consume_by_header_paddr(header_paddr);
+
+    // Free header page
+    page_alloc::dealloc_page(
+        crate::mm::addr::PhysPage::containing(PhysAddr::new(header_paddr))
+    );
 }
 
 /// Look up a PageSet by ID. Returns the data page count and header physical address.
-/// Prefer `donate_single_page` for the common 1-page-consume pattern.
+/// Used internally by syscall handlers after allocation to get the header
+/// paddr for handle table insertion.
 pub fn get_pageset(id: u64) -> Option<(usize, u64)> {
     // SAFETY: single-core, IRQs masked — read-only table access.
     unsafe {
@@ -223,19 +285,23 @@ pub fn get_pageset(id: u64) -> Option<(usize, u64)> {
 // ---------------------------------------------------------------------------
 
 /// A validated reference to a registered PageSet. Constructed from
-/// `PageSetRef::from_id()`, which proves the ID is live in the table.
-/// All methods are safe — the header_paddr validity is established at
-/// construction time.
+/// `PageSetRef::from_header_paddr()` using a handle table entry's
+/// object_paddr. All methods are safe — the header_paddr validity is
+/// established at construction time.
 pub struct PageSetRef {
     count: usize,
     header_paddr: u64,
 }
 
 impl PageSetRef {
-    /// Look up a PageSet by ID. Returns None if the ID is not registered.
-    pub fn from_id(id: u64) -> Option<Self> {
-        let (count, header_paddr) = get_pageset(id)?;
-        Some(PageSetRef { count, header_paddr })
+    /// Construct from a header page physical address (e.g., from a
+    /// handle table entry). Reads the count from the header itself.
+    ///
+    /// # Safety
+    /// `header_paddr` must be a valid PageSetHeader page.
+    pub unsafe fn from_header_paddr(header_paddr: u64) -> Self {
+        let header = read_header(header_paddr);
+        PageSetRef { count: header.data_page_count(), header_paddr }
     }
 
     /// Number of data pages in this PageSet.
@@ -248,13 +314,6 @@ impl PageSetRef {
         // SAFETY: header_paddr came from a registered PageSet — valid kernel page.
         let header = unsafe { read_header(self.header_paddr) };
         header.get_page(index).map(PhysAddr::new)
-    }
-
-    /// Access the underlying PageSetHeader (for bulk operations like
-    /// map_pages_in_existing that take the whole header).
-    pub fn header(&self) -> &PageSetHeader {
-        // SAFETY: header_paddr came from a registered PageSet — valid kernel page.
-        unsafe { read_header(self.header_paddr) }
     }
 }
 
@@ -270,28 +329,3 @@ pub(crate) unsafe fn read_header(header_paddr: u64) -> &'static PageSetHeader {
     &*header.as_ptr()
 }
 
-/// Validate that a PageSet is exactly 1 page and return its physical
-/// address wrapped in a [`ObjectInitPage`]. Folds the
-/// get → validate → read_header → get_page sequence into one safe call,
-/// eliminating raw `u64` header_paddr and `unsafe read_header` from callers.
-///
-/// Does NOT consume the PageSet — the caller must call
-/// [`consume_pageset`] after successful use. This preserves rollback
-/// semantics: if the factory that receives the `ObjectInitPage` fails, the
-/// PageSet is still live and can be reclaimed.
-///
-/// Returns distinct errors for "invalid PageSet ID" vs "wrong page count"
-/// so syscall handlers can propagate the right error code to userspace.
-pub fn donate_single_page(pageset_id: u64) -> Result<crate::mm::addr::ObjectInitPage, lockjaw_types::syscall::SyscallError> {
-    use lockjaw_types::syscall::SyscallError;
-    let pageset = PageSetRef::from_id(pageset_id)
-        .ok_or(SyscallError::INVALID_HANDLE)?;
-    if pageset.count() != 1 {
-        return Err(SyscallError::INVALID_PARAMETER);
-    }
-    let paddr = pageset.page(0)
-        .ok_or(SyscallError::INVALID_HANDLE)?;
-    // SAFETY: the page is kernel-allocated via the page allocator;
-    // ObjectInitPage just wraps the paddr in a typed newtype.
-    Ok(unsafe { crate::mm::addr::ObjectInitPage::new(paddr) })
-}

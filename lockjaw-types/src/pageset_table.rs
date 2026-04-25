@@ -134,6 +134,20 @@ impl PageSetTable {
     pub fn count(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
+
+    /// Find a PageSet by its header physical address. Returns the slot
+    /// index, or None if no entry has that header_paddr. Used for
+    /// reverse lookup when consuming via a handle.
+    pub fn find_by_header_paddr(&self, header_paddr: u64) -> Option<usize> {
+        for i in 0..MAX_PAGESETS {
+            if let Some(entry) = &self.slots[i] {
+                if entry.header_paddr == header_paddr {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -324,5 +338,45 @@ mod tests {
     #[test]
     fn header_size_fits_in_page() {
         assert!(core::mem::size_of::<PageSetHeader>() <= 4096);
+    }
+
+    // --- find_by_header_paddr ---
+
+    #[test]
+    fn find_by_header_paddr_found() {
+        let mut table = PageSetTable::new();
+        let e0 = PageSetEntry { count: 1, header_paddr: 0xA000 };
+        let e1 = PageSetEntry { count: 2, header_paddr: 0xB000 };
+        let id0 = table.insert(e0).unwrap();
+        let _id1 = table.insert(e1).unwrap();
+
+        assert_eq!(table.find_by_header_paddr(0xA000), Some(id0));
+        assert_eq!(table.find_by_header_paddr(0xB000), Some(1));
+    }
+
+    #[test]
+    fn find_by_header_paddr_not_found() {
+        let mut table = PageSetTable::new();
+        table.insert(PageSetEntry { count: 1, header_paddr: 0xA000 }).unwrap();
+        assert_eq!(table.find_by_header_paddr(0xC000), None);
+    }
+
+    #[test]
+    fn find_by_header_paddr_after_remove() {
+        let mut table = PageSetTable::new();
+        let id = table.insert(PageSetEntry { count: 1, header_paddr: 0xA000 }).unwrap();
+        table.remove(id).unwrap();
+        assert_eq!(table.find_by_header_paddr(0xA000), None);
+    }
+
+    // --- zeroed header makes stale reads inert ---
+
+    #[test]
+    fn zeroed_header_has_no_pages() {
+        let h = PageSetHeader::empty();
+        // A zeroed header (as would result from page zeroing after
+        // consumption) must report 0 pages and reject all lookups.
+        assert_eq!(h.data_page_count(), 0);
+        assert_eq!(h.get_page(0), None);
     }
 }

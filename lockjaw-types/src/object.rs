@@ -14,6 +14,7 @@ pub enum ObjectType {
     Notification = 3,
     Reply = 4,
     Process = 5,
+    PageSet = 6,
 }
 
 /// Header written at the start of every kernel object's donated memory.
@@ -47,15 +48,29 @@ pub struct HandleTableHeader {
     pub slot_count: u32,
 }
 
+/// A single entry in a handle table. Stored in donated pages immediately
+/// after the HandleTableHeader.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct HandleEntry {
+    /// Physical address of the kernel object. 0 = empty slot.
+    pub object_paddr: u64,
+    /// Type of the referenced object.
+    pub obj_type: ObjectType,
+    /// Access rights for this handle.
+    pub rights: crate::rights::Rights,
+    _padding: [u8; 6],
+}
+
+/// Maximum handle slots that fit in a single 4KB page.
+pub const HANDLE_SLOTS_PER_PAGE: u32 = ((PAGE_SIZE as usize - core::mem::size_of::<HandleTableHeader>()) / core::mem::size_of::<HandleEntry>()) as u32;
+
 /// How many pages does a HandleTable with this config need?
 ///
-/// Computes: header size + (slot_count * slot_size), rounded up to pages.
-/// The slot size is 16 bytes (HandleEntry: u64 paddr + ObjectType + Rights + padding).
+/// Computes: header size + (slot_count * entry_size), rounded up to pages.
 pub fn query_handle_table_size(info: &HandleTableCreateInfo) -> ObjectSize {
     let header_size = core::mem::size_of::<HandleTableHeader>();
-    // HandleEntry is 16 bytes (u64 + u8 + u8 + 6 padding)
-    let slot_size = 16;
-    let total_bytes = header_size + slot_size * info.slot_count as usize;
+    let total_bytes = header_size + core::mem::size_of::<HandleEntry>() * info.slot_count as usize;
     let pages = (total_bytes + PAGE_SIZE as usize - 1) / PAGE_SIZE as usize;
     ObjectSize { pages }
 }
@@ -164,5 +179,31 @@ mod tests {
     #[test]
     fn create_error_equality() {
         assert_eq!(CreateError::InvalidParameter, CreateError::InvalidParameter);
+    }
+
+    #[test]
+    fn handle_entry_size_is_16() {
+        // HANDLE_SLOTS_PER_PAGE depends on this being exactly 16.
+        assert_eq!(core::mem::size_of::<HandleEntry>(), 16);
+    }
+
+    #[test]
+    fn handle_slots_per_page_uses_full_page() {
+        // 255 entries * 16 bytes + 8 byte header = 4088, fits in 4096.
+        assert_eq!(HANDLE_SLOTS_PER_PAGE, 255);
+        let used = core::mem::size_of::<HandleTableHeader>()
+            + HANDLE_SLOTS_PER_PAGE as usize * core::mem::size_of::<HandleEntry>();
+        assert!(used <= 4096);
+        // One more wouldn't fit.
+        let with_one_more = used + core::mem::size_of::<HandleEntry>();
+        assert!(with_one_more > 4096);
+    }
+
+    #[test]
+    fn pageset_in_object_type_enum() {
+        // PageSet must be a distinct variant for handle table type checking.
+        assert_ne!(ObjectType::PageSet, ObjectType::Endpoint);
+        assert_ne!(ObjectType::PageSet, ObjectType::Notification);
+        assert_ne!(ObjectType::PageSet, ObjectType::HandleTable);
     }
 }

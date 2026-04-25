@@ -1,6 +1,7 @@
-use crate::cap::object::{ObjectType, HandleTableHeader};
+use crate::cap::object::ObjectType;
 use crate::cap::rights::Rights;
 use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
+use lockjaw_types::object::{HandleTableHeader, HandleEntry};
 use lockjaw_types::syscall::SyscallError;
 use core::ptr;
 
@@ -43,18 +44,29 @@ impl HandleTableRef {
     }
 
     /// Insert a new handle into the table. Returns the slot index.
+    /// Returns HANDLE_TABLE_FULL if no empty slot is available.
     pub fn insert(&self, object_paddr: PhysAddr, obj_type: ObjectType, rights: Rights) -> Result<u32, SyscallError> {
         // SAFETY: self.0 was validated at construction.
         unsafe { handle_insert(self.0, object_paddr, obj_type, rights) }
-            .map_err(|_| SyscallError::OUT_OF_MEMORY)
+            .map_err(|_| SyscallError::HANDLE_TABLE_FULL)
     }
 
-    /// Remove a handle from the table. Returns the removed entry.
-    #[allow(dead_code)] // No callers yet — needed for handle revocation.
-    pub fn remove(&self, handle: u32) -> Result<HandleEntry, SyscallError> {
+    /// Remove ALL handles pointing at a given object physical address.
+    /// Used when consuming a PageSet for object creation — invalidates
+    /// any duplicate handles in the same table to prevent stale access.
+    /// Cross-process exported handles are not affected (requires
+    /// revocation infrastructure, tracked in tech-debt).
+    pub fn remove_all_by_object(&self, object_paddr: u64) {
         // SAFETY: self.0 was validated at construction.
-        unsafe { handle_remove(self.0, handle) }
-            .map_err(|_| SyscallError::INVALID_HANDLE)
+        unsafe {
+            let (_header, slots) = table_slots(self.0);
+            for slot in slots.iter_mut() {
+                if slot.object_paddr == object_paddr {
+                    // SAFETY: zeroing via mutable slice reference to mark slot empty.
+                    ptr::write_bytes(slot as *mut HandleEntry, 0, 1);
+                }
+            }
+        }
     }
 
     /// The underlying physical address (needed by cross-table operations
@@ -65,19 +77,9 @@ impl HandleTableRef {
     }
 }
 
-/// A single entry in a handle table. Stored in donated pages immediately
-/// after the HandleTableHeader.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct HandleEntry {
-    /// Physical address of the kernel object. 0 = empty slot.
-    pub object_paddr: u64,
-    /// Type of the referenced object.
-    pub obj_type: ObjectType,
-    /// Access rights for this handle.
-    pub rights: Rights,
-    _padding: [u8; 6],
-}
+// HandleEntry is defined in lockjaw-types/src/object.rs and imported above.
+// HANDLE_SLOTS_PER_PAGE uses size_of::<HandleEntry>() directly — no
+// separate constant or compile-time assertion needed.
 
 /// Errors from handle operations.
 #[derive(Clone, Copy, Debug)]
