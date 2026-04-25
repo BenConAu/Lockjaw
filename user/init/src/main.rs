@@ -26,6 +26,10 @@ static DEVMGR_ELF: &[u8] = include_bytes!("../../device-manager/target/aarch64-u
 /// Built by: cd user/ramfb-driver && cargo build --release
 static RAMFB_ELF: &[u8] = include_bytes!("../../ramfb-driver/target/aarch64-unknown-none/release/lockjaw-ramfb-driver");
 
+/// The display test client ELF binary, embedded at compile time.
+/// Built by: cd user/display-test && cargo build --release
+static DISPLAY_TEST_ELF: &[u8] = include_bytes!("../../display-test/target/aarch64-unknown-none/release/lockjaw-display-test");
+
 // ---------------------------------------------------------------------------
 // ELF spawn helper
 // ---------------------------------------------------------------------------
@@ -271,6 +275,7 @@ pub extern "C" fn _start() -> ! {
     let devmgr_boot_ep = alloc_endpoint("devmgr boot");
     let uart_boot_ep = alloc_endpoint("uart boot");
     let ramfb_boot_ep = alloc_endpoint("ramfb boot");
+    let display_test_boot_ep = alloc_endpoint("dtest boot");
 
     // Spawn child processes.
     // Allocate temp VAs for ELF loading. Each spawn needs:
@@ -284,6 +289,7 @@ pub extern "C" fn _start() -> ! {
     spawn_elf(DEVMGR_ELF, "device-manager", map_array_va, temp_base_va, scratch_ps, devmgr_boot_ep, 8);
     spawn_elf(UART_ELF, "uart-driver", map_array_va, temp_base_va, scratch_ps, uart_boot_ep, 4);
     spawn_elf(RAMFB_ELF, "ramfb-driver", map_array_va, temp_base_va, scratch_ps, ramfb_boot_ep, 4);
+    spawn_elf(DISPLAY_TEST_ELF, "display-test", map_array_va, temp_base_va, scratch_ps, display_test_boot_ep, 1);
 
     // Bootstrap hello: export a test notification into its handle table.
     puts("init: waiting for hello bootstrap...\n");
@@ -341,6 +347,16 @@ pub extern "C" fn _start() -> ! {
     };
     sys_reply(ramfb_devmgr_idx, ramfb_display_idx, 0, 0);
     puts("[BOOTSTRAP] ramfb\n");
+
+    // Bootstrap display-test: export display_ep so it can use the DDI.
+    puts("init: waiting for display-test bootstrap...\n");
+    let _ = sys_receive(display_test_boot_ep);
+    let dtest_display_idx = match sys_export_handle(display_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export display_ep to display-test FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(dtest_display_idx, 0, 0, 0);
+    puts("[BOOTSTRAP] display-test\n");
 
     // Allocate a Reply object for init's own outbound calls (ipc_puts to
     // the uart server). Each client that issues sys_call needs one.

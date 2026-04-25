@@ -37,6 +37,7 @@ build-user: clean-all build-hash
 	cd user/uart-driver && cargo build --release
 	cd user/device-manager && cargo build --release
 	cd user/ramfb-driver && cargo build --release
+	cd user/display-test && cargo build --release
 	cd user/init && cargo build --release
 
 build: build-user check-stack check-pointers
