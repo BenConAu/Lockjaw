@@ -8,7 +8,7 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
 use lockjaw_userlib::*;
-use lockjaw_userlib::display::{DisplayClient, PIXEL_FORMAT_XRGB8888};
+use lockjaw_userlib::display::DisplayClient;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {

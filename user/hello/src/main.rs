@@ -67,7 +67,7 @@ pub extern "C" fn _start() -> ! {
     // arg = shared_va (where to write the marker)
     let stack_top = thread_stack_va + 4096;
     if sys_create_thread(
-        thread_test_entry as u64, stack_top, thread_stack_va, shared_va,
+        thread_test_entry as *const () as u64, stack_top, thread_stack_va, shared_va,
     ).is_err() {
         puts("[THREAD-TEST] create FAILED\n");
         sys_exit();

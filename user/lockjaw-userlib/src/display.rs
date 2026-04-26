@@ -7,7 +7,7 @@
 // Re-export DDI types so drivers and clients can import from one place.
 pub use lockjaw_types::display::*;
 use crate::syscall::*;
-use crate::handle::{EndpointHandle, ReplyHandle, PageSetHandle, Exportable};
+use crate::handle::{EndpointHandle, ReplyHandle, PageSetHandle};
 
 // ---------------------------------------------------------------------------
 // BufferInfo (client-side result from alloc_buffer)

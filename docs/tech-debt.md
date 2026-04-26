@@ -148,6 +148,30 @@ The eventual design is a **device manager** process that:
 
 ---
 
+## Consumed PageSet headers leak as tombstones
+
+**Where:** `src/cap/pageset_table.rs` (consume_pageset)
+
+**What:** When a PageSet is consumed (for object creation or process ownership transfer), its header page is zeroed but never freed. It stays allocated as a tombstone so that stale exported handles in other processes safely read count=0. Each consumption leaks one 4 KB page permanently.
+
+**Why:** Without handle revocation, freeing the header page would let it be reused. A stale exported handle could then read whatever new object lives at that address, creating a use-after-repurpose bug.
+
+**Fix:** Handle revocation — when a PageSet is consumed, walk all handle tables across all processes and remove entries pointing at that header. Then the header page can be safely freed. This requires a process registry and cross-process handle table iteration.
+
+---
+
+## No handle-table cleanup for non-PageSet objects on process exit
+
+**Where:** `src/sched/scheduler.rs` (finish_exit, LastThread arm)
+
+**What:** Process exit walks the handle table and calls handle_cleanup + apply_handle_cleanup for each entry. But handle_cleanup only acts on PageSet handles (dec_refcount, dec_map_count). Handles to endpoints, notifications, and reply objects are silently dropped without any cleanup. Their ObjectHeader.refcount is never decremented.
+
+**Why:** Only PageSets currently have free-on-zero semantics. Endpoints and notifications are kernel objects donated from parent PageSets — their lifetime is managed by the consuming process, not by refcounting. The refcount field in ObjectHeader exists but is not wired into any lifecycle logic for non-PageSet types.
+
+**Fix:** Extend handle_cleanup to act on all object types when their refcounting is wired up. For now, endpoint/notification/reply objects are effectively immortal once created — they are never freed.
+
+---
+
 ## SYS_RECV_NB naming inconsistency
 
 **Where:** `lockjaw-types/src/syscall.rs`, `src/syscall/handler.rs`, `user/lockjaw-userlib/src/syscall.rs`
