@@ -68,6 +68,22 @@ impl PageSetHeader {
     pub fn data_page_count(&self) -> usize {
         self.count as usize
     }
+
+    /// Increment the mapping count. Called when pages are mapped into
+    /// an address space via sys_map_pages.
+    pub fn inc_map_count(&mut self) {
+        self.map_count = self.map_count.checked_add(1)
+            .expect("map_count overflow");
+    }
+
+    /// Decrement the mapping count. Called when pages are unmapped.
+    /// Returns true if both map_count and refcount are now zero
+    /// (caller should free the PageSet).
+    pub fn dec_map_count(&mut self) -> bool {
+        assert!(self.map_count > 0, "map_count underflow");
+        self.map_count -= 1;
+        self.map_count == 0 && self.refcount == 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +389,35 @@ mod tests {
         let id = table.insert(PageSetEntry { count: 1, header_paddr: 0xA000 }).unwrap();
         table.remove(id).unwrap();
         assert_eq!(table.find_by_header_paddr(0xA000), None);
+    }
+
+    // --- map_count lifecycle ---
+
+    #[test]
+    fn map_count_inc_dec() {
+        let mut h = PageSetHeader::empty();
+        h.refcount = 1;
+        h.inc_map_count();
+        assert_eq!(h.map_count, 1);
+        h.inc_map_count();
+        assert_eq!(h.map_count, 2);
+        assert!(!h.dec_map_count()); // map_count=1, refcount=1 → not free
+        assert!(!h.dec_map_count()); // map_count=0, refcount=1 → not free
+    }
+
+    #[test]
+    fn map_count_zero_with_zero_refcount_signals_free() {
+        let mut h = PageSetHeader::empty();
+        h.refcount = 0;
+        h.inc_map_count();
+        assert!(h.dec_map_count()); // map_count=0, refcount=0 → free
+    }
+
+    #[test]
+    #[should_panic(expected = "map_count underflow")]
+    fn map_count_underflow_panics() {
+        let mut h = PageSetHeader::empty();
+        h.dec_map_count();
     }
 
     // --- zeroed header makes stale reads inert ---

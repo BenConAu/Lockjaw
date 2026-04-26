@@ -22,6 +22,7 @@ pub enum VmemError {
     TooManyMappings,
     TooManyL3Regions,
     OutOfPages,
+    InvalidParameter,
 }
 
 /// Allocate a fresh set of page tables and map the given pages.
@@ -257,6 +258,45 @@ pub unsafe fn map_pages_in_existing(
 }
 
 /// Query the mapping state at a user VA and count consecutive pages
+/// Validate that L3 PTEs at [va, va + count*PAGE_SIZE) map to the expected
+/// physical pages, then clear them and flush the TLB.
+/// L3 page entries only — rejects L2 block mappings.
+///
+/// # Safety
+/// `ttbr0_paddr` must be a valid L0 page table base.
+/// `expected_pages` must contain valid physical addresses.
+pub unsafe fn unmap_validated(
+    ttbr0_paddr: PhysAddr,
+    va: u64,
+    expected_pages: &[u64],
+) -> Result<(), VmemError> {
+    // Pure validation + PTE clearing logic in lockjaw-types.
+    // Kernel provides read/write closures for PTE access via TTBR1.
+    lockjaw_types::page_table::unmap_validated(
+        ttbr0_paddr.as_u64(),
+        va,
+        expected_pages,
+        |pte_paddr| {
+            // SAFETY: kernel VA via KERNEL_VA_OFFSET
+            core::ptr::read_volatile((pte_paddr + KERNEL_VA_OFFSET) as *const u64)
+        },
+        |pte_paddr, val| {
+            // SAFETY: kernel VA via KERNEL_VA_OFFSET
+            core::ptr::write_volatile((pte_paddr + KERNEL_VA_OFFSET) as *mut u64, val);
+        },
+    ).map_err(|_| VmemError::InvalidParameter)?;
+
+    // TLB flush after PTE clearing
+    core::arch::asm!(
+        "dsb ish",
+        "tlbi vmalle1is",
+        "dsb ish",
+        "isb",
+    );
+
+    Ok(())
+}
+
 /// with the same state. Uses the pure MappingQuery state machine from
 /// lockjaw-types (host-testable); the kernel only does memory reads.
 ///

@@ -329,3 +329,13 @@ pub(crate) unsafe fn read_header(header_paddr: u64) -> &'static PageSetHeader {
     &*header.as_ptr()
 }
 
+/// Get a mutable reference to a PageSetHeader for updating refcount/map_count.
+///
+/// # Safety
+/// `header_paddr` must be a valid header page physical address.
+/// Caller must ensure exclusive access (GKL held, single-core).
+pub(crate) unsafe fn read_header_mut(header_paddr: u64) -> &'static mut PageSetHeader {
+    let mut header = KernelMut::<PageSetHeader>::from_paddr(PhysAddr::new(header_paddr));
+    &mut *header.as_mut_ptr()
+}
+

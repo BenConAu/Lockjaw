@@ -28,3 +28,16 @@
 # create_kernel_object calls init_fn (function pointer) for the specific
 # object type being created. All possible targets:
 "lockjaw::syscall::handler::create_kernel_object" = ["lockjaw::ipc::endpoint::create_endpoint", "lockjaw::ipc::notification::create_notification", "lockjaw::ipc::reply::create_reply"]
+
+# Cycles involving the crash handler are guarded at runtime by an
+# AtomicBool re-entry flag in print_thread_context. The call graph
+# edges still exist (panic paths call print_thread_context which
+# uses formatting that the compiler sees as potentially panicking),
+# but the runtime guard prevents actual recursion.
+[allowed_cycles]
+# print_thread_context has a runtime AtomicBool re-entry guard.
+"lockjaw::crash::print_thread_context" = true
+# The panic handler (#[panic_handler]) uses writeln! for output,
+# which the compiler sees as potentially panicking again. This is
+# inherent to any panic handler that formats — not real recursion.
+"__rustc::rust_begin_unwind" = true

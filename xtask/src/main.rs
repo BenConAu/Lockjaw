@@ -7,7 +7,8 @@ const NORMAL_PATH_BUDGET: u64 = 3072;
 const INTERRUPT_PATH_BUDGET: u64 = 1024;
 const TOTAL_BUDGET: u64 = NORMAL_PATH_BUDGET + INTERRUPT_PATH_BUDGET;
 
-const KERNEL_ELF: &str = "target/aarch64-unknown-none/release/lockjaw";
+const KERNEL_ELF_RELEASE: &str = "target/aarch64-unknown-none/release/lockjaw";
+const KERNEL_ELF_DEBUG: &str = "target/aarch64-unknown-none/debug/lockjaw";
 
 /// Entry points for worst-case depth analysis.
 /// Normal path starts at _start, interrupt path starts at exception vectors.
@@ -38,10 +39,24 @@ fn check_stack() {
     println!("  Total stack size:      {} bytes", TOTAL_BUDGET);
     println!();
 
+    // Check both release and debug builds. Debug builds have larger
+    // stack frames and are what `make test` runs.
+    check_stack_for_profile("release", KERNEL_ELF_RELEASE);
+    println!();
+    check_stack_for_profile("debug", KERNEL_ELF_DEBUG);
+}
+
+fn check_stack_for_profile(profile: &str, elf_path: &str) {
+    println!("--- Checking {} build ---", profile);
+
     // Step 1: Build with emit-stack-sizes
-    println!("[1/4] Building kernel (release, emit-stack-sizes)...");
+    println!("[1/4] Building kernel ({}, emit-stack-sizes)...", profile);
+    let mut args = vec!["build"];
+    if profile == "release" {
+        args.push("--release");
+    }
     let status = Command::new("cargo")
-        .args(["build", "--release"])
+        .args(&args)
         .env(
             "RUSTFLAGS",
             "-Z emit-stack-sizes -C link-arg=-Tlinker.ld -C link-arg=--gc-sections",
@@ -50,13 +65,13 @@ fn check_stack() {
         .expect("failed to run cargo build");
 
     if !status.success() {
-        eprintln!("FAIL: cargo build failed");
+        eprintln!("FAIL: cargo build ({}) failed", profile);
         process::exit(1);
     }
 
     // Step 2: Parse per-function stack sizes from .stack_sizes ELF section
     println!("[2/4] Parsing per-function stack sizes...");
-    let stack_sizes = parse_stack_sizes();
+    let stack_sizes = parse_stack_sizes(elf_path);
     for (name, size) in &stack_sizes {
         println!("  {:>6} bytes  {}", size, name);
     }
@@ -65,7 +80,7 @@ fn check_stack() {
 
     // Step 3: Extract call graph from disassembly (BL instruction scan)
     println!("[3/4] Extracting call graph from disassembly...");
-    let (functions, call_graph, indirect_calls) = extract_call_graph();
+    let (functions, call_graph, indirect_calls) = extract_call_graph(elf_path);
     let mut total_edges = 0;
     for targets in call_graph.values() {
         total_edges += targets.len();
@@ -114,13 +129,22 @@ fn check_stack() {
     println!("[4/4] Analyzing call graph...");
     let mut failed = false;
 
-    // Cycle detection (recursion check)
-    let cycles = detect_cycles(&call_graph);
-    if cycles.is_empty() {
-        println!("  [PASS] No recursion (zero cycles in call graph)");
+    // Cycle detection (recursion check).
+    // Cycles through functions listed in [allowed_cycles] are accepted
+    // (guarded at runtime, e.g., by re-entry flags).
+    let allowed_cycle_fns = load_allowed_cycles();
+
+    let all_cycles = detect_cycles(&call_graph);
+    let real_cycles: Vec<_> = all_cycles.into_iter().filter(|cycle| {
+        let demangled: Vec<String> = cycle.iter().map(|n| demangle(n).trim().to_string()).collect();
+        !demangled.iter().any(|name| allowed_cycle_fns.contains(name.as_str()))
+    }).collect();
+
+    if real_cycles.is_empty() {
+        println!("  [PASS] No recursion (zero unguarded cycles in call graph)");
     } else {
         eprintln!("  [FAIL] Recursion detected! Cycles found:");
-        for cycle in &cycles {
+        for cycle in &real_cycles {
             eprintln!("    {}", cycle.join(" -> "));
         }
         failed = true;
@@ -156,9 +180,9 @@ fn check_stack() {
 // Parse .stack_sizes section via rust-readobj
 // ---------------------------------------------------------------------------
 
-fn parse_stack_sizes() -> HashMap<String, u64> {
+fn parse_stack_sizes(elf_path: &str) -> HashMap<String, u64> {
     let output = Command::new("rust-readobj")
-        .args(["--stack-sizes", KERNEL_ELF])
+        .args(["--stack-sizes", elf_path])
         .output()
         .expect("failed to run rust-readobj — is cargo-binutils installed?");
 
@@ -200,9 +224,9 @@ fn parse_stack_sizes() -> HashMap<String, u64> {
 // ---------------------------------------------------------------------------
 
 /// Returns (function_names, call_graph, functions_with_indirect_calls)
-fn extract_call_graph() -> (Vec<String>, HashMap<String, Vec<String>>, Vec<String>) {
+fn extract_call_graph(elf_path: &str) -> (Vec<String>, HashMap<String, Vec<String>>, Vec<String>) {
     let output = Command::new("rust-objdump")
-        .args(["-d", "--no-show-raw-insn", KERNEL_ELF])
+        .args(["-d", "--no-show-raw-insn", elf_path])
         .output()
         .expect("failed to run rust-objdump — is cargo-binutils installed?");
 
@@ -438,6 +462,37 @@ fn parse_hex_or_dec(s: &str) -> Result<u64, std::num::ParseIntError> {
     } else {
         s.parse()
     }
+}
+
+/// Load function names from [allowed_cycles] in stack-annotations.toml.
+/// Cycles passing through these functions are accepted (guarded at runtime).
+fn load_allowed_cycles() -> HashSet<String> {
+    let mut allowed = HashSet::new();
+    let path = "xtask/stack-annotations.toml";
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return allowed,
+    };
+    let mut in_section = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line == "[allowed_cycles]" {
+            in_section = true;
+            continue;
+        }
+        if line.starts_with('[') {
+            in_section = false;
+            continue;
+        }
+        if in_section && !line.is_empty() && !line.starts_with('#') {
+            // Parse "function_name" = true
+            if let Some(name) = line.split('=').next() {
+                let name = name.trim().trim_matches('"');
+                allowed.insert(name.to_string());
+            }
+        }
+    }
+    allowed
 }
 
 // ---------------------------------------------------------------------------

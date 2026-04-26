@@ -68,6 +68,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_CREATE_THREAD => SyscallReturn::Void(sys_create_thread(ctx)),
         SYS_QUERY_MAPPING => sys_query_mapping(ctx),
         SYS_CLOSE_HANDLE => SyscallReturn::Void(sys_close_handle(ctx)),
+        SYS_UNMAP_PAGES => SyscallReturn::Void(sys_unmap_pages(ctx)),
         SYS_EXIT => {
             scheduler::exit_current(); // never returns
         }
@@ -272,6 +273,12 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     let virt_addr = ctx.gpr[1];
     let flags = ctx.gpr[2];
 
+    // Reject VA 0 (mapped_va_page uses 0 as "not mapped" sentinel)
+    // and unaligned VAs (would silently round down when stored as VA >> 12).
+    if virt_addr == 0 || virt_addr & 0xFFF != 0 {
+        return SyscallError::INVALID_PARAMETER;
+    }
+
     let addr_space = match CurrentThread::address_space() {
         Some(a) => a,
         None => return SyscallError::INVALID_PARAMETER,
@@ -283,11 +290,32 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
         Ok(e) => e,
         Err(e) => return e,
     };
+
+    // Reject if this handle already has an active mapping.
+    // One mapping per handle — alias mappings require duplicating the handle.
+    match ht.get_mapped_va(handle) {
+        Ok(va_page) if va_page != 0 => return SyscallError::INVALID_PARAMETER,
+        Err(e) => return e,
+        _ => {}
+    }
+
     // SAFETY: object_paddr came from a PageSet handle — valid header page.
-    let header = unsafe { crate::cap::pageset_table::read_header(entry.object_paddr) };
+    let header_paddr = entry.object_paddr;
+    let header = unsafe { crate::cap::pageset_table::read_header(header_paddr) };
     unsafe {
         match crate::arch::aarch64::vmem::map_pages_in_existing(addr_space.ttbr0(), virt_addr, header, flags) {
-            Ok(()) => SyscallError::OK,
+            Ok(()) => {
+                // Record the mapping on this handle and increment the
+                // PageSet's global map count.
+                if let Err(e) = ht.set_mapped_va(handle, (virt_addr >> 12) as u32) {
+                    // Handle disappeared after mapping — shouldn't happen
+                    // but if it does, the mapping is orphaned. Log and fail.
+                    crate::kprintln!("WARNING: set_mapped_va failed after mapping");
+                    return e;
+                }
+                crate::cap::pageset_table::read_header_mut(header_paddr).inc_map_count();
+                SyscallError::OK
+            }
             Err(_) => SyscallError::UNKNOWN,
         }
     }
@@ -737,6 +765,67 @@ fn sys_query_mapping(ctx: &mut ExceptionContext) -> SyscallReturn {
 /// object or its pages — without refcounting, mapping tracking, or
 /// revocation, freeing would be use-after-free if other handles or
 /// mappings to the same object exist.
+/// sys_unmap_pages(handle, va) — unmap a PageSet from the caller's address space.
+/// x0 = PageSet handle (must have been mapped via sys_map_pages).
+/// x1 = VA (must match the VA used in sys_map_pages).
+/// Validates that every L3 PTE maps to the expected physical page from
+/// the PageSet before clearing. L3 only — rejects L2 block mappings.
+fn sys_unmap_pages(ctx: &mut ExceptionContext) -> SyscallError {
+    let handle = ctx.gpr[0] as u32;
+    let va = ctx.gpr[1];
+
+    let addr_space = match CurrentThread::address_space() {
+        Some(a) => a,
+        None => return SyscallError::INVALID_PARAMETER,
+    };
+
+    let ht = CurrentThread::handle_table();
+    let entry = match ht.lookup(handle, Rights::from_bits(RIGHT_READ), ObjectType::PageSet) {
+        Ok(e) => e,
+        Err(e) => return e,
+    };
+
+    // Verify this handle has an active mapping at the given VA.
+    let mapped_va_page = match ht.get_mapped_va(handle) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if mapped_va_page == 0 {
+        return SyscallError::INVALID_PARAMETER; // not mapped
+    }
+    if va != (mapped_va_page as u64) << 12 {
+        return SyscallError::INVALID_PARAMETER; // VA doesn't match
+    }
+
+    // Read the PageSet header to get expected physical pages.
+    // Pass the header's page array directly — no stack copy.
+    let header_paddr = entry.object_paddr;
+    let header = unsafe { crate::cap::pageset_table::read_header(header_paddr) };
+    let count = header.data_page_count();
+    let expected = &header.pages[..count];
+
+    // Validate PTEs and clear them. TLB flushed inside.
+    if unsafe {
+        crate::arch::aarch64::vmem::unmap_validated(
+            addr_space.ttbr0(), va, expected,
+        )
+    }.is_err() {
+        return SyscallError::INVALID_PARAMETER;
+    }
+
+    // Clear the mapping record on this handle.
+    let _ = ht.set_mapped_va(handle, 0);
+
+    // Decrement the PageSet's map count. Free-on-zero is deferred to
+    // the refcounting commit — without refcount increments wired up,
+    // dec_map_count would prematurely free pages the caller still holds.
+    unsafe {
+        let _ = crate::cap::pageset_table::read_header_mut(header_paddr).dec_map_count();
+    }
+
+    SyscallError::OK
+}
+
 fn sys_close_handle(ctx: &mut ExceptionContext) -> SyscallError {
     let handle = ctx.gpr[0] as u32;
     let ht = CurrentThread::handle_table();

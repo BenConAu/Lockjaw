@@ -99,6 +99,7 @@ pub const SYS_EXIT: u64 = 21;
 pub const SYS_CREATE_THREAD: u64 = 22;
 pub const SYS_QUERY_MAPPING: u64 = 23;
 pub const SYS_CLOSE_HANDLE: u64 = 24;
+pub const SYS_UNMAP_PAGES: u64 = 25;
 
 /// Flag for SYS_ALLOC_PAGES: allocated pages must be physically contiguous.
 pub const ALLOC_FLAG_CONTIGUOUS: u64 = 1 << 0;

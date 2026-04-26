@@ -76,11 +76,32 @@ impl HandleTableRef {
         }
     }
 
-    /// The underlying physical address (needed by cross-table operations
-    /// like sys_export_handle on the caller's table).
-    #[allow(dead_code)] // No callers yet — needed for cross-table operations.
-    pub fn paddr(&self) -> PhysAddr {
-        self.0
+    /// Set the mapped_va_page field on a handle entry.
+    /// mapped_va_page = 0 means not mapped; nonzero = VA >> 12.
+    pub fn set_mapped_va(&self, handle: u32, va_page: u32) -> Result<(), SyscallError> {
+        unsafe {
+            let (_header, slots) = table_slots(self.0);
+            let slot = slots.get_mut(handle as usize)
+                .ok_or(SyscallError::INVALID_HANDLE)?;
+            if slot.object_paddr == 0 {
+                return Err(SyscallError::INVALID_HANDLE);
+            }
+            slot.mapped_va_page = va_page;
+            Ok(())
+        }
+    }
+
+    /// Get the mapped_va_page field from a handle entry.
+    pub fn get_mapped_va(&self, handle: u32) -> Result<u32, SyscallError> {
+        unsafe {
+            let (_header, slots) = table_slots(self.0);
+            let slot = slots.get(handle as usize)
+                .ok_or(SyscallError::INVALID_HANDLE)?;
+            if slot.object_paddr == 0 {
+                return Err(SyscallError::INVALID_HANDLE);
+            }
+            Ok(slot.mapped_va_page)
+        }
     }
 }
 

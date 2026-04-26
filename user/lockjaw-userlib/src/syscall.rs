@@ -316,6 +316,22 @@ pub fn sys_wait_any(entries: &[crate::WaitEntry]) -> Result<u64, SyscallError> {
     if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
 }
 
+/// Unmap a PageSet from the caller's address space.
+/// VA must match the address used in sys_map_pages. Validates that
+/// every PTE maps to the expected physical page before clearing.
+pub fn sys_unmap_pages(ps: PageSetHandle, va: u64) -> SyscallError {
+    let err: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") ps.0 => err,
+            in("x1") va,
+            in("x8") SYS_UNMAP_PAGES,
+        );
+    }
+    SyscallError(err)
+}
+
 /// Get boot information from the kernel.
 /// Returns a PageSet handle for the DTB.
 pub fn sys_get_boot_info() -> Result<PageSetHandle, SyscallError> {

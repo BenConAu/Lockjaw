@@ -475,6 +475,86 @@ pub fn query_mapping_run<F: Fn(u64) -> u64>(
     (first_mapped, count)
 }
 
+/// Validate that L3 PTEs at [va, va + count*4096) map to the expected
+/// physical pages, then clear them. Returns Ok(()) if all matched and
+/// were cleared. Returns Err(index) with the first mismatched page index.
+///
+/// L3 page entries only — returns Err if the walk resolves at L1/L2
+/// (block mapping) or faults.
+///
+/// The caller provides closures for reading and writing PTEs, keeping
+/// this function pure and host-testable.
+pub fn unmap_validated<R, W>(
+    ttbr0_paddr: u64,
+    va: u64,
+    expected_pages: &[u64],
+    read_pte: R,
+    write_pte: W,
+) -> Result<(), usize>
+where
+    R: Fn(u64) -> u64,
+    W: Fn(u64, u64),
+{
+    let count = expected_pages.len();
+
+    // Pass 1 (read-only): validate every PTE matches the expected
+    // physical page. No writes — if any page mismatches, the address
+    // space is untouched.
+    for i in 0..count {
+        let page_va = va + (i as u64) * 4096;
+        let (mut walk, mut result) = PageTableWalk::start(ttbr0_paddr, page_va);
+
+        loop {
+            match result {
+                WalkResult::Continue(pte_paddr) => {
+                    let pte_raw = read_pte(pte_paddr);
+                    let next = walk.step(pte_raw);
+                    match next {
+                        WalkResult::Done(phys_addr) => {
+                            let actual_page = phys_addr & !0xFFF;
+                            if actual_page != expected_pages[i] {
+                                return Err(i);
+                            }
+                            break;
+                        }
+                        _ => result = next,
+                    }
+                }
+                WalkResult::Done(_) => return Err(i),
+                WalkResult::Fault => return Err(i),
+            }
+        }
+    }
+
+    // Pass 2 (write): all PTEs validated — now clear them. Walk each
+    // page again to find the L3 PTE address. This is a second page
+    // table walk but avoids a large stack array and is transactional.
+    for i in 0..count {
+        let page_va = va + (i as u64) * 4096;
+        let (mut walk, mut result) = PageTableWalk::start(ttbr0_paddr, page_va);
+
+        loop {
+            match result {
+                WalkResult::Continue(pte_paddr) => {
+                    let pte_raw = read_pte(pte_paddr);
+                    let next = walk.step(pte_raw);
+                    match next {
+                        WalkResult::Done(_) => {
+                            write_pte(pte_paddr, 0);
+                            break;
+                        }
+                        _ => result = next,
+                    }
+                }
+                // Pass 1 already validated — these can't happen
+                _ => break,
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -963,5 +1043,61 @@ mod tests {
         assert!(!mapped);
         let expected = ((0x4000_0000u64 - 0x40_0000) / 4096) as usize;
         assert_eq!(run, expected);
+    }
+
+    // --- unmap_validated tests ---
+
+    #[test]
+    fn unmap_validated_clears_matching_ptes() {
+        use std::cell::RefCell;
+
+        let (pt, l0) = build_basic_pt(3);
+        let pt = RefCell::new(pt);
+
+        // Expected physical pages match what build_basic_pt sets up:
+        // L3[i] maps to 0x8000_0000 + i * 4096
+        let expected = [
+            0x8000_0000,
+            0x8000_1000,
+            0x8000_2000,
+        ];
+
+        let result = unmap_validated(
+            l0, 0x40_0000, &expected,
+            |a| pt.borrow().read(a),
+            |a, v| pt.borrow_mut().set(a, v),
+        );
+        assert!(result.is_ok());
+
+        // Verify PTEs were cleared: querying should show unmapped
+        let (mapped, _) = query_mapping_run(l0, 0x40_0000, |a| pt.borrow().read(a));
+        assert!(!mapped);
+    }
+
+    #[test]
+    fn unmap_validated_rejects_wrong_phys() {
+        let (pt, l0) = build_basic_pt(2);
+        let expected = [0xDEAD_0000, 0xDEAD_1000]; // wrong addresses
+
+        let result = unmap_validated(
+            l0, 0x40_0000, &expected,
+            |a| pt.read(a),
+            |_, _| panic!("should not write"),
+        );
+        assert_eq!(result, Err(0));
+    }
+
+    #[test]
+    fn unmap_validated_rejects_unmapped_page() {
+        let (pt, l0) = build_basic_pt(1);
+        // Try to unmap 2 pages but only 1 is mapped
+        let expected = [0x8000_0000, 0x8000_1000];
+
+        let result = unmap_validated(
+            l0, 0x40_0000, &expected,
+            |a| pt.read(a),
+            |_, _| panic!("should not write"),
+        );
+        assert_eq!(result, Err(1)); // second page is unmapped
     }
 }

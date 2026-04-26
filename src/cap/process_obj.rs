@@ -40,24 +40,26 @@ pub fn create_process_object(
     immortal: bool,
     name: &[u8; 16],
 ) {
-    // SAFETY: page_paddr is a freshly allocated, kernel-owned page.
+    // Zero the page first — owned_pages (1024 bytes) starts as zeros
+    // without constructing a large struct literal on the stack.
+    crate::mm::page_alloc::zero_page(page_paddr);
+
+    // SAFETY: page_paddr is a freshly zeroed, kernel-owned page.
     let mut slot = unsafe { KernelMut::<ProcessObject>::from_paddr(page_paddr) };
-    // SAFETY: writing into freshly donated, uninitialized storage.
+    // Write only the header fields. owned_page_count and owned_pages
+    // are already zero from the page zeroing above.
     unsafe {
-        ptr::write(slot.as_mut_ptr(), ProcessObject {
-            header: ObjectHeader {
-                obj_type: ObjectType::Process,
-                page_count: 1,
-                refcount: 0, // incremented by first handle_insert
-            },
-            ttbr0_paddr,
-            handle_table_paddr,
-            thread_count: 0,
-            immortal,
-            name: *name,
-            owned_page_count: 0,
-            owned_pages: [0; lockjaw_types::process::MAX_OWNED_PAGES],
-        });
+        let p = slot.as_mut_ptr();
+        (*p).header = ObjectHeader {
+            obj_type: ObjectType::Process,
+            page_count: 1,
+            refcount: 0, // incremented by first handle_insert
+        };
+        (*p).ttbr0_paddr = ttbr0_paddr;
+        (*p).handle_table_paddr = handle_table_paddr;
+        (*p).thread_count = 0;
+        (*p).immortal = immortal;
+        (*p).name = *name;
     }
 }
 
