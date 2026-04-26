@@ -126,11 +126,11 @@ pub fn create_process(
     );
     page_alloc::zero_page(proc_guard.addr());
 
-    // Track unique PageSet headers for consumption (small — one per
-    // distinct PageSet, not per page). 32 is generous for any process.
-    const MAX_CONSUMED_HEADERS: usize = 32;
-    let mut consumed_headers = [0u64; MAX_CONSUMED_HEADERS];
-    let mut header_count: usize = 0;
+    // Build the transfer plan: deduplicates owned pages and consumed
+    // headers, validates capacity. All tricky decision logic is in
+    // lockjaw-types with host tests.
+    use lockjaw_types::process::ProcessTransferPlan;
+    let mut plan = ProcessTransferPlan::new();
 
     for i in 0..mapping_count {
         // Read ProcessMapping from user memory via page table walk (TTBR1).
@@ -162,16 +162,7 @@ pub fn create_process(
         ) {
             return Err("too many owned pages");
         }
-
-        // Track unique PageSet headers for consumption
-        let hdr = ps_entry.object_paddr;
-        if !consumed_headers[..header_count].contains(&hdr) {
-            if header_count >= MAX_CONSUMED_HEADERS {
-                return Err("too many PageSets for ownership transfer");
-            }
-            consumed_headers[header_count] = hdr;
-            header_count += 1;
-        }
+        plan.add_header(ps_entry.object_paddr).map_err(|_| "too many PageSets")?;
     }
 
     // Add stack pages contiguously at USER_STACK_BASE
@@ -193,16 +184,7 @@ pub fn create_process(
             return Err("too many owned pages");
         }
     }
-
-    // Track stack PageSet header for consumption
-    let stack_hdr = stack_entry.object_paddr;
-    if !consumed_headers[..header_count].contains(&stack_hdr) {
-        if header_count >= MAX_CONSUMED_HEADERS {
-            return Err("too many PageSets for ownership transfer");
-        }
-        consumed_headers[header_count] = stack_hdr;
-        header_count += 1;
-    }
+    plan.add_header(stack_entry.object_paddr).map_err(|_| "too many PageSets")?;
 
     // Create address space
     // SAFETY: all physical addresses in mappings are from validated PageSets.
@@ -225,8 +207,7 @@ pub fn create_process(
         ).map_err(|_| "handle table create failed")?;
     }
 
-    // Write ProcessObject header into the pre-allocated page.
-    // owned_pages was already populated during mapping resolution above.
+    // Write ProcessObject header (owned_pages already populated above).
     crate::cap::process_obj::init_process_header(
         proc_guard.addr(),
         ttbr0_guard.addr().as_u64(),
@@ -285,8 +266,8 @@ pub fn create_process(
     // Must happen BEFORE the point of no return. If any unmap fails,
     // the entire create_process fails and guards clean up everything.
     let parent_ttbr0 = addr_space.ttbr0();
-    for i in 0..header_count {
-        let hdr = consumed_headers[i];
+    for i in 0..plan.headers().len() {
+        let (idx, hdr) = plan.header_at(i).unwrap();
         let header = unsafe { crate::cap::pageset_table::read_header(hdr) };
         let page_count = header.data_page_count();
         let pages = &header.pages[..page_count];
@@ -297,20 +278,22 @@ pub fn create_process(
             }
         });
 
-        if unmapped != total_mapped {
-            return Err("parent unmap failed during ownership transfer");
-        }
+        plan.record_unmap(idx, total_mapped, unmapped);
 
         // Decrement map_count for successfully unmapped handles
-        if unmapped > 0 {
+        let dec = plan.successful_unmaps(idx);
+        if dec > 0 {
             unsafe {
                 let hdr_mut = crate::cap::pageset_table::read_header_mut(hdr);
-                for _ in 0..unmapped {
+                for _ in 0..dec {
                     hdr_mut.dec_map_count();
                 }
             }
         }
     }
+
+    // Validate: all unmaps must have fully succeeded.
+    plan.validate().map_err(|_| "parent unmap failed during ownership transfer")?;
 
     // Enqueue the thread — last fallible step.
     if !scheduler::add_thread(tcb_guard.addr()) {
@@ -327,9 +310,9 @@ pub fn create_process(
     tcb_guard.defuse();
 
     // --- Phase 2: Consume transferred PageSets (infallible) ---
-    // Parent unmaps already succeeded above, so this is safe.
-    for i in 0..header_count {
-        crate::cap::pageset_table::consume_pageset(consumed_headers[i], &ht);
+    // Plan already validated — all unmaps succeeded.
+    for &hdr in plan.headers() {
+        crate::cap::pageset_table::consume_pageset(hdr, &ht);
     }
 
     Ok(())
