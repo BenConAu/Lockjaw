@@ -42,11 +42,22 @@ pub fn create_process_object(
     // Zero the page first — owned_pages (1024 bytes) starts as zeros
     // without constructing a large struct literal on the stack.
     crate::mm::page_alloc::zero_page(page_paddr);
+    init_process_header(page_paddr, ttbr0_paddr, handle_table_paddr, immortal, name);
+}
 
-    // SAFETY: page_paddr is a freshly zeroed, kernel-owned page.
+/// Write ProcessObject header fields into an already-zeroed page.
+/// Used by create_process when owned_pages was populated first.
+pub fn init_process_header(
+    page_paddr: PhysAddr,
+    ttbr0_paddr: u64,
+    handle_table_paddr: u64,
+    immortal: bool,
+    name: &[u8; 16],
+) {
+    // SAFETY: page_paddr is a zeroed, kernel-owned page.
     let mut slot = unsafe { KernelMut::<ProcessObject>::from_paddr(page_paddr) };
     // Write only the header fields. owned_page_count and owned_pages
-    // are already zero from the page zeroing above.
+    // are preserved (may already be populated by process_push_owned_page).
     unsafe {
         let p = slot.as_mut_ptr();
         (*p).header = ObjectHeader {
@@ -90,6 +101,35 @@ pub fn process_inc_thread_count(process_paddr: PhysAddr) {
     let old_count = p.get().thread_count;
     let new_count = process::on_thread_create(old_count);
     p.get_mut().thread_count = new_count;
+}
+
+/// Append one page to this process's owned_pages array, deduplicating.
+/// The page will be freed when the last thread exits.
+/// Returns false if the array is full (MAX_OWNED_PAGES reached).
+pub fn process_push_owned_page(process_paddr: PhysAddr, page_paddr: u64) -> bool {
+    // SAFETY: process_paddr is a valid ProcessObject (page already zeroed).
+    let mut p = unsafe { KernelMut::<ProcessObject>::from_paddr(process_paddr) };
+    let proc = p.get_mut();
+    let count = proc.owned_page_count as usize;
+    // Dedup: skip if already present
+    for i in 0..count {
+        if proc.owned_pages[i] == page_paddr {
+            return true;
+        }
+    }
+    if count >= process::MAX_OWNED_PAGES {
+        return false;
+    }
+    proc.owned_pages[count] = page_paddr;
+    proc.owned_page_count = (count + 1) as u32;
+    true
+}
+
+/// Read the owned page list for a process (for cleanup on last thread exit).
+pub fn process_owned_pages(process_paddr: PhysAddr) -> (u32, [u64; process::MAX_OWNED_PAGES]) {
+    // SAFETY: process_paddr is a valid ProcessObject.
+    let p = unsafe { KernelRef::<ProcessObject>::from_paddr(process_paddr) };
+    (p.get().owned_page_count, p.get().owned_pages)
 }
 
 /// Decrement the thread count (a thread exited from this process).

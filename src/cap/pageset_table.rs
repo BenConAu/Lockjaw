@@ -228,6 +228,36 @@ pub fn free_header_page(header_paddr: u64) {
     );
 }
 
+/// Consume a PageSet for ownership transfer. Data pages are NOT freed —
+/// the caller takes ownership of them.
+///
+/// Steps:
+/// 1. Zero the header page — makes any stale handles (local duplicates
+///    or cross-process exports) read count=0 from the zeroed header,
+///    so they become inert without needing revocation.
+/// 2. Remove from global pageset table (unlinks the slot).
+/// 3. Remove ALL handles in the given table that point at this header.
+///
+/// The header page is intentionally NOT freed. It stays allocated as a
+/// zeroed tombstone so that stale exported handles in other processes
+/// safely read count=0. Freeing would allow the page to be reused,
+/// making stale handles point at a live object — a use-after-repurpose
+/// bug. The proper fix is handle revocation (future work).
+///
+/// Used by both create_kernel_object (single-page donation for endpoints,
+/// notifications, etc.) and create_process (multi-page image transfer).
+pub fn consume_pageset(
+    header_paddr: u64,
+    handle_table: &super::handle_table::HandleTableRef,
+) {
+    // Zero header BEFORE removing handles — stale handles read count=0
+    page_alloc::zero_page(PhysAddr::new(header_paddr));
+    // Unlink from global table
+    consume_by_header_paddr(header_paddr);
+    // Remove all handles pointing at the consumed PageSet
+    handle_table.remove_all_by_object(header_paddr);
+}
+
 /// Remove a PageSet from the table by its header physical address.
 /// Used when consuming via a handle (which stores header_paddr, not the
 /// global table slot ID). Does NOT free physical pages — use

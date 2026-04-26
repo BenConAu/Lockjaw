@@ -58,6 +58,31 @@ impl HandleTableRef {
             .map_err(|_| SyscallError::INVALID_HANDLE)
     }
 
+    /// For each handle pointing at the given object with a non-zero
+    /// mapped_va_page, call the callback with the mapping VA. The callback
+    /// returns true if the unmap succeeded — only then is mapped_va_page
+    /// cleared. Returns (total_mapped, successfully_unmapped). If these
+    /// differ, some mappings could not be torn down.
+    pub fn unmap_for_object(&self, object_paddr: u64, mut cb: impl FnMut(u64) -> bool) -> (usize, usize) {
+        let mut total = 0;
+        let mut unmapped = 0;
+        // SAFETY: self.0 was validated at construction.
+        unsafe {
+            let (_header, slots) = table_slots(self.0);
+            for slot in slots.iter_mut() {
+                if slot.object_paddr == object_paddr && slot.mapped_va_page != 0 {
+                    total += 1;
+                    let va = (slot.mapped_va_page as u64) << 12;
+                    if cb(va) {
+                        slot.mapped_va_page = 0;
+                        unmapped += 1;
+                    }
+                }
+            }
+        }
+        (total, unmapped)
+    }
+
     /// Remove ALL handles pointing at a given object physical address.
     /// Used when consuming a PageSet for object creation — invalidates
     /// any duplicate handles in the same table to prevent stale access.

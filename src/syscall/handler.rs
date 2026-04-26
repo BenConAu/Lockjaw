@@ -131,20 +131,9 @@ fn create_kernel_object(
         return Err(SyscallError::UNKNOWN);
     }
 
-    // Zero the header page BEFORE removing handles. This makes any stale
-    // handle (local duplicate or cross-process export) read count=0 from
-    // the zeroed header — they become inert without needing revocation.
-    // The header page is separate from the data page (which now holds the
-    // new kernel object), so zeroing doesn't affect the object.
-    crate::mm::page_alloc::zero_page(PhysAddr::new(header_paddr));
-
-    // Consume the backing global pageset table entry.
-    if !crate::cap::pageset_table::consume_by_header_paddr(header_paddr) {
-        crate::kprintln!("WARNING: PageSet consumption failed for header {:#x}", header_paddr);
-    }
-
-    // Remove ALL handles in this table that point at the consumed PageSet.
-    ht.remove_all_by_object(header_paddr);
+    // Consume the PageSet: zero header (inerts stale handles), remove from
+    // global table, remove all handles, free header page.
+    crate::cap::pageset_table::consume_pageset(header_paddr, &ht);
 
     // Insert a new handle for the created object.
     ht.insert(PhysAddr::new(page_paddr), obj_type, Rights::from_bits(RIGHT_READ | RIGHT_WRITE))

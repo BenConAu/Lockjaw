@@ -145,6 +145,50 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     Ok(l0_page.start_addr())
 }
 
+/// Free all page table pages allocated by create_address_space.
+/// Walks L0 → L1 → L2 → L3 and frees each table page. Does NOT free
+/// the user data pages mapped by L3 entries — those belong to the
+/// process's owned_pages.
+///
+/// # Safety
+/// `ttbr0` must be a valid L0 page table base from create_address_space.
+/// No ASID/TTBR0 may reference this table after this call.
+pub unsafe fn free_address_space(ttbr0: PhysAddr) {
+    use crate::mm::addr::PhysPage;
+
+    // SAFETY: kernel VA via KERNEL_VA_OFFSET — ttbr0 is a valid page table base
+    let l0_va = (ttbr0.as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
+
+    // L0[0] → L1 (only entry we allocate)
+    let l0_entry = (*l0_va).entries[0];
+    if l0_entry.is_table() {
+        let l1_paddr = l0_entry.output_addr();
+        // SAFETY: kernel VA via KERNEL_VA_OFFSET — L1 paddr from valid L0 table entry
+        let l1_va = (l1_paddr.as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
+
+        // L1[0] → L2 (user pages). L1[1] is a kernel 1GB block, not a table.
+        let l1_entry = (*l1_va).entries[0];
+        if l1_entry.is_table() {
+            let l2_paddr = l1_entry.output_addr();
+            // SAFETY: kernel VA via KERNEL_VA_OFFSET — L2 paddr from valid L1 table entry
+            let l2_va = (l2_paddr.as_u64() + KERNEL_VA_OFFSET) as *const PageTable;
+
+            // Scan L2 for table entries → L3 pages to free
+            for i in 0..512 {
+                let entry = (*l2_va).entries[i];
+                if entry.is_table() {
+                    page_alloc::dealloc_page(PhysPage::containing(entry.output_addr()));
+                }
+            }
+
+            page_alloc::dealloc_page(PhysPage::containing(l2_paddr));
+        }
+
+        page_alloc::dealloc_page(PhysPage::containing(l1_paddr));
+    }
+
+    page_alloc::dealloc_page(PhysPage::containing(ttbr0));
+}
 
 /// Translate a user virtual address to a kernel-accessible VA by walking
 /// the given page table. Returns None if any level is unmapped.
