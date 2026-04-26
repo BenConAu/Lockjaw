@@ -24,8 +24,13 @@ pub const MAX_PAGES_PER_SET: usize = 510;
 pub struct PageSetHeader {
     /// Number of data pages in the set (does not count the header page itself).
     pub count: u64,
-    /// Reserved for future use.
-    pub _reserved: u64,
+    /// Handle reference count. Incremented on handle_insert, decremented
+    /// on handle_remove. Initialized to 0 by page zeroing.
+    pub refcount: u32,
+    /// Active mapping count across all processes. Incremented by
+    /// sys_map_pages, decremented by sys_unmap_pages. Pages are freed
+    /// when both refcount and map_count reach zero.
+    pub map_count: u32,
     /// Physical addresses of the data pages. Only pages[0..count] are valid.
     pub pages: [u64; MAX_PAGES_PER_SET],
 }
@@ -35,7 +40,8 @@ impl PageSetHeader {
     pub const fn empty() -> Self {
         Self {
             count: 0,
-            _reserved: 0,
+            refcount: 0,
+            map_count: 0,
             pages: [0; MAX_PAGES_PER_SET],
         }
     }

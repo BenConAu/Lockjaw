@@ -31,6 +31,7 @@ pub fn create_notification(page: crate::mm::addr::ObjectInitPage) -> Result<(), 
             header: ObjectHeader {
                 obj_type: ObjectType::Notification,
                 page_count: 1,
+                refcount: 0, // incremented by first handle_insert
             },
             state: NotificationState::new(),
             blocked_tcb_paddr: 0,

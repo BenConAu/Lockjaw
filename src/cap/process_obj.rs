@@ -20,7 +20,15 @@ pub struct ProcessObject {
     pub thread_count: u32,
     pub immortal: bool,
     pub name: [u8; 16],
+    /// Number of process-owned pages (transferred from parent via
+    /// sys_create_process). Freed when the process's last thread exits.
+    pub owned_page_count: u32,
+    /// Physical addresses of process-owned pages.
+    pub owned_pages: [u64; lockjaw_types::process::MAX_OWNED_PAGES],
 }
+
+// ProcessObject must fit in a single donated 4KB page.
+const _: () = assert!(core::mem::size_of::<ProcessObject>() <= 4096);
 
 /// Initialize a ProcessObject in a donated page.
 /// thread_count starts at 0. The caller must immediately call
@@ -40,12 +48,15 @@ pub fn create_process_object(
             header: ObjectHeader {
                 obj_type: ObjectType::Process,
                 page_count: 1,
+                refcount: 0, // incremented by first handle_insert
             },
             ttbr0_paddr,
             handle_table_paddr,
             thread_count: 0,
             immortal,
             name: *name,
+            owned_page_count: 0,
+            owned_pages: [0; lockjaw_types::process::MAX_OWNED_PAGES],
         });
     }
 }

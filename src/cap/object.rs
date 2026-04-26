@@ -18,7 +18,7 @@ pub unsafe fn create_handle_table(
     info: &HandleTableCreateInfo,
     base_paddr: PhysAddr,
 ) -> Result<(), CreateError> {
-    if info.slot_count == 0 {
+    if info.slot_count == 0 || info.slot_count > HANDLE_SLOTS_PER_PAGE {
         return Err(CreateError::InvalidParameter);
     }
 
@@ -32,6 +32,7 @@ pub unsafe fn create_handle_table(
             header: ObjectHeader {
                 obj_type: ObjectType::HandleTable,
                 page_count: required.pages as u8,
+                refcount: 0, // handle tables are not handle-tracked
             },
             slot_count: info.slot_count,
         },

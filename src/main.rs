@@ -438,32 +438,9 @@ pub extern "C" fn kmain() -> ! {
         let idle_stack_base = &__stack_bottom as *const u8 as u64 + mm::addr::KERNEL_VA_OFFSET;
         cap::process_obj::process_inc_thread_count(kernel_proc_page);
 
-        let idle_tcb_page = mm::page_alloc::alloc_page().expect("idle tcb alloc").start_addr();
-        let mut idle_tcb = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(idle_tcb_page);
-        core::ptr::write(idle_tcb.as_mut_ptr(), sched::tcb::Tcb {
-            header: ObjectHeader { obj_type: ObjectType::ThreadControlBlock, page_count: 1 },
-            saved_sp: 0,
-            entry: idle_thread,
-            stack_base: idle_stack_base,
-            process_paddr: kernel_proc_page.as_u64(),
-            ipc_blocked_on: 0,
-            ipc_msg: [0; 4],
-            ipc_queue_next: 0,
-            ipc_wait_kind: 0,
-            current_reply_paddr: 0,
-            ipc_call_reply_paddr: 0,
-            user_entry_point: 0,
-            user_stack_top: 0,
-            user_stack_base: 0,
-            user_arg: 0,
-            wait_objects: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-            wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-            wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-            wait_count: 0,
-            current_syscall: u64::MAX,
-            current_syscall_args: [0; 4],
-            name: *b"init\0\0\0\0\0\0\0\0\0\0\0\0",
-        });
+        let idle_tcb_page = create_idle_tcb(
+            idle_stack_base, kernel_proc_page, *b"init\0\0\0\0\0\0\0\0\0\0\0\0",
+        );
 
         sched::scheduler::add_thread(idle_tcb_page);  // index 0: idle/boot (CPU 0)
         sched::scheduler::add_thread(tcb_a_page);      // index 1: thread A
@@ -489,34 +466,9 @@ pub extern "C" fn kmain() -> ! {
             for (i, &stack_base) in stack_bottoms.iter().enumerate() {
                 let cpu = i + 1;
                 cap::process_obj::process_inc_thread_count(kernel_proc_page);
-                let tcb_page = mm::page_alloc::alloc_page().expect("secondary idle tcb").start_addr();
-                let mut tcb_km = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(tcb_page);
                 let mut name = *b"idle-cpu0\0\0\0\0\0\0\0";
                 name[8] = b'0' + cpu as u8;
-                core::ptr::write(tcb_km.as_mut_ptr(), sched::tcb::Tcb {
-                    header: ObjectHeader { obj_type: ObjectType::ThreadControlBlock, page_count: 1 },
-                    saved_sp: 0,
-                    entry: idle_thread,
-                    stack_base,
-                    process_paddr: kernel_proc_page.as_u64(),
-                    ipc_blocked_on: 0,
-                    ipc_msg: [0; 4],
-                    ipc_queue_next: 0,
-                    ipc_wait_kind: 0,
-                    current_reply_paddr: 0,
-                    ipc_call_reply_paddr: 0,
-                    user_entry_point: 0,
-                    user_stack_top: 0,
-                    user_stack_base: 0,
-                    user_arg: 0,
-                    wait_objects: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-                    wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-                    wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-                    wait_count: 0,
-                    current_syscall: u64::MAX,
-                    current_syscall_args: [0; 4],
-                    name,
-                });
+                let tcb_page = create_idle_tcb(stack_base, kernel_proc_page, name);
                 sched::scheduler::add_thread_for_cpu(tcb_page, cpu);
             }
         }
@@ -753,6 +705,48 @@ fn ipc_receiver() -> ! {
         let reply = [msg[0] * 2, msg[1], msg[2], msg[3]];
         ipc::reply::ipc_reply(reply).expect("reply");
     }
+}
+
+/// Create a TCB for an idle/boot thread using a linker-provided boot stack.
+/// Unlike create_tcb(), this does NOT set up a SavedContext or canary —
+/// idle threads are the initial thread on each CPU and start running
+/// directly, not via context_switch.
+unsafe fn create_idle_tcb(
+    stack_base: u64,
+    process_paddr: mm::addr::PhysAddr,
+    name: [u8; 16],
+) -> mm::addr::PhysAddr {
+    let tcb_page = mm::page_alloc::alloc_page().expect("idle tcb alloc").start_addr();
+    let mut tcb_km = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(tcb_page);
+    core::ptr::write(tcb_km.as_mut_ptr(), sched::tcb::Tcb {
+        header: cap::object::ObjectHeader {
+            obj_type: cap::object::ObjectType::ThreadControlBlock,
+            page_count: 1,
+            refcount: 0, // TCBs are not handle-tracked
+        },
+        saved_sp: 0,
+        entry: idle_thread,
+        stack_base,
+        process_paddr: process_paddr.as_u64(),
+        ipc_blocked_on: 0,
+        ipc_msg: [0; 4],
+        ipc_queue_next: 0,
+        ipc_wait_kind: 0,
+        current_reply_paddr: 0,
+        ipc_call_reply_paddr: 0,
+        user_entry_point: 0,
+        user_stack_top: 0,
+        user_stack_base: 0,
+        user_arg: 0,
+        wait_objects: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+        wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+        wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
+        wait_count: 0,
+        current_syscall: u64::MAX,
+        current_syscall_args: [0; 4],
+        name,
+    });
+    tcb_page
 }
 
 fn idle_thread() -> ! {

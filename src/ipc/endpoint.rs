@@ -60,6 +60,7 @@ pub fn create_endpoint(page: crate::mm::addr::ObjectInitPage) -> Result<(), Crea
             header: ObjectHeader {
                 obj_type: ObjectType::Endpoint,
                 page_count: 1,
+                refcount: 0, // incremented by first handle_insert
             },
             state: EP_IDLE,
             readiness_waiter: lockjaw_types::wait::ReadinessWaiter::empty(),

@@ -85,8 +85,12 @@ impl HandleTableRef {
 }
 
 // HandleEntry is defined in lockjaw-types/src/object.rs and imported above.
-// HANDLE_SLOTS_PER_PAGE uses size_of::<HandleEntry>() directly — no
-// separate constant or compile-time assertion needed.
+// HANDLE_SLOTS_PER_PAGE uses size_of::<HandleEntry>() directly.
+
+// HandleTableHeader must be a multiple of 8 bytes so that the HandleEntry
+// array following it starts at an 8-byte-aligned offset (HandleEntry's
+// first field is u64).
+const _: () = assert!(core::mem::size_of::<HandleTableHeader>() % 8 == 0);
 
 /// Errors from handle operations.
 #[derive(Clone, Copy, Debug)]

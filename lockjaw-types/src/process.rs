@@ -4,6 +4,11 @@
 /// The kernel calls these functions to determine lifecycle outcomes;
 /// this pushes the invariants into testable code.
 
+/// Maximum number of process-owned pages (transferred from parent
+/// via sys_create_process). 128 pages = 512KB of process image.
+/// sys_create_process fails cleanly if this limit is exceeded.
+pub const MAX_OWNED_PAGES: usize = 128;
+
 /// Outcome of a thread exiting from a process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessLifecycle {

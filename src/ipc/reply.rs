@@ -39,6 +39,7 @@ pub fn create_reply(page: crate::mm::addr::ObjectInitPage) -> Result<(), CreateE
             header: ObjectHeader {
                 obj_type: ObjectType::Reply,
                 page_count: 1,
+                refcount: 0, // incremented by first handle_insert
             },
             state: REPLY_STATE_FRESH,
             caller_tcb_paddr: 0,

@@ -23,6 +23,9 @@ pub enum ObjectType {
 pub struct ObjectHeader {
     pub obj_type: ObjectType,
     pub page_count: u8,
+    /// Handle reference count. Accounting only for non-PageSet objects
+    /// (no free-on-zero). Initialized to 0; incremented by handle_insert.
+    pub refcount: u32,
 }
 
 /// Result of a size query — how many 4 KB pages an object needs.
@@ -38,14 +41,14 @@ pub struct ObjectSize {
 /// Describes a HandleTable to create. Same struct for query and create.
 #[derive(Clone, Copy, Debug)]
 pub struct HandleTableCreateInfo {
-    pub slot_count: u32,
+    pub slot_count: u64,
 }
 
 /// Full header for a HandleTable object, stored at the start of its pages.
 #[repr(C)]
 pub struct HandleTableHeader {
     pub header: ObjectHeader,
-    pub slot_count: u32,
+    pub slot_count: u64,
 }
 
 /// A single entry in a handle table. Stored in donated pages immediately
@@ -59,11 +62,15 @@ pub struct HandleEntry {
     pub obj_type: ObjectType,
     /// Access rights for this handle.
     pub rights: crate::rights::Rights,
-    _padding: [u8; 6],
+    _padding: [u8; 2],
+    /// Page number of the VA where this handle's PageSet is mapped.
+    /// 0 = not mapped. Set by sys_map_pages, cleared by sys_unmap_pages.
+    /// Only meaningful for PageSet handles. Stores VA >> 12.
+    pub mapped_va_page: u32,
 }
 
 /// Maximum handle slots that fit in a single 4KB page.
-pub const HANDLE_SLOTS_PER_PAGE: u32 = ((PAGE_SIZE as usize - core::mem::size_of::<HandleTableHeader>()) / core::mem::size_of::<HandleEntry>()) as u32;
+pub const HANDLE_SLOTS_PER_PAGE: u64 = ((PAGE_SIZE as usize - core::mem::size_of::<HandleTableHeader>()) / core::mem::size_of::<HandleEntry>()) as u64;
 
 /// How many pages does a HandleTable with this config need?
 ///

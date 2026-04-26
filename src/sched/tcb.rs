@@ -137,6 +137,7 @@ pub unsafe fn create_tcb(
         header: ObjectHeader {
             obj_type: ObjectType::ThreadControlBlock,
             page_count: 1,
+            refcount: 0, // TCBs are not handle-tracked
         },
         saved_sp: saved_ctx_sp,
         entry: info.entry,
