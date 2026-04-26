@@ -154,6 +154,28 @@ pub struct Tcb {
 // A TCB must fit in one 4 KB page — it's allocated from a single donated page.
 const _: () = assert!(core::mem::size_of::<Tcb>() <= crate::addr::PAGE_SIZE as usize);
 
+impl Tcb {
+    /// Initialize a TCB in place through a raw pointer. The page must
+    /// already be zeroed (most fields are zero-default). This avoids
+    /// materializing a full Tcb on the kernel stack.
+    ///
+    /// Writes the header, entry function, and current_syscall sentinel
+    /// (u64::MAX, since 0 is a valid syscall number). All other fields
+    /// remain zero from the page zeroing.
+    ///
+    /// # Safety
+    /// `ptr` must point to a zeroed, page-aligned, kernel-owned page.
+    pub unsafe fn init_in_place(ptr: *mut Self, entry: fn() -> !) {
+        (*ptr).header = ObjectHeader {
+            obj_type: crate::object::ObjectType::ThreadControlBlock,
+            page_count: 1,
+            refcount: 0,
+        };
+        (*ptr).entry = entry;
+        (*ptr).current_syscall = u64::MAX;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TcbCreateInfo — Vulkan-style create-info
 // ---------------------------------------------------------------------------

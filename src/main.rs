@@ -717,35 +717,16 @@ unsafe fn create_idle_tcb(
     name: [u8; 16],
 ) -> mm::addr::PhysAddr {
     let tcb_page = mm::page_alloc::alloc_page().expect("idle tcb alloc").start_addr();
+    mm::page_alloc::zero_page(tcb_page);
     let mut tcb_km = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(tcb_page);
-    core::ptr::write(tcb_km.as_mut_ptr(), sched::tcb::Tcb {
-        header: cap::object::ObjectHeader {
-            obj_type: cap::object::ObjectType::ThreadControlBlock,
-            page_count: 1,
-            refcount: 0, // TCBs are not handle-tracked
-        },
-        saved_sp: 0,
-        entry: idle_thread,
-        stack_base,
-        process_paddr: process_paddr.as_u64(),
-        ipc_blocked_on: 0,
-        ipc_msg: [0; 4],
-        ipc_queue_next: 0,
-        ipc_wait_kind: 0,
-        current_reply_paddr: 0,
-        ipc_call_reply_paddr: 0,
-        user_entry_point: 0,
-        user_stack_top: 0,
-        user_stack_base: 0,
-        user_arg: 0,
-        wait_objects: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-        wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-        wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-        wait_count: 0,
-        current_syscall: u64::MAX,
-        current_syscall_args: [0; 4],
-        name,
-    });
+    // Idle TCBs don't use create_tcb() because they start directly
+    // (no synthetic SavedContext on a separate stack page). Initialize
+    // in place — no by-value Tcb on the kernel stack.
+    let p = tcb_km.as_mut_ptr();
+    sched::tcb::Tcb::init_in_place(p, idle_thread);
+    (*p).stack_base = stack_base;
+    (*p).process_paddr = process_paddr.as_u64();
+    (*p).name = name;
     tcb_page
 }
 

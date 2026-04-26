@@ -1,4 +1,4 @@
-use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
+use crate::cap::object::CreateError;
 use crate::mm::addr::{PhysAddr, PAGE_SIZE};
 use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::context::SavedContext;
@@ -43,35 +43,20 @@ pub unsafe fn create_tcb(
     // SAFETY: writing into the allocated stack page, above the canary.
     ptr::write(boot.saved_sp as *mut SavedContext, boot.saved_context);
 
-    // Write the TCB
-    ptr::write(tcb_km.as_mut_ptr(), Tcb {
-        header: ObjectHeader {
-            obj_type: ObjectType::ThreadControlBlock,
-            page_count: 1,
-            refcount: 0, // TCBs are not handle-tracked
-        },
-        saved_sp: boot.saved_sp,
-        entry: info.entry,
-        stack_base: stack_va,
-        process_paddr: info.process_paddr.as_u64(),
-        ipc_blocked_on: 0,
-        ipc_msg: [0; 4],
-        ipc_queue_next: 0,
-        ipc_wait_kind: 0,
-        current_reply_paddr: 0,
-        ipc_call_reply_paddr: 0,
-        user_entry_point: info.user_entry_point,
-        user_stack_top: info.user_stack_top,
-        user_stack_base: info.user_stack_base,
-        user_arg: info.user_arg,
-        wait_objects: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-        wait_thresholds: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-        wait_types: [0; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-        wait_count: 0,
-        current_syscall: u64::MAX,
-        current_syscall_args: [0; 4],
-        name: info.name,
-    });
+    // Initialize TCB in place — zero the page first, then write
+    // header + non-default fields through the pointer. No by-value
+    // Tcb on the kernel stack.
+    crate::mm::page_alloc::zero_page(base_paddr);
+    let p = tcb_km.as_mut_ptr();
+    Tcb::init_in_place(p, info.entry);
+    (*p).saved_sp = boot.saved_sp;
+    (*p).stack_base = stack_va;
+    (*p).process_paddr = info.process_paddr.as_u64();
+    (*p).user_entry_point = info.user_entry_point;
+    (*p).user_stack_top = info.user_stack_top;
+    (*p).user_stack_base = info.user_stack_base;
+    (*p).user_arg = info.user_arg;
+    (*p).name = info.name;
 
     Ok(())
 }
