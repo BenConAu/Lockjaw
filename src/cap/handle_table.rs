@@ -101,6 +101,21 @@ impl HandleTableRef {
         }
     }
 
+    /// Walk all occupied slots and call the callback with each non-empty
+    /// HandleEntry. Used during process exit to decrement refcounts and
+    /// map_counts before bulk-freeing the handle table pages.
+    pub fn for_each_entry(&self, mut cb: impl FnMut(&HandleEntry)) {
+        // SAFETY: self.0 was validated at construction.
+        unsafe {
+            let (_header, slots) = table_slots(self.0);
+            for slot in slots.iter() {
+                if slot.object_paddr != 0 {
+                    cb(slot);
+                }
+            }
+        }
+    }
+
     /// Set the mapped_va_page field on a handle entry.
     /// mapped_va_page = 0 means not mapped; nonzero = VA >> 12.
     pub fn set_mapped_va(&self, handle: u32, va_page: u32) -> Result<(), SyscallError> {

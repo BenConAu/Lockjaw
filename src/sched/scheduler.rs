@@ -502,8 +502,46 @@ fn finish_exit() {
 
     match lifecycle {
         ProcessLifecycle::LastThread => {
-            // Last thread in this process — free process resources
+            // Last thread in this process — free all process resources.
+
+            // Free process-owned pages (transferred from parent via
+            // sys_create_process). These are the actual code/data/stack
+            // pages that were mapped into this process's address space.
+            let owned_count = crate::cap::process_obj::process_owned_page_count(process_paddr);
+            for i in 0..owned_count as usize {
+                if let Some(paddr) = crate::cap::process_obj::process_owned_page(process_paddr, i) {
+                    page_alloc::dealloc_page(PhysPage::containing(PhysAddr::new(paddr)));
+                    pages_freed += 1;
+                }
+            }
+
+            // Free address space (page table tree: L0/L1/L2/L3)
+            let ttbr0 = crate::cap::process_obj::process_ttbr0(process_paddr);
+            if ttbr0 != 0 {
+                unsafe { crate::arch::aarch64::vmem::free_address_space(PhysAddr::new(ttbr0)); }
+                // L0 + L1 + L2 = 3 pages minimum, plus L3 tables
+                pages_freed += 3; // approximate — L3 count varies
+            }
+
+            // Walk handle table entries and clean up PageSet accounting
+            // before freeing the table pages. Without this, refcounts and
+            // map_counts for PageSets held by this process would leak.
+            // ttbr0 is None — PTEs are freed separately via free_address_space.
             let ht_paddr = crate::cap::process_obj::process_handle_table(process_paddr);
+            if ht_paddr.as_u64() != 0 {
+                let ht = unsafe {
+                    crate::cap::handle_table::HandleTableRef::from_paddr(ht_paddr)
+                };
+                ht.for_each_entry(|entry| {
+                    if let Some(c) = lockjaw_types::object::handle_cleanup(entry) {
+                        // PTEs already freed via free_address_space above,
+                        // so we skip the unmap but still dec the counters.
+                        crate::cap::pageset_table::apply_handle_cleanup(&c);
+                    }
+                });
+            }
+
+            // Free handle table pages
             let ht_page_count = if ht_paddr.as_u64() != 0 {
                 let ht = unsafe { KernelRef::<HandleTableHeader>::from_paddr(ht_paddr) };
                 ht.get().header.page_count as usize
@@ -515,7 +553,8 @@ fn finish_exit() {
                 page_alloc::dealloc_page(PhysPage::containing(page));
             }
             pages_freed += ht_page_count as u32;
-            // Free ProcessObject page (last)
+
+            // Free ProcessObject page (last — after reading all fields)
             page_alloc::dealloc_page(PhysPage::containing(process_paddr));
             pages_freed += 1;
         }

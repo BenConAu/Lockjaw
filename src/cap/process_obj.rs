@@ -125,11 +125,23 @@ pub fn process_push_owned_page(process_paddr: PhysAddr, page_paddr: u64) -> bool
     true
 }
 
-/// Read the owned page list for a process (for cleanup on last thread exit).
-pub fn process_owned_pages(process_paddr: PhysAddr) -> (u32, [u64; process::MAX_OWNED_PAGES]) {
+/// Number of process-owned pages.
+pub fn process_owned_page_count(process_paddr: PhysAddr) -> u32 {
     // SAFETY: process_paddr is a valid ProcessObject.
     let p = unsafe { KernelRef::<ProcessObject>::from_paddr(process_paddr) };
-    (p.get().owned_page_count, p.get().owned_pages)
+    p.get().owned_page_count
+}
+
+/// Read one owned page by index. Returns None if out of range.
+pub fn process_owned_page(process_paddr: PhysAddr, index: usize) -> Option<u64> {
+    // SAFETY: process_paddr is a valid ProcessObject.
+    let p = unsafe { KernelRef::<ProcessObject>::from_paddr(process_paddr) };
+    let proc = p.get();
+    if index < proc.owned_page_count as usize {
+        Some(proc.owned_pages[index])
+    } else {
+        None
+    }
 }
 
 /// Decrement the thread count (a thread exited from this process).

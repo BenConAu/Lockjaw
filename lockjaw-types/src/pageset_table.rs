@@ -84,6 +84,23 @@ impl PageSetHeader {
         self.map_count -= 1;
         self.map_count == 0 && self.refcount == 0
     }
+
+    /// Increment the handle reference count. Called when a new handle
+    /// to this PageSet is inserted into a handle table.
+    pub fn inc_refcount(&mut self) {
+        self.refcount = self.refcount.checked_add(1)
+            .expect("refcount overflow");
+    }
+
+    /// Decrement the handle reference count. Called when a handle to
+    /// this PageSet is removed (sys_close_handle).
+    /// Returns true if both refcount and map_count are now zero
+    /// (caller should free the PageSet).
+    pub fn dec_refcount(&mut self) -> bool {
+        assert!(self.refcount > 0, "refcount underflow");
+        self.refcount -= 1;
+        self.refcount == 0 && self.map_count == 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,5 +446,62 @@ mod tests {
         // consumption) must report 0 pages and reject all lookups.
         assert_eq!(h.data_page_count(), 0);
         assert_eq!(h.get_page(0), None);
+    }
+
+    // --- refcount ---
+
+    #[test]
+    fn inc_refcount() {
+        let mut h = PageSetHeader::empty();
+        h.inc_refcount();
+        assert_eq!(h.refcount, 1);
+        h.inc_refcount();
+        assert_eq!(h.refcount, 2);
+    }
+
+    #[test]
+    fn dec_refcount_not_zero() {
+        let mut h = PageSetHeader::empty();
+        h.inc_refcount();
+        h.inc_refcount();
+        assert!(!h.dec_refcount()); // refcount 1, not free-on-zero
+    }
+
+    #[test]
+    fn dec_refcount_free_on_zero() {
+        let mut h = PageSetHeader::empty();
+        h.inc_refcount();
+        assert!(h.dec_refcount()); // refcount 0, map_count 0 → free
+    }
+
+    #[test]
+    fn dec_refcount_not_free_if_mapped() {
+        let mut h = PageSetHeader::empty();
+        h.inc_refcount();
+        h.inc_map_count();
+        assert!(!h.dec_refcount()); // refcount 0, map_count 1 → NOT free
+    }
+
+    #[test]
+    fn dec_map_count_free_when_refcount_zero() {
+        let mut h = PageSetHeader::empty();
+        h.inc_map_count();
+        // refcount is 0, map_count goes to 0 → free
+        assert!(h.dec_map_count());
+    }
+
+    #[test]
+    fn dec_map_count_not_free_when_refcount_nonzero() {
+        let mut h = PageSetHeader::empty();
+        h.inc_refcount();
+        h.inc_map_count();
+        assert!(!h.dec_map_count()); // refcount 1 → NOT free
+    }
+
+    #[test]
+    #[should_panic(expected = "refcount underflow")]
+    fn dec_refcount_underflow_panics() {
+        let mut h = PageSetHeader::empty();
+        h.dec_refcount();
     }
 }

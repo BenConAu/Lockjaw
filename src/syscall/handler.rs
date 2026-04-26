@@ -243,7 +243,11 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     match ht.insert(PhysAddr::new(header_paddr), ObjectType::PageSet,
         Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
     {
-        Ok(h) => Ok(h as u64),
+        Ok(h) => {
+            // Increment refcount — a new handle references this PageSet.
+            unsafe { crate::cap::pageset_table::read_header_mut(header_paddr).inc_refcount(); }
+            Ok(h as u64)
+        }
         Err(e) => {
             // Handle table full — free the pageset (global table slot,
             // data pages, and header page) to avoid leaking memory.
@@ -589,11 +593,17 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         let caller_tcb = KernelRef::<Tcb>::from_paddr(PhysAddr::new(caller_tcb_paddr_u64));
         let caller_ht_paddr = crate::cap::process_obj::process_handle_table(PhysAddr::new(caller_tcb.get().process_paddr));
         let caller_ht = handle_table::HandleTableRef::from_paddr(caller_ht_paddr);
-        caller_ht.insert(
+        let idx = caller_ht.insert(
             PhysAddr::new(export_entry.object_paddr),
             export_entry.obj_type,
             export_entry.rights,
-        ).map(|idx| idx as u64)
+        )?;
+        // Increment refcount for PageSets — a new handle references it.
+        if export_entry.obj_type == ObjectType::PageSet {
+            crate::cap::pageset_table::read_header_mut(export_entry.object_paddr)
+                .inc_refcount();
+        }
+        Ok(idx as u64)
     }
 }
 
@@ -605,9 +615,12 @@ fn sys_get_boot_info() -> Result<u64, SyscallError> {
     let (_, header_paddr) = crate::cap::pageset_table::get_pageset(dtb_id)
         .ok_or(SyscallError::UNKNOWN)?;
     let ht = CurrentThread::handle_table();
-    ht.insert(PhysAddr::new(header_paddr), ObjectType::PageSet,
+    let h = ht.insert(PhysAddr::new(header_paddr), ObjectType::PageSet,
         Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
-        .map(|h| h as u64)
+        .map(|h| h as u64)?;
+    // Increment refcount — a new handle references this PageSet.
+    unsafe { crate::cap::pageset_table::read_header_mut(header_paddr).inc_refcount(); }
+    Ok(h)
 }
 
 /// sys_register_device_page(phys_addr) — wrap a physical address as a tracked PageSet.
@@ -624,7 +637,10 @@ fn sys_register_device_page(ctx: &mut ExceptionContext) -> Result<u64, SyscallEr
     match ht.insert(PhysAddr::new(header_paddr), ObjectType::PageSet,
         Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
     {
-        Ok(h) => Ok(h as u64),
+        Ok(h) => {
+            unsafe { crate::cap::pageset_table::read_header_mut(header_paddr).inc_refcount(); }
+            Ok(h as u64)
+        }
         Err(e) => {
             // Handle table full — free the tracking entry + header page.
             // The MMIO page itself is not freed (it's device memory).
@@ -805,11 +821,13 @@ fn sys_unmap_pages(ctx: &mut ExceptionContext) -> SyscallError {
     // Clear the mapping record on this handle.
     let _ = ht.set_mapped_va(handle, 0);
 
-    // Decrement the PageSet's map count. Free-on-zero is deferred to
-    // the refcounting commit — without refcount increments wired up,
-    // dec_map_count would prematurely free pages the caller still holds.
-    unsafe {
-        let _ = crate::cap::pageset_table::read_header_mut(header_paddr).dec_map_count();
+    // Decrement the PageSet's map count. If both map_count and
+    // refcount reach zero, no handles or mappings remain — free it.
+    let should_free = unsafe {
+        crate::cap::pageset_table::read_header_mut(header_paddr).dec_map_count()
+    };
+    if should_free {
+        crate::cap::pageset_table::free_by_header_paddr(header_paddr);
     }
 
     SyscallError::OK
@@ -818,8 +836,46 @@ fn sys_unmap_pages(ctx: &mut ExceptionContext) -> SyscallError {
 fn sys_close_handle(ctx: &mut ExceptionContext) -> SyscallError {
     let handle = ctx.gpr[0] as u32;
     let ht = CurrentThread::handle_table();
+
+    // Look up the live entry (without removing) to get the cleanup
+    // decision. handle_cleanup is the SOLE authority — no separate
+    // map_count or refcount operations outside what it directs.
+    let entry = match ht.lookup_any(handle, Rights::from_bits(0)) {
+        Ok(e) => e,
+        Err(_) => return SyscallError::INVALID_HANDLE,
+    };
+    let cleanup = lockjaw_types::object::handle_cleanup(&entry);
+
+    // If cleanup says we need to unmap, do it BEFORE removing the handle.
+    // If unmap fails, reject the close — handle stays intact.
+    if let Some(ref c) = cleanup {
+        if c.dec_map_count {
+            let header = unsafe {
+                crate::cap::pageset_table::read_header(c.header_paddr)
+            };
+            let pages = &header.pages[..header.data_page_count()];
+            let va = (c.mapped_va_page as u64) << 12;
+            if let Some(addr_space) = CurrentThread::address_space() {
+                if unsafe {
+                    crate::arch::aarch64::vmem::unmap_validated(
+                        addr_space.ttbr0(), va, pages,
+                    )
+                }.is_err() {
+                    return SyscallError::INVALID_PARAMETER;
+                }
+            }
+        }
+    }
+
+    // All fallible work done. Remove the handle, then apply the
+    // cleanup decision (dec_map_count, dec_refcount, free-on-zero).
     match ht.remove(handle) {
-        Ok(_) => SyscallError::OK,
+        Ok(_) => {
+            if let Some(c) = cleanup {
+                crate::cap::pageset_table::apply_handle_cleanup(&c);
+            }
+            SyscallError::OK
+        }
         Err(e) => e,
     }
 }

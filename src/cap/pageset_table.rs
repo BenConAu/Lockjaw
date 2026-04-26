@@ -228,6 +228,26 @@ pub fn free_header_page(header_paddr: u64) {
     );
 }
 
+/// Execute the kernel-side effects for a HandleCleanup decision.
+/// The caller has already obtained the cleanup from handle_cleanup()
+/// and performed any PTE unmapping if dec_map_count was true.
+///
+/// This function decrements map_count and/or refcount as directed,
+/// and frees the PageSet if both reach zero.
+pub fn apply_handle_cleanup(cleanup: &lockjaw_types::object::HandleCleanup) {
+    if cleanup.dec_map_count {
+        unsafe { read_header_mut(cleanup.header_paddr).dec_map_count(); }
+    }
+    if cleanup.dec_refcount {
+        let should_free = unsafe {
+            read_header_mut(cleanup.header_paddr).dec_refcount()
+        };
+        if should_free {
+            free_by_header_paddr(cleanup.header_paddr);
+        }
+    }
+}
+
 /// Consume a PageSet for ownership transfer. Data pages are NOT freed —
 /// the caller takes ownership of them.
 ///

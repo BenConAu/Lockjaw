@@ -62,11 +62,55 @@ pub struct HandleEntry {
     pub obj_type: ObjectType,
     /// Access rights for this handle.
     pub rights: crate::rights::Rights,
-    _padding: [u8; 2],
+    /// Reserved padding for alignment.
+    pub _padding: [u8; 2],
     /// Page number of the VA where this handle's PageSet is mapped.
     /// 0 = not mapped. Set by sys_map_pages, cleared by sys_unmap_pages.
     /// Only meaningful for PageSet handles. Stores VA >> 12.
     pub mapped_va_page: u32,
+}
+
+/// Cleanup actions needed when releasing a handle entry (e.g. during
+/// process exit or sys_close_handle). Pure decision logic — the kernel
+/// executes the actions. This is the SOLE authority for what cleanup
+/// a handle release requires; callers must not add their own separate
+/// map_count or refcount operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandleCleanup {
+    /// Physical address of the PageSet header.
+    pub header_paddr: u64,
+    /// Decrement PageSetHeader.refcount (handle is being released).
+    pub dec_refcount: bool,
+    /// Decrement PageSetHeader.map_count (mapped VA is being discarded).
+    /// If true, the kernel must also clear PTEs before decrementing.
+    pub dec_map_count: bool,
+    /// The mapped VA page (VA >> 12). Only meaningful if dec_map_count is true.
+    pub mapped_va_page: u32,
+}
+
+/// Determine what cleanup is needed for a handle entry being released.
+/// Returns None for empty slots or non-PageSet handles.
+///
+/// The caller must:
+/// 1. If dec_map_count: unmap PTEs at (mapped_va_page << 12), then dec_map_count
+/// 2. If dec_refcount: dec_refcount, free-on-zero if both counters hit 0
+/// 3. Only then remove the handle from the table
+///
+/// This function is the single source of truth — callers must NOT
+/// add separate map_count/refcount operations outside this decision.
+pub fn handle_cleanup(entry: &HandleEntry) -> Option<HandleCleanup> {
+    if entry.object_paddr == 0 {
+        return None;
+    }
+    if entry.obj_type != ObjectType::PageSet {
+        return None;
+    }
+    Some(HandleCleanup {
+        header_paddr: entry.object_paddr,
+        dec_refcount: true,
+        dec_map_count: entry.mapped_va_page != 0,
+        mapped_va_page: entry.mapped_va_page,
+    })
 }
 
 /// Maximum handle slots that fit in a single 4KB page.
@@ -212,5 +256,70 @@ mod tests {
         assert_ne!(ObjectType::PageSet, ObjectType::Endpoint);
         assert_ne!(ObjectType::PageSet, ObjectType::Notification);
         assert_ne!(ObjectType::PageSet, ObjectType::HandleTable);
+    }
+
+    // --- handle_cleanup tests ---
+
+    fn make_entry(obj_type: ObjectType, paddr: u64, mapped_va_page: u32) -> HandleEntry {
+        HandleEntry {
+            object_paddr: paddr,
+            obj_type,
+            rights: crate::rights::Rights::from_bits(0),
+            _padding: [0; 2],
+            mapped_va_page,
+        }
+    }
+
+    #[test]
+    fn cleanup_empty_slot_returns_none() {
+        let entry = make_entry(ObjectType::PageSet, 0, 0);
+        assert_eq!(handle_cleanup(&entry), None);
+    }
+
+    #[test]
+    fn cleanup_non_pageset_returns_none() {
+        let entry = make_entry(ObjectType::Endpoint, 0x1000, 0);
+        assert_eq!(handle_cleanup(&entry), None);
+    }
+
+    #[test]
+    fn cleanup_pageset_unmapped_decrefs_only() {
+        let entry = make_entry(ObjectType::PageSet, 0x1000, 0);
+        let c = handle_cleanup(&entry).unwrap();
+        assert!(c.dec_refcount);
+        assert!(!c.dec_map_count);
+        assert_eq!(c.header_paddr, 0x1000);
+    }
+
+    #[test]
+    fn cleanup_pageset_mapped_decrefs_and_unmaps() {
+        let entry = make_entry(ObjectType::PageSet, 0x1000, 0x400);
+        let c = handle_cleanup(&entry).unwrap();
+        assert!(c.dec_refcount);
+        assert!(c.dec_map_count);
+        assert_eq!(c.mapped_va_page, 0x400);
+        assert_eq!(c.header_paddr, 0x1000);
+    }
+
+    #[test]
+    fn cleanup_is_sole_authority_for_map_count() {
+        // The double-decrement bug: if map_count is decremented manually
+        // AND handle_cleanup says dec_map_count=true, it gets decremented
+        // twice. This test verifies that handle_cleanup only says
+        // dec_map_count=true when mapped_va_page is nonzero, and that
+        // clearing mapped_va_page to 0 produces dec_map_count=false.
+        let mapped = make_entry(ObjectType::PageSet, 0x1000, 0x400);
+        assert!(handle_cleanup(&mapped).unwrap().dec_map_count);
+
+        // After the kernel clears mapped_va_page (simulating the slot
+        // state after set_mapped_va(handle, 0)):
+        let cleared = make_entry(ObjectType::PageSet, 0x1000, 0);
+        assert!(!handle_cleanup(&cleared).unwrap().dec_map_count);
+    }
+
+    #[test]
+    fn cleanup_notification_returns_none() {
+        let entry = make_entry(ObjectType::Notification, 0x2000, 0);
+        assert_eq!(handle_cleanup(&entry), None);
     }
 }
