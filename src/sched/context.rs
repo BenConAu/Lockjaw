@@ -1,27 +1,8 @@
 use core::arch::global_asm;
 
-/// Callee-saved register frame pushed/popped by context_switch.
-/// Layout must match the stp/ldp pairs in the assembly below.
-#[repr(C)]
-pub struct SavedContext {
-    pub x19: u64, pub x20: u64,
-    pub x21: u64, pub x22: u64,
-    pub x23: u64, pub x24: u64,
-    pub x25: u64, pub x26: u64,
-    pub x27: u64, pub x28: u64,
-    pub x29: u64, pub lr: u64,
-}
-
-// Compile-time assertions tying struct layout to the assembly offsets.
-// If the struct gains a field or changes order, these fail immediately
-// instead of silently corrupting the context switch.
-const _: () = {
-    assert!(core::mem::offset_of!(SavedContext, x19) == 0 * 8);
-    assert!(core::mem::offset_of!(SavedContext, x20) == 1 * 8);
-    assert!(core::mem::offset_of!(SavedContext, x29) == 10 * 8);
-    assert!(core::mem::offset_of!(SavedContext, lr) == 11 * 8);
-    assert!(core::mem::size_of::<SavedContext>() == 12 * 8);
-};
+// SavedContext struct and layout assertions live in lockjaw-types
+// (host-testable). Re-export so existing kernel imports work.
+pub use lockjaw_types::thread::SavedContext;
 
 extern "C" {
     /// Switch from the current thread to another.

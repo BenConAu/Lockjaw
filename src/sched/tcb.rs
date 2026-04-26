@@ -4,93 +4,10 @@ use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::context::SavedContext;
 use core::ptr;
 
-// ---------------------------------------------------------------------------
-// Thread state
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// TCB — stored in donated pages
-// ---------------------------------------------------------------------------
-// Thread scheduling state (Ready/Running/Blocked) is NOT stored here.
-// The scheduler's pure state machine in lockjaw_types::scheduler owns
-// it. The TCB holds hardware-facing context (saved SP, TTBR0, etc.)
-// plus object metadata.
-
-/// Thread Control Block. Stored at the start of a donated page.
-#[repr(C)]
-pub struct Tcb {
-    pub header: ObjectHeader,
-    pub saved_sp: u64,
-    pub entry: fn() -> !,
-    pub stack_base: u64,
-    /// Physical address of the owning ProcessObject. Every thread belongs
-    /// to a process. The process owns the address space (TTBR0) and handle
-    /// table. Access via process_ops narrow accessors.
-    pub process_paddr: u64,
-    pub ipc_blocked_on: u64,
-    /// Kernel-internal IPC mailbox. The IPC state machine writes received
-    /// messages here; the syscall handler copies them to the exception
-    /// context (x0-x3) for userspace. Do not use for other purposes.
-    pub ipc_msg: [u64; 4],
-    /// Intrusive link in an endpoint's waiter queue (paddr of next TCB,
-    /// 0 = tail). Written by ep_queue::enqueue, cleared by dequeue.
-    pub ipc_queue_next: u64,
-    /// Kind of wait currently held on an endpoint: 0 = none, 1 = Send,
-    /// 2 = Receive, 3 = Call. Set on enqueue, cleared on dequeue.
-    /// The server reads this on sys_receive to decide whether to unblock
-    /// the head waiter (Send) or leave it blocked awaiting reply (Call).
-    pub ipc_wait_kind: u8,
-    /// Server-side: paddr of the Reply object bound to the call currently
-    /// being handled by this thread. Set by sys_receive when dequeuing a
-    /// Call; cleared by sys_reply. 0 = no outstanding call.
-    pub current_reply_paddr: u64,
-    /// Caller-side: paddr of this thread's own Reply object while queued
-    /// as a Call waiter, so the server can pick it up on sys_receive.
-    /// 0 when not queued as a Call.
-    pub ipc_call_reply_paddr: u64,
-    /// ELF entry point VA for user processes (0 for kernel threads).
-    pub user_entry_point: u64,
-    /// User stack top VA for user processes (0 for kernel threads).
-    pub user_stack_top: u64,
-    /// User stack base VA (lowest mapped page) for overflow detection (0 for kernel threads).
-    pub user_stack_base: u64,
-    /// Argument passed to the new thread's entry point in x0 (0 for process first thread).
-    pub user_arg: u64,
-    /// Objects this thread is waiting on via sys_wait_any (paddrs, 0 = unused).
-    pub wait_objects: [u64; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-    /// Per-object thresholds for the wait (notification target values).
-    pub wait_thresholds: [u64; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-    /// Object types for each wait entry (ObjectType as u8).
-    pub wait_types: [u8; lockjaw_types::wait::MAX_WAIT_OBJECTS],
-    /// Number of valid entries in wait_objects (0 = not in a sys_wait_any).
-    pub wait_count: u8,
-    /// Currently executing syscall number (u64::MAX = not in a syscall).
-    /// Set at syscall entry, cleared at exit. Printed on crash.
-    pub current_syscall: u64,
-    /// Arguments to the current syscall (x0-x3).
-    pub current_syscall_args: [u64; 4],
-    /// Process name for diagnostics. NUL-terminated, max 15 chars + NUL.
-    pub name: [u8; 16],
-}
-
-// A TCB must fit in one 4 KB page — it's allocated from a single donated page.
-const _: () = assert!(core::mem::size_of::<Tcb>() <= PAGE_SIZE as usize);
-
-// ---------------------------------------------------------------------------
-// Vulkan-style create-info
-// ---------------------------------------------------------------------------
-
-/// Describes a thread to create.
-pub struct TcbCreateInfo {
-    pub entry: fn() -> !,
-    pub stack_paddr: PhysAddr,
-    pub process_paddr: PhysAddr,
-    pub user_entry_point: u64,
-    pub user_stack_base: u64,
-    pub user_stack_top: u64,
-    pub user_arg: u64,
-    pub name: [u8; 16],
-}
+// Struct definitions and layout assertions live in lockjaw-types
+// (host-testable). Re-export so all existing kernel import sites
+// (`use crate::sched::tcb::Tcb`) work unchanged.
+pub use lockjaw_types::thread::{Tcb, TcbCreateInfo, ThreadBootstrap};
 
 /// Initialize a TCB in donated memory and set up its stack with a
 /// synthetic frame so it can be context-switched into.
@@ -112,25 +29,19 @@ pub unsafe fn create_tcb(
     ptr::write_volatile(stack_km.as_mut_ptr(), lockjaw_types::constants::STACK_CANARY);
 
     // Set up synthetic SavedContext at top of stack so context_switch
-    // can "return" into this thread. The SavedContext struct layout is
-    // tied to the assembly via compile-time offset assertions in context.rs.
-    let saved_ctx_sp = stack_top - core::mem::size_of::<SavedContext>() as u64;
-
+    // can "return" into this thread. ThreadBootstrap computes the
+    // SavedContext and saved_sp together (they must stay in sync).
     extern "C" {
         fn thread_entry();
     }
+    let boot = ThreadBootstrap::new(
+        info.entry as u64,
+        // SAFETY: thread_entry is a kernel code address (global_asm symbol)
+        thread_entry as *const () as u64,
+        stack_top,
+    );
     // SAFETY: writing into the allocated stack page, above the canary.
-    let ctx_ptr = saved_ctx_sp as *mut SavedContext;
-    ptr::write(ctx_ptr, SavedContext {
-        // x19 = entry function pointer — thread_entry trampoline reads this
-        x19: info.entry as u64,
-        // LR = thread_entry trampoline address
-        // SAFETY: function pointer to kernel code
-        lr: thread_entry as *const () as u64,
-        // All other callee-saved regs start at zero
-        x20: 0, x21: 0, x22: 0, x23: 0, x24: 0,
-        x25: 0, x26: 0, x27: 0, x28: 0, x29: 0,
-    });
+    ptr::write(boot.saved_sp as *mut SavedContext, boot.saved_context);
 
     // Write the TCB
     ptr::write(tcb_km.as_mut_ptr(), Tcb {
@@ -139,7 +50,7 @@ pub unsafe fn create_tcb(
             page_count: 1,
             refcount: 0, // TCBs are not handle-tracked
         },
-        saved_sp: saved_ctx_sp,
+        saved_sp: boot.saved_sp,
         entry: info.entry,
         stack_base: stack_va,
         process_paddr: info.process_paddr.as_u64(),
