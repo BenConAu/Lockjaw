@@ -1,18 +1,26 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::io::Write;
 use std::process::{self, Command, Stdio};
 
-const NORMAL_PATH_BUDGET: u64 = 3072;
-const INTERRUPT_PATH_BUDGET: u64 = 1024;
-const TOTAL_BUDGET: u64 = NORMAL_PATH_BUDGET + INTERRUPT_PATH_BUDGET;
+/// Per-function stack frame cap in bytes. Any single function exceeding
+/// this fails immediately — catches large locals before they interact
+/// with call depth. Set to 1536 to accommodate kmain's boot-time init
+/// frame (~1408 in debug). See docs/stack-budget.md.
+const PER_FUNCTION_CAP: u64 = 1536;
 
-const KERNEL_ELF_RELEASE: &str = "target/aarch64-unknown-none/release/lockjaw";
+/// Total kernel stack budget: normal path + worst-case nested exception.
+const TOTAL_BUDGET: u64 = 8192;
+
 const KERNEL_ELF_DEBUG: &str = "target/aarch64-unknown-none/debug/lockjaw";
+const KERNEL_ELF_RELEASE: &str = "target/aarch64-unknown-none/release/lockjaw";
 
 /// Entry points for worst-case depth analysis.
-/// Normal path starts at _start, interrupt path starts at exception vectors.
 const NORMAL_ENTRY: &str = "_start";
+const SECONDARY_ENTRY: &str = "_secondary_start";
+const SYNC_EXCEPTION_ENTRY: &str = "__vec_sync_lower";
+const IRQ_EXCEPTION_ENTRY: &str = "__vec_irq";
+
+const ANNOTATIONS_PATH: &str = "xtask/stack-annotations.toml";
 
 fn main() {
     match env::args().nth(1).as_deref() {
@@ -33,147 +41,288 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 fn check_stack() {
-    println!("=== Stack Depth Verification ===");
-    println!("  Normal path budget:    {} bytes", NORMAL_PATH_BUDGET);
-    println!("  Interrupt path budget: {} bytes", INTERRUPT_PATH_BUDGET);
-    println!("  Total stack size:      {} bytes", TOTAL_BUDGET);
-    println!();
+    // Verify rustfilt is available — needed for consistent symbol demangling.
+    ensure_tool("rustfilt", "cargo install rustfilt");
 
-    // Check both release and debug builds. Debug builds have larger
-    // stack frames and are what `make test` runs.
-    check_stack_for_profile("release", KERNEL_ELF_RELEASE);
-    println!();
+    // Debug first — it's what `make test` runs and has larger frames.
     check_stack_for_profile("debug", KERNEL_ELF_DEBUG);
+    println!();
+    check_stack_for_profile("release", KERNEL_ELF_RELEASE);
 }
 
 fn check_stack_for_profile(profile: &str, elf_path: &str) {
-    println!("--- Checking {} build ---", profile);
+    println!("=== Stack Depth Verification ({}) ===", profile);
+    println!("  Per-function cap: {} bytes", PER_FUNCTION_CAP);
+    println!("  Total budget (normal + exception): {} bytes", TOTAL_BUDGET);
+    println!();
 
-    // Step 1: Build with emit-stack-sizes
-    println!("[1/4] Building kernel ({}, emit-stack-sizes)...", profile);
-    let mut args = vec!["build"];
+    // Build kernel. emit-stack-sizes is in .cargo/config.toml, so no
+    // RUSTFLAGS override needed — we check the same binary tests run.
+    println!("Building kernel ({})...", profile);
+    let mut build_args = vec!["build"];
     if profile == "release" {
-        args.push("--release");
+        build_args.push("--release");
     }
     let status = Command::new("cargo")
-        .args(&args)
-        .env(
-            "RUSTFLAGS",
-            "-Z emit-stack-sizes -C link-arg=-Tlinker.ld -C link-arg=--gc-sections",
-        )
+        .args(&build_args)
         .status()
         .expect("failed to run cargo build");
-
     if !status.success() {
         eprintln!("FAIL: cargo build ({}) failed", profile);
         process::exit(1);
     }
-
-    // Step 2: Parse per-function stack sizes from .stack_sizes ELF section
-    println!("[2/4] Parsing per-function stack sizes...");
-    let stack_sizes = parse_stack_sizes(elf_path);
-    for (name, size) in &stack_sizes {
-        println!("  {:>6} bytes  {}", size, name);
-    }
-    println!("  ({} functions)", stack_sizes.len());
     println!();
 
-    // Step 3: Extract call graph from disassembly (BL instruction scan)
-    println!("[3/4] Extracting call graph from disassembly...");
-    let (functions, call_graph, indirect_calls) = extract_call_graph(elf_path);
-    let mut total_edges = 0;
-    for targets in call_graph.values() {
-        total_edges += targets.len();
-    }
-    println!("  {} functions, {} call edges", functions.len(), total_edges);
-
-    // Check all indirect calls (BLR) are annotated in stack-annotations.toml
     let annotations = load_annotations();
-    if !indirect_calls.is_empty() {
-        // Demangle the indirect call function names for matching against annotations
-        let demangled_names: Vec<String> = indirect_calls
-            .iter()
-            .map(|name| demangle(name).trim().to_string())
-            .collect();
+    let mut failed = false;
 
-        println!("  {} functions contain indirect calls (BLR):", indirect_calls.len());
+    // [1/5] Stack sizes from ELF .stack_sizes section
+    println!("[1/5] Reading stack sizes from {} ELF...", profile);
+    let mut stack_sizes = parse_stack_sizes(elf_path);
+    println!("  {} functions with compiler stack size data", stack_sizes.len());
+
+    // [2/5] Call graph from disassembly
+    println!();
+    println!("[2/5] Extracting call graph...");
+    let (functions, mut call_graph, indirect_fns, bl_count, tail_count) =
+        extract_call_graph(elf_path);
+    println!(
+        "  {} functions, {} call edges (bl), {} tail edges (b)",
+        functions.len(),
+        bl_count,
+        tail_count
+    );
+
+    // Validate known_assembly symbols exist in disassembly.
+    // For generic functions (e.g. assert_failed), accept a match
+    // if any monomorphized instance (assert_failed::<u64, u64>) exists.
+    // External symbols (core::, mem*) may be absent in release builds
+    // (optimized away) — only warn, don't fail.
+    for sym in annotations.known_assembly.keys() {
+        if functions.contains(sym.as_str()) {
+            continue;
+        }
+        let has_generic_instance = functions
+            .iter()
+            .any(|f| f.starts_with(sym.as_str()) && f[sym.len()..].starts_with("::<"));
+        if has_generic_instance {
+            continue;
+        }
+        // External symbols may be absent in optimized builds
+        let is_external = sym.starts_with("core::")
+            || sym.starts_with("OUTLINED_FUNCTION")
+            || sym == "memcpy"
+            || sym == "memset"
+            || sym == "memcmp";
+        if is_external {
+            // Absent external — silently skip, not needed for analysis
+            continue;
+        }
+        eprintln!(
+            "FAIL: [known_assembly] symbol '{}' not found in disassembly",
+            sym
+        );
+        eprintln!("Symbol may have been renamed or deleted.");
+        process::exit(1);
+    }
+
+    // Merge known_assembly sizes into stack_sizes
+    for (sym, size) in &annotations.known_assembly {
+        stack_sizes.insert(sym.clone(), *size);
+    }
+    if !annotations.known_assembly.is_empty() {
+        println!(
+            "  {} assembly functions from [known_assembly]",
+            annotations.known_assembly.len()
+        );
+    }
+
+    // Check all indirect calls (BLR) are annotated
+    if !indirect_fns.is_empty() {
+        println!(
+            "  {} functions contain indirect calls (BLR):",
+            indirect_fns.len()
+        );
         let mut unannotated = Vec::new();
-        for (i, name) in demangled_names.iter().enumerate() {
-            if annotations.contains_key(name.as_str()) {
+        for name in &indirect_fns {
+            if annotations.indirect_calls.contains_key(name.as_str()) {
                 println!("    - {} [annotated]", name);
             } else {
-                // Also try the mangled name
-                if annotations.contains_key(indirect_calls[i].as_str()) {
-                    println!("    - {} [annotated]", name);
-                } else {
-                    println!("    - {} [UNANNOTATED]", name);
-                    unannotated.push(name.clone());
-                }
+                println!("    - {} [UNANNOTATED]", name);
+                unannotated.push(name.clone());
             }
         }
         if !unannotated.is_empty() {
             eprintln!();
-            eprintln!("  [FAIL] {} unannotated indirect call site(s)!", unannotated.len());
-            eprintln!("  Every BLR must be listed in xtask/stack-annotations.toml.");
-            eprintln!("  Unannotated functions:");
+            eprintln!(
+                "  FAIL: {} unannotated indirect call site(s)",
+                unannotated.len()
+            );
+            eprintln!("  Every BLR must be listed in {}", ANNOTATIONS_PATH);
             for name in &unannotated {
                 eprintln!("    - {}", name);
             }
             process::exit(1);
         }
-        println!("  [PASS] All indirect calls annotated");
+        println!("  All indirect calls annotated");
     }
-    println!();
 
-    // Step 4: Analyze — cycle detection + worst-case depth
-    println!("[4/4] Analyzing call graph...");
-    let mut failed = false;
+    // Resolve indirect call annotation targets into call graph edges.
+    // Skip annotations for functions that were inlined away in this
+    // profile — their BLR sites are absorbed into the inlining caller.
+    let mut resolved_count = 0;
+    for (fn_name, annotation) in &annotations.indirect_calls {
+        if !call_graph.contains_key(fn_name) {
+            continue;
+        }
+        if let IndirectAnnotation::Targets(targets) = annotation {
+            for target in targets {
+                if let Some(resolved) = resolve_target_name(target, &functions) {
+                    let callees = call_graph.entry(fn_name.clone()).or_default();
+                    if !callees.contains(&resolved) {
+                        callees.push(resolved);
+                        resolved_count += 1;
+                    }
+                } else {
+                    eprintln!(
+                        "FAIL: indirect call target '{}' (from '{}') not found in disassembly",
+                        target, fn_name
+                    );
+                    process::exit(1);
+                }
+            }
+        }
+    }
+    if resolved_count > 0 {
+        println!(
+            "  Resolved {} indirect-call targets into graph",
+            resolved_count
+        );
+    }
+
+    // Check all reachable functions have stack size data.
+    let entry_points = [NORMAL_ENTRY, SECONDARY_ENTRY, SYNC_EXCEPTION_ENTRY, IRQ_EXCEPTION_ENTRY];
+    let reachable = collect_reachable(&entry_points, &call_graph);
+    let mut missing: Vec<String> = reachable
+        .iter()
+        .filter(|name| lookup_stack_size(name, &stack_sizes).is_none())
+        .cloned()
+        .collect();
+    missing.sort();
+    if !missing.is_empty() {
+        eprintln!();
+        eprintln!(
+            "FAIL: {} reachable function(s) have no stack size data:",
+            missing.len()
+        );
+        for name in &missing {
+            eprintln!("  - {}", name);
+        }
+        eprintln!();
+        eprintln!("This can happen if the function is assembly-only or was stripped.");
+        eprintln!(
+            "Add it to [known_assembly] in {} with a",
+            ANNOTATIONS_PATH
+        );
+        eprintln!("manually measured size, or fix the build to emit stack sizes.");
+        process::exit(1);
+    }
+
+    // [3/5] Per-function frame cap
+    println!();
+    println!(
+        "[3/5] Checking per-function frame sizes (cap: {})...",
+        PER_FUNCTION_CAP
+    );
+    let (largest_fn, largest_size) = stack_sizes
+        .iter()
+        .max_by_key(|(_, &size)| size)
+        .map(|(name, &size)| (name.clone(), size))
+        .unwrap_or_default();
+    println!("  Largest: {} ({} bytes)", largest_fn, largest_size);
+
+    let mut over_cap: Vec<(String, u64)> = stack_sizes
+        .iter()
+        .filter(|(_, &size)| size > PER_FUNCTION_CAP)
+        .map(|(name, &size)| (name.clone(), size))
+        .collect();
+    over_cap.sort_by(|a, b| b.1.cmp(&a.1));
+
+    if over_cap.is_empty() {
+        println!("  [PASS] All functions within cap");
+    } else {
+        for (name, size) in &over_cap {
+            eprintln!(
+                "  FAIL: {} uses {} bytes (per-function cap: {})",
+                name, size, PER_FUNCTION_CAP
+            );
+        }
+        failed = true;
+    }
+
+    // [4/5] Path analysis — cycle detection + worst-case depth
+    println!();
+    println!("[4/5] Analyzing paths...");
 
     // Cycle detection (recursion check).
-    // Cycles through functions listed in [allowed_cycles] are accepted
-    // (guarded at runtime, e.g., by re-entry flags).
-    let allowed_cycle_fns = load_allowed_cycles();
-
     let all_cycles = detect_cycles(&call_graph);
-    let real_cycles: Vec<_> = all_cycles.into_iter().filter(|cycle| {
-        let demangled: Vec<String> = cycle.iter().map(|n| demangle(n).trim().to_string()).collect();
-        !demangled.iter().any(|name| allowed_cycle_fns.contains(name.as_str()))
-    }).collect();
+    let real_cycles: Vec<_> = all_cycles
+        .into_iter()
+        .filter(|cycle| {
+            !cycle
+                .iter()
+                .any(|name| annotations.allowed_cycles.contains(name.as_str()))
+        })
+        .collect();
 
     if real_cycles.is_empty() {
-        println!("  [PASS] No recursion (zero unguarded cycles in call graph)");
+        println!("  No unguarded cycles");
     } else {
-        eprintln!("  [FAIL] Recursion detected! Cycles found:");
+        eprintln!("  FAIL: Recursion detected! Unguarded cycles:");
         for cycle in &real_cycles {
             eprintln!("    {}", cycle.join(" -> "));
         }
         failed = true;
     }
 
-    // Worst-case depth from normal entry point
-    if let Some(max_depth) = worst_case_depth(NORMAL_ENTRY, &call_graph, &stack_sizes) {
-        println!(
-            "  Normal path worst-case:    {} bytes (budget: {})",
-            max_depth, NORMAL_PATH_BUDGET
-        );
-        if max_depth > NORMAL_PATH_BUDGET {
-            eprintln!("  [FAIL] Exceeds normal path budget!");
-            failed = true;
-        } else {
-            println!("  [PASS] Within normal path budget");
-        }
-    } else {
-        println!("  [SKIP] Entry point '{}' not found in call graph", NORMAL_ENTRY);
-    }
+    let normal_depth = require_depth(NORMAL_ENTRY, &call_graph, &stack_sizes);
+    println!("  Normal ({}): worst-case {} bytes", NORMAL_ENTRY, normal_depth);
 
-    // TODO: Interrupt path analysis — add when exception vectors exist (Phase 3)
+    let secondary_depth = require_depth(SECONDARY_ENTRY, &call_graph, &stack_sizes);
+    println!("  Secondary ({}): worst-case {} bytes", SECONDARY_ENTRY, secondary_depth);
+
+    let sync_depth = require_depth(SYNC_EXCEPTION_ENTRY, &call_graph, &stack_sizes);
+    println!("  Sync exception ({}): worst-case {} bytes", SYNC_EXCEPTION_ENTRY, sync_depth);
+
+    let irq_depth = require_depth(IRQ_EXCEPTION_ENTRY, &call_graph, &stack_sizes);
+    println!("  IRQ exception ({}): worst-case {} bytes", IRQ_EXCEPTION_ENTRY, irq_depth);
+
+    // [5/5] Combined check — worst normal-mode path + worst exception ≤ total budget
+    // Normal-mode paths: primary boot (_start) and secondary boot (_secondary_start)
+    // both run on per-CPU kernel stacks.
+    println!();
+    println!("[5/5] Combined check...");
+    let worst_normal = normal_depth.max(secondary_depth);
+    let exception_depth = sync_depth.max(irq_depth);
+    let combined = worst_normal + exception_depth;
+    println!(
+        "  max(normal {}, secondary {}) + max(sync {}, irq {}) = {} bytes (budget: {})",
+        normal_depth, secondary_depth, sync_depth, irq_depth, combined, TOTAL_BUDGET
+    );
+
+    if combined > TOTAL_BUDGET {
+        eprintln!("  FAIL: Exceeds total budget!");
+        failed = true;
+    } else {
+        println!("  [PASS]");
+    }
 
     println!();
     if failed {
-        eprintln!("=== Stack check FAILED ===");
+        eprintln!("=== Stack check FAILED ({}) ===", profile);
         process::exit(1);
     }
-    println!("=== Stack check PASSED ===");
+    println!("=== Stack check PASSED ({}) ===", profile);
 }
 
 // ---------------------------------------------------------------------------
@@ -187,11 +336,9 @@ fn parse_stack_sizes(elf_path: &str) -> HashMap<String, u64> {
         .expect("failed to run rust-readobj — is cargo-binutils installed?");
 
     if !output.status.success() {
-        eprintln!(
-            "WARN: rust-readobj failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return HashMap::new();
+        eprintln!("FAIL: rust-readobj --stack-sizes failed:");
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        process::exit(1);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -223,30 +370,37 @@ fn parse_stack_sizes(elf_path: &str) -> HashMap<String, u64> {
 // Extract call graph from objdump disassembly
 // ---------------------------------------------------------------------------
 
-/// Returns (function_names, call_graph, functions_with_indirect_calls)
-fn extract_call_graph(elf_path: &str) -> (Vec<String>, HashMap<String, Vec<String>>, Vec<String>) {
+/// Returns (function_set, call_graph, indirect_call_fns, bl_count, tail_count)
+fn extract_call_graph(
+    elf_path: &str,
+) -> (
+    HashSet<String>,
+    HashMap<String, Vec<String>>,
+    Vec<String>,
+    usize,
+    usize,
+) {
     let output = Command::new("rust-objdump")
-        .args(["-d", "--no-show-raw-insn", elf_path])
+        .args(["-d", "--no-show-raw-insn", "--demangle", elf_path])
         .output()
         .expect("failed to run rust-objdump — is cargo-binutils installed?");
 
     if !output.status.success() {
-        eprintln!(
-            "WARN: cargo objdump failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return (vec![], HashMap::new(), vec![]);
+        eprintln!("FAIL: rust-objdump failed:");
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        process::exit(1);
     }
 
+    // --demangle handles symbol demangling inline (no rustfilt pipe
+    // needed for the large disassembly output).
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Note: we don't demangle here — objdump output is large (thousands of lines)
-    // and piping through rustfilt is slow. Function names from <name>: headers
-    // are sufficient for call graph analysis.
 
-    let mut functions: Vec<String> = Vec::new();
+    let mut functions = HashSet::new();
     let mut call_graph: HashMap<String, Vec<String>> = HashMap::new();
-    let mut indirect_calls: Vec<String> = Vec::new();
+    let mut indirect_fns: Vec<String> = Vec::new();
     let mut current_fn = String::new();
+    let mut bl_count: usize = 0;
+    let mut tail_count: usize = 0;
 
     for line in stdout.lines() {
         let line = line.trim();
@@ -254,9 +408,10 @@ fn extract_call_graph(elf_path: &str) -> (Vec<String>, HashMap<String, Vec<Strin
         // Function header: "0000000040080078 <kmain>:"
         if line.ends_with(">:") {
             if let Some(start) = line.find('<') {
+                // Use rfind for '>' to handle demangled generics like Result<T, E>
                 let name = line[start + 1..line.len() - 2].to_string();
                 current_fn = name.clone();
-                functions.push(name.clone());
+                functions.insert(name.clone());
                 call_graph.entry(name).or_default();
             }
             continue;
@@ -266,43 +421,223 @@ fn extract_call_graph(elf_path: &str) -> (Vec<String>, HashMap<String, Vec<Strin
             continue;
         }
 
-        // Parse instruction lines: "40080050:  bl  0x40080078 <kmain>"
-        // After --no-show-raw-insn: "40080050:       bl      0x40080078 <kmain>"
+        // Parse instruction: "40080050:       bl      0x40080078 <kmain>"
         if let Some(colon_pos) = line.find(':') {
             let insn_part = line[colon_pos + 1..].trim();
+            let mnemonic = insn_part.split_whitespace().next().unwrap_or("");
 
-            // BL — direct call
-            if insn_part.starts_with("bl\t") || insn_part.starts_with("bl ") {
-                if let Some(target) = extract_call_target(insn_part) {
-                    let callees = call_graph.entry(current_fn.clone()).or_default();
-                    if !callees.contains(&target) {
-                        callees.push(target);
+            match mnemonic {
+                // BL — direct call
+                "bl" => {
+                    if let Some(target) = extract_call_target(insn_part) {
+                        let callees = call_graph.entry(current_fn.clone()).or_default();
+                        if !callees.contains(&target) {
+                            callees.push(target);
+                            bl_count += 1;
+                        }
                     }
                 }
+                // B — unconditional branch, potential tail call.
+                // Only count inter-function branches: target is a different
+                // symbol with no +offset (which indicates an internal branch
+                // within the same or another function body).
+                "b" => {
+                    if let Some(target) = extract_call_target(insn_part) {
+                        if !target.contains('+') && target != current_fn {
+                            let callees = call_graph.entry(current_fn.clone()).or_default();
+                            if !callees.contains(&target) {
+                                callees.push(target);
+                                tail_count += 1;
+                            }
+                        }
+                    }
+                }
+                // BLR — indirect call via register (can't trace statically)
+                "blr" => {
+                    if !indirect_fns.contains(&current_fn) {
+                        indirect_fns.push(current_fn.clone());
+                    }
+                }
+                _ => {}
             }
-            // BLR — indirect call via register (flagged, can't trace)
-            else if insn_part.starts_with("blr\t") || insn_part.starts_with("blr ") {
-                if !indirect_calls.contains(&current_fn) {
-                    indirect_calls.push(current_fn.clone());
+        }
+    }
+
+    (functions, call_graph, indirect_fns, bl_count, tail_count)
+}
+
+/// Extract the target function name from a call/branch instruction.
+/// Handles demangled names with nested angle brackets (e.g. Result<T, E>).
+fn extract_call_target(insn: &str) -> Option<String> {
+    let start = insn.find('<')?;
+    let end = insn.rfind('>')?;
+    if end > start {
+        Some(insn[start + 1..end].to_string())
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Annotation loading
+// ---------------------------------------------------------------------------
+
+enum IndirectAnnotation {
+    /// Unresolvable formatter dispatch — no edges added to call graph.
+    FmtInternal,
+    /// Known call targets — edges added to call graph.
+    Targets(Vec<String>),
+}
+
+struct Annotations {
+    indirect_calls: HashMap<String, IndirectAnnotation>,
+    allowed_cycles: HashSet<String>,
+    known_assembly: HashMap<String, u64>,
+}
+
+fn load_annotations() -> Annotations {
+    let content = match std::fs::read_to_string(ANNOTATIONS_PATH) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("FAIL: could not read {}: {}", ANNOTATIONS_PATH, e);
+            process::exit(1);
+        }
+    };
+
+    let mut indirect_calls = HashMap::new();
+    let mut allowed_cycles = HashSet::new();
+    let mut known_assembly = HashMap::new();
+
+    enum Section {
+        None,
+        IndirectCalls,
+        AllowedCycles,
+        KnownAssembly,
+    }
+    let mut section = Section::None;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match line {
+            "[indirect_calls]" => {
+                section = Section::IndirectCalls;
+                continue;
+            }
+            "[allowed_cycles]" => {
+                section = Section::AllowedCycles;
+                continue;
+            }
+            "[known_assembly]" => {
+                section = Section::KnownAssembly;
+                continue;
+            }
+            _ if line.starts_with('[') => {
+                section = Section::None;
+                continue;
+            }
+            _ => {}
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().trim_matches('"').to_string();
+        let value = value.trim();
+
+        match section {
+            Section::IndirectCalls => {
+                if value == "\"fmt-internal\"" {
+                    indirect_calls.insert(key, IndirectAnnotation::FmtInternal);
+                } else if value.starts_with('[') {
+                    // Parse array: ["a", "b", "c"]
+                    let inner = value.trim_start_matches('[').trim_end_matches(']');
+                    let targets: Vec<String> = inner
+                        .split(',')
+                        .map(|s| s.trim().trim_matches('"').to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    indirect_calls.insert(key, IndirectAnnotation::Targets(targets));
+                }
+            }
+            Section::AllowedCycles => {
+                allowed_cycles.insert(key);
+            }
+            Section::KnownAssembly => {
+                if let Ok(size) = parse_hex_or_dec(value) {
+                    known_assembly.insert(key, size);
+                }
+            }
+            Section::None => {}
+        }
+    }
+
+    Annotations {
+        indirect_calls,
+        allowed_cycles,
+        known_assembly,
+    }
+}
+
+/// Resolve an annotation target name to a function in the disassembly.
+/// Tries exact match first, then suffix match (::name).
+fn resolve_target_name(target: &str, functions: &HashSet<String>) -> Option<String> {
+    // Exact match
+    if functions.contains(target) {
+        return Some(target.to_string());
+    }
+    // Suffix match: look for functions ending in ::target
+    let suffix = format!("::{}", target);
+    let matches: Vec<&String> = functions.iter().filter(|f| f.ends_with(&suffix)).collect();
+    match matches.len() {
+        1 => Some(matches[0].clone()),
+        0 => None,
+        _ => {
+            eprintln!(
+                "WARN: annotation target '{}' matches multiple functions:",
+                target
+            );
+            for m in &matches {
+                eprintln!("  - {}", m);
+            }
+            // Ambiguous — treat as unresolved
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reachability
+// ---------------------------------------------------------------------------
+
+/// Collect all functions reachable from the given entry points via BFS.
+fn collect_reachable(
+    entries: &[&str],
+    graph: &HashMap<String, Vec<String>>,
+) -> HashSet<String> {
+    let mut reachable = HashSet::new();
+    let mut worklist: Vec<String> = entries
+        .iter()
+        .filter(|&&e| graph.contains_key(e))
+        .map(|&e| e.to_string())
+        .collect();
+
+    while let Some(node) = worklist.pop() {
+        if !reachable.insert(node.clone()) {
+            continue;
+        }
+        if let Some(callees) = graph.get(&node) {
+            for callee in callees {
+                if !reachable.contains(callee) {
+                    worklist.push(callee.clone());
                 }
             }
         }
     }
 
-    (functions, call_graph, indirect_calls)
-}
-
-/// Extract the target function name from a "bl 0xADDR <name>" instruction.
-fn extract_call_target(insn: &str) -> Option<String> {
-    // Format: "bl\t0x40080078 <kmain>" or "bl\t0x40080078"
-    if let Some(start) = insn.find('<') {
-        let end = insn.find('>')?;
-        Some(insn[start + 1..end].to_string())
-    } else {
-        // No symbolic name — use raw address
-        let addr_part = insn.split_whitespace().nth(1)?;
-        Some(addr_part.to_string())
-    }
+    reachable
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +700,18 @@ fn dfs_cycles(
 // Worst-case stack depth (DFS with memoization)
 // ---------------------------------------------------------------------------
 
+/// Compute worst-case depth from a required entry point, exiting on failure.
+fn require_depth(
+    entry: &str,
+    graph: &HashMap<String, Vec<String>>,
+    stack_sizes: &HashMap<String, u64>,
+) -> u64 {
+    worst_case_depth(entry, graph, stack_sizes).unwrap_or_else(|| {
+        eprintln!("FAIL: entry point '{}' not found in call graph", entry);
+        process::exit(1);
+    })
+}
+
 /// Compute worst-case stack depth from an entry point by summing frame sizes
 /// along the deepest path. Returns None if the entry point is not found.
 fn worst_case_depth(
@@ -378,7 +725,13 @@ fn worst_case_depth(
 
     let mut memo: HashMap<String, u64> = HashMap::new();
     let mut in_progress: HashSet<String> = HashSet::new();
-    Some(compute_depth(entry, graph, stack_sizes, &mut memo, &mut in_progress))
+    Some(compute_depth(
+        entry,
+        graph,
+        stack_sizes,
+        &mut memo,
+        &mut in_progress,
+    ))
 }
 
 fn compute_depth(
@@ -398,7 +751,7 @@ fn compute_depth(
     }
     in_progress.insert(node.to_string());
 
-    let my_size = stack_sizes.get(node).copied().unwrap_or(0);
+    let my_size = lookup_stack_size(node, stack_sizes).unwrap_or(0);
 
     let max_callee_depth = graph
         .get(node)
@@ -421,39 +774,40 @@ fn compute_depth(
 // Utilities
 // ---------------------------------------------------------------------------
 
-/// Load indirect call annotations from xtask/stack-annotations.toml.
-/// Returns a map of function_name -> annotation (either "fmt-internal" or a list of targets).
-fn load_annotations() -> HashMap<String, String> {
-    let mut annotations = HashMap::new();
+/// Strip LLVM internal suffix like " (.llvm.13824057243090990755)" from
+/// function names. These are LLVM-duplicated specializations that share
+/// the same stack frame as the original.
+fn strip_llvm_suffix(name: &str) -> &str {
+    if let Some(idx) = name.find(" (.llvm.") {
+        &name[..idx]
+    } else {
+        name
+    }
+}
 
-    let path = "xtask/stack-annotations.toml";
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("WARN: Could not read {}", path);
-            return annotations;
-        }
-    };
-
-    // Simple TOML parser: look for lines under [indirect_calls]
-    let mut in_section = false;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_section = line == "[indirect_calls]";
-            continue;
-        }
-        if !in_section || line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // Parse: "function_name" = "value" or "function_name" = ["a", "b"]
-        if let Some((key, _value)) = line.split_once('=') {
-            let key = key.trim().trim_matches('"');
-            annotations.insert(key.to_string(), "annotated".to_string());
+/// Look up a function's stack size, trying in order:
+/// 1. Exact match
+/// 2. With .llvm.NNNN suffix stripped
+/// 3. Generic prefix match (name::<T> matches base name)
+fn lookup_stack_size(name: &str, sizes: &HashMap<String, u64>) -> Option<u64> {
+    if let Some(&s) = sizes.get(name) {
+        return Some(s);
+    }
+    let stripped = strip_llvm_suffix(name);
+    if stripped != name {
+        if let Some(&s) = sizes.get(stripped) {
+            return Some(s);
         }
     }
-
-    annotations
+    // Generic monomorphization: "foo::bar::<u64, u64>" matches "foo::bar"
+    sizes
+        .iter()
+        .find(|(key, _)| {
+            name.starts_with(key.as_str())
+                && name.len() > key.len()
+                && name[key.len()..].starts_with("::<")
+        })
+        .map(|(_, &s)| s)
 }
 
 fn parse_hex_or_dec(s: &str) -> Result<u64, std::num::ParseIntError> {
@@ -464,35 +818,46 @@ fn parse_hex_or_dec(s: &str) -> Result<u64, std::num::ParseIntError> {
     }
 }
 
-/// Load function names from [allowed_cycles] in stack-annotations.toml.
-/// Cycles passing through these functions are accepted (guarded at runtime).
-fn load_allowed_cycles() -> HashSet<String> {
-    let mut allowed = HashSet::new();
-    let path = "xtask/stack-annotations.toml";
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return allowed,
+/// Pipe text through `rustfilt` to demangle Rust symbols.
+/// Returns the original text unchanged if rustfilt is not installed.
+///
+/// Uses a temp file for input to avoid pipe buffer deadlock.
+fn demangle(text: &str) -> String {
+    let tmp = format!("/tmp/lockjaw-rustfilt-{}.tmp", std::process::id());
+    if std::fs::write(&tmp, text).is_err() {
+        return text.to_string();
+    }
+    let file = match std::fs::File::open(&tmp) {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            return text.to_string();
+        }
     };
-    let mut in_section = false;
-    for line in content.lines() {
-        let line = line.trim();
-        if line == "[allowed_cycles]" {
-            in_section = true;
-            continue;
+    let result = Command::new("rustfilt").stdin(file).output();
+    let _ = std::fs::remove_file(&tmp);
+    match result {
+        Ok(output) if output.status.success() => {
+            String::from_utf8(output.stdout).unwrap_or_else(|_| text.to_string())
         }
-        if line.starts_with('[') {
-            in_section = false;
-            continue;
-        }
-        if in_section && !line.is_empty() && !line.starts_with('#') {
-            // Parse "function_name" = true
-            if let Some(name) = line.split('=').next() {
-                let name = name.trim().trim_matches('"');
-                allowed.insert(name.to_string());
-            }
+        _ => text.to_string(),
+    }
+}
+
+/// Check that a required tool is on PATH.
+fn ensure_tool(name: &str, install_hint: &str) {
+    let result = Command::new(name)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match result {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("FAIL: '{}' not found. Install with: {}", name, install_hint);
+            process::exit(1);
         }
     }
-    allowed
 }
 
 // ---------------------------------------------------------------------------
@@ -591,33 +956,5 @@ fn visit_rs_files(dir: &std::path::Path, cb: &mut dyn FnMut(&std::path::Path)) {
         } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
             cb(&path);
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
-
-/// Pipe text through `rustfilt` to demangle Rust symbols.
-/// Returns the original text unchanged if rustfilt is not installed.
-fn demangle(text: &str) -> String {
-    let child = Command::new("rustfilt")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn();
-
-    match child {
-        Ok(mut child) => {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            match child.wait_with_output() {
-                Ok(output) if output.status.success() => {
-                    String::from_utf8(output.stdout).unwrap_or_else(|_| text.to_string())
-                }
-                _ => text.to_string(),
-            }
-        }
-        Err(_) => text.to_string(),
     }
 }

@@ -5,7 +5,6 @@
 /// the panic handler. We write directly to the UART via core::fmt::Write
 /// and discard errors with `let _ =`. No .unwrap() on any fallible path.
 
-use crate::mm::kernel_ptr::KernelRef;
 use crate::sched::tcb::Tcb;
 use core::fmt::Write;
 

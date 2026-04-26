@@ -2,7 +2,6 @@ use crate::mm::addr::PhysAddr;
 use crate::mm::kernel_ptr::{KernelMut, KernelRef};
 use lockjaw_types::object::{ObjectHeader, ObjectType};
 use lockjaw_types::process::{self, ProcessLifecycle};
-use core::ptr;
 
 // ---------------------------------------------------------------------------
 // ProcessObject — kernel-side live struct, stored in a donated page

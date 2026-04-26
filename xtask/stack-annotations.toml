@@ -34,6 +34,65 @@
 # edges still exist (panic paths call print_thread_context which
 # uses formatting that the compiler sees as potentially panicking),
 # but the runtime guard prevents actual recursion.
+# Manually verified stack sizes for assembly-only functions.
+# emit-stack-sizes only covers Rust code; these are measured from
+# the assembly source. The checker validates every symbol here
+# exists in the disassembly — if a symbol is renamed/deleted, the
+# check fails.
+[known_assembly]
+# Exception vector stubs: SAVE_REGS allocates EXCEPTION_FRAME_SIZE
+# = size_of::<ExceptionContext>() = 288 bytes (31 GPRs + ELR + SPSR
+# + ESR + SP_EL0 + pad = 36 × 8).
+"__vec_sync" = 288
+"__vec_irq" = 288
+"__vec_fiq" = 288
+"__vec_serror" = 288
+"__vec_sync_lower" = 288
+# context_switch: sub sp, sp, #(12 * 8) = 96 bytes for SavedContext
+# (callee-saved x19–x30). Switches stacks mid-function; the 96 bytes
+# remain allocated on the old thread's stack.
+"context_switch" = 96
+# thread_entry: trampoline that calls blr x19. No stack allocation.
+"thread_entry" = 0
+# _start: sets SP from linker symbol, no frame allocation.
+"_start" = 0
+# _secondary_start: sets per-CPU SP, no frame allocation.
+"_secondary_start" = 0
+
+# Compiler builtins — leaf functions, no stack frame.
+"memcpy" = 0
+"memset" = 0
+"memcmp" = 0
+
+# LLVM code de-duplication artifact. Small outlined sequences.
+"OUTLINED_FUNCTION_0" = 0
+
+# Core library functions from the precompiled sysroot (no
+# emit-stack-sizes). Conservative upper bounds. The proper long-term
+# fix is -Zbuild-std so core is rebuilt with our rustflags.
+# Panic/abort paths — divergent, never return. Stack usage doesn't
+# combine with further callees, but frames still exist on the stack.
+"core::panicking::panic" = 128
+"core::panicking::panic_fmt" = 128
+"core::panicking::panic_nounwind_fmt" = 128
+"core::panicking::panic_bounds_check" = 128
+"core::panicking::assert_failed_inner" = 128
+"core::panicking::panic_misaligned_pointer_dereference" = 64
+"core::panicking::panic_null_pointer_dereference" = 64
+"core::panicking::panic_const::panic_const_add_overflow" = 64
+"core::panicking::panic_const::panic_const_mul_overflow" = 64
+"core::panicking::panic_const::panic_const_shl_overflow" = 64
+"core::panicking::panic_const::panic_const_sub_overflow" = 64
+"core::option::expect_failed" = 128
+"core::option::unwrap_failed" = 128
+"core::result::unwrap_failed" = 128
+"core::slice::index::slice_index_fail" = 128
+# core::panicking::assert_failed is generic — the checker resolves
+# the monomorphized instances via .llvm. suffix stripping.
+"core::panicking::assert_failed" = 128
+# core::fmt::write — drives formatting via fn pointers. Moderate frame.
+"core::fmt::write" = 128
+
 [allowed_cycles]
 # print_thread_context has a runtime AtomicBool re-entry guard.
 "lockjaw::crash::print_thread_context" = true

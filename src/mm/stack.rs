@@ -8,10 +8,14 @@ extern "C" {
     static __per_cpu_stacks: u8;
 }
 
-/// Per-CPU stack size: guard page (4 KB) + stack (4 KB) = 8 KB stride.
-/// Used by init_canary_for_cpu (secondary core boot, commit 2).
+/// Per-CPU block stride: guard page (4 KB) + stack (8 KB) = 12 KB.
+/// Must match linker.ld and boot.rs secondary stack calculation.
 #[allow(dead_code)]
-const PER_CPU_STACK_STRIDE: u64 = 8192;
+const PER_CPU_STACK_STRIDE: u64 = 12288;
+
+/// Usable stack size per CPU (excluding guard page).
+#[allow(dead_code)]
+const PER_CPU_STACK_SIZE: u64 = 8192;
 
 /// Write the stack canary at the bottom of CPU 0's stack and fill the rest
 /// with a known pattern for high-water-mark analysis.
@@ -35,7 +39,7 @@ pub unsafe fn init_canary() {
 pub unsafe fn init_canary_for_cpu(cpu_id: u32) {
     let base = &raw const __per_cpu_stacks as u64;
     let bottom = base + (cpu_id as u64) * PER_CPU_STACK_STRIDE + 4096; // skip guard
-    let top = bottom + 4096;
+    let top = bottom + PER_CPU_STACK_SIZE;
     init_canary_at(bottom, top);
 }
 

@@ -45,9 +45,9 @@ SECTIONS
     __kernel_end = .;
 
     /*
-     * Per-CPU stacks (4 CPUs × 8 KB each = 32 KB total).
-     * Each CPU gets a guard page (4 KB, unmapped) + stack (4 KB).
-     * Stack budget: 3072 normal + 1024 interrupt = 4 KB.
+     * Per-CPU stacks (4 CPUs × 12 KB each = 48 KB total).
+     * Each CPU gets a guard page (4 KB, unmapped) + stack (8 KB).
+     * Stack budget: see docs/stack-budget.md.
      *
      * CPU 0's symbols are aliased to the legacy names so existing
      * code referencing __guard_page/__stack_bottom/__stack_top
@@ -67,28 +67,28 @@ SECTIONS
     __guard_page_0 = .;
     . = . + 4K;
     __stack_bottom_0 = .;
-    . = . + 4K;
+    . = . + 8K;
     __stack_top_0 = .;
 
     /* CPU 1 */
     __guard_page_1 = .;
     . = . + 4K;
     __stack_bottom_1 = .;
-    . = . + 4K;
+    . = . + 8K;
     __stack_top_1 = .;
 
     /* CPU 2 */
     __guard_page_2 = .;
     . = . + 4K;
     __stack_bottom_2 = .;
-    . = . + 4K;
+    . = . + 8K;
     __stack_top_2 = .;
 
     /* CPU 3 */
     __guard_page_3 = .;
     . = . + 4K;
     __stack_bottom_3 = .;
-    . = . + 4K;
+    . = . + 8K;
     __stack_top_3 = .;
 
     __per_cpu_stacks_end = .;

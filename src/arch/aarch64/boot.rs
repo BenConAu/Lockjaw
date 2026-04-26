@@ -90,12 +90,12 @@ _secondary_start:
     isb
 
     // --- Set per-CPU stack ---
-    // Stack layout: __per_cpu_stacks + cpu_id * 8192 + 4096 (skip guard) + 4096 (stack top)
-    // = __per_cpu_stacks + cpu_id * 8192 + 8192
-    // = __per_cpu_stacks + (cpu_id + 1) * 8192
+    // Stack layout: __per_cpu_stacks + (cpu_id + 1) * 12288
+    // Each CPU block: 4 KB guard + 8 KB stack = 12 KB = 12288 bytes.
     ldr     x1, =__per_cpu_stacks    // Base of all per-CPU stacks
     add     x2, x19, #1             // cpu_id + 1
-    lsl     x2, x2, #13             // × 8192
+    movz    x3, #12288               // Per-CPU block stride (4K guard + 8K stack)
+    mul     x2, x2, x3              // (cpu_id + 1) * 12288
     add     sp, x1, x2              // SP = stack top for this CPU
 
     // --- Call Rust secondary_main(cpu_id) ---

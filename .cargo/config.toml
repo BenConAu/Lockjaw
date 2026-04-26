@@ -5,6 +5,7 @@ target = "aarch64-unknown-none"
 rustflags = [
     "-C", "link-arg=-Tlinker.ld",
     "-C", "link-arg=--gc-sections",
+    "-Z", "emit-stack-sizes",
 ]
 
 [alias]
