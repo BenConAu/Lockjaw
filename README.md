@@ -11,9 +11,10 @@ The design follows a few core principles:
 - **Kernel never allocates.** All object memory comes from user-donated pages (PageSets). The kernel has only a fixed-size boot region in BSS.
 - **Handle-based access control.** Every kernel object is accessed through an integer handle with an associated rights bitmask. No handle, no access.
 - **Vulkan-inspired create-info pattern.** Each object type has its own create-info struct used for both size queries and creation. Same struct, no mismatch.
-- **Proven stack safety.** A custom build tool analyzes the call graph and per-function stack sizes on every build. Indirect calls must be annotated or the build fails.
-- **Map or donate, never both.** A PageSet is consumed when donated for a kernel object. This prevents userspace from reading kernel object internals or reusing the page.
-- **Verified IPC state machine.** The IPC endpoint logic is driven by a pure state machine model that is exhaustively explored at test time -- all reachable states, all transitions, all effect orderings verified. The kernel executes effects mechanically; the model makes all decisions.
+- **Proven stack safety.** A custom build tool analyzes the call graph and per-function stack sizes from four entry points (_start, _secondary_start, __vec_sync_lower, __vec_irq) on every build. Indirect calls must be annotated or the build fails.
+- **Map or donate, never both.** A PageSet is consumed when donated for a kernel object. Consumed headers are left as zeroed tombstones so stale exported handles safely read count=0.
+- **Verified IPC state machine.** The IPC endpoint logic is driven by a pure state machine model that is exhaustively explored at test time -- all reachable states, all transitions, all effect orderings verified. Kernel IPC handlers match on typed decision enums (SendDecision, ReceiveDecision, CallDecision, ReplyDecision) returned by lockjaw-types. No inline state branching in kernel code.
+- **Pull over push.** Kernel code is organized by integration shape: pull (types drives sequencing), plan/apply (types returns a decision, kernel executes), or push (kernel calls helpers). Push is treated as highest review-risk; the extraction rubric converts push to pull wherever possible.
 - **All MMIO through the device manager.** Drivers cannot map arbitrary physical addresses. The device manager discovers hardware from the DTB and issues tracked PageSets for MMIO pages. Only processes that receive an MMIO PageSet can map device memory.
 
 ## What works today
@@ -84,20 +85,24 @@ Three layers of automated testing run on every build:
 
 | Layer | Count | What it tests |
 |-------|-------|---------------|
-| Unit tests (host) | 235 | Scheduler model (BFS, per-CPU), IPC state machine (exhaustive), process lifecycle, buddy allocator, page tables, FDT parser, notifications, wait readiness, ticket lock (multi-threaded) |
-| Integration tests (QEMU) | 39 | Full boot through 9 phases, scheduler/MMU integration, IPC bootstrap, thread exit cleanup |
-| Stack analysis | 3 | No recursion, depth within budget, all indirect calls annotated |
-| Pointer cast lint | 60 | Every `as *const` / `as *mut` in kernel code has a SAFETY comment |
+| Unit tests (host) | 365 | Scheduler model (BFS, per-CPU), IPC state machine (exhaustive) + decision functions, process lifecycle + transfer plan + teardown plan, buddy allocator, page tables, ExceptionContext ABI offsets, SavedContext/Tcb ABI offsets, ESR decode, handle close decisions, FDT parser, notifications, wait readiness, ticket lock (multi-threaded) |
+| Integration tests (QEMU) | 40 | Full boot through 10 phases, scheduler/MMU integration, IPC bootstrap, thread exit cleanup, thread creation |
+| Stack analysis | 4 entry points | No recursion, depth within 8KB budget, per-function 1536B cap, all indirect calls annotated, both debug and release profiles |
+| Pointer cast lint | 70 | Every `as *const` / `as *mut` in kernel code has a SAFETY comment |
 
 The IPC state machine test exhaustively explores all reachable system states (endpoint state x per-client reply state x thread states) via BFS with a 3-thread model and verifies: no kernel-caused deadlocks, all 8 invariants hold, all effect orderings correct (BlockCurrent always last, UnblockThread before ClearReply).
 
 ### Build tools
 
-**`cargo xtask check-stack`** runs automatically before every `make build` and verifies:
+**`cargo xtask check-stack`** runs automatically before every `make build` and verifies both debug and release profiles:
 
-- **No recursion** -- detects cycles in the call graph (DFS on disassembly)
-- **Stack depth within budget** -- sums per-function frame sizes along the worst-case path (normal path budget: 3072 bytes, interrupt path: 1024 bytes)
+- **Four entry points** -- _start, _secondary_start, __vec_sync_lower, __vec_irq (not just the boot path)
+- **Combined budget** -- max(normal, secondary) + max(sync exception, IRQ) <= 8192 bytes
+- **Per-function cap** -- any single function exceeding 1536 bytes fails immediately
+- **No recursion** -- detects cycles in the call graph (DFS on disassembly, allowed_cycles for guarded paths)
 - **All indirect calls annotated** -- every `BLR` instruction must be listed in `xtask/stack-annotations.toml` with its known targets, or the build fails
+- **Tail call modeling** -- `b <symbol>` parsed as inter-function branches (conservative)
+- **No silent gaps** -- missing stack size data is a hard error (assembly functions in `[known_assembly]`, core library with conservative estimates)
 
 **`cargo xtask check-pointers`** runs automatically before every `make build` and verifies:
 
@@ -147,7 +152,7 @@ src/
     uart.rs                  # PL011 UART driver (kernel debug on UART0)
     mmu.rs                   # Boot page tables, MMU enable, higher-half, guard page
     vmem.rs                  # Dynamic per-process page table management
-    exceptions.rs            # Exception vectors, ESR decode, stack overflow detection
+    exceptions.rs            # Exception vectors, crash diagnostics (imports types for ESR decode)
     gic.rs                   # GICv3 interrupt controller
     timer.rs                 # Virtual timer (10ms periodic ticks)
     irq_bind.rs              # IRQ-to-notification binding table
@@ -167,14 +172,14 @@ src/
     pageset.rs               # PageSet state machine
     pageset_table.rs         # PageSetRef, PageSet tracking table, contiguous allocation
   sched/
-    tcb.rs                   # Thread Control Block, SavedContext struct
-    context.rs               # context_switch assembly, SavedContext offset assertions
+    tcb.rs                   # TCB creation (imports Tcb/SavedContext from lockjaw-types)
+    context.rs               # context_switch assembly (imports SavedContext from lockjaw-types)
     scheduler.rs             # Per-CPU round-robin scheduler, BlockToken, scoped_mut
     gkl.rs                   # Giant Kernel Lock (wraps TicketLock from lockjaw-types)
     current.rs               # CurrentThread safe facade (narrow per-field accessors)
   ipc/
-    endpoint.rs              # Endpoint object, send/receive/call with scoped borrows
-    reply.rs                 # Reply object (per-client caller identity for IPC)
+    endpoint.rs              # Endpoint object, send/receive/call (matches on IPC decisions from types)
+    reply.rs                 # Reply object, ipc_reply (matches on ReplyDecision from types)
     notification.rs          # Notification object (timeline semaphore for IRQ delivery)
     ep_queue.rs              # Intrusive FIFO waiter queue on endpoints
 
@@ -184,16 +189,19 @@ lockjaw-types/               # Pure-logic library crate, testable on host
     buddy.rs                 # Buddy allocator (bitmap-per-order, contiguous support)
     page_table.rs            # PageTableEntry, PageTable, PageTableWalk, MapWalk
     rights.rs                # Rights bitmask
-    object.rs                # ObjectType, ObjectSize, create-info structs
-    ipc_state.rs             # IPC state machine model, exhaustive BFS verification
+    object.rs                # ObjectType, create-info structs, CloseHandleResult, TeardownHandleAction
+    ipc_state.rs             # IPC state machine model + kernel-facing decision functions (decide_send/receive/call/reply)
+    exception.rs             # ExceptionContext ABI, ESR decode, sync exception classification
+    thread.rs                # SavedContext, Tcb, TcbCreateInfo, ThreadBootstrap ABI
     notification_state.rs    # Notification timeline semaphore model
-    pageset_table.rs         # PageSet table model with unit tests
+    pageset_table.rs         # PageSet table model, refcount/map_count lifecycle
+    process.rs               # ProcessLifecycle, ProcessTransferPlan, ProcessTeardownPlan
     vmem.rs                  # Page table walk/map validation, index computation
     wait.rs                  # sys_wait_any readiness model, ReadinessWaiter
     fdt.rs                   # Flattened Device Tree parser
     device.rs                # Device types, compatible string hashing
     elf.rs                   # ELF64 parser
-    syscall.rs               # Syscall numbers, SyscallError type, ALLOC_FLAG_CONTIGUOUS
+    syscall.rs               # Syscall numbers, SyscallError type, syscall_name(), ALLOC_FLAG_CONTIGUOUS
     constants.rs             # Stack canary, fill pattern, stack base address
     scheduler.rs             # Round-robin scheduling model
     user_pod.rs              # UserPod trait for safe copy_from_user
@@ -204,7 +212,8 @@ user/                        # Userspace binaries (separate Cargo projects)
   uart-driver/               # UART driver -- claims PL011 from device manager
   device-manager/            # Device manager -- DTB parsing, device claim IPC server
   ramfb-driver/              # Display driver -- fw_cfg DMA, contiguous framebuffer
-  lockjaw-userlib/           # Shared userspace library (syscall wrappers, print helpers)
+  display-test/              # Display DDI test client -- queries modes, draws gradient
+  lockjaw-userlib/           # Shared userspace library (syscall wrappers, display DDI, typed handles)
 
 docs/                        # Book of Lockjaw -- design documentation
   memory-model.md            # Why the kernel never allocates
@@ -215,9 +224,11 @@ docs/                        # Book of Lockjaw -- design documentation
   syscalls.md                # Syscall ABI, EL0 drop, yield
   ipc.md                     # IPC design, the two ABIs, message registers
   process-creation.md        # Userspace-driven process creation
+  stack-budget.md            # Stack budget analysis and rationale for 8KB
   tech-debt.md               # Known limitations and planned fixes
+  types-extraction-plan.md   # Extraction roadmap: what moves to lockjaw-types
   yagni-parking-lot.md       # Removed code tracked for future phases
-  development-journal.md     # Journal entries from the AI collaborator
+  development-journal.md     # Journal entries from the AI collaborator (1-6)
 
 xtask/                       # Build tools
   src/main.rs                # check-stack and check-pointers commands
@@ -231,10 +242,21 @@ tests/
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| 1-10 | Done | Boot, memory, exceptions, objects, threads, syscalls, IPC, processes, drivers, device manager, display |
-| 11. SMP | Done | Per-CPU stacks, PSCI secondary boot, Giant Kernel Lock (ticket lock), per-CPU scheduler, per-CPU idle threads, GKL-serialized exception handlers |
-| 12. Real Hardware | Planned | Bring-up on a simple AArch64 board (Raspberry Pi 4 or similar). UART, interrupts, and memory map without QEMU training wheels |
-| 13. POSIX Compatibility | Planned | POSIX personality server in userspace, musl libc port, enough to run simple C programs |
+| 1. Boot to UART | Done | Bare-metal Rust on QEMU virt, PL011 UART, kprintln!, panic handler |
+| 2. Memory Management | Done | Buddy allocator, 4-level page tables, identity + higher-half mapping, guard pages |
+| 3. Exceptions and Interrupts | Done | Vector table, GICv3, virtual timer, structured crash diagnostics |
+| 4. Kernel Object Model | Done | Vulkan-style create-info, handle tables, rights checking, PageSet donation |
+| 5. Threads and Context Switching | Done | TCBs, assembly context_switch, round-robin scheduler, preemptive multithreading |
+| 6. Syscall Interface | Done | EL0 userspace, SVC dispatch, typed error returns, PXN/UXN security bits |
+| 7. IPC | Done | Synchronous rendezvous, call/reply with per-client Reply objects, non-blocking receive, sys_wait_any |
+| 8. Userspace Processes | Done | Per-process TTBR0, ELF loader, init spawns children, bootstrap channel protocol |
+| 9. Userspace Drivers | Done | UART driver in userspace, event loop with sys_wait_any, notification-based IRQ delivery |
+| 10. Device Manager and Display | Done | DTB parsing, device claim IPC, MMIO PageSets, ramfb driver with DMA framebuffer |
+| 11. SMP | Done | Per-CPU stacks, PSCI secondary boot, Giant Kernel Lock, per-CPU scheduler and idle threads |
+| 12. PageSet Lifecycle | Done | Mapping tracking, ownership transfer, refcounting, free-on-zero, process exit cleanup |
+| 13. Architecture Hardening | In progress | Extracting pure logic to lockjaw-types (push→pull), pinning ABI contracts, making illegal states unrepresentable |
+| 14. Real Hardware | Planned | Bring-up on a simple AArch64 board (Raspberry Pi 4 or similar) |
+| 15. POSIX Compatibility | Planned | POSIX personality server in userspace, musl libc port |
 
 ## License
 
