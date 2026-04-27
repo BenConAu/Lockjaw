@@ -74,8 +74,11 @@ lockjaw-types already contains substantial extracted logic:
   refcount/map_count lifecycle
 - **process.rs** (350+ lines): ProcessTransferPlan, ProcessLifecycle,
   on_thread_exit/create
-- **object.rs** (320+ lines): HandleEntry, HandleCleanup,
-  handle_cleanup, HANDLE_SLOTS_PER_PAGE
+- **object.rs** (320+ lines): HandleEntry, HandleEntry::EMPTY,
+  CloseHandleResult, decide_close_handle, TeardownHandleAction,
+  decide_teardown_handle, HANDLE_SLOTS_PER_PAGE
+- **handle_ops.rs**: HandleError, slot_insert/lookup/remove,
+  find_empty_slot, slot_remove_all_by_object, slot_get/set_mapped_va
 - **ipc_state.rs**: EpState model, NotificationState, IPC decision
   functions (decide_send/receive/call/reply), raw constants,
   typed conversions, IpcError
@@ -85,6 +88,7 @@ lockjaw-types already contains substantial extracted logic:
   Tcb::init_in_place, crash-sensitive offset tests
 
 Host test count as of this audit: 305 unit + 1 doctest.
+Updated after extraction work: 387 unit + 1 doctest.
 
 ---
 
@@ -110,7 +114,7 @@ Host test count as of this audit: 305 unit + 1 doctest.
 - **PageSetHeader refcount/map_count** — DONE (commit 4). inc/dec
   with free-on-zero, 7 host tests.
 
-Current: 349 host tests + 1 doctest.
+Current: 387 host tests + 1 doctest.
 
 ### Also done since audit
 
@@ -122,11 +126,20 @@ Current: 349 host tests + 1 doctest.
   HandleCleanup. ProcessTeardownPlan with construction-safe teardown
   step variants. Narrow helpers (dec_refcount_and_maybe_free,
   dec_both_and_maybe_free) single-sourced across both paths.
+- **#2 Handle table slot operations** — DONE. Pure slot-array logic
+  (insert, lookup, remove, rights checking) moved to
+  lockjaw-types/src/handle_ops.rs. Kernel functions are now thin
+  wrappers: table_slots() for PhysAddr→slice, then delegate.
+  Rights::contains() and HandleEntry::EMPTY added. 22 new host tests.
 - **#4 SavedContext + TCB layout** — DONE. Moved to thread.rs with
   ThreadBootstrap, Tcb::init_in_place. 10 host tests with pinned
   crash-sensitive offsets.
 - **#11 Endpoint state constants** — DONE (part of IPC extraction).
   EP_IDLE, WAIT_KIND_*, REPLY_STATE_* moved to ipc_state.rs.
+- **ExceptionContext + ESR decode** — DONE. ExceptionContext with
+  pinned ABI offsets, ESR decode functions, classify_sync_exception
+  in lockjaw-types/src/exception.rs. 16 host tests.
+- **syscall_name** — DONE. Moved to lockjaw-types/src/syscall.rs.
 
 ### Remaining
 
@@ -144,21 +157,13 @@ ReceiveDecision, CallDecision, ReplyDecision with typed inputs
 (EpState, WaitKind, ReplyState). Kernel handlers rewritten to
 match-on-decision. 22 host tests.
 
-### 2. Handle table slot operations
+### 2. Handle table slot operations — DONE
 
-**Source**: `src/cap/handle_table.rs` (handle_insert, handle_lookup,
-handle_remove)
-
-The slot-finding and rights-checking logic is pure array/bitmask
-operations on `&[HandleEntry]` slices:
-
-- `find_empty_slot(slots) -> Option<usize>`
-- `check_rights(required, present) -> bool`
-
-Currently interleaved with unsafe KernelMut access via table_slots().
-
-**Tests**: slot reuse after removal, full-table rejection, rights
-bitmask edge cases (requesting READ|GRANT when only READ|WRITE).
+Moved to `lockjaw-types/src/handle_ops.rs`. HandleError, find_empty_slot,
+slot_insert, slot_lookup, slot_remove, slot_remove_all_by_object,
+slot_get/set_mapped_va. Rights::contains() added to rights.rs.
+HandleEntry::EMPTY constant in object.rs. Kernel handle_table.rs
+functions are thin wrappers: table_slots() then delegate. 22 host tests.
 
 ### 3. IRQ binding table
 
@@ -323,12 +328,12 @@ These categories of code are inherently kernel-side:
 
 | Tier | Items | Status | New tests | Effort |
 |------|-------|--------|-----------|--------|
-| 1 | 5 structural extractions | 4 done (#1, #2, #4, #11), 1 remaining | ~8 remaining | Medium |
+| 1 | 5 structural extractions | 5 done (#1, #2, #4, #11 + ExceptionContext) | 0 remaining | — |
 | 2 | 5 validation functions | 0 done | ~25 | Low |
-| 3 | 6 constants/helpers | 1 done (#11), 5 remaining | ~12 remaining | Very low |
-| **Total** | **16 items** | **5 done, 11 remaining** | **~45 remaining** | |
+| 3 | 6 constants/helpers | 3 done (#11, #13, ExceptionContext), 3 remaining | ~8 remaining | Very low |
+| **Total** | **16 items** | **8 done, 8 remaining** | **~33 remaining** | |
 
-Current: 349 host tests. After: ~394 host tests.
+Current: 387 host tests + 1 doctest.
 
 ---
 
@@ -338,33 +343,28 @@ With #4 (SavedContext/TCB) and the lifecycle series done, rank
 remaining items by the rubric: convert raw push to pull or
 plan/apply first.
 
-### Priority 1: Push → Pull/Plan-Apply conversions
+### Priority 1: Push → Pull/Plan-Apply conversions — ALL DONE
 
 1. ~~IPC decision enums (#1)~~ — **DONE.**
-
 2. ~~Handle release lifecycle (#2)~~ — **DONE.** CloseHandleResult,
    ProcessTeardownPlan, construction-safe teardown narrowing.
-
 3. ~~Process/thread teardown~~ — **DONE** (part of #2).
 
-### Priority 2: Layout and decision extractions
+### Priority 2: Layout and decision extractions — ALL DONE
 
-4. **ExceptionContext + ESR decode (Codex #1)** — frame layout is
-   as critical as SavedContext (now done). ESR classification
-   (SVC vs data abort vs instruction abort) is pure decision logic
-   currently inline in the exception handler. Pull candidate.
+4. ~~ExceptionContext + ESR decode (Codex #1)~~ — **DONE.**
+   exception.rs with pinned ABI offsets and classify_sync_exception.
+5. ~~Handle table slot operations (#2)~~ — **DONE.** handle_ops.rs
+   with pure slot-array operations. 22 host tests.
 
-5. **Handle table slot operations (#2)** — rights checking and
-   slot finding. Currently push. ~8 tests.
+### Priority 3: Remaining extractions
 
 6. **IRQ binding table (#3)** — clean generic data structure.
    Almost entirely pure. ~6 tests.
-
-### Priority 3: Easy wins (already pull-shaped, just not extracted)
 
 7. **Syscall validation batch (#6-10)** — five pure functions.
    Already naturally pull (return Ok/Err). ~25 tests. Low effort.
 
 8. ~~Endpoint state constants (#11)~~ — **DONE** (part of IPC).
-9. **syscall_name (#13)** — trivial move
+9. ~~syscall_name (#13)~~ — **DONE.** Moved to syscall.rs.
 10. **Platform constants (#12)** — eliminate duplication

@@ -1,6 +1,6 @@
 # Codex Kernel Architecture Work Items
 
-Status updated 2026-04-26.
+Status updated 2026-04-27.
 
 This captures the synthesized architectural review of the kernel with the guiding rule:
 
@@ -9,9 +9,9 @@ This captures the synthesized architectural review of the kernel with the guidin
 
 ## Highest-Value Work Items
 
-1. Move `ExceptionContext`, frame layout metadata, and ESR/FAR classification out of [src/arch/aarch64/exceptions.rs](/Users/Ben/Code/Lockjaw/src/arch/aarch64/exceptions.rs) into a new `lockjaw-types` exception module. Keep vector assembly and entrypoints in-kernel.
+1. ~~Move `ExceptionContext`, frame layout metadata, and ESR/FAR classification out of exceptions.rs into a new `lockjaw-types` exception module.~~ **DONE.** `lockjaw-types/src/exception.rs`: ExceptionContext with pinned ABI offsets, ESR decode (esr_exception_class, esr_data_fault_status, exception_class_name, data_fault_name), classify_sync_exception. 16 host tests. classify_address and stack overflow detection stay in kernel (layout-coupled).
 2. ~~Move `SavedContext` and `Tcb` layout into `lockjaw-types`.~~ **DONE.** `lockjaw-types/src/thread.rs`: SavedContext, Tcb, TcbCreateInfo, ThreadBootstrap, Tcb::init_in_place. 10 host tests with pinned crash-sensitive offsets.
-3. ~~Make handle access policy pure.~~ **PARTIALLY DONE.** CloseHandleResult in object.rs replaces HandleCleanup as the single close/release vocabulary. ProcessTeardownPlan with construction-safe narrowing (CleanupHandleEntriesPtesGone vs NoAddressSpace + TeardownHandleAction). Remaining: rights/type/empty-slot validation for insert/lookup paths.
+3. ~~Make handle access policy pure.~~ **DONE.** CloseHandleResult and TeardownHandleAction for close/release lifecycle. Pure slot operations (insert, lookup, remove, rights checking) in `lockjaw-types/src/handle_ops.rs`. Rights::contains() and HandleEntry::EMPTY. Kernel handle_table.rs is now thin wrappers: table_slots() then delegate. 22 + 10 host tests across handle_ops and object modules.
 4. Add pure constructors for object headers in `lockjaw-types`: replace scattered literal writes in [src/cap/object.rs](/Users/Ben/Code/Lockjaw/src/cap/object.rs) and [src/cap/process_obj.rs](/Users/Ben/Code/Lockjaw/src/cap/process_obj.rs) with `ObjectHeader::new(...)`, `HandleTableHeader::new(...)`, and related constructors.
 5. ~~Finish extracting `create_process` decision logic.~~ **DONE.** ProcessTransferPlan in lockjaw-types/src/process.rs with 11 host tests. HandleCleanup in lockjaw-types/src/object.rs with 6 host tests. create_process is now orchestration + side effects only.
 6. Move `ProcessMapping` and thread-start validation out of [src/process.rs](/Users/Ben/Code/Lockjaw/src/process.rs) and [src/syscall/handler.rs](/Users/Ben/Code/Lockjaw/src/syscall/handler.rs) into `lockjaw-types::process`.
@@ -27,7 +27,7 @@ This captures the synthesized architectural review of the kernel with the guidin
 13. Consolidate platform and per-CPU stack constants from [src/arch/aarch64/platform.rs](/Users/Ben/Code/Lockjaw/src/arch/aarch64/platform.rs) and [src/mm/stack.rs](/Users/Ben/Code/Lockjaw/src/mm/stack.rs) into shared `lockjaw-types` facts so boot, MMU, GIC, UART, and stack code use one source of truth.
 14. Promote the `PageSet` value object from [src/cap/pageset.rs](/Users/Ben/Code/Lockjaw/src/cap/pageset.rs) into `lockjaw-types`, leaving allocation/rollback in the kernel.
 15. Move owned-page dedup/bounds semantics out of [src/cap/process_obj.rs](/Users/Ben/Code/Lockjaw/src/cap/process_obj.rs) into a pure `OwnedPageList` or equivalent in `lockjaw-types::process`.
-16. Move handle-table search policy from [src/cap/handle_table.rs](/Users/Ben/Code/Lockjaw/src/cap/handle_table.rs) into `lockjaw-types` helpers: first-free-slot, lookup shape, release decision.
+16. ~~Move handle-table search policy from handle_table.rs into `lockjaw-types` helpers: first-free-slot, lookup shape, release decision.~~ **DONE.** find_empty_slot, slot_lookup, slot_insert, slot_remove, slot_remove_all_by_object, slot_get/set_mapped_va in handle_ops.rs.
 17. ~~Make endpoint.rs and reply.rs execute ipc_state decisions.~~ **DONE.** Kernel-facing decision functions (decide_send/receive/call/reply) in ipc_state.rs. Raw constants, IpcError, typed conversions moved. Kernel handlers rewritten to match-on-decision with typed state inputs. 22 host tests.
 18. Promote the queue contract in [src/ipc/ep_queue.rs](/Users/Ben/Code/Lockjaw/src/ipc/ep_queue.rs) to the pure queue model in [lockjaw-types/src/ipc_state.rs](/Users/Ben/Code/Lockjaw/lockjaw-types/src/ipc_state.rs); keep intrusive pointer surgery in-kernel.
 19. Move `ReplyObject` liveness/state tags to match `lockjaw_types::ipc_state::ReplyState` exactly.
@@ -35,7 +35,7 @@ This captures the synthesized architectural review of the kernel with the guidin
 
 ## Low-Cost Cleanups
 
-21. Move syscall-name metadata from [src/crash.rs](/Users/Ben/Code/Lockjaw/src/crash.rs) into `lockjaw-types::syscall`.
+21. ~~Move syscall-name metadata from crash.rs into `lockjaw-types::syscall`.~~ **DONE.** syscall_name() in lockjaw-types/src/syscall.rs, kernel re-exports.
 22. Remove [src/elf.rs](/Users/Ben/Code/Lockjaw/src/elf.rs) as a kernel shim and import `lockjaw_types::elf` directly.
 23. Keep [src/mm/user_access.rs](/Users/Ben/Code/Lockjaw/src/mm/user_access.rs) thin; optional only: add a typed `UserBufferSpec` in `lockjaw-types`.
 24. Keep [src/cap/object_ops.rs](/Users/Ben/Code/Lockjaw/src/cap/object_ops.rs) thin and consume the new pure handle-access helpers instead of repeating checks.
@@ -46,8 +46,8 @@ This captures the synthesized architectural review of the kernel with the guidin
 
 ## Best Verification Payoff
 
-- Host tests for exception frame layout and decode.
-- Host tests for handle access validation and header constructors.
+- ~~Host tests for exception frame layout and decode.~~ **DONE.** 16 tests in exception.rs.
+- ~~Host tests for handle access validation and header constructors.~~ **DONE.** 22 tests in handle_ops.rs + 10 in object.rs.
 - ~~Host tests for `create_process` planning and partial-unmap rejection.~~ **DONE.** ProcessTransferPlan tests.
 - Host tests for boot memory layout and per-CPU stack layout.
 - Host tests for page-table teardown planning.
