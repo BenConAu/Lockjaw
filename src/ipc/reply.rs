@@ -1,19 +1,15 @@
 use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
-use crate::ipc::endpoint::IpcError;
 use crate::mm::addr::PhysAddr;
 use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::scheduler;
 use crate::sched::tcb::Tcb;
 use core::ptr;
 
-/// Reply object state.
-///
-/// `Fresh` — not bound to any call. sys_call consumes a Fresh Reply.
-/// `Bound` — bound to a caller that is currently blocked waiting. The server's
-///           sys_reply uses `caller_tcb_paddr` to unblock exactly that caller
-///           and return the Reply to Fresh.
-pub const REPLY_STATE_FRESH: u8 = 0;
-pub const REPLY_STATE_BOUND: u8 = 1;
+// Single source of truth: constants and decisions from types.
+use lockjaw_types::ipc_state::{
+    IpcError, REPLY_STATE_FRESH, REPLY_STATE_BOUND,
+    ReplyDecision, decide_reply,
+};
 
 /// Kernel-side Reply object. Lives in one donated page.
 ///
@@ -62,41 +58,48 @@ pub fn ipc_reply(
 ) -> Result<(), IpcError> {
     let replier_tcb_paddr = scheduler::current_tcb_paddr();
     // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
-    let mut replier_tcb = unsafe { KernelMut::<Tcb>::from_paddr(replier_tcb_paddr) };
+    let replier_tcb = unsafe { KernelMut::<Tcb>::from_paddr(replier_tcb_paddr) };
     let reply_paddr_u64 = replier_tcb.get().current_reply_paddr;
-    if reply_paddr_u64 == 0 {
-        return Err(IpcError::NoCaller);
+
+    let has_reply = reply_paddr_u64 != 0;
+    let reply_is_bound = if has_reply {
+        // SAFETY: current_reply_paddr was set by ipc_receive from a valid Reply.
+        let reply = unsafe { KernelMut::<ReplyObject>::from_paddr(PhysAddr::new(reply_paddr_u64)) };
+        debug_assert_eq!(reply.get().header.obj_type, ObjectType::Reply);
+        reply.get().state == REPLY_STATE_BOUND
+    } else {
+        false
+    };
+
+    match decide_reply(has_reply, reply_is_bound) {
+        ReplyDecision::Deliver => {
+            let mut reply = unsafe { KernelMut::<ReplyObject>::from_paddr(PhysAddr::new(reply_paddr_u64)) };
+            let caller_paddr = PhysAddr::new(reply.get().caller_tcb_paddr);
+            // SAFETY: Reply.caller_tcb_paddr was set by ipc_call from a valid TCB.
+            let mut caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_paddr) };
+
+            // Deliver the reply message straight to the caller's ipc_msg.
+            {
+                let c = caller_tcb.get_mut();
+                c.ipc_msg = msg;
+                c.ipc_blocked_on = 0;
+            }
+
+            // Unblock BEFORE clearing the Reply (ordering rule: UnblockThread
+            // precedes ClearReply, because unblock reads reply.caller).
+            scheduler::unblock_thread(caller_paddr);
+
+            // Return the Reply to Fresh and detach this server from the call.
+            {
+                let r = reply.get_mut();
+                r.state = REPLY_STATE_FRESH;
+                r.caller_tcb_paddr = 0;
+            }
+            let mut replier_tcb = unsafe { KernelMut::<Tcb>::from_paddr(replier_tcb_paddr) };
+            replier_tcb.get_mut().current_reply_paddr = 0;
+
+            Ok(())
+        }
+        ReplyDecision::Error(e) => Err(e),
     }
-
-    // SAFETY: current_reply_paddr was set by ipc_receive from a valid Reply.
-    let mut reply = unsafe { KernelMut::<ReplyObject>::from_paddr(PhysAddr::new(reply_paddr_u64)) };
-    debug_assert_eq!(reply.get().header.obj_type, ObjectType::Reply);
-    if reply.get().state != REPLY_STATE_BOUND {
-        // Someone else (or stale state) — shouldn't happen in a coherent kernel.
-        return Err(IpcError::NoCaller);
-    }
-    let caller_paddr = PhysAddr::new(reply.get().caller_tcb_paddr);
-    // SAFETY: Reply.caller_tcb_paddr was set by ipc_call from a valid TCB.
-    let mut caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_paddr) };
-
-    // Deliver the reply message straight to the caller's ipc_msg.
-    {
-        let c = caller_tcb.get_mut();
-        c.ipc_msg = msg;
-        c.ipc_blocked_on = 0;
-    }
-
-    // Unblock BEFORE clearing the Reply (ordering rule: UnblockThread
-    // precedes ClearReply, because unblock reads reply.caller).
-    scheduler::unblock_thread(caller_paddr);
-
-    // Return the Reply to Fresh and detach this server from the call.
-    {
-        let r = reply.get_mut();
-        r.state = REPLY_STATE_FRESH;
-        r.caller_tcb_paddr = 0;
-    }
-    replier_tcb.get_mut().current_reply_paddr = 0;
-
-    Ok(())
 }

@@ -126,6 +126,258 @@ pub enum ReplyState {
     Bound { caller: ClientId },
 }
 
+// ---------------------------------------------------------------------------
+// Raw constants — kernel stores these in endpoint/TCB/reply u8 fields.
+// Single source of truth: kernel re-exports from here.
+// ---------------------------------------------------------------------------
+
+pub const EP_IDLE: u8 = 0;
+pub const EP_HAS_WAITERS: u8 = 1;
+pub const EP_HAS_RECEIVER: u8 = 2;
+
+pub const WAIT_KIND_NONE: u8 = 0;
+pub const WAIT_KIND_SEND: u8 = 1;
+pub const WAIT_KIND_RECEIVE: u8 = 2;
+pub const WAIT_KIND_CALL: u8 = 3;
+
+pub const REPLY_STATE_FRESH: u8 = 0;
+pub const REPLY_STATE_BOUND: u8 = 1;
+
+// ---------------------------------------------------------------------------
+// Typed ↔ raw conversion
+// ---------------------------------------------------------------------------
+
+impl EpState {
+    pub fn from_raw(v: u8) -> Option<Self> {
+        match v {
+            EP_IDLE => Some(EpState::Idle),
+            EP_HAS_WAITERS => Some(EpState::HasWaiters),
+            EP_HAS_RECEIVER => Some(EpState::HasReceiver),
+            _ => None,
+        }
+    }
+    pub fn to_raw(self) -> u8 {
+        match self {
+            EpState::Idle => EP_IDLE,
+            EpState::HasWaiters => EP_HAS_WAITERS,
+            EpState::HasReceiver => EP_HAS_RECEIVER,
+        }
+    }
+}
+
+impl WaitKind {
+    pub fn from_raw(v: u8) -> Option<Self> {
+        match v {
+            WAIT_KIND_SEND => Some(WaitKind::Send),
+            WAIT_KIND_RECEIVE => Some(WaitKind::Receive),
+            WAIT_KIND_CALL => Some(WaitKind::Call),
+            _ => None,
+        }
+    }
+    pub fn to_raw(self) -> u8 {
+        match self {
+            WaitKind::Send => WAIT_KIND_SEND,
+            WaitKind::Receive => WAIT_KIND_RECEIVE,
+            WaitKind::Call => WAIT_KIND_CALL,
+        }
+    }
+}
+
+// ReplyState in the model carries a ClientId for Bound. The kernel
+// stores just a u8 tag (0=Fresh, 1=Bound) + a separate caller_paddr
+// field. from_raw/to_raw handle the tag only.
+impl ReplyState {
+    pub fn is_fresh(self) -> bool {
+        matches!(self, ReplyState::Fresh)
+    }
+    pub fn raw_tag(self) -> u8 {
+        match self {
+            ReplyState::Fresh => REPLY_STATE_FRESH,
+            ReplyState::Bound { .. } => REPLY_STATE_BOUND,
+        }
+    }
+    /// Convert a raw tag to Fresh (for Bound, use the model constructor
+    /// which requires a ClientId).
+    pub fn from_raw_tag(v: u8) -> Option<Self> {
+        match v {
+            REPLY_STATE_FRESH => Some(ReplyState::Fresh),
+            // Bound requires caller context — kernel provides this separately
+            _ => None,
+        }
+    }
+    /// Is this raw tag the Bound state?
+    pub fn raw_is_bound(v: u8) -> bool {
+        v == REPLY_STATE_BOUND
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPC errors — shared between kernel and decision functions
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpcError {
+    /// Another receiver already queued, or reply slot occupied.
+    EndpointBusy,
+    /// No bound caller for reply.
+    NoCaller,
+    /// Non-blocking receive found no waiters.
+    WouldBlock,
+    /// Call attempted with already-bound Reply.
+    ReplyBound,
+}
+
+// ---------------------------------------------------------------------------
+// Kernel-facing decision API
+// ---------------------------------------------------------------------------
+// These functions take typed state observations from the kernel and
+// return structured decisions. They are derived from the same logic
+// as the model's step_send/receive/call/reply, but return kernel-
+// friendly types — no placeholder ThreadId/ClientId.
+//
+// The kernel reads state, calls a decision function, matches on the
+// result, and executes side effects mechanically.
+
+/// Decision for ipc_send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendDecision {
+    /// Receiver is waiting — dequeue, deliver message, unblock.
+    DeliverToReceiver { next_ep_state: EpState },
+    /// No receiver — enqueue self as Send waiter, block.
+    /// wake_readiness: true on Idle→HasWaiters transition.
+    QueueAndBlock {
+        next_ep_state: EpState,
+        wake_readiness: bool,
+    },
+}
+
+pub fn decide_send(ep_state: EpState) -> SendDecision {
+    match ep_state {
+        EpState::HasReceiver => SendDecision::DeliverToReceiver {
+            next_ep_state: EpState::Idle,
+        },
+        EpState::Idle => SendDecision::QueueAndBlock {
+            next_ep_state: EpState::HasWaiters,
+            wake_readiness: true,
+        },
+        EpState::HasWaiters => SendDecision::QueueAndBlock {
+            next_ep_state: EpState::HasWaiters,
+            wake_readiness: false,
+        },
+    }
+}
+
+/// Decision for ipc_receive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiveDecision {
+    /// Head is a Send waiter — dequeue, deliver msg, unblock sender.
+    DequeueSend { next_ep_state: EpState },
+    /// Head is a Call waiter — dequeue, deliver msg, bind reply to
+    /// receiver. Caller stays blocked.
+    DequeueCall { next_ep_state: EpState },
+    /// Queue empty — enqueue self as Receiver, block.
+    QueueAndBlock { next_ep_state: EpState },
+    /// Error condition.
+    Error(IpcError),
+}
+
+/// Decide what to do on ipc_receive.
+///
+/// Inputs (all kernel observations):
+/// - `ep_state`: current endpoint state
+/// - `has_outstanding_reply`: true if receiver already has a bound reply
+/// - `head_wait_kind`: wait kind of the queue head (None if no head)
+/// - `queue_has_more`: true if queue has >1 item (determines next state
+///   after dequeue). Kernel observes this; types decides the transition.
+pub fn decide_receive(
+    ep_state: EpState,
+    has_outstanding_reply: bool,
+    head_wait_kind: Option<WaitKind>,
+    queue_has_more: bool,
+) -> ReceiveDecision {
+    // Precondition: receiver must not have an outstanding reply
+    if has_outstanding_reply {
+        return ReceiveDecision::Error(IpcError::EndpointBusy);
+    }
+
+    match ep_state {
+        EpState::HasWaiters => {
+            let next = if queue_has_more { EpState::HasWaiters } else { EpState::Idle };
+            match head_wait_kind {
+                Some(WaitKind::Send) => ReceiveDecision::DequeueSend {
+                    next_ep_state: next,
+                },
+                Some(WaitKind::Call) => ReceiveDecision::DequeueCall {
+                    next_ep_state: next,
+                },
+                _ => ReceiveDecision::Error(IpcError::EndpointBusy),
+            }
+        }
+        EpState::HasReceiver => ReceiveDecision::Error(IpcError::EndpointBusy),
+        EpState::Idle => ReceiveDecision::QueueAndBlock {
+            next_ep_state: EpState::HasReceiver,
+        },
+    }
+}
+
+/// Decision for ipc_call. Caller always blocks on non-error paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallDecision {
+    /// Receiver waiting — dequeue, deliver msg + reply binding,
+    /// unblock receiver. Caller always blocks afterward.
+    DeliverToReceiver { next_ep_state: EpState },
+    /// No receiver — enqueue self as Call waiter, block.
+    QueueAndBlock {
+        next_ep_state: EpState,
+        wake_readiness: bool,
+    },
+    /// Reply not fresh.
+    Error(IpcError),
+}
+
+pub fn decide_call(reply_is_fresh: bool, ep_state: EpState) -> CallDecision {
+    if !reply_is_fresh {
+        return CallDecision::Error(IpcError::ReplyBound);
+    }
+
+    match ep_state {
+        EpState::HasReceiver => CallDecision::DeliverToReceiver {
+            next_ep_state: EpState::Idle,
+        },
+        EpState::Idle => CallDecision::QueueAndBlock {
+            next_ep_state: EpState::HasWaiters,
+            wake_readiness: true,
+        },
+        EpState::HasWaiters => CallDecision::QueueAndBlock {
+            next_ep_state: EpState::HasWaiters,
+            wake_readiness: false,
+        },
+    }
+}
+
+/// Decision for ipc_reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplyDecision {
+    /// Deliver msg to bound caller, unblock, clear reply binding.
+    Deliver,
+    /// Error (no bound call).
+    Error(IpcError),
+}
+
+pub fn decide_reply(has_reply: bool, reply_is_bound: bool) -> ReplyDecision {
+    if !has_reply {
+        return ReplyDecision::Error(IpcError::NoCaller);
+    }
+    if !reply_is_bound {
+        return ReplyDecision::Error(IpcError::NoCaller);
+    }
+    ReplyDecision::Deliver
+}
+
+// ---------------------------------------------------------------------------
+// Model types (continued)
+// ---------------------------------------------------------------------------
+
 /// IPC operation requested by a thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcOp {
@@ -851,5 +1103,182 @@ mod tests {
         // explodes unexpectedly (would warn us to canonicalize client symmetry).
         assert!(visited.len() < 10_000,
             "State space too large: {}", visited.len());
+    }
+
+    // -------------------------------------------------------------------
+    // Raw ↔ typed conversion
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn ep_state_raw_round_trip() {
+        for &s in &[EpState::Idle, EpState::HasWaiters, EpState::HasReceiver] {
+            assert_eq!(EpState::from_raw(s.to_raw()), Some(s));
+        }
+    }
+
+    #[test]
+    fn wait_kind_raw_round_trip() {
+        for &k in &[WaitKind::Send, WaitKind::Receive, WaitKind::Call] {
+            assert_eq!(WaitKind::from_raw(k.to_raw()), Some(k));
+        }
+    }
+
+    #[test]
+    fn ep_state_from_raw_invalid() {
+        assert_eq!(EpState::from_raw(255), None);
+    }
+
+    #[test]
+    fn wait_kind_from_raw_none_is_zero() {
+        assert_eq!(WaitKind::from_raw(WAIT_KIND_NONE), None);
+    }
+
+    // -------------------------------------------------------------------
+    // Send decisions
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn send_has_receiver_delivers() {
+        let d = decide_send(EpState::HasReceiver);
+        assert_eq!(d, SendDecision::DeliverToReceiver {
+            next_ep_state: EpState::Idle,
+        });
+    }
+
+    #[test]
+    fn send_idle_queues_with_readiness() {
+        let d = decide_send(EpState::Idle);
+        assert_eq!(d, SendDecision::QueueAndBlock {
+            next_ep_state: EpState::HasWaiters,
+            wake_readiness: true,
+        });
+    }
+
+    #[test]
+    fn send_has_waiters_queues_no_readiness() {
+        let d = decide_send(EpState::HasWaiters);
+        assert_eq!(d, SendDecision::QueueAndBlock {
+            next_ep_state: EpState::HasWaiters,
+            wake_readiness: false,
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // Receive decisions (densest — most subtle operation)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn receive_send_waiter_unblocks() {
+        let d = decide_receive(EpState::HasWaiters, false, Some(WaitKind::Send), false);
+        assert_eq!(d, ReceiveDecision::DequeueSend {
+            next_ep_state: EpState::Idle,
+        });
+    }
+
+    #[test]
+    fn receive_call_waiter_binds() {
+        let d = decide_receive(EpState::HasWaiters, false, Some(WaitKind::Call), false);
+        assert_eq!(d, ReceiveDecision::DequeueCall {
+            next_ep_state: EpState::Idle,
+        });
+    }
+
+    #[test]
+    fn receive_idle_queues_and_blocks() {
+        let d = decide_receive(EpState::Idle, false, None, false);
+        assert_eq!(d, ReceiveDecision::QueueAndBlock {
+            next_ep_state: EpState::HasReceiver,
+        });
+    }
+
+    #[test]
+    fn receive_double_receiver_errors() {
+        let d = decide_receive(EpState::HasReceiver, false, None, false);
+        assert_eq!(d, ReceiveDecision::Error(IpcError::EndpointBusy));
+    }
+
+    #[test]
+    fn receive_outstanding_reply_errors() {
+        // Even if there are waiters, a receiver with an outstanding
+        // reply must not dequeue another call.
+        let d = decide_receive(EpState::HasWaiters, true, Some(WaitKind::Send), false);
+        assert_eq!(d, ReceiveDecision::Error(IpcError::EndpointBusy));
+    }
+
+    #[test]
+    fn receive_dequeue_last_collapses_to_idle() {
+        let d = decide_receive(EpState::HasWaiters, false, Some(WaitKind::Send), false);
+        assert_eq!(d, ReceiveDecision::DequeueSend {
+            next_ep_state: EpState::Idle,
+        });
+    }
+
+    #[test]
+    fn receive_dequeue_with_more_stays_has_waiters() {
+        let d = decide_receive(EpState::HasWaiters, false, Some(WaitKind::Send), true);
+        assert_eq!(d, ReceiveDecision::DequeueSend {
+            next_ep_state: EpState::HasWaiters,
+        });
+    }
+
+    #[test]
+    fn receive_has_waiters_but_unexpected_kind_errors() {
+        // Receive waiter in the Send/Call queue is a protocol error
+        let d = decide_receive(EpState::HasWaiters, false, Some(WaitKind::Receive), false);
+        assert_eq!(d, ReceiveDecision::Error(IpcError::EndpointBusy));
+    }
+
+    #[test]
+    fn receive_has_waiters_but_no_head_kind_errors() {
+        // HasWaiters but None head_wait_kind = inconsistent state
+        let d = decide_receive(EpState::HasWaiters, false, None, false);
+        assert_eq!(d, ReceiveDecision::Error(IpcError::EndpointBusy));
+    }
+
+    // -------------------------------------------------------------------
+    // Call decisions
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn call_has_receiver_delivers() {
+        let d = decide_call(true, EpState::HasReceiver);
+        assert_eq!(d, CallDecision::DeliverToReceiver {
+            next_ep_state: EpState::Idle,
+        });
+    }
+
+    #[test]
+    fn call_idle_queues_with_readiness() {
+        let d = decide_call(true, EpState::Idle);
+        assert_eq!(d, CallDecision::QueueAndBlock {
+            next_ep_state: EpState::HasWaiters,
+            wake_readiness: true,
+        });
+    }
+
+    #[test]
+    fn call_bound_reply_errors() {
+        let d = decide_call(false, EpState::HasReceiver);
+        assert_eq!(d, CallDecision::Error(IpcError::ReplyBound));
+    }
+
+    // -------------------------------------------------------------------
+    // Reply decisions
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn reply_bound_delivers() {
+        assert_eq!(decide_reply(true, true), ReplyDecision::Deliver);
+    }
+
+    #[test]
+    fn reply_no_reply_errors() {
+        assert_eq!(decide_reply(false, false), ReplyDecision::Error(IpcError::NoCaller));
+    }
+
+    #[test]
+    fn reply_fresh_errors() {
+        // has_reply=true but reply is not bound
+        assert_eq!(decide_reply(true, false), ReplyDecision::Error(IpcError::NoCaller));
     }
 }
