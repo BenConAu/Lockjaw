@@ -1,5 +1,7 @@
 # Codex Kernel Architecture Work Items
 
+Status updated 2026-04-26.
+
 This captures the synthesized architectural review of the kernel with the guiding rule:
 
 - Move pure layout, state machines, validation, bounded collections, planners, and decode logic into `lockjaw-types`.
@@ -8,10 +10,10 @@ This captures the synthesized architectural review of the kernel with the guidin
 ## Highest-Value Work Items
 
 1. Move `ExceptionContext`, frame layout metadata, and ESR/FAR classification out of [src/arch/aarch64/exceptions.rs](/Users/Ben/Code/Lockjaw/src/arch/aarch64/exceptions.rs) into a new `lockjaw-types` exception module. Keep vector assembly and entrypoints in-kernel.
-2. Move `SavedContext` and `Tcb` layout out of [src/sched/context.rs](/Users/Ben/Code/Lockjaw/src/sched/context.rs) and [src/sched/tcb.rs](/Users/Ben/Code/Lockjaw/src/sched/tcb.rs) into `lockjaw-types`. Keep `context_switch`, `thread_entry`, and stack-frame installation in-kernel.
+2. ~~Move `SavedContext` and `Tcb` layout into `lockjaw-types`.~~ **DONE.** `lockjaw-types/src/thread.rs`: SavedContext, Tcb, TcbCreateInfo, ThreadBootstrap, Tcb::init_in_place. 10 host tests with pinned crash-sensitive offsets.
 3. Make handle access policy pure: extract rights/type/empty-slot validation from [src/cap/handle_table.rs](/Users/Ben/Code/Lockjaw/src/cap/handle_table.rs) into `lockjaw-types::object` or `lockjaw-types::rights`. Kernel should fetch slots and mutate memory, not decide policy ad hoc.
 4. Add pure constructors for object headers in `lockjaw-types`: replace scattered literal writes in [src/cap/object.rs](/Users/Ben/Code/Lockjaw/src/cap/object.rs) and [src/cap/process_obj.rs](/Users/Ben/Code/Lockjaw/src/cap/process_obj.rs) with `ObjectHeader::new(...)`, `HandleTableHeader::new(...)`, and related constructors.
-5. Finish extracting `create_process` decision logic: extend [lockjaw-types/src/process.rs](/Users/Ben/Code/Lockjaw/lockjaw-types/src/process.rs) so [src/process.rs](/Users/Ben/Code/Lockjaw/src/process.rs) becomes orchestration only. This is the biggest quality/verifiability win in the current kernel.
+5. ~~Finish extracting `create_process` decision logic.~~ **DONE.** ProcessTransferPlan in lockjaw-types/src/process.rs with 11 host tests. HandleCleanup in lockjaw-types/src/object.rs with 6 host tests. create_process is now orchestration + side effects only.
 6. Move `ProcessMapping` and thread-start validation out of [src/process.rs](/Users/Ben/Code/Lockjaw/src/process.rs) and [src/syscall/handler.rs](/Users/Ben/Code/Lockjaw/src/syscall/handler.rs) into `lockjaw-types::process`.
 7. Extract boot-memory reservation planning from [src/mm/page_alloc.rs](/Users/Ben/Code/Lockjaw/src/mm/page_alloc.rs) `init_with_gap()` into `lockjaw-types`, returning free ranges for the kernel allocator to apply.
 8. Extract stack layout policy from [src/mm/stack.rs](/Users/Ben/Code/Lockjaw/src/mm/stack.rs) into `lockjaw-types`: stride, guard-page offset, canary region, fill window. Kernel should only write/check the computed range.
@@ -46,7 +48,7 @@ This captures the synthesized architectural review of the kernel with the guidin
 
 - Host tests for exception frame layout and decode.
 - Host tests for handle access validation and header constructors.
-- Host tests for `create_process` planning and partial-unmap rejection.
+- ~~Host tests for `create_process` planning and partial-unmap rejection.~~ **DONE.** ProcessTransferPlan tests.
 - Host tests for boot memory layout and per-CPU stack layout.
 - Host tests for page-table teardown planning.
 - Trace-level tests that kernel IPC wrappers match `lockjaw-types::ipc_state::step()`.
