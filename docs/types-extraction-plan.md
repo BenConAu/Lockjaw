@@ -99,12 +99,18 @@ Host test count as of this audit: 305 unit + 1 doctest.
   for zero-copy initialization. 10 new host tests.
 - **ProcessTransferPlan** — DONE (commit 3 series). Pure ownership
   transfer decisions with 11 host tests.
-- **HandleCleanup** — DONE (commit 4 series). Single-authority
-  cleanup decision for handle release with 6 host tests.
+- **CloseHandleResult** — DONE. Replaces HandleCleanup as single
+  cleanup vocabulary for both sys_close_handle and finish_exit.
+  7 host tests.
+- **ProcessTeardownPlan** — DONE. Conditional step sequence with
+  construction-safe narrowing: CleanupHandleEntriesPtesGone vs
+  CleanupHandleEntriesNoAddressSpace. TeardownHandleAction has
+  no unmap variant, making illegal state unrepresentable.
+  8 + 3 host tests.
 - **PageSetHeader refcount/map_count** — DONE (commit 4). inc/dec
   with free-on-zero, 7 host tests.
 
-Current: 337 host tests + 1 doctest.
+Current: 349 host tests + 1 doctest.
 
 ### Also done since audit
 
@@ -112,6 +118,10 @@ Current: 337 host tests + 1 doctest.
   in ipc_state.rs. Kernel IPC handlers rewritten to match-on-decision.
   Raw constants, IpcError, typed conversions all moved to types.
   22 new host tests. Push→pull conversion complete.
+- **#2 Handle release lifecycle** — DONE. CloseHandleResult replaces
+  HandleCleanup. ProcessTeardownPlan with construction-safe teardown
+  step variants. Narrow helpers (dec_refcount_and_maybe_free,
+  dec_both_and_maybe_free) single-sourced across both paths.
 - **#4 SavedContext + TCB layout** — DONE. Moved to thread.rs with
   ThreadBootstrap, Tcb::init_in_place. 10 host tests with pinned
   crash-sensitive offsets.
@@ -313,12 +323,12 @@ These categories of code are inherently kernel-side:
 
 | Tier | Items | Status | New tests | Effort |
 |------|-------|--------|-----------|--------|
-| 1 | 5 structural extractions | 3 done (#1, #4, #11), 2 remaining | ~15 remaining | Medium |
+| 1 | 5 structural extractions | 4 done (#1, #2, #4, #11), 1 remaining | ~8 remaining | Medium |
 | 2 | 5 validation functions | 0 done | ~25 | Low |
 | 3 | 6 constants/helpers | 1 done (#11), 5 remaining | ~12 remaining | Very low |
-| **Total** | **16 items** | **4 done, 12 remaining** | **~52 remaining** | |
+| **Total** | **16 items** | **5 done, 11 remaining** | **~45 remaining** | |
 
-Current: 337 host tests. After: ~389 host tests.
+Current: 349 host tests. After: ~394 host tests.
 
 ---
 
@@ -332,15 +342,10 @@ plan/apply first.
 
 1. ~~IPC decision enums (#1)~~ — **DONE.**
 
-2. **PageSet/handle release lifecycle** — sys_close_handle and
-   finish_exit still sequence a delicate protocol around small
-   pure helpers. handle_cleanup() is plan/apply but the kernel
-   still owns unmap-before-remove ordering. Needs a stronger
-   plan/apply shape. Both docs flag this (our #2, Codex #3/#16).
+2. ~~Handle release lifecycle (#2)~~ — **DONE.** CloseHandleResult,
+   ProcessTeardownPlan, construction-safe teardown narrowing.
 
-3. **Process/thread teardown** — finish_exit's LastThread arm is
-   push: kernel sequences owned_pages free, address space free,
-   handle table walk, process page free. Should be plan/apply.
+3. ~~Process/thread teardown~~ — **DONE** (part of #2).
 
 ### Priority 2: Layout and decision extractions
 

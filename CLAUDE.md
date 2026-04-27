@@ -15,3 +15,26 @@
 - Use drop guards for resource cleanup on failure paths, not manual rollback in each error branch.
 - Push pure state and logic into lockjaw-types where possible so it can be tested on the host.
 - QEMU requires dual UARTs + GICv3. Use the Makefile, not bare `-nographic`.
+
+# Prioritization: correctness over speed
+
+Lockjaw is a kernel written entirely in Rust. The goal is
+architectural correctness and code isolation that humans cannot
+achieve at this scale. Development speed is already 100x a human
+team — use that leverage for correctness, not throughput.
+
+When choosing what to work on next:
+- **Prefer hard wins over fast wins.** The value is in making the
+  architecture safer, not in inflating test counts with easy
+  extractions.
+- **Follow the push→pull rubric.** Convert the riskiest push-shaped
+  kernel code to pull or plan/apply first. See
+  `docs/types-extraction-plan.md` for the integration shapes.
+- **Make illegal states unrepresentable.** If the type system can
+  prevent a bug class, prefer that over runtime assertions. Narrow
+  return types, distinct step variants, and construction-safe APIs
+  are worth the design effort.
+- **The kernel should be thin.** Inline assembly + mechanical
+  execution of lockjaw-types decisions. Every decision that can be
+  a pure function in types should be. The kernel's job is side
+  effects, not policy.
