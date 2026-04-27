@@ -186,17 +186,16 @@ pub enum TeardownStep {
     FreeOwnedPages { count: u32 },
     /// Free address space page table tree (L0/L1/L2/L3).
     FreeAddressSpace,
-    /// Walk handle table, apply decide_close_handle per entry.
-    /// `mappings_already_cleared`: true if FreeAddressSpace was
-    /// executed as a prior step, so all PTEs are gone. When true,
-    /// UnmapThenRemove entries skip PTE unmap and only dec counters.
-    ///
-    /// Invariant: a process without an address space cannot have
-    /// mapped PageSet handles (kernel processes don't call
-    /// sys_map_pages). So when mappings_already_cleared is false,
-    /// UnmapThenRemove is unreachable — enforced by hard assert
-    /// in the kernel (panics in release builds).
-    CleanupHandleEntries { mappings_already_cleared: bool },
+    /// Handle cleanup after FreeAddressSpace has run (user process).
+    /// PTEs are gone. The kernel calls decide_close_handle per entry;
+    /// UnmapThenRemove entries skip the actual unmap and just dec
+    /// both counters.
+    CleanupHandleEntriesPtesGone,
+    /// Handle cleanup for a process with no address space (kernel
+    /// process). The kernel calls decide_teardown_handle per entry,
+    /// which can only return DecRef or Skip — no unmap variant exists
+    /// in the return type, making the illegal state unrepresentable.
+    CleanupHandleEntriesNoAddressSpace,
     /// Free handle table pages.
     FreeHandleTable { page_count: u8 },
     /// Free process object page. Must be last — prior steps read
@@ -257,12 +256,11 @@ pub fn build_teardown_plan(
         plan.push(TeardownStep::FreeAddressSpace);
     }
     if has_handle_table {
-        // Computed, not assumed: handle cleanup knows whether it
-        // can skip PTE unmap based on whether we freed the address
-        // space in a prior step.
-        plan.push(TeardownStep::CleanupHandleEntries {
-            mappings_already_cleared: has_address_space,
-        });
+        if has_address_space {
+            plan.push(TeardownStep::CleanupHandleEntriesPtesGone);
+        } else {
+            plan.push(TeardownStep::CleanupHandleEntriesNoAddressSpace);
+        }
         plan.push(TeardownStep::FreeHandleTable {
             page_count: handle_table_page_count,
         });
@@ -457,31 +455,25 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn teardown_handle_cleanup_knows_mappings_cleared() {
+    fn teardown_user_process_uses_ptes_gone_variant() {
         let plan = build_teardown_plan(0, true, true, 1);
-        let cleanup = plan.iter().find(|s|
-            matches!(s, TeardownStep::CleanupHandleEntries { .. }));
-        assert_eq!(cleanup, Some(&TeardownStep::CleanupHandleEntries {
-            mappings_already_cleared: true,
-        }));
+        assert!(plan.iter().any(|s|
+            matches!(s, TeardownStep::CleanupHandleEntriesPtesGone)));
     }
 
     #[test]
-    fn teardown_handle_cleanup_knows_mappings_not_cleared_without_addr_space() {
-        // Kernel process: no address space → flag is false
+    fn teardown_kernel_process_uses_no_address_space_variant() {
         let plan = build_teardown_plan(0, false, true, 1);
-        let cleanup = plan.iter().find(|s|
-            matches!(s, TeardownStep::CleanupHandleEntries { .. }));
-        assert_eq!(cleanup, Some(&TeardownStep::CleanupHandleEntries {
-            mappings_already_cleared: false,
-        }));
+        assert!(plan.iter().any(|s|
+            matches!(s, TeardownStep::CleanupHandleEntriesNoAddressSpace)));
     }
 
     #[test]
     fn teardown_no_handle_table_skips_cleanup_and_free() {
         let plan = build_teardown_plan(5, true, false, 0);
         assert!(!plan.iter().any(|s|
-            matches!(s, TeardownStep::CleanupHandleEntries { .. })));
+            matches!(s, TeardownStep::CleanupHandleEntriesPtesGone
+                | TeardownStep::CleanupHandleEntriesNoAddressSpace)));
         assert!(!plan.iter().any(|s|
             matches!(s, TeardownStep::FreeHandleTable { .. })));
     }
@@ -515,7 +507,7 @@ mod tests {
         let addr_idx = steps.iter().position(|s|
             matches!(s, TeardownStep::FreeAddressSpace));
         let cleanup_idx = steps.iter().position(|s|
-            matches!(s, TeardownStep::CleanupHandleEntries { .. }));
+            matches!(s, TeardownStep::CleanupHandleEntriesPtesGone));
         assert!(addr_idx.unwrap() < cleanup_idx.unwrap());
     }
 

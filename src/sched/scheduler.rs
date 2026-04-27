@@ -536,7 +536,8 @@ fn finish_exit() {
                         unsafe { crate::arch::aarch64::vmem::free_address_space(PhysAddr::new(ttbr0)); }
                         pages_freed += 3; // approximate — L3 count varies
                     }
-                    TeardownStep::CleanupHandleEntries { mappings_already_cleared } => {
+                    TeardownStep::CleanupHandleEntriesPtesGone => {
+                        // PTEs already freed by FreeAddressSpace.
                         let ht = unsafe {
                             crate::cap::handle_table::HandleTableRef::from_paddr(ht_paddr)
                         };
@@ -546,12 +547,26 @@ fn finish_exit() {
                                     crate::cap::pageset_table::dec_refcount_and_maybe_free(header_paddr);
                                 }
                                 CloseHandleResult::UnmapThenRemove { header_paddr, .. } => {
-                                    assert!(*mappings_already_cleared,
-                                        "UnmapThenRemove during teardown without prior \
-                                         FreeAddressSpace — ordering violation");
+                                    // PTEs already gone — skip unmap, dec both.
                                     crate::cap::pageset_table::dec_both_and_maybe_free(header_paddr);
                                 }
                                 _ => {}
+                            }
+                        });
+                    }
+                    TeardownStep::CleanupHandleEntriesNoAddressSpace => {
+                        // Kernel process: narrower decision type,
+                        // no unmap variant exists.
+                        use lockjaw_types::object::{TeardownHandleAction, decide_teardown_handle};
+                        let ht = unsafe {
+                            crate::cap::handle_table::HandleTableRef::from_paddr(ht_paddr)
+                        };
+                        ht.for_each_entry(|entry| {
+                            match decide_teardown_handle(entry) {
+                                TeardownHandleAction::DecRef { header_paddr } => {
+                                    crate::cap::pageset_table::dec_refcount_and_maybe_free(header_paddr);
+                                }
+                                TeardownHandleAction::Skip => {}
                             }
                         });
                     }

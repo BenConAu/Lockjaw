@@ -121,6 +121,34 @@ pub fn decide_close_handle(entry: Option<&HandleEntry>) -> CloseHandleResult {
     }
 }
 
+/// Teardown-specific handle decision for processes without an
+/// address space (kernel processes). The return type has no unmap
+/// variant, making the illegal state unrepresentable by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeardownHandleAction {
+    /// PageSet handle — dec refcount, maybe free.
+    DecRef { header_paddr: u64 },
+    /// Non-PageSet or empty — nothing to do.
+    Skip,
+}
+
+/// Decide cleanup for a handle entry during kernel-process teardown.
+/// Only returns DecRef or Skip — no unmap action exists.
+pub fn decide_teardown_handle(entry: &HandleEntry) -> TeardownHandleAction {
+    if entry.object_paddr == 0 || entry.obj_type != ObjectType::PageSet {
+        return TeardownHandleAction::Skip;
+    }
+    // Invariant: kernel processes don't have mapped PageSets
+    // (they don't call sys_map_pages). A nonzero mapped_va_page
+    // here means the invariant is broken at the source — halt
+    // rather than silently skip the map_count decrement.
+    assert!(entry.mapped_va_page == 0,
+        "mapped PageSet handle in kernel process teardown");
+    TeardownHandleAction::DecRef {
+        header_paddr: entry.object_paddr,
+    }
+}
+
 /// Maximum handle slots that fit in a single 4KB page.
 pub const HANDLE_SLOTS_PER_PAGE: u64 = ((PAGE_SIZE as usize - core::mem::size_of::<HandleTableHeader>()) / core::mem::size_of::<HandleEntry>()) as u64;
 
@@ -317,6 +345,30 @@ mod tests {
         let entry = make_entry(ObjectType::Notification, 0x2000, 0);
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::RemoveOnly);
     }
+
+    // --- decide_teardown_handle tests ---
+
+    #[test]
+    fn teardown_handle_unmapped_pageset_dec_ref() {
+        let entry = make_entry(ObjectType::PageSet, 0x1000, 0);
+        assert_eq!(decide_teardown_handle(&entry), TeardownHandleAction::DecRef {
+            header_paddr: 0x1000,
+        });
+    }
+
+    #[test]
+    fn teardown_handle_non_pageset_skip() {
+        let entry = make_entry(ObjectType::Endpoint, 0x1000, 0);
+        assert_eq!(decide_teardown_handle(&entry), TeardownHandleAction::Skip);
+    }
+
+    #[test]
+    fn teardown_handle_empty_slot_skip() {
+        let entry = make_entry(ObjectType::PageSet, 0, 0);
+        assert_eq!(decide_teardown_handle(&entry), TeardownHandleAction::Skip);
+    }
+
+    // --- close_decision regression tests ---
 
     #[test]
     fn close_decision_is_sole_authority_for_map_count() {
