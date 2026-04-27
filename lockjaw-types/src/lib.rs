@@ -23,3 +23,5 @@ pub mod handle_ops;
 pub mod rights;
 pub mod thread;
 pub mod display;
+pub mod virtio;
+pub mod block;

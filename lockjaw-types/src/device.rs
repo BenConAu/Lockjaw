@@ -44,8 +44,34 @@ pub struct DeviceInfo {
     pub claimed: bool,
 }
 
-/// Device manager IPC protocol commands.
+/// Pre-computed hash for "virtio,mmio" — used by virtio drivers.
+pub const VIRTIO_MMIO_HASH: u64 = compatible_hash(b"virtio,mmio");
+
+// ---------------------------------------------------------------------------
+// Device manager IPC protocol commands
+// ---------------------------------------------------------------------------
+
+/// Claim the first unclaimed device matching a compatible hash.
+/// Request:  msg = [CMD_CLAIM_DEVICE, compatible_hash, 0, 0]
+/// Response: msg = [exported_handle, intid, 0, 0]
 pub const CMD_CLAIM_DEVICE: u64 = 1;
+
+/// Probe an unclaimed device without claiming it.
+/// The device-manager temporarily maps the MMIO page, reads u32 at
+/// offset 0 (magic) and offset 8 (device_id), unmaps, and returns.
+/// Request:  msg = [CMD_PROBE_DEVICE, compatible_hash, skip_count, 0]
+///   skip_count: skip this many unclaimed matching devices (0 = first)
+/// Response: msg = [mmio_addr, intid, mmio_magic, mmio_device_id]
+///   mmio_addr = 0 means no matching device found.
+pub const CMD_PROBE_DEVICE: u64 = 2;
+
+/// Claim a device by its exact MMIO physical address (TOCTOU-safe).
+/// The driver first uses CMD_PROBE_DEVICE to discover the mmio_addr,
+/// then claims by stable identity — no skip_count, no race.
+/// Request:  msg = [CMD_CLAIM_BY_ADDR, mmio_addr, 0, 0]
+/// Response: msg = [exported_handle, intid, 0, 0]
+///   exported_handle = 0 means no match or already claimed.
+pub const CMD_CLAIM_BY_ADDR: u64 = 3;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -91,5 +117,23 @@ mod tests {
     fn device_info_size() {
         // Ensure it's a reasonable size for array storage
         assert!(core::mem::size_of::<DeviceInfo>() <= 40);
+    }
+
+    #[test]
+    fn virtio_mmio_hash_is_deterministic() {
+        assert_eq!(compatible_hash(b"virtio,mmio"), VIRTIO_MMIO_HASH);
+    }
+
+    #[test]
+    fn virtio_mmio_hash_differs_from_others() {
+        assert_ne!(VIRTIO_MMIO_HASH, PL011_HASH);
+        assert_ne!(VIRTIO_MMIO_HASH, FW_CFG_HASH);
+    }
+
+    #[test]
+    fn device_manager_commands_distinct() {
+        assert_ne!(CMD_CLAIM_DEVICE, CMD_PROBE_DEVICE);
+        assert_ne!(CMD_CLAIM_DEVICE, CMD_CLAIM_BY_ADDR);
+        assert_ne!(CMD_PROBE_DEVICE, CMD_CLAIM_BY_ADDR);
     }
 }
