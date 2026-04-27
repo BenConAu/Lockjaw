@@ -70,47 +70,55 @@ pub struct HandleEntry {
     pub mapped_va_page: u32,
 }
 
-/// Cleanup actions needed when releasing a handle entry (e.g. during
-/// process exit or sys_close_handle). Pure decision logic — the kernel
-/// executes the actions. This is the SOLE authority for what cleanup
-/// a handle release requires; callers must not add their own separate
-/// map_count or refcount operations.
+/// Decision for closing/releasing a handle. Single vocabulary for
+/// both sys_close_handle and finish_exit handle table cleanup.
+/// Replaces the former HandleCleanup struct.
+///
+/// The kernel matches on the variant and executes mechanically:
+/// - RemoveOnly: just remove the handle slot, no accounting.
+/// - RemoveAndDecRef: remove + dec refcount + maybe free.
+/// - UnmapThenRemove: unmap PTEs first (fallible in sys_close_handle,
+///   asserted-already-done in finish_exit), then remove + dec both.
+/// - InvalidHandle: entry is empty or absent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HandleCleanup {
-    /// Physical address of the PageSet header.
-    pub header_paddr: u64,
-    /// Decrement PageSetHeader.refcount (handle is being released).
-    pub dec_refcount: bool,
-    /// Decrement PageSetHeader.map_count (mapped VA is being discarded).
-    /// If true, the kernel must also clear PTEs before decrementing.
-    pub dec_map_count: bool,
-    /// The mapped VA page (VA >> 12). Only meaningful if dec_map_count is true.
-    pub mapped_va_page: u32,
+pub enum CloseHandleResult {
+    /// Occupied non-PageSet handle — just remove, no accounting.
+    RemoveOnly,
+    /// PageSet, not mapped — remove + dec refcount + maybe free.
+    RemoveAndDecRef { header_paddr: u64 },
+    /// PageSet, mapped — must unmap first, then remove + dec both
+    /// counters + maybe free.
+    UnmapThenRemove {
+        header_paddr: u64,
+        mapped_va_page: u32,
+    },
+    /// Empty slot or absent entry.
+    InvalidHandle,
 }
 
-/// Determine what cleanup is needed for a handle entry being released.
-/// Returns None for empty slots or non-PageSet handles.
+/// Decide what to do when closing/releasing a handle entry.
 ///
-/// The caller must:
-/// 1. If dec_map_count: unmap PTEs at (mapped_va_page << 12), then dec_map_count
-/// 2. If dec_refcount: dec_refcount, free-on-zero if both counters hit 0
-/// 3. Only then remove the handle from the table
-///
-/// This function is the single source of truth — callers must NOT
-/// add separate map_count/refcount operations outside this decision.
-pub fn handle_cleanup(entry: &HandleEntry) -> Option<HandleCleanup> {
-    if entry.object_paddr == 0 {
-        return None;
-    }
+/// For sys_close_handle: pass the looked-up entry.
+/// For finish_exit: pass each occupied entry from for_each_entry.
+/// None input (failed lookup) returns InvalidHandle.
+pub fn decide_close_handle(entry: Option<&HandleEntry>) -> CloseHandleResult {
+    let entry = match entry {
+        Some(e) if e.object_paddr != 0 => e,
+        _ => return CloseHandleResult::InvalidHandle,
+    };
     if entry.obj_type != ObjectType::PageSet {
-        return None;
+        return CloseHandleResult::RemoveOnly;
     }
-    Some(HandleCleanup {
-        header_paddr: entry.object_paddr,
-        dec_refcount: true,
-        dec_map_count: entry.mapped_va_page != 0,
-        mapped_va_page: entry.mapped_va_page,
-    })
+    if entry.mapped_va_page != 0 {
+        CloseHandleResult::UnmapThenRemove {
+            header_paddr: entry.object_paddr,
+            mapped_va_page: entry.mapped_va_page,
+        }
+    } else {
+        CloseHandleResult::RemoveAndDecRef {
+            header_paddr: entry.object_paddr,
+        }
+    }
 }
 
 /// Maximum handle slots that fit in a single 4KB page.
@@ -258,7 +266,7 @@ mod tests {
         assert_ne!(ObjectType::PageSet, ObjectType::HandleTable);
     }
 
-    // --- handle_cleanup tests ---
+    // --- decide_close_handle tests ---
 
     fn make_entry(obj_type: ObjectType, paddr: u64, mapped_va_page: u32) -> HandleEntry {
         HandleEntry {
@@ -271,55 +279,61 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_empty_slot_returns_none() {
+    fn close_none_returns_invalid() {
+        assert_eq!(decide_close_handle(None), CloseHandleResult::InvalidHandle);
+    }
+
+    #[test]
+    fn close_empty_slot_returns_invalid() {
         let entry = make_entry(ObjectType::PageSet, 0, 0);
-        assert_eq!(handle_cleanup(&entry), None);
+        assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::InvalidHandle);
     }
 
     #[test]
-    fn cleanup_non_pageset_returns_none() {
+    fn close_non_pageset_remove_only() {
         let entry = make_entry(ObjectType::Endpoint, 0x1000, 0);
-        assert_eq!(handle_cleanup(&entry), None);
+        assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::RemoveOnly);
     }
 
     #[test]
-    fn cleanup_pageset_unmapped_decrefs_only() {
+    fn close_unmapped_pageset_dec_ref() {
         let entry = make_entry(ObjectType::PageSet, 0x1000, 0);
-        let c = handle_cleanup(&entry).unwrap();
-        assert!(c.dec_refcount);
-        assert!(!c.dec_map_count);
-        assert_eq!(c.header_paddr, 0x1000);
+        assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::RemoveAndDecRef {
+            header_paddr: 0x1000,
+        });
     }
 
     #[test]
-    fn cleanup_pageset_mapped_decrefs_and_unmaps() {
+    fn close_mapped_pageset_unmap_then_remove() {
         let entry = make_entry(ObjectType::PageSet, 0x1000, 0x400);
-        let c = handle_cleanup(&entry).unwrap();
-        assert!(c.dec_refcount);
-        assert!(c.dec_map_count);
-        assert_eq!(c.mapped_va_page, 0x400);
-        assert_eq!(c.header_paddr, 0x1000);
+        assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::UnmapThenRemove {
+            header_paddr: 0x1000,
+            mapped_va_page: 0x400,
+        });
     }
 
     #[test]
-    fn cleanup_is_sole_authority_for_map_count() {
-        // The double-decrement bug: if map_count is decremented manually
-        // AND handle_cleanup says dec_map_count=true, it gets decremented
-        // twice. This test verifies that handle_cleanup only says
-        // dec_map_count=true when mapped_va_page is nonzero, and that
-        // clearing mapped_va_page to 0 produces dec_map_count=false.
+    fn close_notification_remove_only() {
+        let entry = make_entry(ObjectType::Notification, 0x2000, 0);
+        assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::RemoveOnly);
+    }
+
+    #[test]
+    fn close_decision_is_sole_authority_for_map_count() {
+        // Regression for the double-decrement bug: if the kernel
+        // decrements map_count manually AND the decision also implies
+        // a map_count decrement, it happens twice. This test verifies
+        // that mapped_va_page controls the variant: nonzero produces
+        // UnmapThenRemove (which includes map_count dec), zero
+        // produces RemoveAndDecRef (which does not).
         let mapped = make_entry(ObjectType::PageSet, 0x1000, 0x400);
-        assert!(handle_cleanup(&mapped).unwrap().dec_map_count);
+        assert!(matches!(decide_close_handle(Some(&mapped)),
+            CloseHandleResult::UnmapThenRemove { .. }));
 
         // After the kernel clears mapped_va_page (simulating the slot
         // state after set_mapped_va(handle, 0)):
         let cleared = make_entry(ObjectType::PageSet, 0x1000, 0);
-        assert!(!handle_cleanup(&cleared).unwrap().dec_map_count);
-    }
-
-    #[test]
-    fn cleanup_notification_returns_none() {
-        let entry = make_entry(ObjectType::Notification, 0x2000, 0);
-        assert_eq!(handle_cleanup(&entry), None);
+        assert!(matches!(decide_close_handle(Some(&cleared)),
+            CloseHandleResult::RemoveAndDecRef { .. }));
     }
 }

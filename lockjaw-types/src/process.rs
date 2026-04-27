@@ -174,6 +174,105 @@ impl ProcessTransferPlan {
 }
 
 // ---------------------------------------------------------------------------
+// Process teardown plan
+// ---------------------------------------------------------------------------
+
+/// A step in the process teardown sequence. Each variant carries the
+/// behavioral facts the kernel needs to execute it correctly.
+/// Steps are conditional — absent resources are omitted from the plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeardownStep {
+    /// Free N owned pages (code/data/stack transferred from parent).
+    FreeOwnedPages { count: u32 },
+    /// Free address space page table tree (L0/L1/L2/L3).
+    FreeAddressSpace,
+    /// Walk handle table, apply decide_close_handle per entry.
+    /// `mappings_already_cleared`: true if FreeAddressSpace was
+    /// executed as a prior step, so all PTEs are gone. When true,
+    /// UnmapThenRemove entries skip PTE unmap and only dec counters.
+    ///
+    /// Invariant: a process without an address space cannot have
+    /// mapped PageSet handles (kernel processes don't call
+    /// sys_map_pages). So when mappings_already_cleared is false,
+    /// UnmapThenRemove is unreachable — enforced by hard assert
+    /// in the kernel (panics in release builds).
+    CleanupHandleEntries { mappings_already_cleared: bool },
+    /// Free handle table pages.
+    FreeHandleTable { page_count: u8 },
+    /// Free process object page. Must be last — prior steps read
+    /// from the process object.
+    FreeProcessPage,
+}
+
+/// Plan for tearing down a process after its last thread exits.
+/// Built from process state observations by `build_teardown_plan`.
+/// The kernel iterates the steps and executes each mechanically.
+pub struct ProcessTeardownPlan {
+    steps: [Option<TeardownStep>; 5],
+    count: usize,
+}
+
+impl ProcessTeardownPlan {
+    fn new() -> Self {
+        Self {
+            steps: [None; 5],
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, step: TeardownStep) {
+        debug_assert!(self.count < 5, "teardown plan overflow");
+        self.steps[self.count] = Some(step);
+        self.count += 1;
+    }
+
+    /// Number of steps in the plan.
+    pub fn step_count(&self) -> usize {
+        self.count
+    }
+
+    /// Iterate the steps in execution order.
+    pub fn iter(&self) -> impl Iterator<Item = &TeardownStep> {
+        self.steps[..self.count].iter().filter_map(|s| s.as_ref())
+    }
+}
+
+/// Build a teardown plan from process state observations.
+///
+/// The builder decides which steps to include and computes
+/// behavioral flags (mappings_already_cleared). The kernel
+/// provides the observations; types owns the plan.
+pub fn build_teardown_plan(
+    owned_page_count: u32,
+    has_address_space: bool,
+    has_handle_table: bool,
+    handle_table_page_count: u8,
+) -> ProcessTeardownPlan {
+    let mut plan = ProcessTeardownPlan::new();
+
+    if owned_page_count > 0 {
+        plan.push(TeardownStep::FreeOwnedPages { count: owned_page_count });
+    }
+    if has_address_space {
+        plan.push(TeardownStep::FreeAddressSpace);
+    }
+    if has_handle_table {
+        // Computed, not assumed: handle cleanup knows whether it
+        // can skip PTE unmap based on whether we freed the address
+        // space in a prior step.
+        plan.push(TeardownStep::CleanupHandleEntries {
+            mappings_already_cleared: has_address_space,
+        });
+        plan.push(TeardownStep::FreeHandleTable {
+            page_count: handle_table_page_count,
+        });
+    }
+    // Always last — prior steps read from the process object.
+    plan.push(TeardownStep::FreeProcessPage);
+    plan
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -351,5 +450,78 @@ mod tests {
                 failed: 1,
             })
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ProcessTeardownPlan tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn teardown_handle_cleanup_knows_mappings_cleared() {
+        let plan = build_teardown_plan(0, true, true, 1);
+        let cleanup = plan.iter().find(|s|
+            matches!(s, TeardownStep::CleanupHandleEntries { .. }));
+        assert_eq!(cleanup, Some(&TeardownStep::CleanupHandleEntries {
+            mappings_already_cleared: true,
+        }));
+    }
+
+    #[test]
+    fn teardown_handle_cleanup_knows_mappings_not_cleared_without_addr_space() {
+        // Kernel process: no address space → flag is false
+        let plan = build_teardown_plan(0, false, true, 1);
+        let cleanup = plan.iter().find(|s|
+            matches!(s, TeardownStep::CleanupHandleEntries { .. }));
+        assert_eq!(cleanup, Some(&TeardownStep::CleanupHandleEntries {
+            mappings_already_cleared: false,
+        }));
+    }
+
+    #[test]
+    fn teardown_no_handle_table_skips_cleanup_and_free() {
+        let plan = build_teardown_plan(5, true, false, 0);
+        assert!(!plan.iter().any(|s|
+            matches!(s, TeardownStep::CleanupHandleEntries { .. })));
+        assert!(!plan.iter().any(|s|
+            matches!(s, TeardownStep::FreeHandleTable { .. })));
+    }
+
+    #[test]
+    fn teardown_no_owned_pages_skips_free_owned() {
+        let plan = build_teardown_plan(0, true, true, 1);
+        assert!(!plan.iter().any(|s|
+            matches!(s, TeardownStep::FreeOwnedPages { .. })));
+    }
+
+    #[test]
+    fn teardown_process_page_always_last() {
+        let plan = build_teardown_plan(5, true, true, 1);
+        let last = plan.iter().last().unwrap();
+        assert_eq!(*last, TeardownStep::FreeProcessPage);
+    }
+
+    #[test]
+    fn teardown_empty_process_only_frees_process_page() {
+        let plan = build_teardown_plan(0, false, false, 0);
+        assert_eq!(plan.step_count(), 1);
+        assert_eq!(*plan.iter().next().unwrap(), TeardownStep::FreeProcessPage);
+    }
+
+    #[test]
+    fn teardown_addr_space_freed_before_handle_cleanup() {
+        let plan = build_teardown_plan(0, true, true, 1);
+        let steps: [TeardownStep; 5] = core::array::from_fn(|i|
+            plan.iter().nth(i).copied().unwrap_or(TeardownStep::FreeProcessPage));
+        let addr_idx = steps.iter().position(|s|
+            matches!(s, TeardownStep::FreeAddressSpace));
+        let cleanup_idx = steps.iter().position(|s|
+            matches!(s, TeardownStep::CleanupHandleEntries { .. }));
+        assert!(addr_idx.unwrap() < cleanup_idx.unwrap());
+    }
+
+    #[test]
+    fn teardown_full_process_has_all_five_steps() {
+        let plan = build_teardown_plan(3, true, true, 1);
+        assert_eq!(plan.step_count(), 5);
     }
 }

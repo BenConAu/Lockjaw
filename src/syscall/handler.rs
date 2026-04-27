@@ -834,27 +834,40 @@ fn sys_unmap_pages(ctx: &mut ExceptionContext) -> SyscallError {
 }
 
 fn sys_close_handle(ctx: &mut ExceptionContext) -> SyscallError {
+    use lockjaw_types::object::{CloseHandleResult, decide_close_handle};
+
     let handle = ctx.gpr[0] as u32;
     let ht = CurrentThread::handle_table();
 
-    // Look up the live entry (without removing) to get the cleanup
-    // decision. handle_cleanup is the SOLE authority — no separate
-    // map_count or refcount operations outside what it directs.
-    let entry = match ht.lookup_any(handle, Rights::from_bits(0)) {
-        Ok(e) => e,
-        Err(_) => return SyscallError::INVALID_HANDLE,
-    };
-    let cleanup = lockjaw_types::object::handle_cleanup(&entry);
+    // Single decision — determines the entire close protocol.
+    let entry = ht.lookup_any(handle, Rights::from_bits(0)).ok();
+    match decide_close_handle(entry.as_ref()) {
+        CloseHandleResult::InvalidHandle => SyscallError::INVALID_HANDLE,
 
-    // If cleanup says we need to unmap, do it BEFORE removing the handle.
-    // If unmap fails, reject the close — handle stays intact.
-    if let Some(ref c) = cleanup {
-        if c.dec_map_count {
+        CloseHandleResult::RemoveOnly => {
+            match ht.remove(handle) {
+                Ok(_) => SyscallError::OK,
+                Err(e) => e,
+            }
+        }
+
+        CloseHandleResult::RemoveAndDecRef { header_paddr } => {
+            match ht.remove(handle) {
+                Ok(_) => {
+                    crate::cap::pageset_table::dec_refcount_and_maybe_free(header_paddr);
+                    SyscallError::OK
+                }
+                Err(e) => e,
+            }
+        }
+
+        CloseHandleResult::UnmapThenRemove { header_paddr, mapped_va_page } => {
+            // Unmap PTEs first — fallible. If unmap fails, reject close.
             let header = unsafe {
-                crate::cap::pageset_table::read_header(c.header_paddr)
+                crate::cap::pageset_table::read_header(header_paddr)
             };
             let pages = &header.pages[..header.data_page_count()];
-            let va = (c.mapped_va_page as u64) << 12;
+            let va = (mapped_va_page as u64) << 12;
             if let Some(addr_space) = CurrentThread::address_space() {
                 if unsafe {
                     crate::arch::aarch64::vmem::unmap_validated(
@@ -864,19 +877,15 @@ fn sys_close_handle(ctx: &mut ExceptionContext) -> SyscallError {
                     return SyscallError::INVALID_PARAMETER;
                 }
             }
-        }
-    }
-
-    // All fallible work done. Remove the handle, then apply the
-    // cleanup decision (dec_map_count, dec_refcount, free-on-zero).
-    match ht.remove(handle) {
-        Ok(_) => {
-            if let Some(c) = cleanup {
-                crate::cap::pageset_table::apply_handle_cleanup(&c);
+            // Unmap succeeded. Remove + dec both counters.
+            match ht.remove(handle) {
+                Ok(_) => {
+                    crate::cap::pageset_table::dec_both_and_maybe_free(header_paddr);
+                    SyscallError::OK
+                }
+                Err(e) => e,
             }
-            SyscallError::OK
         }
-        Err(e) => e,
     }
 }
 
