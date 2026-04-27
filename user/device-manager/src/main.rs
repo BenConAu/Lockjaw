@@ -176,31 +176,35 @@ pub extern "C" fn _start() -> ! {
 // CMD_PROBE_DEVICE handler
 // ---------------------------------------------------------------------------
 
-/// Probe the Nth unclaimed device matching a compatible hash.
-/// Temporarily maps the MMIO page, reads magic (offset 0) and
-/// device_id (offset 8), unmaps, and replies without claiming.
+/// Probe the Nth device (absolute index) matching a compatible hash.
+///
+/// Index is over ALL matching devices in the DTB-derived list,
+/// including claimed ones. This makes enumeration stable regardless
+/// of concurrent claims by other drivers.
+///
+/// For unclaimed devices: temporarily maps MMIO, reads magic + device_id.
+/// For claimed devices: returns PROBE_DEVICE_CLAIMED as device_id.
 fn handle_probe_device(devices: &mut lockjaw_types::fdt::FdtDevices, msg: &[u64; 4]) {
     let requested_hash = msg[1];
-    let skip_count = msg[2] as usize;
+    let index = msg[2] as usize;
 
-    // Find the Nth unclaimed device matching the hash.
-    let mut skipped = 0;
+    // Find the Nth device matching the hash (regardless of claimed).
+    let mut matched = 0;
     let mut target_idx = None;
     for i in 0..devices.count {
-        let dev = &devices.devices[i];
-        if dev.compatible_hash == requested_hash && !dev.claimed {
-            if skipped == skip_count {
+        if devices.devices[i].compatible_hash == requested_hash {
+            if matched == index {
                 target_idx = Some(i);
                 break;
             }
-            skipped += 1;
+            matched += 1;
         }
     }
 
     let idx = match target_idx {
         Some(i) => i,
         None => {
-            // No matching device found.
+            // No device at this index — end of list.
             sys_reply(0, 0, 0, 0);
             return;
         }
@@ -208,7 +212,14 @@ fn handle_probe_device(devices: &mut lockjaw_types::fdt::FdtDevices, msg: &[u64;
 
     let dev = devices.devices[idx];
 
-    // Register + map the MMIO page temporarily to read magic + device_id.
+    // If claimed, return the address + intid but signal CLAIMED for device_id.
+    // We can't map the MMIO page — the claiming driver already owns it.
+    if dev.claimed {
+        sys_reply(dev.mmio_addr, dev.intid as u64, 0, lockjaw_types::device::PROBE_DEVICE_CLAIMED);
+        return;
+    }
+
+    // Unclaimed: register + map MMIO page temporarily to read magic + device_id.
     let mmio_ps = match sys_register_device_page(dev.mmio_addr) {
         Ok(id) => id,
         Err(_) => {
@@ -221,6 +232,7 @@ fn handle_probe_device(devices: &mut lockjaw_types::fdt::FdtDevices, msg: &[u64;
     let probe_va = VMEM.alloc(1).expect("VA exhausted for probe");
     if !sys_map_pages(mmio_ps, probe_va, MAP_FLAG_DEVICE).is_ok() {
         puts("devmgr: probe map FAILED\n");
+        VMEM.free(probe_va, 1);
         sys_close_handle(mmio_ps);
         sys_reply(0, 0, 0, 0);
         return;
@@ -230,11 +242,14 @@ fn handle_probe_device(devices: &mut lockjaw_types::fdt::FdtDevices, msg: &[u64;
     let magic = unsafe { ptr::read_volatile(probe_va as *const u32) };
     let device_id = unsafe { ptr::read_volatile((probe_va + 8) as *const u32) };
 
-    // Unmap and release the temporary mapping.
-    sys_unmap_pages(mmio_ps, probe_va);
+    // Teardown: unmap first, then close handle, then free VA.
+    // Ordering matters: VA must not be freed while still mapped.
+    let unmap_ok = sys_unmap_pages(mmio_ps, probe_va).is_ok();
     sys_close_handle(mmio_ps);
-    // Return VA to allocator for reuse.
-    VMEM.free(probe_va, 1);
+    if unmap_ok {
+        VMEM.free(probe_va, 1);
+    }
+    // If unmap failed, leak the VA rather than hand out a still-mapped page.
 
     sys_reply(dev.mmio_addr, dev.intid as u64, magic as u64, device_id as u64);
 }

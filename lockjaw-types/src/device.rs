@@ -56,14 +56,27 @@ pub const VIRTIO_MMIO_HASH: u64 = compatible_hash(b"virtio,mmio");
 /// Response: msg = [exported_handle, intid, 0, 0]
 pub const CMD_CLAIM_DEVICE: u64 = 1;
 
-/// Probe an unclaimed device without claiming it.
-/// The device-manager temporarily maps the MMIO page, reads u32 at
-/// offset 0 (magic) and offset 8 (device_id), unmaps, and returns.
-/// Request:  msg = [CMD_PROBE_DEVICE, compatible_hash, skip_count, 0]
-///   skip_count: skip this many unclaimed matching devices (0 = first)
+/// Probe a device by absolute index among ALL devices matching a hash.
+///
+/// The index is over the full DTB-derived device list (including
+/// claimed devices), so it is stable regardless of concurrent claims.
+///
+/// For unclaimed devices: the device-manager temporarily maps the
+/// MMIO page, reads u32 at offset 0 (magic) and offset 8 (device_id),
+/// unmaps, and returns the values.
+///
+/// For claimed devices: MMIO cannot be read (another driver owns it),
+/// so mmio_device_id = PROBE_DEVICE_CLAIMED (0xFFFF_FFFF).
+///
+/// Request:  msg = [CMD_PROBE_DEVICE, compatible_hash, index, 0]
+///   index: absolute index among all matching devices (0 = first)
 /// Response: msg = [mmio_addr, intid, mmio_magic, mmio_device_id]
-///   mmio_addr = 0 means no matching device found.
+///   mmio_addr = 0: no device at this index (end of list).
+///   mmio_device_id = PROBE_DEVICE_CLAIMED: device exists but is claimed.
 pub const CMD_PROBE_DEVICE: u64 = 2;
+
+/// Sentinel value for mmio_device_id when the probed device is claimed.
+pub const PROBE_DEVICE_CLAIMED: u64 = 0xFFFF_FFFF;
 
 /// Claim a device by its exact MMIO physical address (TOCTOU-safe).
 /// The driver first uses CMD_PROBE_DEVICE to discover the mmio_addr,
