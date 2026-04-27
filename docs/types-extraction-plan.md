@@ -76,9 +76,13 @@ lockjaw-types already contains substantial extracted logic:
   on_thread_exit/create
 - **object.rs** (320+ lines): HandleEntry, HandleCleanup,
   handle_cleanup, HANDLE_SLOTS_PER_PAGE
-- **ipc_state.rs**: EpState model, NotificationState
+- **ipc_state.rs**: EpState model, NotificationState, IPC decision
+  functions (decide_send/receive/call/reply), raw constants,
+  typed conversions, IpcError
 - **scheduler.rs**: RoundRobinState, SchedDecision, select_next
 - **wait.rs**: compute_ready_mask, readiness checks
+- **thread.rs**: SavedContext, Tcb, TcbCreateInfo, ThreadBootstrap,
+  Tcb::init_in_place, crash-sensitive offset tests
 
 Host test count as of this audit: 305 unit + 1 doctest.
 
@@ -100,7 +104,19 @@ Host test count as of this audit: 305 unit + 1 doctest.
 - **PageSetHeader refcount/map_count** — DONE (commit 4). inc/dec
   with free-on-zero, 7 host tests.
 
-Current: 315 host tests + 1 doctest.
+Current: 337 host tests + 1 doctest.
+
+### Also done since audit
+
+- **#1 IPC decision enums** — DONE. decide_send/receive/call/reply
+  in ipc_state.rs. Kernel IPC handlers rewritten to match-on-decision.
+  Raw constants, IpcError, typed conversions all moved to types.
+  22 new host tests. Push→pull conversion complete.
+- **#4 SavedContext + TCB layout** — DONE. Moved to thread.rs with
+  ThreadBootstrap, Tcb::init_in_place. 10 host tests with pinned
+  crash-sensitive offsets.
+- **#11 Endpoint state constants** — DONE (part of IPC extraction).
+  EP_IDLE, WAIT_KIND_*, REPLY_STATE_* moved to ipc_state.rs.
 
 ### Remaining
 
@@ -111,27 +127,12 @@ Current: 315 host tests + 1 doctest.
 These move meaningful state machines or data structures to
 lockjaw-types, enabling host tests for bug classes we've hit.
 
-### 1. IPC decision enums
+### 1. IPC decision enums — DONE
 
-**Source**: `src/ipc/endpoint.rs`, `src/ipc/reply.rs`
-
-The kernel's IPC handlers (ipc_send, ipc_receive, ipc_call,
-ipc_reply) contain state-machine decisions interleaved with TCB
-mutations and scheduler calls. The decisions are pure:
-
-- **SendDecision**: EP_HAS_RECEIVER -> deliver immediately, else
-  queue and block
-- **ReceiveDecision**: EP_HAS_WAITERS -> dequeue (Send vs Call
-  determines unblock vs bind-reply), EP_IDLE -> queue as receiver
-- **CallDecision**: reply must be Fresh, then same as send with
-  reply binding
-- **ReplyDecision**: reply must be Bound, deliver to caller
-
-Extract as pure functions in lockjaw-types that take endpoint state
-and return a decision enum. Kernel applies the side effects.
-
-**Tests**: all state transitions, error conditions (double-receive,
-reply-not-bound, reply-already-bound).
+Moved to `lockjaw-types/src/ipc_state.rs`. SendDecision,
+ReceiveDecision, CallDecision, ReplyDecision with typed inputs
+(EpState, WaitKind, ReplyState). Kernel handlers rewritten to
+match-on-decision. 22 host tests.
 
 ### 2. Handle table slot operations
 
@@ -312,12 +313,12 @@ These categories of code are inherently kernel-side:
 
 | Tier | Items | Status | New tests | Effort |
 |------|-------|--------|-----------|--------|
-| 1 | 5 structural extractions | 1 done (#4), 4 remaining | ~30 remaining | Medium |
+| 1 | 5 structural extractions | 3 done (#1, #4, #11), 2 remaining | ~15 remaining | Medium |
 | 2 | 5 validation functions | 0 done | ~25 | Low |
-| 3 | 6 constants/helpers | 0 done | ~15 | Very low |
-| **Total** | **16 items** | **1 done, 15 remaining** | **~70 remaining** | |
+| 3 | 6 constants/helpers | 1 done (#11), 5 remaining | ~12 remaining | Very low |
+| **Total** | **16 items** | **4 done, 12 remaining** | **~52 remaining** | |
 
-Current: 315 host tests. After: ~385 host tests.
+Current: 337 host tests. After: ~389 host tests.
 
 ---
 
@@ -327,44 +328,38 @@ With #4 (SavedContext/TCB) and the lifecycle series done, rank
 remaining items by the rubric: convert raw push to pull or
 plan/apply first.
 
-### Priority 1: Push → Pull conversions (highest bug-prevention ROI)
+### Priority 1: Push → Pull/Plan-Apply conversions
 
-1. **IPC decision enums (#1)** — currently the most push-heavy code
-   in the kernel. Four operations, each with inline state checks,
-   branching, and subtle interactions. Convert to pull: types returns
-   SendDecision/ReceiveDecision/CallDecision/ReplyDecision, kernel
-   executes side effects. Both docs agree. ~15 tests.
+1. ~~IPC decision enums (#1)~~ — **DONE.**
 
 2. **PageSet/handle release lifecycle** — sys_close_handle and
-   finish_exit are still "kernel sequences a delicate protocol
-   around small pure helpers." handle_cleanup() is plan/apply but
-   the kernel still owns unmap-before-remove ordering. Needs a
-   stronger plan/apply shape where the decision object captures
-   the full sequence. Both docs flag this (our #2, Codex #3/#16).
+   finish_exit still sequence a delicate protocol around small
+   pure helpers. handle_cleanup() is plan/apply but the kernel
+   still owns unmap-before-remove ordering. Needs a stronger
+   plan/apply shape. Both docs flag this (our #2, Codex #3/#16).
 
 3. **Process/thread teardown** — finish_exit's LastThread arm is
    push: kernel sequences owned_pages free, address space free,
-   handle table walk, process page free. Should be plan/apply:
-   types returns a CleanupPlan, kernel executes. Codex #5.
+   handle table walk, process page free. Should be plan/apply.
 
-### Priority 2: Plan/Apply improvements
+### Priority 2: Layout and decision extractions
 
 4. **ExceptionContext + ESR decode (Codex #1)** — frame layout is
-   as critical as SavedContext. ESR classification (SVC vs data
-   abort vs instruction abort) is pure decision logic currently
-   inline in the exception handler. Pull candidate.
+   as critical as SavedContext (now done). ESR classification
+   (SVC vs data abort vs instruction abort) is pure decision logic
+   currently inline in the exception handler. Pull candidate.
 
 5. **Handle table slot operations (#2)** — rights checking and
-   slot finding. Currently push (kernel calls at the right time).
-   Simple enough that plan/apply is sufficient. ~8 tests.
+   slot finding. Currently push. ~8 tests.
+
+6. **IRQ binding table (#3)** — clean generic data structure.
+   Almost entirely pure. ~6 tests.
 
 ### Priority 3: Easy wins (already pull-shaped, just not extracted)
 
-6. **Syscall validation batch (#6-10)** — five pure functions.
-   Already naturally pull (return Ok/Err). Just not extracted yet.
-   ~25 tests. Low effort.
+7. **Syscall validation batch (#6-10)** — five pure functions.
+   Already naturally pull (return Ok/Err). ~25 tests. Low effort.
 
-7. **Endpoint state constants (#11)** — move to types
-8. **syscall_name (#13)** — trivial move
-9. **Platform constants (#12)** — eliminate duplication
-10. **IRQ binding table (#3)** — clean data structure extraction
+8. ~~Endpoint state constants (#11)~~ — **DONE** (part of IPC).
+9. **syscall_name (#13)** — trivial move
+10. **Platform constants (#12)** — eliminate duplication

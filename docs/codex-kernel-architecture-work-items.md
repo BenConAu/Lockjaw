@@ -28,7 +28,7 @@ This captures the synthesized architectural review of the kernel with the guidin
 14. Promote the `PageSet` value object from [src/cap/pageset.rs](/Users/Ben/Code/Lockjaw/src/cap/pageset.rs) into `lockjaw-types`, leaving allocation/rollback in the kernel.
 15. Move owned-page dedup/bounds semantics out of [src/cap/process_obj.rs](/Users/Ben/Code/Lockjaw/src/cap/process_obj.rs) into a pure `OwnedPageList` or equivalent in `lockjaw-types::process`.
 16. Move handle-table search policy from [src/cap/handle_table.rs](/Users/Ben/Code/Lockjaw/src/cap/handle_table.rs) into `lockjaw-types` helpers: first-free-slot, lookup shape, release decision.
-17. Make [src/ipc/endpoint.rs](/Users/Ben/Code/Lockjaw/src/ipc/endpoint.rs) and [src/ipc/reply.rs](/Users/Ben/Code/Lockjaw/src/ipc/reply.rs) execute `lockjaw_types::ipc_state::step()` rather than re-encoding IPC transition policy in kernel code.
+17. ~~Make endpoint.rs and reply.rs execute ipc_state decisions.~~ **DONE.** Kernel-facing decision functions (decide_send/receive/call/reply) in ipc_state.rs. Raw constants, IpcError, typed conversions moved. Kernel handlers rewritten to match-on-decision with typed state inputs. 22 host tests.
 18. Promote the queue contract in [src/ipc/ep_queue.rs](/Users/Ben/Code/Lockjaw/src/ipc/ep_queue.rs) to the pure queue model in [lockjaw-types/src/ipc_state.rs](/Users/Ben/Code/Lockjaw/lockjaw-types/src/ipc_state.rs); keep intrusive pointer surgery in-kernel.
 19. Move `ReplyObject` liveness/state tags to match `lockjaw_types::ipc_state::ReplyState` exactly.
 20. Extract a pure `wait_any` planner from [src/syscall/handler.rs](/Users/Ben/Code/Lockjaw/src/syscall/handler.rs): readiness snapshot, mask computation, waiter registration plan, wake cleanup plan.
