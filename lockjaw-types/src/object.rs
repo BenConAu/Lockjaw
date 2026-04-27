@@ -53,7 +53,7 @@ pub struct HandleTableHeader {
 
 /// A single entry in a handle table. Stored in donated pages immediately
 /// after the HandleTableHeader.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct HandleEntry {
     /// Physical address of the kernel object. 0 = empty slot.
@@ -68,6 +68,19 @@ pub struct HandleEntry {
     /// 0 = not mapped. Set by sys_map_pages, cleared by sys_unmap_pages.
     /// Only meaningful for PageSet handles. Stores VA >> 12.
     pub mapped_va_page: u32,
+}
+
+impl HandleEntry {
+    /// Empty slot sentinel. `object_paddr == 0` is the sole empty-slot
+    /// test throughout the codebase. Other fields are inert filler —
+    /// not meaningful state when object_paddr is zero.
+    pub const EMPTY: Self = Self {
+        object_paddr: 0,
+        obj_type: ObjectType::HandleTable,
+        rights: crate::rights::Rights::none(),
+        _padding: [0; 2],
+        mapped_va_page: 0,
+    };
 }
 
 /// Decision for closing/releasing a handle. Single vocabulary for

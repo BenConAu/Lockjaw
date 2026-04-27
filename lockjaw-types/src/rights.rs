@@ -20,6 +20,11 @@ impl Rights {
     pub const fn none() -> Self {
         Self(0)
     }
+
+    /// True if `self` has every bit set that `required` has.
+    pub const fn contains(self, required: Rights) -> bool {
+        required.bits() & !self.bits() == 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -68,5 +73,26 @@ mod tests {
         assert_eq!(required_read.bits() & !slot_rights.bits(), 0);
         // Grant should fail
         assert_ne!(required_grant.bits() & !slot_rights.bits(), 0);
+    }
+
+    #[test]
+    fn contains_subset() {
+        let rw = Rights::from_bits(RIGHT_READ | RIGHT_WRITE);
+        assert!(rw.contains(Rights::from_bits(RIGHT_READ)));
+        assert!(rw.contains(Rights::from_bits(RIGHT_WRITE)));
+        assert!(rw.contains(rw));
+    }
+
+    #[test]
+    fn contains_disjoint_fails() {
+        let rw = Rights::from_bits(RIGHT_READ | RIGHT_WRITE);
+        assert!(!rw.contains(Rights::from_bits(RIGHT_GRANT)));
+        assert!(!rw.contains(Rights::from_bits(RIGHT_READ | RIGHT_GRANT)));
+    }
+
+    #[test]
+    fn contains_empty_always_true() {
+        assert!(Rights::none().contains(Rights::none()));
+        assert!(Rights::from_bits(RIGHT_READ).contains(Rights::none()));
     }
 }

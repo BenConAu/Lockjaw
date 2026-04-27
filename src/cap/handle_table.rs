@@ -2,8 +2,8 @@ use crate::cap::object::ObjectType;
 use crate::cap::rights::Rights;
 use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
 use lockjaw_types::object::{HandleTableHeader, HandleEntry};
+use lockjaw_types::handle_ops::{self, HandleError};
 use lockjaw_types::syscall::SyscallError;
-use core::ptr;
 
 // ---------------------------------------------------------------------------
 // HandleTableRef — safe typed wrapper over handle table operations
@@ -27,35 +27,52 @@ impl HandleTableRef {
     /// Look up a handle by index without type checking (for export/transfer).
     pub fn lookup_any(&self, handle: u32, required_rights: Rights) -> Result<HandleEntry, SyscallError> {
         // SAFETY: self.0 was validated at construction.
-        unsafe { handle_lookup(self.0, handle, required_rights) }
-            .map_err(|_| SyscallError::INVALID_HANDLE)
+        unsafe {
+            let (_header, slots) = table_slots(self.0);
+            handle_ops::slot_lookup(slots, handle, required_rights)
+                .map_err(|_| SyscallError::INVALID_HANDLE)
+        }
     }
 
     /// Look up a handle by index with type and rights checking.
     /// Returns the HandleEntry on success.
     pub fn lookup(&self, handle: u32, required_rights: Rights, expected_type: ObjectType) -> Result<HandleEntry, SyscallError> {
         // SAFETY: self.0 was validated at construction.
-        let entry = unsafe { handle_lookup(self.0, handle, required_rights) }
-            .map_err(|_| SyscallError::INVALID_HANDLE)?;
-        if entry.obj_type != expected_type {
-            return Err(SyscallError::INVALID_PARAMETER);
+        unsafe {
+            let (_header, slots) = table_slots(self.0);
+            let entry = handle_ops::slot_lookup(slots, handle, required_rights)
+                .map_err(|_| SyscallError::INVALID_HANDLE)?;
+            if entry.obj_type != expected_type {
+                return Err(SyscallError::INVALID_PARAMETER);
+            }
+            Ok(entry)
         }
-        Ok(entry)
     }
 
     /// Insert a new handle into the table. Returns the slot index.
     /// Returns HANDLE_TABLE_FULL if no empty slot is available.
     pub fn insert(&self, object_paddr: PhysAddr, obj_type: ObjectType, rights: Rights) -> Result<u32, SyscallError> {
         // SAFETY: self.0 was validated at construction.
-        unsafe { handle_insert(self.0, object_paddr, obj_type, rights) }
-            .map_err(|_| SyscallError::HANDLE_TABLE_FULL)
+        unsafe {
+            let (_header, slots) = table_slots(self.0);
+            handle_ops::slot_insert(slots, object_paddr.as_u64(), obj_type, rights)
+                .map_err(|e| {
+                    if matches!(e, HandleError::TableFull) {
+                        crate::kprintln!("HANDLE TABLE FULL: {} slots, all occupied", slots.len());
+                    }
+                    SyscallError::HANDLE_TABLE_FULL
+                })
+        }
     }
 
     /// Remove a single handle by index. Returns the removed entry.
     pub fn remove(&self, handle: u32) -> Result<HandleEntry, SyscallError> {
         // SAFETY: self.0 was validated at construction.
-        unsafe { handle_remove(self.0, handle) }
-            .map_err(|_| SyscallError::INVALID_HANDLE)
+        unsafe {
+            let (_header, slots) = table_slots(self.0);
+            handle_ops::slot_remove(slots, handle)
+                .map_err(|_| SyscallError::INVALID_HANDLE)
+        }
     }
 
     /// For each handle pointing at the given object with a non-zero
@@ -92,12 +109,7 @@ impl HandleTableRef {
         // SAFETY: self.0 was validated at construction.
         unsafe {
             let (_header, slots) = table_slots(self.0);
-            for slot in slots.iter_mut() {
-                if slot.object_paddr == object_paddr {
-                    // SAFETY: zeroing via mutable slice reference to mark slot empty.
-                    ptr::write_bytes(slot as *mut HandleEntry, 0, 1);
-                }
-            }
+            handle_ops::slot_remove_all_by_object(slots, object_paddr);
         }
     }
 
@@ -119,28 +131,21 @@ impl HandleTableRef {
     /// Set the mapped_va_page field on a handle entry.
     /// mapped_va_page = 0 means not mapped; nonzero = VA >> 12.
     pub fn set_mapped_va(&self, handle: u32, va_page: u32) -> Result<(), SyscallError> {
+        // SAFETY: self.0 was validated at construction.
         unsafe {
             let (_header, slots) = table_slots(self.0);
-            let slot = slots.get_mut(handle as usize)
-                .ok_or(SyscallError::INVALID_HANDLE)?;
-            if slot.object_paddr == 0 {
-                return Err(SyscallError::INVALID_HANDLE);
-            }
-            slot.mapped_va_page = va_page;
-            Ok(())
+            handle_ops::slot_set_mapped_va(slots, handle, va_page)
+                .map_err(|_| SyscallError::INVALID_HANDLE)
         }
     }
 
     /// Get the mapped_va_page field from a handle entry.
     pub fn get_mapped_va(&self, handle: u32) -> Result<u32, SyscallError> {
+        // SAFETY: self.0 was validated at construction.
         unsafe {
             let (_header, slots) = table_slots(self.0);
-            let slot = slots.get(handle as usize)
-                .ok_or(SyscallError::INVALID_HANDLE)?;
-            if slot.object_paddr == 0 {
-                return Err(SyscallError::INVALID_HANDLE);
-            }
-            Ok(slot.mapped_va_page)
+            handle_ops::slot_get_mapped_va(slots, handle)
+                .map_err(|_| SyscallError::INVALID_HANDLE)
         }
     }
 }
@@ -153,16 +158,10 @@ impl HandleTableRef {
 // first field is u64).
 const _: () = assert!(core::mem::size_of::<HandleTableHeader>() % 8 == 0);
 
-/// Errors from handle operations.
-#[derive(Clone, Copy, Debug)]
-pub enum HandleError {
-    TableFull,
-    InvalidHandle,
-    InsufficientRights,
-}
+// HandleError is defined in lockjaw-types/src/handle_ops.rs and imported above.
 
 // ---------------------------------------------------------------------------
-// Handle operations — work on a HandleTableObject in donated memory
+// Handle operations — thin wrappers that delegate to lockjaw-types
 // ---------------------------------------------------------------------------
 
 /// Insert a new handle into the table. Returns the handle index (slot number).
@@ -173,19 +172,13 @@ pub unsafe fn handle_insert(
     rights: Rights,
 ) -> Result<u32, HandleError> {
     let (_header, slots) = table_slots(table_paddr);
-
-    // Find first empty slot
-    for (i, slot) in slots.iter_mut().enumerate() {
-        if slot.object_paddr == 0 {
-            slot.object_paddr = object_paddr.as_u64();
-            slot.obj_type = obj_type;
-            slot.rights = rights;
-            return Ok(i as u32);
-        }
-    }
-
-    crate::kprintln!("HANDLE TABLE FULL: {} slots, all occupied", slots.len());
-    Err(HandleError::TableFull)
+    handle_ops::slot_insert(slots, object_paddr.as_u64(), obj_type, rights)
+        .map_err(|e| {
+            if matches!(e, HandleError::TableFull) {
+                crate::kprintln!("HANDLE TABLE FULL: {} slots, all occupied", slots.len());
+            }
+            e
+        })
 }
 
 /// Look up a handle by index, checking that the required rights are present.
@@ -195,19 +188,7 @@ pub unsafe fn handle_lookup(
     required: Rights,
 ) -> Result<HandleEntry, HandleError> {
     let (_header, slots) = table_slots(table_paddr);
-
-    let slot = slots.get(handle as usize)
-        .ok_or(HandleError::InvalidHandle)?;
-    if slot.object_paddr == 0 {
-        return Err(HandleError::InvalidHandle);
-    }
-
-    // Check every required right is present
-    if required.bits() & !slot.rights.bits() != 0 {
-        return Err(HandleError::InsufficientRights);
-    }
-
-    Ok(*slot)
+    handle_ops::slot_lookup(slots, handle, required)
 }
 
 /// Remove a handle, returning what was in the slot.
@@ -216,17 +197,7 @@ pub unsafe fn handle_remove(
     handle: u32,
 ) -> Result<HandleEntry, HandleError> {
     let (_header, slots) = table_slots(table_paddr);
-
-    let slot = slots.get_mut(handle as usize)
-        .ok_or(HandleError::InvalidHandle)?;
-    if slot.object_paddr == 0 {
-        return Err(HandleError::InvalidHandle);
-    }
-
-    let removed = *slot;
-    // SAFETY: zeroing via the mutable slice reference to mark slot empty.
-    ptr::write_bytes(slot as *mut HandleEntry, 0, 1);
-    Ok(removed)
+    handle_ops::slot_remove(slots, handle)
 }
 
 // ---------------------------------------------------------------------------
