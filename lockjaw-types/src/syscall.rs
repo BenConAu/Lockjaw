@@ -103,3 +103,36 @@ pub const SYS_UNMAP_PAGES: u64 = 25;
 
 /// Flag for SYS_ALLOC_PAGES: allocated pages must be physically contiguous.
 pub const ALLOC_FLAG_CONTIGUOUS: u64 = 1 << 0;
+
+/// Decode a syscall number to its name. Used by crash diagnostics.
+pub fn syscall_name(num: u64) -> &'static str {
+    match num {
+        SYS_DEBUG_PUTC => "sys_debug_putc",
+        SYS_YIELD => "sys_yield",
+        SYS_SEND => "sys_send",
+        SYS_RECEIVE => "sys_receive",
+        SYS_CALL => "sys_call",
+        SYS_REPLY => "sys_reply",
+        SYS_ALLOC_PAGES => "sys_alloc_pages",
+        SYS_MAP_PAGES => "sys_map_pages",
+        SYS_CREATE_PROCESS => "sys_create_process",
+        SYS_CREATE_NOTIFICATION => "sys_create_notification",
+        SYS_SIGNAL_NOTIFICATION => "sys_signal_notification",
+        SYS_WAIT_NOTIFICATION => "sys_wait_notification",
+        SYS_BIND_IRQ => "sys_bind_irq",
+        SYS_CREATE_ENDPOINT => "sys_create_endpoint",
+        SYS_RECV_NB => "sys_recv_nb",
+        SYS_WAIT_ANY => "sys_wait_any",
+        SYS_EXPORT_HANDLE => "sys_export_handle",
+        SYS_GET_BOOT_INFO => "sys_get_boot_info",
+        SYS_REGISTER_DEVICE_PAGE => "sys_register_device_page",
+        SYS_QUERY_PAGESET_PHYS => "sys_query_pageset_phys",
+        SYS_CREATE_REPLY => "sys_create_reply",
+        SYS_EXIT => "sys_exit",
+        SYS_CREATE_THREAD => "sys_create_thread",
+        SYS_QUERY_MAPPING => "sys_query_mapping",
+        SYS_CLOSE_HANDLE => "sys_close_handle",
+        SYS_UNMAP_PAGES => "sys_unmap_pages",
+        _ => "unknown",
+    }
+}

@@ -8,38 +8,9 @@
 use crate::sched::tcb::Tcb;
 use core::fmt::Write;
 
-/// Decode a syscall number to its name.
-pub fn syscall_name(num: u64) -> &'static str {
-    match num {
-        0  => "sys_debug_putc",
-        1  => "sys_yield",
-        2  => "sys_send",
-        3  => "sys_receive",
-        4  => "sys_call",
-        5  => "sys_reply",
-        6  => "sys_alloc_pages",
-        7  => "sys_map_pages",
-        8  => "sys_create_process",
-        9  => "sys_create_notification",
-        10 => "sys_signal_notification",
-        11 => "sys_wait_notification",
-        12 => "sys_bind_irq",
-        13 => "sys_create_endpoint",
-        14 => "sys_recv_nb",
-        15 => "sys_wait_any",
-        16 => "sys_export_handle",
-        17 => "sys_get_boot_info",
-        18 => "sys_register_device_page",
-        19 => "sys_query_pageset_phys",
-        20 => "sys_create_reply",
-        21 => "sys_exit",
-        22 => "sys_create_thread",
-        23 => "sys_query_mapping",
-        24 => "sys_close_handle",
-        25 => "sys_unmap_pages",
-        _  => "unknown",
-    }
-}
+// syscall_name lives in lockjaw-types/src/syscall.rs (host-testable,
+// alongside the syscall number constants). Re-export for kernel use.
+pub use lockjaw_types::syscall::syscall_name;
 
 /// Print thread ID and syscall breadcrumb. Must never panic — a panic
 /// here causes infinite recursion (panic → print_thread_context → panic)

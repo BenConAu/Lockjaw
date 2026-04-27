@@ -1,95 +1,23 @@
 use core::arch::global_asm;
 
-/// Exception context saved by the vector entry stub.
-/// Must match the layout in the assembly save/restore macros.
-#[repr(C)]
-/// CPU state saved by the exception vector entry stub.
-///
-/// Created on the kernel stack by the SAVE_REGS assembly macro when an
-/// exception is taken. The Rust handler receives a pointer to this struct.
-/// For syscalls, the handler modifies `gpr[0]` (x0) to set the return value.
-/// RESTORE_REGS loads the (potentially modified) values back before `eret`.
-///
-/// Layout must match the assembly in SAVE_REGS/RESTORE_REGS exactly.
-pub struct ExceptionContext {
-    /// General-purpose registers x0–x30.
-    pub gpr: [u64; 31],
-    /// Exception Link Register — the PC to return to.
-    pub elr: u64,
-    /// Saved Program Status Register (PSTATE at time of exception).
-    pub spsr: u64,
-    /// Exception Syndrome Register — encodes the exception cause.
-    /// EC field (bits 31:26) identifies the exception class (SVC, data abort, etc).
-    pub esr: u64,
-    /// User stack pointer (SP_EL0). Must be saved/restored so that context
-    /// switches during IRQs or syscalls don't lose the interrupted thread's
-    /// user SP.
-    pub sp_el0: u64,
-    /// Padding to keep the frame 16-byte aligned (AArch64 ABI requirement).
-    pub _pad: u64,
-}
-
-/// Frame size must be 16-byte aligned for AArch64 ABI stack alignment.
-const _: () = assert!(
-    core::mem::size_of::<ExceptionContext>() % 16 == 0,
-    "ExceptionContext size must be 16-byte aligned"
-);
-
-/// Frame size in bytes, used by the assembly save/restore macros.
-pub const EXCEPTION_FRAME_SIZE: usize = core::mem::size_of::<ExceptionContext>();
-
-// Field offsets for assembly. Using core::mem::offset_of! so these stay
-// correct if fields are reordered or padding changes.
-pub const OFF_ELR: usize = core::mem::offset_of!(ExceptionContext, elr);
-pub const OFF_SPSR: usize = core::mem::offset_of!(ExceptionContext, spsr);
-pub const OFF_ESR: usize = core::mem::offset_of!(ExceptionContext, esr);
-pub const OFF_SP_EL0: usize = core::mem::offset_of!(ExceptionContext, sp_el0);
+// ExceptionContext struct, layout constants, and ESR decode live in
+// lockjaw-types (host-testable). Re-export so existing kernel imports work.
+pub use lockjaw_types::exception::{
+    ExceptionContext, EXCEPTION_FRAME_SIZE,
+    OFF_ELR, OFF_SPSR, OFF_ESR, OFF_SP_EL0,
+};
 
 // ---------------------------------------------------------------------------
 // Rust exception handlers (called from assembly stubs)
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// ESR decode helpers
-// ---------------------------------------------------------------------------
-
-fn exception_class_str(ec: u64) -> &'static str {
-    match ec {
-        0x00 => "Unknown reason",
-        0x01 => "Trapped WFI/WFE",
-        0x15 => "SVC from AArch64 (syscall)",
-        0x18 => "Trapped MSR/MRS/System instruction",
-        0x20 => "Instruction Abort from lower EL",
-        0x21 => "Instruction Abort from same EL",
-        0x22 => "PC alignment fault",
-        0x24 => "Data Abort from lower EL",
-        0x25 => "Data Abort from same EL",
-        0x26 => "SP alignment fault",
-        0x2C => "Trapped FP exception",
-        0x30 => "Breakpoint from lower EL",
-        0x31 => "Breakpoint from same EL",
-        0x3C => "BRK instruction",
-        _    => "Other/reserved",
-    }
-}
-
-fn data_fault_str(dfsc: u64) -> &'static str {
-    match dfsc & 0x3F {
-        0x04 => "Translation fault, level 0",
-        0x05 => "Translation fault, level 1",
-        0x06 => "Translation fault, level 2",
-        0x07 => "Translation fault, level 3",
-        0x09 => "Access flag fault, level 1",
-        0x0A => "Access flag fault, level 2",
-        0x0B => "Access flag fault, level 3",
-        0x0D => "Permission fault, level 1",
-        0x0E => "Permission fault, level 2",
-        0x0F => "Permission fault, level 3",
-        0x10 => "Synchronous external abort",
-        0x21 => "Alignment fault",
-        _    => "Other/reserved DFSC",
-    }
-}
+// ESR decode helpers are in lockjaw-types/src/exception.rs (host-testable).
+use lockjaw_types::exception::{
+    esr_exception_class, esr_data_fault_status,
+    exception_class_name, data_fault_name,
+    EC_DATA_ABORT_LOWER,
+    SyncExceptionAction, classify_sync_exception,
+};
 
 /// Classify a virtual address into a known memory region.
 ///
@@ -131,7 +59,8 @@ fn classify_address(addr: u64) -> &'static str {
 
 fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
     let esr = ctx.esr;
-    let ec = (esr >> 26) & 0x3F;
+    let ec = esr_exception_class(esr);
+    let dfsc = esr_data_fault_status(esr);
     let far: u64;
     unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
 
@@ -145,7 +74,7 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
     crate::crash::print_thread_context(prefix);
 
     crate::kprintln!("{}  ESR:  {:#010x} — {} — {}", prefix, esr,
-        exception_class_str(ec), data_fault_str(esr));
+        exception_class_name(ec), data_fault_name(dfsc));
     crate::kprintln!("{}  ELR:  {:#018x} [{}]", prefix, ctx.elr, classify_address(ctx.elr));
     crate::kprintln!("{}  FAR:  {:#018x} [{}]", prefix, far, classify_address(far));
     crate::kprintln!("{}  SPSR: {:#018x}", prefix, ctx.spsr);
@@ -154,7 +83,7 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
     }
 
     // User stack overflow detection
-    if is_user && (ec == 0x24) && (esr & 0x3F) >= 0x04 && (esr & 0x3F) <= 0x07 {
+    if is_user && ec == EC_DATA_ABORT_LOWER && dfsc >= 0x04 && dfsc <= 0x07 {
         // Data abort from lower EL with translation fault — check if near stack
         unsafe {
             let tcb_paddr = crate::sched::scheduler::current_tcb_paddr();
@@ -232,13 +161,11 @@ extern "C" fn handle_exception_sync(ctx: &ExceptionContext) {
 extern "C" fn handle_exception_sync_lower(ctx: &mut ExceptionContext) {
     crate::sched::gkl::gkl_lock();
 
-    let ec = (ctx.esr >> 26) & 0x3F;
-    match ec {
-        0x15 => {
-            // SVC from AArch64 — syscall dispatch
+    match classify_sync_exception(ctx.esr) {
+        SyncExceptionAction::Syscall => {
             crate::syscall::handler::handle_syscall(ctx);
         }
-        _ => {
+        SyncExceptionAction::UserFault => {
             // Userspace fault — halt with lock held (kernel is dead anyway)
             print_fault("[FAULT:USER]", ctx, true);
             loop { unsafe { core::arch::asm!("wfi") }; }
