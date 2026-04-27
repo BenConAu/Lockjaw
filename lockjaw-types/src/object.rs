@@ -51,6 +51,45 @@ pub struct HandleTableHeader {
     pub slot_count: u64,
 }
 
+/// Object type + per-type metadata for a handle table entry.
+///
+/// Discriminant values match the legacy ObjectType enum so that
+/// diagnostic code and tests can compare by value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, u8)]
+pub enum HandleKind {
+    Empty = 0,
+    HandleTable = 1,
+    ThreadControlBlock = 2,
+    Endpoint = 3,
+    Notification = 4,
+    Reply = 5,
+    Process = 6,
+    PageSet { mapped_va_page: u32 } = 7,
+}
+
+impl HandleKind {
+    /// True if this is the PageSet variant (any mapped_va_page value).
+    pub fn is_pageset(&self) -> bool {
+        matches!(self, HandleKind::PageSet { .. })
+    }
+
+    /// Return the ObjectType equivalent for code that still needs it
+    /// (e.g., object header checks, refcount paths).
+    pub fn obj_type(&self) -> ObjectType {
+        match self {
+            HandleKind::Empty => ObjectType::HandleTable, // inert
+            HandleKind::HandleTable => ObjectType::HandleTable,
+            HandleKind::ThreadControlBlock => ObjectType::ThreadControlBlock,
+            HandleKind::Endpoint => ObjectType::Endpoint,
+            HandleKind::Notification => ObjectType::Notification,
+            HandleKind::Reply => ObjectType::Reply,
+            HandleKind::Process => ObjectType::Process,
+            HandleKind::PageSet { .. } => ObjectType::PageSet,
+        }
+    }
+}
+
 /// A single entry in a handle table. Stored in donated pages immediately
 /// after the HandleTableHeader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,17 +97,17 @@ pub struct HandleTableHeader {
 pub struct HandleEntry {
     /// Physical address of the kernel object. 0 = empty slot.
     pub object_paddr: u64,
-    /// Type of the referenced object.
-    pub obj_type: ObjectType,
-    /// Access rights for this handle.
+    /// Access rights for this handle. Inert filler when kind = Empty
+    /// (emptiness is keyed by object_paddr == 0).
     pub rights: crate::rights::Rights,
-    /// Reserved padding for alignment.
-    pub _padding: [u8; 2],
-    /// Page number of the VA where this handle's PageSet is mapped.
-    /// 0 = not mapped. Set by sys_map_pages, cleared by sys_unmap_pages.
-    /// Only meaningful for PageSet handles. Stores VA >> 12.
-    pub mapped_va_page: u32,
+    /// Object type + per-type metadata.
+    pub kind: HandleKind,
 }
+
+// Static layout assertions — part of the design contract.
+const _: () = assert!(core::mem::size_of::<HandleEntry>() == 24);
+const _: () = assert!(core::mem::align_of::<HandleEntry>() == 8);
+const _: () = assert!(core::mem::size_of::<HandleKind>() == 8);
 
 impl HandleEntry {
     /// Empty slot sentinel. `object_paddr == 0` is the sole empty-slot
@@ -76,10 +115,8 @@ impl HandleEntry {
     /// not meaningful state when object_paddr is zero.
     pub const EMPTY: Self = Self {
         object_paddr: 0,
-        obj_type: ObjectType::HandleTable,
         rights: crate::rights::Rights::none(),
-        _padding: [0; 2],
-        mapped_va_page: 0,
+        kind: HandleKind::Empty,
     };
 }
 
@@ -119,18 +156,19 @@ pub fn decide_close_handle(entry: Option<&HandleEntry>) -> CloseHandleResult {
         Some(e) if e.object_paddr != 0 => e,
         _ => return CloseHandleResult::InvalidHandle,
     };
-    if entry.obj_type != ObjectType::PageSet {
-        return CloseHandleResult::RemoveOnly;
-    }
-    if entry.mapped_va_page != 0 {
-        CloseHandleResult::UnmapThenRemove {
-            header_paddr: entry.object_paddr,
-            mapped_va_page: entry.mapped_va_page,
+    match entry.kind {
+        HandleKind::PageSet { mapped_va_page } if mapped_va_page != 0 => {
+            CloseHandleResult::UnmapThenRemove {
+                header_paddr: entry.object_paddr,
+                mapped_va_page,
+            }
         }
-    } else {
-        CloseHandleResult::RemoveAndDecRef {
-            header_paddr: entry.object_paddr,
+        HandleKind::PageSet { .. } => {
+            CloseHandleResult::RemoveAndDecRef {
+                header_paddr: entry.object_paddr,
+            }
         }
+        _ => CloseHandleResult::RemoveOnly,
     }
 }
 
@@ -148,17 +186,22 @@ pub enum TeardownHandleAction {
 /// Decide cleanup for a handle entry during kernel-process teardown.
 /// Only returns DecRef or Skip — no unmap action exists.
 pub fn decide_teardown_handle(entry: &HandleEntry) -> TeardownHandleAction {
-    if entry.object_paddr == 0 || entry.obj_type != ObjectType::PageSet {
+    if entry.object_paddr == 0 {
         return TeardownHandleAction::Skip;
     }
-    // Invariant: kernel processes don't have mapped PageSets
-    // (they don't call sys_map_pages). A nonzero mapped_va_page
-    // here means the invariant is broken at the source — halt
-    // rather than silently skip the map_count decrement.
-    assert!(entry.mapped_va_page == 0,
-        "mapped PageSet handle in kernel process teardown");
-    TeardownHandleAction::DecRef {
-        header_paddr: entry.object_paddr,
+    match entry.kind {
+        HandleKind::PageSet { mapped_va_page } => {
+            // Invariant: kernel processes don't have mapped PageSets
+            // (they don't call sys_map_pages). A nonzero mapped_va_page
+            // here means the invariant is broken at the source — halt
+            // rather than silently skip the map_count decrement.
+            assert!(mapped_va_page == 0,
+                "mapped PageSet handle in kernel process teardown");
+            TeardownHandleAction::DecRef {
+                header_paddr: entry.object_paddr,
+            }
+        }
+        _ => TeardownHandleAction::Skip,
     }
 }
 
@@ -241,8 +284,8 @@ mod tests {
     }
 
     #[test]
-    fn handle_table_256_slots_fits_in_one_page() {
-        // header (~8 bytes) + 256 * 16 = 4104 bytes > 4096 → 2 pages
+    fn handle_table_256_slots() {
+        // header (8 bytes) + 256 * 24 = 6152 bytes → 2 pages
         let info = HandleTableCreateInfo { slot_count: 256 };
         let size = query_handle_table_size(&info);
         assert_eq!(size.pages, 2);
@@ -252,8 +295,8 @@ mod tests {
     fn handle_table_1000_slots() {
         let info = HandleTableCreateInfo { slot_count: 1000 };
         let size = query_handle_table_size(&info);
-        // header + 1000 * 16 = ~16008 bytes → 4 pages
-        assert_eq!(size.pages, 4);
+        // header + 1000 * 24 = 24008 bytes → 6 pages
+        assert_eq!(size.pages, 6);
     }
 
     #[test]
@@ -282,21 +325,39 @@ mod tests {
     }
 
     #[test]
-    fn handle_entry_size_is_16() {
-        // HANDLE_SLOTS_PER_PAGE depends on this being exactly 16.
-        assert_eq!(core::mem::size_of::<HandleEntry>(), 16);
+    fn handle_entry_size_is_24() {
+        assert_eq!(core::mem::size_of::<HandleEntry>(), 24);
     }
 
     #[test]
-    fn handle_slots_per_page_uses_full_page() {
-        // 255 entries * 16 bytes + 8 byte header = 4088, fits in 4096.
-        assert_eq!(HANDLE_SLOTS_PER_PAGE, 255);
+    fn handle_kind_size_is_8() {
+        assert_eq!(core::mem::size_of::<HandleKind>(), 8);
+    }
+
+    #[test]
+    fn handle_entry_alignment_is_8() {
+        assert_eq!(core::mem::align_of::<HandleEntry>(), 8);
+    }
+
+    #[test]
+    fn handle_slots_per_page() {
+        assert_eq!(HANDLE_SLOTS_PER_PAGE, 170);
         let used = core::mem::size_of::<HandleTableHeader>()
             + HANDLE_SLOTS_PER_PAGE as usize * core::mem::size_of::<HandleEntry>();
         assert!(used <= 4096);
         // One more wouldn't fit.
         let with_one_more = used + core::mem::size_of::<HandleEntry>();
         assert!(with_one_more > 4096);
+    }
+
+    #[test]
+    fn handle_kind_discriminants_match_object_type() {
+        // Ensure HandleKind discriminant values match ObjectType for diagnostics.
+        assert_eq!(HandleKind::Empty.obj_type(), ObjectType::HandleTable); // inert
+        assert_eq!(HandleKind::HandleTable.obj_type(), ObjectType::HandleTable);
+        assert_eq!(HandleKind::Endpoint.obj_type(), ObjectType::Endpoint);
+        assert_eq!(HandleKind::PageSet { mapped_va_page: 0 }.obj_type(), ObjectType::PageSet);
+        assert_eq!(HandleKind::Notification.obj_type(), ObjectType::Notification);
     }
 
     #[test]
@@ -309,13 +370,11 @@ mod tests {
 
     // --- decide_close_handle tests ---
 
-    fn make_entry(obj_type: ObjectType, paddr: u64, mapped_va_page: u32) -> HandleEntry {
+    fn make_entry(kind: HandleKind, paddr: u64) -> HandleEntry {
         HandleEntry {
             object_paddr: paddr,
-            obj_type,
             rights: crate::rights::Rights::from_bits(0),
-            _padding: [0; 2],
-            mapped_va_page,
+            kind,
         }
     }
 
@@ -326,19 +385,19 @@ mod tests {
 
     #[test]
     fn close_empty_slot_returns_invalid() {
-        let entry = make_entry(ObjectType::PageSet, 0, 0);
+        let entry = make_entry(HandleKind::PageSet { mapped_va_page: 0 }, 0);
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::InvalidHandle);
     }
 
     #[test]
     fn close_non_pageset_remove_only() {
-        let entry = make_entry(ObjectType::Endpoint, 0x1000, 0);
+        let entry = make_entry(HandleKind::Endpoint, 0x1000);
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::RemoveOnly);
     }
 
     #[test]
     fn close_unmapped_pageset_dec_ref() {
-        let entry = make_entry(ObjectType::PageSet, 0x1000, 0);
+        let entry = make_entry(HandleKind::PageSet { mapped_va_page: 0 }, 0x1000);
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::RemoveAndDecRef {
             header_paddr: 0x1000,
         });
@@ -346,7 +405,7 @@ mod tests {
 
     #[test]
     fn close_mapped_pageset_unmap_then_remove() {
-        let entry = make_entry(ObjectType::PageSet, 0x1000, 0x400);
+        let entry = make_entry(HandleKind::PageSet { mapped_va_page: 0x400 }, 0x1000);
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::UnmapThenRemove {
             header_paddr: 0x1000,
             mapped_va_page: 0x400,
@@ -355,7 +414,7 @@ mod tests {
 
     #[test]
     fn close_notification_remove_only() {
-        let entry = make_entry(ObjectType::Notification, 0x2000, 0);
+        let entry = make_entry(HandleKind::Notification, 0x2000);
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::RemoveOnly);
     }
 
@@ -363,7 +422,7 @@ mod tests {
 
     #[test]
     fn teardown_handle_unmapped_pageset_dec_ref() {
-        let entry = make_entry(ObjectType::PageSet, 0x1000, 0);
+        let entry = make_entry(HandleKind::PageSet { mapped_va_page: 0 }, 0x1000);
         assert_eq!(decide_teardown_handle(&entry), TeardownHandleAction::DecRef {
             header_paddr: 0x1000,
         });
@@ -371,13 +430,13 @@ mod tests {
 
     #[test]
     fn teardown_handle_non_pageset_skip() {
-        let entry = make_entry(ObjectType::Endpoint, 0x1000, 0);
+        let entry = make_entry(HandleKind::Endpoint, 0x1000);
         assert_eq!(decide_teardown_handle(&entry), TeardownHandleAction::Skip);
     }
 
     #[test]
     fn teardown_handle_empty_slot_skip() {
-        let entry = make_entry(ObjectType::PageSet, 0, 0);
+        let entry = make_entry(HandleKind::PageSet { mapped_va_page: 0 }, 0);
         assert_eq!(decide_teardown_handle(&entry), TeardownHandleAction::Skip);
     }
 
@@ -391,13 +450,13 @@ mod tests {
         // that mapped_va_page controls the variant: nonzero produces
         // UnmapThenRemove (which includes map_count dec), zero
         // produces RemoveAndDecRef (which does not).
-        let mapped = make_entry(ObjectType::PageSet, 0x1000, 0x400);
+        let mapped = make_entry(HandleKind::PageSet { mapped_va_page: 0x400 }, 0x1000);
         assert!(matches!(decide_close_handle(Some(&mapped)),
             CloseHandleResult::UnmapThenRemove { .. }));
 
         // After the kernel clears mapped_va_page (simulating the slot
         // state after set_mapped_va(handle, 0)):
-        let cleared = make_entry(ObjectType::PageSet, 0x1000, 0);
+        let cleared = make_entry(HandleKind::PageSet { mapped_va_page: 0 }, 0x1000);
         assert!(matches!(decide_close_handle(Some(&cleared)),
             CloseHandleResult::RemoveAndDecRef { .. }));
     }

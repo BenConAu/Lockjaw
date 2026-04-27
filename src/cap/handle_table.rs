@@ -1,7 +1,7 @@
 use crate::cap::object::ObjectType;
 use crate::cap::rights::Rights;
 use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
-use lockjaw_types::object::{HandleTableHeader, HandleEntry};
+use lockjaw_types::object::{HandleTableHeader, HandleEntry, HandleKind};
 use lockjaw_types::handle_ops::{self, HandleError};
 use lockjaw_types::syscall::SyscallError;
 
@@ -42,7 +42,7 @@ impl HandleTableRef {
             let (_header, slots) = table_slots(self.0);
             let entry = handle_ops::slot_lookup(slots, handle, required_rights)
                 .map_err(|_| SyscallError::INVALID_HANDLE)?;
-            if entry.obj_type != expected_type {
+            if entry.kind.obj_type() != expected_type {
                 return Err(SyscallError::INVALID_PARAMETER);
             }
             Ok(entry)
@@ -51,11 +51,11 @@ impl HandleTableRef {
 
     /// Insert a new handle into the table. Returns the slot index.
     /// Returns HANDLE_TABLE_FULL if no empty slot is available.
-    pub fn insert(&self, object_paddr: PhysAddr, obj_type: ObjectType, rights: Rights) -> Result<u32, SyscallError> {
+    pub fn insert(&self, object_paddr: PhysAddr, rights: Rights, kind: HandleKind) -> Result<u32, SyscallError> {
         // SAFETY: self.0 was validated at construction.
         unsafe {
             let (_header, slots) = table_slots(self.0);
-            handle_ops::slot_insert(slots, object_paddr.as_u64(), obj_type, rights)
+            handle_ops::slot_insert(slots, object_paddr.as_u64(), rights, kind)
                 .map_err(|e| {
                     if matches!(e, HandleError::TableFull) {
                         crate::kprintln!("HANDLE TABLE FULL: {} slots, all occupied", slots.len());
@@ -87,12 +87,14 @@ impl HandleTableRef {
         unsafe {
             let (_header, slots) = table_slots(self.0);
             for slot in slots.iter_mut() {
-                if slot.object_paddr == object_paddr && slot.mapped_va_page != 0 {
-                    total += 1;
-                    let va = (slot.mapped_va_page as u64) << 12;
-                    if cb(va) {
-                        slot.mapped_va_page = 0;
-                        unmapped += 1;
+                if let HandleKind::PageSet { mapped_va_page } = &mut slot.kind {
+                    if slot.object_paddr == object_paddr && *mapped_va_page != 0 {
+                        total += 1;
+                        let va = (*mapped_va_page as u64) << 12;
+                        if cb(va) {
+                            *mapped_va_page = 0;
+                            unmapped += 1;
+                        }
                     }
                 }
             }
@@ -168,11 +170,11 @@ const _: () = assert!(core::mem::size_of::<HandleTableHeader>() % 8 == 0);
 pub unsafe fn handle_insert(
     table_paddr: PhysAddr,
     object_paddr: PhysAddr,
-    obj_type: ObjectType,
     rights: Rights,
+    kind: HandleKind,
 ) -> Result<u32, HandleError> {
     let (_header, slots) = table_slots(table_paddr);
-    handle_ops::slot_insert(slots, object_paddr.as_u64(), obj_type, rights)
+    handle_ops::slot_insert(slots, object_paddr.as_u64(), rights, kind)
         .map_err(|e| {
             if matches!(e, HandleError::TableFull) {
                 crate::kprintln!("HANDLE TABLE FULL: {} slots, all occupied", slots.len());

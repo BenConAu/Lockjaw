@@ -6,7 +6,7 @@
 /// PhysAddr, then delegates to these functions. No kernel APIs
 /// (alloc, PTE, scheduler) are needed here.
 
-use crate::object::{HandleEntry, ObjectType};
+use crate::object::{HandleEntry, HandleKind};
 use crate::rights::Rights;
 
 // ---------------------------------------------------------------------------
@@ -51,19 +51,33 @@ pub fn slot_lookup(
 
 /// Insert a new handle entry into the first empty slot.
 /// Returns the slot index on success.
+///
+/// Rejects HandleKind::Empty — an occupied slot (object_paddr != 0)
+/// with kind = Empty is an illegal state. Use HandleEntry::EMPTY
+/// assignment for clearing slots instead.
+///
+/// For PageSet handles, mapped_va_page is forced to 0 regardless
+/// of the input. Mapping state is per-address-space and must not
+/// leak across handle copies (sys_export_handle, create_process).
 pub fn slot_insert(
     slots: &mut [HandleEntry],
     object_paddr: u64,
-    obj_type: ObjectType,
     rights: Rights,
+    kind: HandleKind,
 ) -> Result<u32, HandleError> {
+    if matches!(kind, HandleKind::Empty) {
+        return Err(HandleError::InvalidHandle);
+    }
     let idx = find_empty_slot(slots).ok_or(HandleError::TableFull)?;
+    // Clear per-address-space state on PageSet handles.
+    let kind = match kind {
+        HandleKind::PageSet { .. } => HandleKind::PageSet { mapped_va_page: 0 },
+        other => other,
+    };
     slots[idx] = HandleEntry {
         object_paddr,
-        obj_type,
         rights,
-        _padding: [0; 2],
-        mapped_va_page: 0,
+        kind,
     };
     Ok(idx as u32)
 }
@@ -72,7 +86,7 @@ pub fn slot_insert(
 /// the slot. Returns the removed entry on success.
 ///
 /// Ordering: copy-out BEFORE zeroing — kernel code reads
-/// mapped_va_page, rights, and obj_type from the returned entry.
+/// kind and rights from the returned entry.
 pub fn slot_remove(
     slots: &mut [HandleEntry],
     index: u32,
@@ -106,7 +120,8 @@ pub fn slot_remove_all_by_object(
     count
 }
 
-/// Get the `mapped_va_page` field for a handle entry by index.
+/// Get the `mapped_va_page` for a PageSet handle entry by index.
+/// Returns InvalidHandle if the slot is empty or not a PageSet.
 pub fn slot_get_mapped_va(
     slots: &[HandleEntry],
     index: u32,
@@ -116,10 +131,14 @@ pub fn slot_get_mapped_va(
     if slot.object_paddr == 0 {
         return Err(HandleError::InvalidHandle);
     }
-    Ok(slot.mapped_va_page)
+    match slot.kind {
+        HandleKind::PageSet { mapped_va_page } => Ok(mapped_va_page),
+        _ => Err(HandleError::InvalidHandle),
+    }
 }
 
-/// Set the `mapped_va_page` field on a handle entry by index.
+/// Set the `mapped_va_page` on a PageSet handle entry by index.
+/// Returns InvalidHandle if the slot is empty or not a PageSet.
 pub fn slot_set_mapped_va(
     slots: &mut [HandleEntry],
     index: u32,
@@ -130,8 +149,13 @@ pub fn slot_set_mapped_va(
     if slot.object_paddr == 0 {
         return Err(HandleError::InvalidHandle);
     }
-    slot.mapped_va_page = va_page;
-    Ok(())
+    match &mut slot.kind {
+        HandleKind::PageSet { mapped_va_page } => {
+            *mapped_va_page = va_page;
+            Ok(())
+        }
+        _ => Err(HandleError::InvalidHandle),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +178,7 @@ mod tests {
     #[test]
     fn insert_into_empty_table_returns_index_0() {
         let mut slots = empty_table(4);
-        let idx = slot_insert(&mut slots, 0x1000, ObjectType::Endpoint, Rights::from_bits(RIGHT_READ));
+        let idx = slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ), HandleKind::Endpoint);
         assert_eq!(idx, Ok(0));
         assert_eq!(slots[0].object_paddr, 0x1000);
     }
@@ -162,21 +186,19 @@ mod tests {
     #[test]
     fn insert_fills_sequentially() {
         let mut slots = empty_table(4);
-        assert_eq!(slot_insert(&mut slots, 0x1000, ObjectType::Endpoint, Rights::none()), Ok(0));
-        assert_eq!(slot_insert(&mut slots, 0x2000, ObjectType::Notification, Rights::none()), Ok(1));
-        assert_eq!(slot_insert(&mut slots, 0x3000, ObjectType::Reply, Rights::none()), Ok(2));
-        assert_eq!(slot_insert(&mut slots, 0x4000, ObjectType::PageSet, Rights::none()), Ok(3));
+        assert_eq!(slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint), Ok(0));
+        assert_eq!(slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Notification), Ok(1));
+        assert_eq!(slot_insert(&mut slots, 0x3000, Rights::none(), HandleKind::Reply), Ok(2));
+        assert_eq!(slot_insert(&mut slots, 0x4000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }), Ok(3));
     }
 
     #[test]
     fn insert_reuses_removed_slot() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, ObjectType::Endpoint, Rights::none()).unwrap();
-        slot_insert(&mut slots, 0x2000, ObjectType::Endpoint, Rights::none()).unwrap();
-        // Remove slot 0
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint).unwrap();
         slot_remove(&mut slots, 0).unwrap();
-        // Next insert should reuse slot 0
-        let idx = slot_insert(&mut slots, 0x3000, ObjectType::Endpoint, Rights::none()).unwrap();
+        let idx = slot_insert(&mut slots, 0x3000, Rights::none(), HandleKind::Endpoint).unwrap();
         assert_eq!(idx, 0);
         assert_eq!(slots[0].object_paddr, 0x3000);
     }
@@ -184,10 +206,10 @@ mod tests {
     #[test]
     fn insert_full_table_returns_table_full() {
         let mut slots = empty_table(2);
-        slot_insert(&mut slots, 0x1000, ObjectType::Endpoint, Rights::none()).unwrap();
-        slot_insert(&mut slots, 0x2000, ObjectType::Endpoint, Rights::none()).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint).unwrap();
         assert_eq!(
-            slot_insert(&mut slots, 0x3000, ObjectType::Endpoint, Rights::none()),
+            slot_insert(&mut slots, 0x3000, Rights::none(), HandleKind::Endpoint),
             Err(HandleError::TableFull)
         );
     }
@@ -197,10 +219,10 @@ mod tests {
     #[test]
     fn lookup_valid_entry() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, ObjectType::Endpoint, Rights::from_bits(RIGHT_READ | RIGHT_WRITE)).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), HandleKind::Endpoint).unwrap();
         let entry = slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ)).unwrap();
         assert_eq!(entry.object_paddr, 0x1000);
-        assert_eq!(entry.obj_type, ObjectType::Endpoint);
+        assert_eq!(entry.kind, HandleKind::Endpoint);
     }
 
     #[test]
@@ -218,23 +240,19 @@ mod tests {
     #[test]
     fn lookup_rights_subset_passes() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, ObjectType::Endpoint, Rights::from_bits(RIGHT_READ | RIGHT_WRITE)).unwrap();
-        // Requesting only READ against READ|WRITE — should pass
+        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), HandleKind::Endpoint).unwrap();
         assert!(slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ)).is_ok());
-        // Requesting READ|WRITE against READ|WRITE — should pass
         assert!(slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ | RIGHT_WRITE)).is_ok());
     }
 
     #[test]
     fn lookup_missing_rights_returns_insufficient() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, ObjectType::Endpoint, Rights::from_bits(RIGHT_READ)).unwrap();
-        // Requesting GRANT when only READ present
+        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ), HandleKind::Endpoint).unwrap();
         assert_eq!(
             slot_lookup(&slots, 0, Rights::from_bits(RIGHT_GRANT)),
             Err(HandleError::InsufficientRights)
         );
-        // Requesting READ|GRANT when only READ present
         assert_eq!(
             slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ | RIGHT_GRANT)),
             Err(HandleError::InsufficientRights)
@@ -244,8 +262,7 @@ mod tests {
     #[test]
     fn lookup_no_required_rights_always_passes() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, ObjectType::Endpoint, Rights::none()).unwrap();
-        // Requiring no rights should always succeed on occupied slot
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint).unwrap();
         assert!(slot_lookup(&slots, 0, Rights::none()).is_ok());
     }
 
@@ -254,17 +271,17 @@ mod tests {
     #[test]
     fn remove_valid_entry_returns_it() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, ObjectType::PageSet, Rights::from_bits(RIGHT_READ)).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
         let removed = slot_remove(&mut slots, 0).unwrap();
         assert_eq!(removed.object_paddr, 0x1000);
-        assert_eq!(removed.obj_type, ObjectType::PageSet);
+        assert!(removed.kind.is_pageset());
         assert_eq!(removed.rights, Rights::from_bits(RIGHT_READ));
     }
 
     #[test]
     fn remove_zeros_slot() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, ObjectType::Endpoint, Rights::none()).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint).unwrap();
         slot_remove(&mut slots, 0).unwrap();
         assert_eq!(slots[0].object_paddr, 0);
     }
@@ -286,9 +303,9 @@ mod tests {
     #[test]
     fn remove_all_by_object_clears_matching() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, ObjectType::PageSet, Rights::none()).unwrap();
-        slot_insert(&mut slots, 0x2000, ObjectType::Endpoint, Rights::none()).unwrap();
-        slot_insert(&mut slots, 0x1000, ObjectType::PageSet, Rights::none()).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
         let count = slot_remove_all_by_object(&mut slots, 0x1000);
         assert_eq!(count, 2);
         assert_eq!(slots[0].object_paddr, 0);
@@ -298,8 +315,8 @@ mod tests {
     #[test]
     fn remove_all_by_object_preserves_others() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, ObjectType::PageSet, Rights::none()).unwrap();
-        slot_insert(&mut slots, 0x2000, ObjectType::Endpoint, Rights::none()).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint).unwrap();
         slot_remove_all_by_object(&mut slots, 0x1000);
         assert_eq!(slots[1].object_paddr, 0x2000);
     }
@@ -309,7 +326,7 @@ mod tests {
     #[test]
     fn set_get_mapped_va_round_trip() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, ObjectType::PageSet, Rights::none()).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
         slot_set_mapped_va(&mut slots, 0, 0x400).unwrap();
         assert_eq!(slot_get_mapped_va(&slots, 0), Ok(0x400));
     }
@@ -321,11 +338,39 @@ mod tests {
         assert_eq!(slot_set_mapped_va(&mut slots, 0, 0x400), Err(HandleError::InvalidHandle));
     }
 
+    #[test]
+    fn mapped_va_on_non_pageset_returns_invalid() {
+        let mut slots = empty_table(4);
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint).unwrap();
+        assert_eq!(slot_get_mapped_va(&slots, 0), Err(HandleError::InvalidHandle));
+        assert_eq!(slot_set_mapped_va(&mut slots, 0, 0x400), Err(HandleError::InvalidHandle));
+    }
+
+    // --- insert guards ---
+
+    #[test]
+    fn insert_rejects_empty_kind() {
+        let mut slots = empty_table(4);
+        assert_eq!(
+            slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Empty),
+            Err(HandleError::InvalidHandle)
+        );
+    }
+
+    #[test]
+    fn insert_clears_pageset_mapped_va() {
+        // Simulates export/copy: source handle has mapped_va_page = 0x400,
+        // but the inserted copy must start at 0 (mapping is per-address-space).
+        let mut slots = empty_table(4);
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0x400 }).unwrap();
+        assert_eq!(slot_get_mapped_va(&slots, 0), Ok(0));
+    }
+
     // --- HandleEntry::EMPTY ---
 
     #[test]
     fn empty_entry_has_zero_paddr() {
         assert_eq!(HandleEntry::EMPTY.object_paddr, 0);
-        assert_eq!(HandleEntry::EMPTY.mapped_va_page, 0);
+        assert_eq!(HandleEntry::EMPTY.kind, HandleKind::Empty);
     }
 }

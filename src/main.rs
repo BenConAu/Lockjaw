@@ -311,13 +311,13 @@ pub extern "C" fn kmain() -> ! {
 
     // Insert a handle pointing to the table itself (for testing)
     let h0 = unsafe {
-        handle_insert(ht_paddr, ht_paddr, ObjectType::HandleTable, Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
+        handle_insert(ht_paddr, ht_paddr, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), HandleKind::HandleTable)
     }.expect("insert failed");
     kprintln!("  Inserted handle {} (RW)", h0);
 
     // Look up with matching rights — should succeed
     let entry = unsafe { handle_lookup(ht_paddr, h0, Rights::from_bits(RIGHT_READ)) }.expect("lookup failed");
-    kprintln!("  Lookup h{}: type={:?}, rights={:#04x}", h0, entry.obj_type, entry.rights.bits());
+    kprintln!("  Lookup h{}: kind={:?}, rights={:#04x}", h0, entry.kind, entry.rights.bits());
 
     // Look up with Grant right — should fail (we only gave RW)
     let bad = unsafe { handle_lookup(ht_paddr, h0, Rights::from_bits(RIGHT_GRANT)) };
@@ -325,7 +325,7 @@ pub extern "C" fn kmain() -> ! {
 
     // Remove the handle
     let removed = unsafe { handle_remove(ht_paddr, h0) }.expect("remove failed");
-    kprintln!("  Removed h{}: type={:?}", h0, removed.obj_type);
+    kprintln!("  Removed h{}: kind={:?}", h0, removed.kind);
 
     // Verify slot is now empty
     let empty = unsafe { handle_lookup(ht_paddr, h0, Rights::none()) };
@@ -411,10 +411,12 @@ pub extern "C" fn kmain() -> ! {
         );
 
         // Insert endpoint + reply handles into kernel handle table
-        handle_table::handle_insert(kernel_ht_page, ep_page, ObjectType::Endpoint,
-            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE)).expect("insert ep handle");
-        handle_table::handle_insert(kernel_ht_page, bench_reply_page, ObjectType::Reply,
-            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE)).expect("insert reply handle");
+        handle_table::handle_insert(kernel_ht_page, ep_page,
+            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
+            lockjaw_types::object::HandleKind::Endpoint).expect("insert ep handle");
+        handle_table::handle_insert(kernel_ht_page, bench_reply_page,
+            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
+            lockjaw_types::object::HandleKind::Reply).expect("insert reply handle");
 
         // Thread A (sender) — kernel thread in the kernel process
         cap::process_obj::process_inc_thread_count(kernel_proc_page);

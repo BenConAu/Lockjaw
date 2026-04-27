@@ -232,8 +232,8 @@ pub fn create_process(
         let child_ht = unsafe { HandleTableRef::from_paddr(ht_guard.addr()) };
         child_ht.insert(
             PhysAddr::new(entry.object_paddr),
-            entry.obj_type,
             entry.rights,
+            entry.kind,
         ).map_err(|_| "child handle insert failed")?;
     }
 

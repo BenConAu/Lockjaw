@@ -109,7 +109,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
 /// count=0 from the zeroed header and cannot map, query, or re-donate.
 fn create_kernel_object(
     ps_handle: u32,
-    obj_type: ObjectType,
+    kind: lockjaw_types::object::HandleKind,
     init_fn: fn(crate::mm::addr::ObjectInitPage) -> Result<(), crate::cap::object::CreateError>,
 ) -> Result<u64, SyscallError> {
     let ht = CurrentThread::handle_table();
@@ -136,7 +136,7 @@ fn create_kernel_object(
     crate::cap::pageset_table::consume_pageset(header_paddr, &ht);
 
     // Insert a new handle for the created object.
-    ht.insert(PhysAddr::new(page_paddr), obj_type, Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
+    ht.insert(PhysAddr::new(page_paddr), Rights::from_bits(RIGHT_READ | RIGHT_WRITE), kind)
         .map(|h| h as u64)
 }
 
@@ -240,8 +240,9 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let (_, header_paddr) = crate::cap::pageset_table::get_pageset(id)
         .ok_or(SyscallError::UNKNOWN)?;
     let ht = CurrentThread::handle_table();
-    match ht.insert(PhysAddr::new(header_paddr), ObjectType::PageSet,
-        Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
+    match ht.insert(PhysAddr::new(header_paddr),
+        Rights::from_bits(RIGHT_READ | RIGHT_WRITE),
+        lockjaw_types::object::HandleKind::PageSet { mapped_va_page: 0 })
     {
         Ok(h) => {
             // Increment refcount — a new handle references this PageSet.
@@ -347,7 +348,7 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
 /// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_notification(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(ctx.gpr[0] as u32, ObjectType::Notification, crate::ipc::notification::create_notification)
+    create_kernel_object(ctx.gpr[0] as u32, lockjaw_types::object::HandleKind::Notification, crate::ipc::notification::create_notification)
 }
 
 /// sys_signal_notification(handle, value) — signal a notification.
@@ -411,14 +412,14 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
 /// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_endpoint(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(ctx.gpr[0] as u32, ObjectType::Endpoint, endpoint::create_endpoint)
+    create_kernel_object(ctx.gpr[0] as u32, lockjaw_types::object::HandleKind::Endpoint, endpoint::create_endpoint)
 }
 
 /// sys_create_reply(handle) — create a Reply object from a donated page.
 /// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_reply(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(ctx.gpr[0] as u32, ObjectType::Reply, crate::ipc::reply::create_reply)
+    create_kernel_object(ctx.gpr[0] as u32, lockjaw_types::object::HandleKind::Reply, crate::ipc::reply::create_reply)
 }
 
 /// sys_recv_nb(handle) — non-blocking receive on an endpoint.
@@ -480,11 +481,12 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
                 entry.handle as u32,
                 Rights::from_bits(crate::cap::rights::RIGHT_READ),
             )?;
-            if he.obj_type != ObjectType::Endpoint && he.obj_type != ObjectType::Notification {
+            let obj_type = he.kind.obj_type();
+            if obj_type != ObjectType::Endpoint && obj_type != ObjectType::Notification {
                 return Err(SyscallError::INVALID_PARAMETER);
             }
             paddrs[i] = PhysAddr::new(he.object_paddr);
-            types[i] = he.obj_type;
+            types[i] = obj_type;
             thresholds[i] = entry.threshold;
         }
 
@@ -595,11 +597,11 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         let caller_ht = handle_table::HandleTableRef::from_paddr(caller_ht_paddr);
         let idx = caller_ht.insert(
             PhysAddr::new(export_entry.object_paddr),
-            export_entry.obj_type,
             export_entry.rights,
+            export_entry.kind,
         )?;
         // Increment refcount for PageSets — a new handle references it.
-        if export_entry.obj_type == ObjectType::PageSet {
+        if export_entry.kind.is_pageset() {
             crate::cap::pageset_table::read_header_mut(export_entry.object_paddr)
                 .inc_refcount();
         }
@@ -615,8 +617,9 @@ fn sys_get_boot_info() -> Result<u64, SyscallError> {
     let (_, header_paddr) = crate::cap::pageset_table::get_pageset(dtb_id)
         .ok_or(SyscallError::UNKNOWN)?;
     let ht = CurrentThread::handle_table();
-    let h = ht.insert(PhysAddr::new(header_paddr), ObjectType::PageSet,
-        Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
+    let h = ht.insert(PhysAddr::new(header_paddr),
+        Rights::from_bits(RIGHT_READ | RIGHT_WRITE),
+        lockjaw_types::object::HandleKind::PageSet { mapped_va_page: 0 })
         .map(|h| h as u64)?;
     // Increment refcount — a new handle references this PageSet.
     unsafe { crate::cap::pageset_table::read_header_mut(header_paddr).inc_refcount(); }
@@ -634,8 +637,9 @@ fn sys_register_device_page(ctx: &mut ExceptionContext) -> Result<u64, SyscallEr
     let (_, header_paddr) = crate::cap::pageset_table::get_pageset(id)
         .ok_or(SyscallError::UNKNOWN)?;
     let ht = CurrentThread::handle_table();
-    match ht.insert(PhysAddr::new(header_paddr), ObjectType::PageSet,
-        Rights::from_bits(RIGHT_READ | RIGHT_WRITE))
+    match ht.insert(PhysAddr::new(header_paddr),
+        Rights::from_bits(RIGHT_READ | RIGHT_WRITE),
+        lockjaw_types::object::HandleKind::PageSet { mapped_va_page: 0 })
     {
         Ok(h) => {
             unsafe { crate::cap::pageset_table::read_header_mut(header_paddr).inc_refcount(); }
