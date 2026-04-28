@@ -1,0 +1,14 @@
+[package]
+name = "lockjaw-virtio-blk-driver"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+lockjaw-userlib = { path = "../lockjaw-userlib" }
+lockjaw-types = { path = "../../lockjaw-types" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2

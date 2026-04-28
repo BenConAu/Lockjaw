@@ -10,7 +10,7 @@ use core::arch::asm;
 use core::ptr;
 use lockjaw_userlib::*;
 use lockjaw_types::fdt::parse_fdt;
-use lockjaw_types::device::{CMD_PROBE_DEVICE, CMD_CLAIM_BY_ADDR};
+use lockjaw_types::device::{CMD_PROBE_DEVICE, CMD_CLAIM_BY_ADDR, CLAIM_OK, CLAIM_ERR};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -127,24 +127,22 @@ pub extern "C" fn _start() -> ! {
                         Ok(id) => id,
                         Err(_) => {
                             puts("devmgr: register MMIO page FAILED\n");
-                            sys_reply(0, 0, 0, 0);
+                            sys_reply(CLAIM_ERR, 0, 0, 0);
                             found = true;
                             break;
                         }
                     };
                     // Export the MMIO PageSet handle into the claiming
                     // driver's handle table (the caller blocked on our
-                    // endpoint). Reply with the exported index + INTID.
+                    // endpoint). Reply with [status, handle, intid, 0].
                     // Mark claimed AFTER export succeeds — if export fails,
                     // the device stays available for a future claim attempt.
                     let exported = match sys_export_handle(mmio_ps) {
                         Ok(idx) => idx,
                         Err(_) => {
-                            // Reclaim the handle slot. Backing PageSet pages
-                            // still leak (no refcount-aware free yet).
                             sys_close_handle(mmio_ps);
                             puts("devmgr: export MMIO handle FAILED\n");
-                            sys_reply(0, 0, 0, 0);
+                            sys_reply(CLAIM_ERR, 0, 0, 0);
                             found = true;
                             break;
                         }
@@ -153,14 +151,14 @@ pub extern "C" fn _start() -> ! {
                     puts("devmgr: claimed device at ");
                     put_hex(dev.mmio_addr);
                     putc(b'\n');
-                    sys_reply(exported, dev.intid as u64, 0, 0);
+                    sys_reply(CLAIM_OK, exported, dev.intid as u64, 0);
                     found = true;
                     break;
                 }
             }
             if !found {
                 puts("devmgr: no matching device\n");
-                sys_reply(0, 0, 0, 0);
+                sys_reply(CLAIM_ERR, 0, 0, 0);
             }
         } else if cmd == CMD_PROBE_DEVICE {
             handle_probe_device(&mut devices, &msg);
@@ -274,8 +272,7 @@ fn handle_claim_by_addr(devices: &mut lockjaw_types::fdt::FdtDevices, mmio_addr:
     let idx = match target_idx {
         Some(i) => i,
         None => {
-            // No match or already claimed.
-            sys_reply(0, 0, 0, 0);
+            sys_reply(CLAIM_ERR, 0, 0, 0);
             return;
         }
     };
@@ -287,7 +284,7 @@ fn handle_claim_by_addr(devices: &mut lockjaw_types::fdt::FdtDevices, mmio_addr:
         Ok(id) => id,
         Err(_) => {
             puts("devmgr: claim-by-addr register FAILED\n");
-            sys_reply(0, 0, 0, 0);
+            sys_reply(CLAIM_ERR, 0, 0, 0);
             return;
         }
     };
@@ -298,7 +295,7 @@ fn handle_claim_by_addr(devices: &mut lockjaw_types::fdt::FdtDevices, mmio_addr:
         Err(_) => {
             sys_close_handle(mmio_ps);
             puts("devmgr: claim-by-addr export FAILED\n");
-            sys_reply(0, 0, 0, 0);
+            sys_reply(CLAIM_ERR, 0, 0, 0);
             return;
         }
     };
@@ -307,7 +304,7 @@ fn handle_claim_by_addr(devices: &mut lockjaw_types::fdt::FdtDevices, mmio_addr:
     puts("devmgr: claimed device at ");
     put_hex(dev.mmio_addr);
     putc(b'\n');
-    sys_reply(exported, dev.intid as u64, 0, 0);
+    sys_reply(CLAIM_OK, exported, dev.intid as u64, 0);
 }
 
 // ---------------------------------------------------------------------------

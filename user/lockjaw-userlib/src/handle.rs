@@ -39,3 +39,37 @@ impl Exportable for ReplyHandle { fn raw(&self) -> u64 { self.0 } }
 pub fn bootstrap_endpoint() -> EndpointHandle {
     EndpointHandle(0)
 }
+
+/// RAII guard for a PageSetHandle. Closes the handle on drop unless
+/// explicitly taken via `take()`. Prevents handle/page leaks on error
+/// paths — same principle as the kernel's PageGuard.
+pub struct PageSetGuard {
+    handle: Option<PageSetHandle>,
+}
+
+impl PageSetGuard {
+    /// Wrap a freshly allocated PageSetHandle.
+    pub fn new(ps: PageSetHandle) -> Self {
+        Self { handle: Some(ps) }
+    }
+
+    /// Access the handle without consuming the guard.
+    pub fn handle(&self) -> PageSetHandle {
+        self.handle.expect("PageSetGuard already taken")
+    }
+
+    /// Take ownership of the handle, disarming the drop guard.
+    /// Use this once the handle is successfully tracked elsewhere
+    /// (e.g., inserted into a buffer table, exported to a client).
+    pub fn take(mut self) -> PageSetHandle {
+        self.handle.take().expect("PageSetGuard already taken")
+    }
+}
+
+impl Drop for PageSetGuard {
+    fn drop(&mut self) {
+        if let Some(ps) = self.handle {
+            crate::syscall::sys_close_handle(ps);
+        }
+    }
+}

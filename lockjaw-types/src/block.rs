@@ -45,7 +45,11 @@ pub const CMD_READ: u64 = 3;
 ///   status: 0 = ok, nonzero = error
 pub const CMD_WRITE: u64 = 4;
 
-/// Free a previously allocated buffer.
+/// Release the server's reference to a previously allocated buffer.
+/// The server drops its handle and tracking slot. The client must
+/// separately close its own exported PageSetHandle (and unmap if
+/// mapped) for the backing pages to be fully reclaimed. The buffer_id
+/// becomes invalid for further CMD_READ / CMD_WRITE after this call.
 /// Request:  msg = [CMD_FREE_BUFFER, buffer_id, 0, 0]
 /// Response: msg = [status, 0, 0, 0]
 ///   status: 0 = ok, BLK_ERR_INVALID = unknown buffer_id

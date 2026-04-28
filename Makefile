@@ -18,9 +18,9 @@ QEMU_DISPLAY_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -m 128M \
 	-device ramfb -display cocoa \
 	-kernel
 
-USER_CRATES := user/hello user/uart-driver user/device-manager user/ramfb-driver user/display-test user/init
+USER_CRATES := user/hello user/uart-driver user/device-manager user/ramfb-driver user/display-test user/virtio-blk-driver user/init
 
-.PHONY: build build-release build-user build-hash clean-all run run-release run-display objdump nm check-stack check-pointers test test-unit test-qemu clean
+.PHONY: build build-release build-user build-hash clean-all run run-release run-display run-blk objdump nm check-stack check-pointers test test-unit test-qemu clean
 
 clean-all:
 	cargo clean
@@ -38,6 +38,7 @@ build-user: clean-all build-hash
 	cd user/device-manager && cargo build --release
 	cd user/ramfb-driver && cargo build --release
 	cd user/display-test && cargo build --release
+	cd user/virtio-blk-driver && cargo build --release
 	cd user/init && cargo build --release
 
 build: build-user check-stack check-pointers
@@ -54,6 +55,12 @@ run-release: build-release
 
 run-display: build
 	$(QEMU) $(QEMU_DISPLAY_FLAGS) $(KERNEL_ELF)
+
+run-blk: build
+	@test -f test.img || dd if=/dev/zero of=test.img bs=1M count=1 2>/dev/null
+	$(QEMU) $(QEMU_FLAGS) \
+		-drive file=test.img,format=raw,if=virtio \
+		$(KERNEL_ELF)
 
 objdump: build
 	cargo objdump -- -d | head -80

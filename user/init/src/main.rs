@@ -30,6 +30,10 @@ static RAMFB_ELF: &[u8] = include_bytes!("../../ramfb-driver/target/aarch64-unkn
 /// Built by: cd user/display-test && cargo build --release
 static DISPLAY_TEST_ELF: &[u8] = include_bytes!("../../display-test/target/aarch64-unknown-none/release/lockjaw-display-test");
 
+/// The virtio-blk driver ELF binary, embedded at compile time.
+/// Built by: cd user/virtio-blk-driver && cargo build --release
+static BLK_ELF: &[u8] = include_bytes!("../../virtio-blk-driver/target/aarch64-unknown-none/release/lockjaw-virtio-blk-driver");
+
 // ---------------------------------------------------------------------------
 // ELF spawn helper
 // ---------------------------------------------------------------------------
@@ -276,6 +280,8 @@ pub extern "C" fn _start() -> ! {
     let uart_boot_ep = alloc_endpoint("uart boot");
     let ramfb_boot_ep = alloc_endpoint("ramfb boot");
     let display_test_boot_ep = alloc_endpoint("dtest boot");
+    let blk_srv_ep = alloc_endpoint("blk srv");
+    let blk_boot_ep = alloc_endpoint("blk boot");
 
     // Spawn child processes.
     // Allocate temp VAs for ELF loading. Each spawn needs:
@@ -289,6 +295,7 @@ pub extern "C" fn _start() -> ! {
     spawn_elf(DEVMGR_ELF, "device-manager", map_array_va, temp_base_va, scratch_ps, devmgr_boot_ep, 8);
     spawn_elf(UART_ELF, "uart-driver", map_array_va, temp_base_va, scratch_ps, uart_boot_ep, 4);
     spawn_elf(RAMFB_ELF, "ramfb-driver", map_array_va, temp_base_va, scratch_ps, ramfb_boot_ep, 4);
+    spawn_elf(BLK_ELF, "blk-driver", map_array_va, temp_base_va, scratch_ps, blk_boot_ep, 4);
     spawn_elf(DISPLAY_TEST_ELF, "display-test", map_array_va, temp_base_va, scratch_ps, display_test_boot_ep, 1);
 
     // Bootstrap hello: export a test notification into its handle table.
@@ -371,6 +378,21 @@ pub extern "C" fn _start() -> ! {
     };
     sys_reply(dtest_display_idx, 0, 0, 0);
     puts("[BOOTSTRAP] display-test\n");
+
+    // Bootstrap blk-driver: export blk_srv_ep (to serve block clients)
+    // and devmgr_ep (to claim virtio device) into its handle table.
+    puts("init: waiting for blk bootstrap...\n");
+    let _ = sys_receive(blk_boot_ep);
+    let blk_srv_idx = match sys_export_handle(blk_srv_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export blk_srv_ep FAILED\n"); loop { sys_yield(); } }
+    };
+    let blk_devmgr_idx = match sys_export_handle(devmgr_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export devmgr to blk FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(blk_srv_idx, blk_devmgr_idx, 0, 0);
+    puts("[BOOTSTRAP] blk\n");
 
     // Allocate a Reply object for init's own outbound calls (ipc_puts to
     // the uart server). Each client that issues sys_call needs one.

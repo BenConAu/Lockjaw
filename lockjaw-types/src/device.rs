@@ -53,7 +53,9 @@ pub const VIRTIO_MMIO_HASH: u64 = compatible_hash(b"virtio,mmio");
 
 /// Claim the first unclaimed device matching a compatible hash.
 /// Request:  msg = [CMD_CLAIM_DEVICE, compatible_hash, 0, 0]
-/// Response: msg = [exported_handle, intid, 0, 0]
+/// Response: msg = [status, exported_handle, intid, 0]
+///   status: CLAIM_OK on success, CLAIM_ERR on failure.
+///   Handle 0 is a valid handle-table index — check status, not handle.
 pub const CMD_CLAIM_DEVICE: u64 = 1;
 
 /// Probe a device by absolute index among ALL devices matching a hash.
@@ -82,9 +84,13 @@ pub const PROBE_DEVICE_CLAIMED: u64 = 0xFFFF_FFFF;
 /// The driver first uses CMD_PROBE_DEVICE to discover the mmio_addr,
 /// then claims by stable identity — no skip_count, no race.
 /// Request:  msg = [CMD_CLAIM_BY_ADDR, mmio_addr, 0, 0]
-/// Response: msg = [exported_handle, intid, 0, 0]
-///   exported_handle = 0 means no match or already claimed.
+/// Response: msg = [status, exported_handle, intid, 0]
+///   status: CLAIM_OK on success, CLAIM_ERR on failure.
 pub const CMD_CLAIM_BY_ADDR: u64 = 3;
+
+/// Claim response status codes.
+pub const CLAIM_OK:  u64 = 0;
+pub const CLAIM_ERR: u64 = 1;
 
 // ---------------------------------------------------------------------------
 // Tests

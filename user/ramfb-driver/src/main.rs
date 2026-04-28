@@ -444,11 +444,11 @@ pub extern "C" fn _start() -> ! {
         Ok(r) => r,
         Err(_) => { puts("ramfb: claim FAILED\n"); halt(); }
     };
-    let fwcfg_pageset = PageSetHandle(claim[0]);
-    if claim[0] == 0 {
+    if claim[0] != lockjaw_userlib::CLAIM_OK {
         puts("ramfb: no fw_cfg device\n");
         halt();
     }
+    let fwcfg_pageset = PageSetHandle(claim[1]);
     puts("ramfb: claimed fw_cfg\n");
 
     // Map fw_cfg MMIO page

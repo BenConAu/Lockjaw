@@ -302,12 +302,16 @@ pub fn free_by_header_paddr(header_paddr: u64) {
     let header = unsafe { read_header(header_paddr) };
     let count = header.data_page_count();
 
-    // Free data pages
+    // Free data pages (skip device MMIO pages — they are below RAM_START
+    // and were never allocated from the buddy allocator).
+    let ram_start = crate::mm::addr::RAM_START.as_u64();
     for i in 0..count {
         if let Some(paddr) = header.get_page(i) {
-            page_alloc::dealloc_page(
-                crate::mm::addr::PhysPage::containing(PhysAddr::new(paddr))
-            );
+            if paddr >= ram_start {
+                page_alloc::dealloc_page(
+                    crate::mm::addr::PhysPage::containing(PhysAddr::new(paddr))
+                );
+            }
         }
     }
 

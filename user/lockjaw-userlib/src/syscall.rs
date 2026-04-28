@@ -280,6 +280,22 @@ pub fn sys_bind_irq(intid: u64, notif: NotificationHandle) -> SyscallError {
     SyscallError(err)
 }
 
+/// Wait on a notification until the timeline value reaches the threshold.
+/// Returns the current counter value on success, or blocks until it does.
+pub fn sys_wait_notification(notif: NotificationHandle, threshold: u64) -> Result<u64, SyscallError> {
+    let err: u64;
+    let val: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") notif.0 => err,
+            inlateout("x1") threshold => val,
+            in("x8") SYS_WAIT_NOTIFICATION,
+        );
+    }
+    if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
+}
+
 /// Export a handle into the caller currently bound on this thread's TCB
 /// (set by the preceding sys_receive). Any handle type can be exported.
 /// Returns the new handle index in the caller's handle table.
