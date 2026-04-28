@@ -29,12 +29,16 @@ use lockjaw_types::ipc_state::{
 /// The state is simply "do we have waiters, a blocked receiver, or nobody."
 /// Waiters link themselves into the queue via `ipc_queue_next` in their own
 /// TCBs; messages travel via the waiter's `ipc_msg`. Per-call caller
-/// identity lives on each client's Reply object, not on the endpoint.
+/// identity is carried as a kernel-assigned caller token on each handle
+/// and delivered to the server via sys_query_caller_token.
 #[repr(C)]
 pub struct EndpointObject {
     pub header: ObjectHeader,
     /// EP_IDLE, EP_HAS_WAITERS, or EP_HAS_RECEIVER.
     pub state: u8,
+    /// Monotonic counter for assigning caller tokens on export.
+    /// Starts at 1; token 0 means "no token" (server's own handle).
+    pub next_token: u64,
     /// Thread waiting via sys_wait_any for readiness.
     pub readiness_waiter: lockjaw_types::wait::ReadinessWaiter,
     /// Head of the intrusive waiter queue (paddr of first queued TCB,
@@ -59,6 +63,7 @@ pub fn create_endpoint(page: crate::mm::addr::ObjectInitPage) -> Result<(), Crea
                 refcount: 0, // incremented by first handle_insert
             },
             state: EP_IDLE,
+            next_token: 1,
             readiness_waiter: lockjaw_types::wait::ReadinessWaiter::empty(),
             queue_head: 0,
             queue_tail: 0,
@@ -86,6 +91,7 @@ pub fn create_endpoint(page: crate::mm::addr::ObjectInitPage) -> Result<(), Crea
 pub fn ipc_send(
     ep: *mut EndpointObject,
     msg: [u64; 4],
+    caller_token: u64,
 ) -> Result<(), IpcError> {
     let ep_state = EpState::from_raw(unsafe { (*ep).state })
         .expect("corrupted endpoint state");
@@ -103,6 +109,7 @@ pub fn ipc_send(
             {
                 let r = receiver_tcb.get_mut();
                 r.ipc_msg = msg;
+                r.last_caller_token = caller_token;
                 r.ipc_wait_kind = WAIT_KIND_NONE;
                 // Receiver's ipc_blocked_on was set when it queued itself; clear
                 // it so teardown/diagnostics never see a runnable thread that
@@ -124,6 +131,7 @@ pub fn ipc_send(
                 let sender_tcb = unsafe { KernelMut::<Tcb>::from_paddr(sender_tcb_paddr) };
                 let s = unsafe { scoped_mut(sender_tcb.raw_ptr(), &mut tok) };
                 s.ipc_msg = msg;
+                s.ipc_caller_token = caller_token;
                 s.ipc_wait_kind = WAIT_KIND_SEND;
                 s.ipc_blocked_on = ep_paddr.as_u64();
             }
@@ -183,8 +191,12 @@ pub fn ipc_receive(
             // SAFETY: head paddr from the endpoint queue — valid TCB.
             let mut head_tcb = unsafe { KernelMut::<Tcb>::from_paddr(head) };
             let msg = head_tcb.get().ipc_msg;
+            let sender_token = head_tcb.get().ipc_caller_token;
             head_tcb.get_mut().ipc_wait_kind = WAIT_KIND_NONE;
             head_tcb.get_mut().ipc_blocked_on = 0;
+            // Write sender's caller token to receiver's last_caller_token.
+            let mut receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr) };
+            receiver_tcb.get_mut().last_caller_token = sender_token;
             scheduler::unblock_thread(head);
             ep_ref.state = next_ep_state.to_raw();
             Ok(msg)
@@ -198,12 +210,14 @@ pub fn ipc_receive(
             // SAFETY: head paddr from the endpoint queue — valid TCB.
             let mut head_tcb = unsafe { KernelMut::<Tcb>::from_paddr(head) };
             let msg = head_tcb.get().ipc_msg;
+            let sender_token = head_tcb.get().ipc_caller_token;
             head_tcb.get_mut().ipc_wait_kind = WAIT_KIND_NONE;
             // Bind the caller's Reply object to THIS receiver's current_reply slot.
             let reply_paddr = head_tcb.get().ipc_call_reply_paddr;
             head_tcb.get_mut().ipc_call_reply_paddr = 0;
             let mut receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr) };
             receiver_tcb.get_mut().current_reply_paddr = reply_paddr;
+            receiver_tcb.get_mut().last_caller_token = sender_token;
             ep_ref.state = next_ep_state.to_raw();
             Ok(msg)
         }
@@ -246,6 +260,7 @@ pub fn ipc_call(
     ep: *mut EndpointObject,
     reply: *mut ReplyObject,
     msg: [u64; 4],
+    caller_token: u64,
 ) -> Result<[u64; 4], IpcError> {
     debug_assert_eq!(unsafe { (*ep).header.obj_type }, ObjectType::Endpoint);
     debug_assert_eq!(unsafe { (*reply).header.obj_type }, ObjectType::Reply);
@@ -278,6 +293,7 @@ pub fn ipc_call(
                 {
                     let r = receiver_tcb.get_mut();
                     r.ipc_msg = msg;
+                    r.last_caller_token = caller_token;
                     r.ipc_wait_kind = WAIT_KIND_NONE;
                     r.current_reply_paddr = reply_paddr.as_u64();
                     r.ipc_blocked_on = 0;
@@ -315,6 +331,7 @@ pub fn ipc_call(
                 let caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_tcb_paddr) };
                 let c = unsafe { scoped_mut(caller_tcb.raw_ptr(), &mut tok) };
                 c.ipc_msg = msg;
+                c.ipc_caller_token = caller_token;
                 c.ipc_wait_kind = WAIT_KIND_CALL;
                 c.ipc_call_reply_paddr = reply_paddr.as_u64();
                 c.ipc_blocked_on = ep_paddr.as_u64();

@@ -228,12 +228,29 @@ pub fn create_process(
             crate::cap::rights::Rights::none(),
         ).map_err(|_| "parent handle lookup failed")?;
 
+        // For Endpoint handles: assign a caller token so the child can
+        // send/call on this handle. Same logic as sys_export_handle:
+        // token==0 → fresh from endpoint counter, nonzero → copy (lineage).
+        let child_kind = match entry.kind {
+            lockjaw_types::object::HandleKind::Endpoint { caller_token } if caller_token == 0 => {
+                let mut ep = unsafe {
+                    crate::mm::kernel_ptr::KernelMut::<crate::ipc::endpoint::EndpointObject>::from_paddr(
+                        PhysAddr::new(entry.object_paddr),
+                    )
+                };
+                let token = ep.get().next_token;
+                ep.get_mut().next_token = token + 1;
+                lockjaw_types::object::HandleKind::Endpoint { caller_token: token }
+            }
+            other => other,
+        };
+
         // SAFETY: ht_guard was just initialized as a valid handle table above.
         let child_ht = unsafe { HandleTableRef::from_paddr(ht_guard.addr()) };
         child_ht.insert(
             PhysAddr::new(entry.object_paddr),
             entry.rights,
-            entry.kind,
+            child_kind,
         ).map_err(|_| "child handle insert failed")?;
     }
 

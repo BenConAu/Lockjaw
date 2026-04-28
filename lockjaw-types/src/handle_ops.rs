@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn insert_into_empty_table_returns_index_0() {
         let mut slots = empty_table(4);
-        let idx = slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ), HandleKind::Endpoint);
+        let idx = slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ), HandleKind::Endpoint { caller_token: 0 });
         assert_eq!(idx, Ok(0));
         assert_eq!(slots[0].object_paddr, 0x1000);
     }
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn insert_fills_sequentially() {
         let mut slots = empty_table(4);
-        assert_eq!(slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint), Ok(0));
+        assert_eq!(slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }), Ok(0));
         assert_eq!(slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Notification), Ok(1));
         assert_eq!(slot_insert(&mut slots, 0x3000, Rights::none(), HandleKind::Reply), Ok(2));
         assert_eq!(slot_insert(&mut slots, 0x4000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }), Ok(3));
@@ -195,10 +195,10 @@ mod tests {
     #[test]
     fn insert_reuses_removed_slot() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint).unwrap();
-        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
         slot_remove(&mut slots, 0).unwrap();
-        let idx = slot_insert(&mut slots, 0x3000, Rights::none(), HandleKind::Endpoint).unwrap();
+        let idx = slot_insert(&mut slots, 0x3000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
         assert_eq!(idx, 0);
         assert_eq!(slots[0].object_paddr, 0x3000);
     }
@@ -206,10 +206,10 @@ mod tests {
     #[test]
     fn insert_full_table_returns_table_full() {
         let mut slots = empty_table(2);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint).unwrap();
-        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
         assert_eq!(
-            slot_insert(&mut slots, 0x3000, Rights::none(), HandleKind::Endpoint),
+            slot_insert(&mut slots, 0x3000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }),
             Err(HandleError::TableFull)
         );
     }
@@ -219,10 +219,10 @@ mod tests {
     #[test]
     fn lookup_valid_entry() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), HandleKind::Endpoint { caller_token: 0 }).unwrap();
         let entry = slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ)).unwrap();
         assert_eq!(entry.object_paddr, 0x1000);
-        assert_eq!(entry.kind, HandleKind::Endpoint);
+        assert_eq!(entry.kind, HandleKind::Endpoint { caller_token: 0 });
     }
 
     #[test]
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn lookup_rights_subset_passes() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), HandleKind::Endpoint { caller_token: 0 }).unwrap();
         assert!(slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ)).is_ok());
         assert!(slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ | RIGHT_WRITE)).is_ok());
     }
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn lookup_missing_rights_returns_insufficient() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ), HandleKind::Endpoint { caller_token: 0 }).unwrap();
         assert_eq!(
             slot_lookup(&slots, 0, Rights::from_bits(RIGHT_GRANT)),
             Err(HandleError::InsufficientRights)
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn lookup_no_required_rights_always_passes() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
         assert!(slot_lookup(&slots, 0, Rights::none()).is_ok());
     }
 
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn remove_zeros_slot() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
         slot_remove(&mut slots, 0).unwrap();
         assert_eq!(slots[0].object_paddr, 0);
     }
@@ -304,7 +304,7 @@ mod tests {
     fn remove_all_by_object_clears_matching() {
         let mut slots = empty_table(4);
         slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
-        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
         slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
         let count = slot_remove_all_by_object(&mut slots, 0x1000);
         assert_eq!(count, 2);
@@ -316,7 +316,7 @@ mod tests {
     fn remove_all_by_object_preserves_others() {
         let mut slots = empty_table(4);
         slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
-        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
         slot_remove_all_by_object(&mut slots, 0x1000);
         assert_eq!(slots[1].object_paddr, 0x2000);
     }
@@ -341,7 +341,7 @@ mod tests {
     #[test]
     fn mapped_va_on_non_pageset_returns_invalid() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
         assert_eq!(slot_get_mapped_va(&slots, 0), Err(HandleError::InvalidHandle));
         assert_eq!(slot_set_mapped_va(&mut slots, 0, 0x400), Err(HandleError::InvalidHandle));
     }

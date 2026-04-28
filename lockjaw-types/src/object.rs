@@ -61,7 +61,7 @@ pub enum HandleKind {
     Empty = 0,
     HandleTable = 1,
     ThreadControlBlock = 2,
-    Endpoint = 3,
+    Endpoint { caller_token: u64 } = 3,
     Notification = 4,
     Reply = 5,
     Process = 6,
@@ -81,7 +81,7 @@ impl HandleKind {
             HandleKind::Empty => ObjectType::HandleTable, // inert
             HandleKind::HandleTable => ObjectType::HandleTable,
             HandleKind::ThreadControlBlock => ObjectType::ThreadControlBlock,
-            HandleKind::Endpoint => ObjectType::Endpoint,
+            HandleKind::Endpoint { .. } => ObjectType::Endpoint,
             HandleKind::Notification => ObjectType::Notification,
             HandleKind::Reply => ObjectType::Reply,
             HandleKind::Process => ObjectType::Process,
@@ -105,9 +105,9 @@ pub struct HandleEntry {
 }
 
 // Static layout assertions — part of the design contract.
-const _: () = assert!(core::mem::size_of::<HandleEntry>() == 24);
+const _: () = assert!(core::mem::size_of::<HandleEntry>() == 32);
 const _: () = assert!(core::mem::align_of::<HandleEntry>() == 8);
-const _: () = assert!(core::mem::size_of::<HandleKind>() == 8);
+const _: () = assert!(core::mem::size_of::<HandleKind>() == 16);
 
 impl HandleEntry {
     /// Empty slot sentinel. `object_paddr == 0` is the sole empty-slot
@@ -285,18 +285,18 @@ mod tests {
 
     #[test]
     fn handle_table_256_slots() {
-        // header (8 bytes) + 256 * 24 = 6152 bytes → 2 pages
+        // header (8 bytes) + 256 * 32 = 8200 bytes → 3 pages
         let info = HandleTableCreateInfo { slot_count: 256 };
         let size = query_handle_table_size(&info);
-        assert_eq!(size.pages, 2);
+        assert_eq!(size.pages, 3);
     }
 
     #[test]
     fn handle_table_1000_slots() {
         let info = HandleTableCreateInfo { slot_count: 1000 };
         let size = query_handle_table_size(&info);
-        // header + 1000 * 24 = 24008 bytes → 6 pages
-        assert_eq!(size.pages, 6);
+        // header + 1000 * 32 = 32008 bytes → 8 pages
+        assert_eq!(size.pages, 8);
     }
 
     #[test]
@@ -325,13 +325,13 @@ mod tests {
     }
 
     #[test]
-    fn handle_entry_size_is_24() {
-        assert_eq!(core::mem::size_of::<HandleEntry>(), 24);
+    fn handle_entry_size_is_32() {
+        assert_eq!(core::mem::size_of::<HandleEntry>(), 32);
     }
 
     #[test]
-    fn handle_kind_size_is_8() {
-        assert_eq!(core::mem::size_of::<HandleKind>(), 8);
+    fn handle_kind_size_is_16() {
+        assert_eq!(core::mem::size_of::<HandleKind>(), 16);
     }
 
     #[test]
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn handle_slots_per_page() {
-        assert_eq!(HANDLE_SLOTS_PER_PAGE, 170);
+        assert_eq!(HANDLE_SLOTS_PER_PAGE, 127);
         let used = core::mem::size_of::<HandleTableHeader>()
             + HANDLE_SLOTS_PER_PAGE as usize * core::mem::size_of::<HandleEntry>();
         assert!(used <= 4096);
@@ -355,7 +355,7 @@ mod tests {
         // Ensure HandleKind discriminant values match ObjectType for diagnostics.
         assert_eq!(HandleKind::Empty.obj_type(), ObjectType::HandleTable); // inert
         assert_eq!(HandleKind::HandleTable.obj_type(), ObjectType::HandleTable);
-        assert_eq!(HandleKind::Endpoint.obj_type(), ObjectType::Endpoint);
+        assert_eq!(HandleKind::Endpoint { caller_token: 0 }.obj_type(), ObjectType::Endpoint);
         assert_eq!(HandleKind::PageSet { mapped_va_page: 0 }.obj_type(), ObjectType::PageSet);
         assert_eq!(HandleKind::Notification.obj_type(), ObjectType::Notification);
     }
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn close_non_pageset_remove_only() {
-        let entry = make_entry(HandleKind::Endpoint, 0x1000);
+        let entry = make_entry(HandleKind::Endpoint { caller_token: 0 }, 0x1000);
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::RemoveOnly);
     }
 
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn teardown_handle_non_pageset_skip() {
-        let entry = make_entry(HandleKind::Endpoint, 0x1000);
+        let entry = make_entry(HandleKind::Endpoint { caller_token: 0 }, 0x1000);
         assert_eq!(decide_teardown_handle(&entry), TeardownHandleAction::Skip);
     }
 

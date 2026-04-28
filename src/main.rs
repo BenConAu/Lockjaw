@@ -410,10 +410,18 @@ pub extern "C" fn kmain() -> ! {
             b"kernel\0\0\0\0\0\0\0\0\0\0",
         );
 
-        // Insert endpoint + reply handles into kernel handle table
+        // Insert endpoint + reply handles into kernel handle table.
+        // Assign a caller token from the endpoint's counter so the kernel
+        // sender thread can use it (token 0 = receive-only).
+        let ep_token = {
+            let mut ep_km = mm::kernel_ptr::KernelMut::<ipc::endpoint::EndpointObject>::from_paddr(ep_page);
+            let t = ep_km.get().next_token;
+            ep_km.get_mut().next_token = t + 1;
+            t
+        };
         handle_table::handle_insert(kernel_ht_page, ep_page,
             cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
-            lockjaw_types::object::HandleKind::Endpoint).expect("insert ep handle");
+            lockjaw_types::object::HandleKind::Endpoint { caller_token: ep_token }).expect("insert ep handle");
         handle_table::handle_insert(kernel_ht_page, bench_reply_page,
             cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
             lockjaw_types::object::HandleKind::Reply).expect("insert reply handle");

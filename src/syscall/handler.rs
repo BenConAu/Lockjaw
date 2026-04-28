@@ -5,7 +5,7 @@ use crate::cap::object::ObjectType;
 use crate::cap::rights::{Rights, RIGHT_READ, RIGHT_WRITE};
 use crate::ipc::endpoint;
 use crate::mm::addr::PhysAddr;
-use crate::mm::kernel_ptr::KernelRef;
+use crate::mm::kernel_ptr::{KernelRef, KernelMut};
 use crate::sched::current::CurrentThread;
 use crate::sched::scheduler;
 use crate::sched::tcb::Tcb;
@@ -69,6 +69,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_QUERY_MAPPING => sys_query_mapping(ctx),
         SYS_CLOSE_HANDLE => SyscallReturn::Void(sys_close_handle(ctx)),
         SYS_UNMAP_PAGES => SyscallReturn::Void(sys_unmap_pages(ctx)),
+        SYS_QUERY_CALLER_TOKEN => SyscallReturn::Value(Ok(sys_query_caller_token())),
         SYS_EXIT => {
             scheduler::exit_current(); // never returns
         }
@@ -412,7 +413,7 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
 /// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_endpoint(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(ctx.gpr[0] as u32, lockjaw_types::object::HandleKind::Endpoint, endpoint::create_endpoint)
+    create_kernel_object(ctx.gpr[0] as u32, lockjaw_types::object::HandleKind::Endpoint { caller_token: 0 }, endpoint::create_endpoint)
 }
 
 /// sys_create_reply(handle) — create a Reply object from a donated page.
@@ -591,6 +592,22 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         let exporter_ht = CurrentThread::handle_table();
         let export_entry = exporter_ht.lookup_any(handle_to_export, Rights::none())?;
 
+        // For Endpoint handles: assign a caller token.
+        // - caller_token == 0 (server's own handle): allocate fresh from endpoint.next_token
+        // - caller_token != 0 (re-export): copy unchanged (lineage preservation)
+        let export_kind = match export_entry.kind {
+            lockjaw_types::object::HandleKind::Endpoint { caller_token } if caller_token == 0 => {
+                // First export: assign fresh token from the endpoint's counter.
+                let mut ep = KernelMut::<crate::ipc::endpoint::EndpointObject>::from_paddr(
+                    PhysAddr::new(export_entry.object_paddr),
+                );
+                let token = ep.get().next_token;
+                ep.get_mut().next_token = token + 1;
+                lockjaw_types::object::HandleKind::Endpoint { caller_token: token }
+            }
+            other => other, // non-Endpoint or re-export: pass through
+        };
+
         // Insert into the caller's handle table (cross-table operation).
         let caller_tcb = KernelRef::<Tcb>::from_paddr(PhysAddr::new(caller_tcb_paddr_u64));
         let caller_ht_paddr = crate::cap::process_obj::process_handle_table(PhysAddr::new(caller_tcb.get().process_paddr));
@@ -598,10 +615,10 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         let idx = caller_ht.insert(
             PhysAddr::new(export_entry.object_paddr),
             export_entry.rights,
-            export_entry.kind,
+            export_kind,
         )?;
         // Increment refcount for PageSets — a new handle references it.
-        if export_entry.kind.is_pageset() {
+        if export_kind.is_pageset() {
             crate::cap::pageset_table::read_header_mut(export_entry.object_paddr)
                 .inc_refcount();
         }
@@ -899,4 +916,15 @@ fn obj_type_from_u8(v: u8) -> ObjectType {
         3 => ObjectType::Notification,
         _ => ObjectType::HandleTable,
     }
+}
+
+/// sys_query_caller_token() — returns the caller token of the most
+/// recently dequeued sender/caller on this thread. Set on every
+/// successful sys_receive or sys_recv_nb. Returns 0 if this thread
+/// has never received.
+fn sys_query_caller_token() -> u64 {
+    let tcb_paddr = scheduler::current_tcb_paddr();
+    // SAFETY: current_tcb_paddr is always valid.
+    let tcb = unsafe { KernelRef::<Tcb>::from_paddr(tcb_paddr) };
+    tcb.get().last_caller_token
 }

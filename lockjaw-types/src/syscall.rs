@@ -100,6 +100,7 @@ pub const SYS_CREATE_THREAD: u64 = 22;
 pub const SYS_QUERY_MAPPING: u64 = 23;
 pub const SYS_CLOSE_HANDLE: u64 = 24;
 pub const SYS_UNMAP_PAGES: u64 = 25;
+pub const SYS_QUERY_CALLER_TOKEN: u64 = 26;
 
 /// Flag for SYS_ALLOC_PAGES: allocated pages must be physically contiguous.
 pub const ALLOC_FLAG_CONTIGUOUS: u64 = 1 << 0;
@@ -133,6 +134,7 @@ pub fn syscall_name(num: u64) -> &'static str {
         SYS_QUERY_MAPPING => "sys_query_mapping",
         SYS_CLOSE_HANDLE => "sys_close_handle",
         SYS_UNMAP_PAGES => "sys_unmap_pages",
+        SYS_QUERY_CALLER_TOKEN => "sys_query_caller_token",
         _ => "unknown",
     }
 }
