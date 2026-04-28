@@ -417,6 +417,22 @@ pub fn sys_query_mapping(va: u64) -> Result<(bool, u64), SyscallError> {
     if err == 0 { Ok((mapped != 0, run_pages)) } else { Err(SyscallError(err)) }
 }
 
+/// Query the caller token of the most recently dequeued sender/caller
+/// on this thread. Set on every successful sys_receive or sys_recv_nb.
+/// Returns 0 if this thread has never received.
+pub fn sys_query_caller_token() -> u64 {
+    let val: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            lateout("x0") _,
+            lateout("x1") val,
+            in("x8") SYS_QUERY_CALLER_TOKEN,
+        );
+    }
+    val
+}
+
 /// Close a handle, freeing the slot for reuse. Does not free the
 /// backing kernel object or its pages (no refcounting yet).
 pub fn sys_close_handle(h: impl Exportable) -> SyscallError {

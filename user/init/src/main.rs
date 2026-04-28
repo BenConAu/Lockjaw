@@ -293,7 +293,21 @@ pub extern "C" fn _start() -> ! {
 
     // Bootstrap hello: export a test notification into its handle table.
     puts("init: waiting for hello bootstrap...\n");
-    let _ = sys_receive(hello_boot_ep);
+    match sys_receive(hello_boot_ep) {
+        Ok(_) => {
+            // Verify caller token: the hello process called us via an exported
+            // endpoint handle, so the kernel should have assigned a nonzero token.
+            let token = sys_query_caller_token();
+            if token != 0 {
+                puts("init: caller token OK (nonzero)\n");
+            } else {
+                puts("init: caller token ZERO — token delivery broken!\n");
+            }
+        }
+        Err(_) => {
+            puts("init: hello bootstrap receive FAILED\n");
+        }
+    }
     let test_notif_ps = match sys_alloc_pages(1) {
         Ok(id) => id,
         Err(_) => { puts("init: alloc notif FAILED\n"); loop { sys_yield(); } }

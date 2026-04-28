@@ -27,6 +27,16 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    if echo "$OUTPUT" | grep -q "$1"; then
+        echo "  FAIL: $2 (unexpected: '$1')"
+        FAILED=$((FAILED + 1))
+    else
+        echo "  PASS: $2"
+        PASSED=$((PASSED + 1))
+    fi
+}
+
 echo "Phase 1 — Boot:"
 assert_contains "Lockjaw Microkernel" "Boot banner printed"
 assert_contains "Page allocator:" "Page allocator initialized"
@@ -75,6 +85,9 @@ assert_contains "DTB PageSet OK" "sys_get_boot_info returns valid DTB"
 assert_contains "spawned OK" "Init spawned child via sys_create_process"
 assert_contains "Hello from child process" "Child process running in own address space"
 assert_contains "child: alive" "Child process scheduled and printing"
+assert_not_contains "token ZERO" "Caller token is nonzero"
+assert_not_contains "bootstrap receive FAILED" "Hello bootstrap receive succeeded"
+assert_contains "caller token OK" "Caller token delivered via IPC"
 assert_contains "\[BOOTSTRAP\] hello" "Init-hello bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] devmgr" "Init-devmgr bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] uart" "Init-uart bootstrap IPC completed"
