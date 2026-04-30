@@ -16,10 +16,11 @@ The design follows a few core principles:
 - **Verified IPC state machine.** The IPC endpoint logic is driven by a pure state machine model that is exhaustively explored at test time -- all reachable states, all transitions, all effect orderings verified. Kernel IPC handlers match on typed decision enums (SendDecision, ReceiveDecision, CallDecision, ReplyDecision) returned by lockjaw-types. No inline state branching in kernel code.
 - **Pull over push.** Kernel code is organized by integration shape: pull (types drives sequencing), plan/apply (types returns a decision, kernel executes), or push (kernel calls helpers). Push is treated as highest review-risk; the extraction rubric converts push to pull wherever possible.
 - **All MMIO through the device manager.** Drivers cannot map arbitrary physical addresses. The device manager discovers hardware from the DTB and issues tracked PageSets for MMIO pages. Only processes that receive an MMIO PageSet can map device memory.
+- **Unforgeable caller identity.** IPC endpoints carry kernel-assigned opaque caller tokens. When a handle is exported, the kernel assigns a monotonic per-endpoint token stored in the handle entry. Servers query the token after receive to scope resources per-client. Tokens identify handle lineage, not processes — delegates inherit the original token. Token 0 is receive-only; send/call with token 0 is rejected by the kernel.
 
 ## What works today
 
-Lockjaw boots on QEMU with up to 4 cores (`-smp 4`), manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads across multiple CPUs with a Giant Kernel Lock, serves 23 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects, runs five isolated userspace processes loaded from ELF binaries, has a device manager that discovers hardware from the DTB, a UART driver, and a ramfb display driver that renders to a framebuffer via DMA.
+Lockjaw boots on QEMU with up to 4 cores (`-smp 4`), manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads across multiple CPUs with a Giant Kernel Lock, serves 27 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects and kernel-assigned caller tokens for multi-client isolation, runs six isolated userspace processes loaded from ELF binaries, has a device manager that discovers hardware from the DTB with probe and claim-by-address protocols, a UART driver, a ramfb display driver, and a VirtIO block driver that reads from a virtual disk via virtqueues.
 
 ```
 === Lockjaw Microkernel v0.1.0 ===
@@ -36,11 +37,15 @@ init: hello spawned OK
 init: device-manager spawned OK
 init: uart-driver spawned OK
 init: ramfb-driver spawned OK
+init: blk-driver spawned OK
 devmgr: parsed DTB, 49 devices
 uart-driver: claimed PL011
 uart-driver: server ready
 ramfb: claimed fw_cfg
 ramfb: display configured
+blk: found virtio-blk device            # with -drive flag
+blk: selftest read OK, sector 0 = [4c 4f 43 4b ...]
+blk: serving
 [IPC BENCHMARK] 10000 call/reply round-trips in 74 ticks
 [IPC BENCHMARK] 135 round-trips per tick
 ```
@@ -65,9 +70,15 @@ ramfb: display configured
 
 **Phase 9 -- Userspace Drivers.** UART driver runs entirely in userspace. Receives its server endpoint and device-manager endpoint via bootstrap. Event loop using sys_wait_any multiplexes IPC requests and hardware interrupts. Notification objects serve as timeline semaphores for IRQ delivery. Init prints messages through the UART driver via IPC.
 
-**Phase 10 -- Device Manager and Display Driver.** Device manager process parses the Flattened Device Tree (DTB) at boot to discover hardware. Serves CMD_CLAIM_DEVICE requests from drivers via IPC. Creates tracked MMIO PageSets so drivers can map device memory without knowing physical addresses. ramfb display driver claims fw_cfg from the device manager, allocates a contiguous DMA framebuffer via the buddy allocator, configures the display via the fw_cfg DMA protocol, and renders a test pattern.
+**Phase 10 -- Device Manager and Display Driver.** Device manager process parses the Flattened Device Tree (DTB) at boot to discover hardware. Serves CMD_CLAIM_DEVICE, CMD_PROBE_DEVICE (with explicit status codes: PROBE_OK/END/CLAIMED/ERR), and CMD_CLAIM_BY_ADDR (TOCTOU-safe claim by stable MMIO address) requests from drivers via IPC. Probe uses absolute indexing over all matching DTB nodes for stable concurrent enumeration. Creates tracked MMIO PageSets with sub-page offset support (multiple virtio-mmio devices share a 4K page). ramfb display driver claims fw_cfg from the device manager, allocates a contiguous DMA framebuffer, configures the display via the fw_cfg DMA protocol, and renders a test pattern.
 
 **Phase 11 -- SMP.** Secondary CPUs booted via PSCI CPU_ON. Per-CPU stacks in the linker script (2MB-aligned, 4 guard+stack pairs). Per-CPU data via TPIDR_EL1 with narrow accessors. Giant Kernel Lock (ticket lock from lockjaw-types, host-testable with multi-threaded tests) serializes all kernel execution. Scheduler model adapted for per-CPU current threads. Exception handlers acquire/release GKL. Kernel threads run cooperatively under the GKL with IRQs masked. Idle threads release GKL and halt in wfi. Process entry releases GKL before eret to EL0. INTID 0 reserved for future cross-core reschedule SGI (parked until fine-grained locking).
+
+**Phase 12 -- PageSet Lifecycle.** Mapping tracking, ownership transfer with ProcessTransferPlan, refcounting with free-on-zero, process exit cleanup via ProcessTeardownPlan with construction-safe narrowing (separate step variants for with/without address space, making illegal unmap-during-teardown unrepresentable).
+
+**Phase 13 -- Caller Tokens.** HandleEntry redesigned with typed HandleKind enum (repr(C, u8) with per-type metadata: caller_token on Endpoint, mapped_va_page on PageSet). Kernel assigns monotonic u64 tokens per endpoint on sys_export_handle and create_process handle copy. Token 0 = receive-only; send/call with token 0 is rejected. Servers query tokens via SYS_QUERY_CALLER_TOKEN (syscall 26). Tokens identify handle lineage for capability delegation. Integration test verifies nonzero token delivery.
+
+**Phase 14 -- VirtIO Block Driver.** VirtIO MMIO transport with modern (non-legacy) device support. Pure types in lockjaw-types (register offsets, virtqueue layout calculator, feature negotiation model, block request types). Virtqueue runtime in userlib with volatile access and AArch64 memory barriers (dmb ishst/ish/ishld). BlockEngine trait + run_block_server() framework (same pattern as display DDI). Per-device GIC trigger mode (sys_bind_irq flags parameter). Device-manager probe protocol with explicit status codes (PROBE_OK/END/CLAIMED/ERR). Sub-page MMIO offset for virtio-mmio devices (8 per 4K page). Driver selftest reads sector 0 and prints content.
 
 ### Unsafe reduction
 
@@ -85,10 +96,10 @@ Three layers of automated testing run on every build:
 
 | Layer | Count | What it tests |
 |-------|-------|---------------|
-| Unit tests (host) | 365 | Scheduler model (BFS, per-CPU), IPC state machine (exhaustive) + decision functions, process lifecycle + transfer plan + teardown plan, buddy allocator, page tables, ExceptionContext ABI offsets, SavedContext/Tcb ABI offsets, ESR decode, handle close decisions, FDT parser, notifications, wait readiness, ticket lock (multi-threaded) |
-| Integration tests (QEMU) | 40 | Full boot through 10 phases, scheduler/MMU integration, IPC bootstrap, thread exit cleanup, thread creation |
+| Unit tests (host) | 417 | Scheduler model, IPC state machine (exhaustive) + decision functions, process lifecycle + transfer plan + teardown plan, buddy allocator, page tables, ExceptionContext ABI, ESR decode, HandleKind + handle ops, VirtIO types + layout, block protocol, FDT parser, device probe protocol, notifications, wait readiness, ticket lock (multi-threaded), feature negotiation |
+| Integration tests (QEMU) | 43 | Full boot through 13 phases, scheduler/MMU integration, IPC bootstrap, caller token delivery (positive + negative assertions), thread exit cleanup, thread creation |
 | Stack analysis | 4 entry points | No recursion, depth within 8KB budget, per-function 1536B cap, all indirect calls annotated, both debug and release profiles |
-| Pointer cast lint | 70 | Every `as *const` / `as *mut` in kernel code has a SAFETY comment |
+| Pointer cast lint | 70+ | Every `as *const` / `as *mut` in kernel code has a SAFETY comment |
 
 The IPC state machine test exhaustively explores all reachable system states (endpoint state x per-client reply state x thread states) via BFS with a 3-thread model and verifies: no kernel-caused deadlocks, all 8 invariants hold, all effect orderings correct (BlockCurrent always last, UnblockThread before ClearReply).
 
@@ -126,6 +137,7 @@ brew install qemu  # or apt install qemu-system-aarch64
 make build            # Build (runs stack + pointer checks first)
 make run              # Build and run in QEMU
 make run-display      # Build and run with ramfb display window
+make run-blk          # Build and run with virtio-blk disk (creates test.img)
 make test             # Run all tests (unit + integration + stack)
 make test-unit        # Host-side unit tests only
 make test-qemu        # QEMU integration tests only
@@ -134,7 +146,7 @@ make check-pointers   # Pointer cast SAFETY annotation check
 make objdump          # Disassemble the kernel
 ```
 
-QEMU is invoked with two UARTs (UART0 for kernel debug, UART1 for userspace driver), GICv3, and a serial mux. Press Ctrl-A then X to exit. `make run-display` adds `-device ramfb -display cocoa` for the framebuffer window. See `Makefile` for the full command.
+QEMU is invoked with two UARTs (UART0 for kernel debug, UART1 for userspace driver), GICv3, and a serial mux. Press Ctrl-A then X to exit. `make run-display` adds `-device ramfb -display cocoa` for the framebuffer window. `make run-blk` adds a 1MB virtio-blk device with modern MMIO transport. See `Makefile` for the full command.
 
 ## Project structure
 
@@ -189,7 +201,10 @@ lockjaw-types/               # Pure-logic library crate, testable on host
     buddy.rs                 # Buddy allocator (bitmap-per-order, contiguous support)
     page_table.rs            # PageTableEntry, PageTable, PageTableWalk, MapWalk
     rights.rs                # Rights bitmask
-    object.rs                # ObjectType, create-info structs, CloseHandleResult, TeardownHandleAction
+    object.rs                # ObjectType, HandleKind enum, HandleEntry, CloseHandleResult, TeardownHandleAction
+    handle_ops.rs            # Pure handle-table slot operations (insert/lookup/remove/rights)
+    virtio.rs                # VirtIO MMIO registers, virtqueue types, block request types, feature negotiation
+    block.rs                 # Block device IPC protocol (CMD_GET_INFO/ALLOC_BUFFER/READ/WRITE/FREE_BUFFER)
     ipc_state.rs             # IPC state machine model + kernel-facing decision functions (decide_send/receive/call/reply)
     exception.rs             # ExceptionContext ABI, ESR decode, sync exception classification
     thread.rs                # SavedContext, Tcb, TcbCreateInfo, ThreadBootstrap ABI
@@ -199,9 +214,9 @@ lockjaw-types/               # Pure-logic library crate, testable on host
     vmem.rs                  # Page table walk/map validation, index computation
     wait.rs                  # sys_wait_any readiness model, ReadinessWaiter
     fdt.rs                   # Flattened Device Tree parser
-    device.rs                # Device types, compatible string hashing
+    device.rs                # Device types, compatible string hashing, probe/claim protocol constants
     elf.rs                   # ELF64 parser
-    syscall.rs               # Syscall numbers, SyscallError type, syscall_name(), ALLOC_FLAG_CONTIGUOUS
+    syscall.rs               # Syscall numbers (27), SyscallError type, syscall_name()
     constants.rs             # Stack canary, fill pattern, stack base address
     scheduler.rs             # Round-robin scheduling model
     user_pod.rs              # UserPod trait for safe copy_from_user
@@ -210,10 +225,11 @@ user/                        # Userspace binaries (separate Cargo projects)
   init/                      # Init process -- spawns and bootstraps all children
   hello/                     # Hello process -- bootstrap protocol test
   uart-driver/               # UART driver -- claims PL011 from device manager
-  device-manager/            # Device manager -- DTB parsing, device claim IPC server
+  device-manager/            # Device manager -- DTB parsing, probe/claim-by-addr IPC
   ramfb-driver/              # Display driver -- fw_cfg DMA, contiguous framebuffer
+  virtio-blk-driver/         # VirtIO block driver -- MMIO transport, virtqueue, BlockEngine
   display-test/              # Display DDI test client -- queries modes, draws gradient
-  lockjaw-userlib/           # Shared userspace library (syscall wrappers, display DDI, typed handles)
+  lockjaw-userlib/           # Shared library (syscalls, display DDI, block DDI, virtqueue, PageSetGuard)
 
 docs/                        # Book of Lockjaw -- design documentation
   memory-model.md            # Why the kernel never allocates
@@ -254,9 +270,11 @@ tests/
 | 10. Device Manager and Display | Done | DTB parsing, device claim IPC, MMIO PageSets, ramfb driver with DMA framebuffer |
 | 11. SMP | Done | Per-CPU stacks, PSCI secondary boot, Giant Kernel Lock, per-CPU scheduler and idle threads |
 | 12. PageSet Lifecycle | Done | Mapping tracking, ownership transfer, refcounting, free-on-zero, process exit cleanup |
-| 13. Architecture Hardening | In progress | Extracting pure logic to lockjaw-types (push→pull), pinning ABI contracts, making illegal states unrepresentable |
-| 14. Real Hardware | Planned | Bring-up on a simple AArch64 board (Raspberry Pi 4 or similar) |
-| 15. POSIX Compatibility | Planned | POSIX personality server in userspace, musl libc port |
+| 13. Caller Tokens | Done | Kernel-assigned opaque per-endpoint caller tokens for multi-client IPC isolation |
+| 14. VirtIO Block Driver | Done | VirtIO MMIO transport, split virtqueue with barriers, block engine + server framework, per-device GIC trigger mode, selftest reads sector 0 |
+| 15. Architecture Hardening | In progress | Extracting pure logic to lockjaw-types (push→pull), making illegal states unrepresentable |
+| 16. Real Hardware | Planned | Bring-up on a simple AArch64 board (Raspberry Pi 4 or similar) |
+| 17. POSIX Compatibility | Planned | POSIX personality server in userspace, musl libc port |
 
 ## License
 
