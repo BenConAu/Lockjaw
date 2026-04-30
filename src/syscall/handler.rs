@@ -381,12 +381,15 @@ fn sys_wait_notification(ctx: &mut ExceptionContext) -> Result<u64, SyscallError
     }
 }
 
-/// sys_bind_irq(intid, notification_handle) — bind a hardware IRQ to a notification.
-/// x0 = hardware INTID, x1 = notification handle.
+/// sys_bind_irq(intid, notification_handle, flags) — bind a hardware IRQ to a notification.
+/// x0 = hardware INTID, x1 = notification handle, x2 = flags.
+/// flags bit 0: 1 = edge-triggered, 0 = level-triggered (default).
 /// When the IRQ fires, the kernel signals the notification (increments timeline by 1).
 fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
     let intid = ctx.gpr[0] as u32;
     let notif_handle = ctx.gpr[1] as u32;
+    let flags = ctx.gpr[2];
+    let edge_triggered = flags & 1 != 0;
 
     // bind_irq needs the notification paddr for the arch/ binding layer,
     // not a mutable reference — use the existing typed lookup.
@@ -401,7 +404,7 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
         if intid >= 32 {
             // SAFETY: intid validated by irq_bind::bind; enable_spi is a GIC
             // MMIO write that is safe to execute for any valid SPI.
-            unsafe { crate::arch::aarch64::gic::enable_spi(intid) };
+            unsafe { crate::arch::aarch64::gic::enable_spi(intid, edge_triggered) };
         }
         SyscallError::OK
     } else {

@@ -267,18 +267,29 @@ pub fn sys_recv_nb(ep: EndpointHandle) -> Result<u64, SyscallError> {
 }
 
 /// Bind a hardware IRQ to a notification.
+/// Bind a hardware IRQ to a notification (level-triggered, the default).
 pub fn sys_bind_irq(intid: u64, notif: NotificationHandle) -> SyscallError {
+    sys_bind_irq_flags(intid, notif, 0)
+}
+
+/// Bind a hardware IRQ to a notification with explicit trigger flags.
+/// flags bit 0: 1 = edge-triggered, 0 = level-triggered.
+pub fn sys_bind_irq_flags(intid: u64, notif: NotificationHandle, flags: u64) -> SyscallError {
     let err: u64;
     unsafe {
         asm!(
             "svc #0",
             inlateout("x0") intid => err,
             in("x1") notif.0,
+            in("x2") flags,
             in("x8") SYS_BIND_IRQ,
         );
     }
     SyscallError(err)
 }
+
+/// IRQ trigger flag: edge-triggered delivery.
+pub const IRQ_FLAG_EDGE: u64 = 1;
 
 /// Wait on a notification until the timeline value reaches the threshold.
 /// Returns the current counter value on success, or blocks until it does.

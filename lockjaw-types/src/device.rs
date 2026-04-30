@@ -64,21 +64,21 @@ pub const CMD_CLAIM_DEVICE: u64 = 1;
 /// claimed devices), so it is stable regardless of concurrent claims.
 ///
 /// For unclaimed devices: the device-manager temporarily maps the
-/// MMIO page, reads u32 at offset 0 (magic) and offset 8 (device_id),
-/// unmaps, and returns the values.
-///
-/// For claimed devices: MMIO cannot be read (another driver owns it),
-/// so mmio_device_id = PROBE_DEVICE_CLAIMED (0xFFFF_FFFF).
+/// MMIO page, reads the device_id register, unmaps, and returns it.
+/// Magic validation is done internally by the device-manager; if
+/// magic is wrong, the response is PROBE_ERR.
 ///
 /// Request:  msg = [CMD_PROBE_DEVICE, compatible_hash, index, 0]
-///   index: absolute index among all matching devices (0 = first)
-/// Response: msg = [mmio_addr, intid, mmio_magic, mmio_device_id]
-///   mmio_addr = 0: no device at this index (end of list).
-///   mmio_device_id = PROBE_DEVICE_CLAIMED: device exists but is claimed.
+/// Response: msg = [status, mmio_addr, intid, device_id]
+///   status: PROBE_OK, PROBE_END, PROBE_CLAIMED, or PROBE_ERR.
+///   mmio_addr/intid/device_id only meaningful when status = PROBE_OK.
 pub const CMD_PROBE_DEVICE: u64 = 2;
 
-/// Sentinel value for mmio_device_id when the probed device is claimed.
-pub const PROBE_DEVICE_CLAIMED: u64 = 0xFFFF_FFFF;
+/// Probe response status codes.
+pub const PROBE_OK:      u64 = 0; // device found, device_id valid
+pub const PROBE_END:     u64 = 1; // no device at this index (end of list)
+pub const PROBE_CLAIMED: u64 = 2; // device exists but already claimed
+pub const PROBE_ERR:     u64 = 3; // internal failure (register/map/bad magic)
 
 /// Claim a device by its exact MMIO physical address (TOCTOU-safe).
 /// The driver first uses CMD_PROBE_DEVICE to discover the mmio_addr,

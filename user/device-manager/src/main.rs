@@ -180,9 +180,11 @@ pub extern "C" fn _start() -> ! {
 /// including claimed ones. This makes enumeration stable regardless
 /// of concurrent claims by other drivers.
 ///
-/// For unclaimed devices: temporarily maps MMIO, reads magic + device_id.
-/// For claimed devices: returns PROBE_DEVICE_CLAIMED as device_id.
+/// Response: [status, mmio_addr, intid, device_id].
+/// Magic validation is done internally; bad magic → PROBE_ERR.
 fn handle_probe_device(devices: &mut lockjaw_types::fdt::FdtDevices, msg: &[u64; 4]) {
+    use lockjaw_types::device::*;
+
     let requested_hash = msg[1];
     let index = msg[2] as usize;
 
@@ -202,27 +204,24 @@ fn handle_probe_device(devices: &mut lockjaw_types::fdt::FdtDevices, msg: &[u64;
     let idx = match target_idx {
         Some(i) => i,
         None => {
-            // No device at this index — end of list.
-            sys_reply(0, 0, 0, 0);
+            sys_reply(PROBE_END, 0, 0, 0);
             return;
         }
     };
 
     let dev = devices.devices[idx];
 
-    // If claimed, return the address + intid but signal CLAIMED for device_id.
-    // We can't map the MMIO page — the claiming driver already owns it.
     if dev.claimed {
-        sys_reply(dev.mmio_addr, dev.intid as u64, 0, lockjaw_types::device::PROBE_DEVICE_CLAIMED);
+        sys_reply(PROBE_CLAIMED, dev.mmio_addr, dev.intid as u64, 0);
         return;
     }
 
-    // Unclaimed: register + map MMIO page temporarily to read magic + device_id.
+    // Unclaimed: register + map MMIO page temporarily to read device_id.
     let mmio_ps = match sys_register_device_page(dev.mmio_addr) {
         Ok(id) => id,
         Err(_) => {
             puts("devmgr: probe register FAILED\n");
-            sys_reply(0, 0, 0, 0);
+            sys_reply(PROBE_ERR, dev.mmio_addr, dev.intid as u64, 0);
             return;
         }
     };
@@ -232,13 +231,17 @@ fn handle_probe_device(devices: &mut lockjaw_types::fdt::FdtDevices, msg: &[u64;
         puts("devmgr: probe map FAILED\n");
         VMEM.free(probe_va, 1);
         sys_close_handle(mmio_ps);
-        sys_reply(0, 0, 0, 0);
+        sys_reply(PROBE_ERR, dev.mmio_addr, dev.intid as u64, 0);
         return;
     }
 
-    // Read magic (offset 0) and device_id (offset 8) via volatile.
-    let magic = unsafe { ptr::read_volatile(probe_va as *const u32) };
-    let device_id = unsafe { ptr::read_volatile((probe_va + 8) as *const u32) };
+    // Read magic (offset 0) and device_id (offset 8) within the device's
+    // sub-page region. Multiple virtio-mmio devices share a single 4K page
+    // (each device is 512 bytes), so we must add the intra-page offset.
+    let intra_page = dev.mmio_addr & 0xFFF;
+    let dev_base = probe_va + intra_page;
+    let magic = unsafe { ptr::read_volatile(dev_base as *const u32) };
+    let device_id = unsafe { ptr::read_volatile((dev_base + 8) as *const u32) };
 
     // Teardown: unmap first, then close handle, then free VA.
     // Ordering matters: VA must not be freed while still mapped.
@@ -247,9 +250,15 @@ fn handle_probe_device(devices: &mut lockjaw_types::fdt::FdtDevices, msg: &[u64;
     if unmap_ok {
         VMEM.free(probe_va, 1);
     }
-    // If unmap failed, leak the VA rather than hand out a still-mapped page.
 
-    sys_reply(dev.mmio_addr, dev.intid as u64, magic as u64, device_id as u64);
+    // Validate magic internally — bad magic means the device is not
+    // a valid virtio-mmio transport.
+    if magic != 0x74726976 {
+        sys_reply(PROBE_ERR, dev.mmio_addr, dev.intid as u64, 0);
+        return;
+    }
+
+    sys_reply(PROBE_OK, dev.mmio_addr, dev.intid as u64, device_id as u64);
 }
 
 // ---------------------------------------------------------------------------

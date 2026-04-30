@@ -2,9 +2,9 @@ use crate::mm::addr::PhysAddr;
 use core::cell::UnsafeCell;
 
 /// Maximum number of IRQ-to-Notification bindings.
-/// Must be > 33 to cover UART0 (SPI 1 = INTID 33).
+/// Must cover UART (INTID 33-40) and virtio-mmio (INTID 48-79).
 /// Known limitation: static table, see docs/tech-debt.md.
-const MAX_BINDINGS: usize = 64;
+const MAX_BINDINGS: usize = 96;
 
 // ---------------------------------------------------------------------------
 // IrqBindings singleton

@@ -59,7 +59,9 @@ run-display: build
 run-blk: build
 	@test -f test.img || dd if=/dev/zero of=test.img bs=1M count=1 2>/dev/null
 	$(QEMU) $(QEMU_FLAGS) \
-		-drive file=test.img,format=raw,if=virtio \
+		-global virtio-mmio.force-legacy=false \
+		-drive file=test.img,format=raw,if=none,id=blk0 \
+		-device virtio-blk-device,drive=blk0 \
 		$(KERNEL_ELF)
 
 objdump: build

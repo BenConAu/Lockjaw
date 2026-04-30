@@ -15,7 +15,7 @@ use lockjaw_userlib::block::{BlockEngine, BlockInfo, BlockError, run_block_serve
 use lockjaw_userlib::virtqueue::{Virtqueue, mmio_read32, mmio_write32};
 use lockjaw_types::virtio::*;
 use lockjaw_types::device::{VIRTIO_MMIO_HASH, CMD_PROBE_DEVICE, CMD_CLAIM_BY_ADDR,
-                            PROBE_DEVICE_CLAIMED};
+                            PROBE_OK, PROBE_END};
 
 // ---------------------------------------------------------------------------
 // VirtIO block engine
@@ -242,13 +242,14 @@ pub extern "C" fn _start() -> ! {
             Ok(r) => r,
             Err(_) => { puts("blk: probe FAILED\n"); halt(); }
         };
-        let addr = probe[0];
+        let status = probe[0];
+        let addr = probe[1];
         let device_id = probe[3];
-        if addr == 0 {
+        if status == PROBE_END {
             puts("blk: no virtio-blk device found\n");
             halt();
         }
-        if device_id == PROBE_DEVICE_CLAIMED || device_id != DEVICE_ID_BLOCK as u64 {
+        if status != PROBE_OK || device_id != DEVICE_ID_BLOCK as u64 {
             skip += 1;
             continue;
         }
@@ -269,14 +270,18 @@ pub extern "C" fn _start() -> ! {
     }
     let mmio_ps = PageSetHandle(claim[1]);
     let irq_intid = claim[2];
-    puts("blk: claimed device\n");
+    puts("blk: claimed device, intid=");
+    put_decimal(irq_intid);
+    putc(b'\n');
 
-    // Map MMIO page.
-    let mmio_va = VMEM.alloc(1).expect("VA exhausted for MMIO");
-    if !sys_map_pages(mmio_ps, mmio_va, MAP_FLAG_DEVICE).is_ok() {
+    // Map MMIO page. Multiple virtio-mmio devices share a single 4K page
+    // (each device is 512 bytes), so add the intra-page offset.
+    let mmio_page_va = VMEM.alloc(1).expect("VA exhausted for MMIO");
+    if !sys_map_pages(mmio_ps, mmio_page_va, MAP_FLAG_DEVICE).is_ok() {
         puts("blk: map MMIO FAILED\n");
         halt();
     }
+    let mmio_va = mmio_page_va + (mmio_addr & 0xFFF);
 
     // Verify magic.
     let magic = unsafe { mmio_read32(mmio_va, VIRTIO_MMIO_MAGIC) };
@@ -384,7 +389,7 @@ pub extern "C" fn _start() -> ! {
         // Bind IRQ.
         let irq_notif = sys_alloc_pages(1).and_then(sys_create_notification)
             .expect("blk: create irq notif");
-        if !sys_bind_irq(irq_intid, irq_notif).is_ok() {
+        if !sys_bind_irq_flags(irq_intid, irq_notif, IRQ_FLAG_EDGE).is_ok() {
             puts("blk: bind IRQ FAILED\n");
             halt();
         }
@@ -401,6 +406,39 @@ pub extern "C" fn _start() -> ! {
             dma_buffers: [DMA_BUFFER_EMPTY; MAX_DMA_BUFFERS],
             dma_count: 0,
         };
+
+        // Self-test: read sector 0 and print the first 16 bytes.
+        let test_buf = engine.alloc_buffer(1).expect("blk: selftest alloc");
+        let test_va = VMEM.alloc(1).expect("VA exhausted for selftest");
+        if !sys_map_pages(test_buf, test_va, 0).is_ok() {
+            puts("blk: selftest map FAILED\n");
+            halt();
+        }
+        // Zero the buffer so we can distinguish read data from garbage.
+        zero_page_at_va(test_va);
+        match engine.read(0, 1, test_buf) {
+            Ok(()) => {
+                puts("blk: selftest read OK, sector 0 = [");
+                let data = test_va as *const u8;
+                for i in 0..16 {
+                    let b = core::ptr::read_volatile(data.add(i));
+                    let hi = (b >> 4) & 0xF;
+                    let lo = b & 0xF;
+                    if i > 0 { putc(b' '); }
+                    putc(if hi < 10 { b'0' + hi } else { b'a' + hi - 10 });
+                    putc(if lo < 10 { b'0' + lo } else { b'a' + lo - 10 });
+                }
+                puts("]\n");
+            }
+            Err(_) => {
+                puts("blk: selftest read FAILED\n");
+            }
+        }
+        let unmap_ok = sys_unmap_pages(test_buf, test_va).is_ok();
+        engine.free_buffer(test_buf);
+        if unmap_ok {
+            VMEM.free(test_va, 1);
+        }
 
         puts("blk: serving\n");
         run_block_server(&mut engine, server_ep);

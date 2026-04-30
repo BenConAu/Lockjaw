@@ -198,7 +198,7 @@ pub unsafe fn handle_irq() -> u32 {
 ///
 /// # Safety
 /// Must be called after `init()`. `intid` must be an SPI (>= 32).
-pub unsafe fn enable_spi(intid: u32) {
+pub unsafe fn enable_spi(intid: u32, edge_triggered: bool) {
     let reg = (intid / 32) as u64;     // Which 32-bit register
     let bit = intid % 32;              // Which bit within that register
 
@@ -216,6 +216,16 @@ pub unsafe fn enable_spi(intid: u32) {
         let cur = mmio_read32(pri_addr & !3);
         (cur & !(0xFF << byte_offset)) | (0xA0 << byte_offset)
     });
+
+    // Configure trigger type in GICD_ICFGR.
+    // Each INTID gets 2 bits: bit[1] = 1 for edge, 0 for level.
+    if edge_triggered {
+        let icfg_reg = (intid / 16) as u64;
+        let icfg_bit = ((intid % 16) * 2 + 1) as u32;
+        let icfg_addr = gicd_addr() + 0xC00 + icfg_reg * 4;
+        let icfg = mmio_read32(icfg_addr);
+        mmio_write32(icfg_addr, icfg | (1 << icfg_bit));
+    }
 
     // Enable in GICD_ISENABLER (write-1-to-set)
     let en_addr = gicd_addr() + GICD_ISENABLER + reg * 4;
