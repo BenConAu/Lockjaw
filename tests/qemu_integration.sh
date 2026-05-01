@@ -5,10 +5,11 @@ set -e
 
 TIMEOUT=30
 QEMU="qemu-system-aarch64"
-QEMU_FLAGS="-machine virt,gic-version=3 -cpu cortex-a53 -nographic"
+GIC_VERSION="${GIC_VERSION:-3}"
+QEMU_FLAGS="-machine virt,gic-version=${GIC_VERSION} -cpu cortex-a53 -nographic"
 KERNEL="target/aarch64-unknown-none/debug/lockjaw"
 
-echo "=== Lockjaw QEMU Integration Tests ==="
+echo "=== Lockjaw QEMU Integration Tests (GICv${GIC_VERSION}) ==="
 echo "Booting kernel with ${TIMEOUT}s timeout..."
 echo
 
@@ -49,7 +50,8 @@ assert_contains "Stack canary intact" "Stack canary written and verified"
 
 echo "Phase 3 — Exceptions and Interrupts:"
 assert_contains "Exception vectors installed" "Exception vector table at VBAR"
-assert_contains "GIC initialized" "GICv3 interrupt controller"
+assert_contains "GIC initialized" "GIC interrupt controller initialized"
+assert_contains "GICv${GIC_VERSION} distributor" "Correct GIC version detected"
 assert_contains "Timer armed" "Virtual timer configured"
 assert_contains "ticks received" "Timer interrupts firing"
 

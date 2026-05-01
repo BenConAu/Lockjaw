@@ -808,7 +808,7 @@ pub extern "C" fn secondary_main(cpu_id: u64) -> ! {
 
     // Initialize this CPU's GIC redistributor + CPU interface (silent —
     // no kprintln, UART not serialized during secondary bring-up).
-    unsafe { arch::aarch64::gic::init_redistributor(cpu_id as u32); }
+    unsafe { arch::aarch64::gic::init_cpu(cpu_id as u32); }
 
     // Arm this CPU's virtual timer (silent variant)
     unsafe { arch::aarch64::timer::init_secondary(); }
