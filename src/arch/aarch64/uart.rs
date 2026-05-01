@@ -1,8 +1,10 @@
 use core::cell::UnsafeCell;
 use core::ptr;
 
-/// PL011 UART0 physical base address (from platform constants).
-const UART0_BASE_PHYS: usize = super::platform::UART0_BASE_PHYS as usize;
+/// PL011 UART0 physical base address — compile-time default for early
+/// boot prints (before DTB discovery). Updated by set_base() once the
+/// DTB is parsed.
+const DEFAULT_UART0_BASE: usize = super::platform::DEFAULT_UART0_BASE as usize;
 
 /// TX FIFO Full flag in UARTFR.
 const UARTFR_TXFF: u32 = 1 << 5;
@@ -22,7 +24,7 @@ struct UartBase(UnsafeCell<usize>);
 /// boot (use_high_addresses), then only read. No concurrent access.
 unsafe impl Sync for UartBase {}
 
-static UART: UartBase = UartBase(UnsafeCell::new(UART0_BASE_PHYS));
+static UART: UartBase = UartBase(UnsafeCell::new(DEFAULT_UART0_BASE));
 
 /// PL011 UART driver — zero-sized, hardcoded MMIO addresses.
 ///
@@ -52,12 +54,22 @@ impl Uart {
         }
     }
 
+    /// Update the UART base address from DTB discovery.
+    /// Called after platform::discover(), before use_high_addresses().
+    ///
+    /// # Safety
+    /// Must be called during single-core boot, before any concurrent access.
+    pub unsafe fn set_base(phys_addr: u64) {
+        *UART.0.get() = phys_addr as usize;
+    }
+
     /// Switch UART to higher-half virtual addresses.
     ///
     /// # Safety
     /// Higher-half mapping must be active (TTBR1 installed).
     pub unsafe fn use_high_addresses() {
-        *UART.0.get() = UART0_BASE_PHYS + crate::mm::addr::KERNEL_VA_OFFSET as usize;
+        let current = *UART.0.get();
+        *UART.0.get() = current + crate::mm::addr::KERNEL_VA_OFFSET as usize;
     }
 
     /// Transmit a string, converting `\n` to `\r\n` for serial terminals.

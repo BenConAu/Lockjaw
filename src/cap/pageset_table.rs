@@ -304,7 +304,7 @@ pub fn free_by_header_paddr(header_paddr: u64) {
 
     // Free data pages (skip device MMIO pages — they are below RAM_START
     // and were never allocated from the buddy allocator).
-    let ram_start = crate::mm::addr::RAM_START.as_u64();
+    let ram_start = crate::mm::addr::ram_start().as_u64();
     for i in 0..count {
         if let Some(paddr) = header.get_page(i) {
             if paddr >= ram_start {

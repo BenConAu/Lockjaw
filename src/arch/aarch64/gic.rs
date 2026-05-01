@@ -3,13 +3,8 @@ use core::arch::asm;
 use core::ptr;
 
 // ---------------------------------------------------------------------------
-// GICv3 MMIO base addresses (QEMU virt machine)
+// GIC MMIO base addresses (from DTB via platform discovery)
 // ---------------------------------------------------------------------------
-
-use super::platform;
-
-const GICD_BASE_PHYS: u64 = platform::GICD_BASE_PHYS;
-const GICR_BASE_PHYS: u64 = platform::GICR_BASE_PHYS;
 
 /// Distributor registers (offsets from GICD_BASE)
 const GICD_CTLR: u64 = 0x0000;
@@ -23,7 +18,7 @@ const GICD_IPRIORITYR: u64 = 0x0400;   // Interrupt Priority Registers (one byte
 const GICR_WAKER: u64 = 0x0014;
 const GICR_SGI_BASE: u64 = 0x10000;
 
-const TIMER_PPI_INTID: u32 = platform::VIRTUAL_TIMER_INTID;
+const TIMER_PPI_INTID: u32 = super::platform::VIRTUAL_TIMER_INTID;
 
 // ---------------------------------------------------------------------------
 // GICv3 system register helpers (ICC_* accessed via MSR/MRS)
@@ -80,11 +75,11 @@ unsafe fn icc_eoir1_el1_write(intid: u32) {
 // ---------------------------------------------------------------------------
 
 fn gicd_addr() -> u64 {
-    GICD_BASE_PHYS + KERNEL_VA_OFFSET
+    super::platform::info().gicd_base + KERNEL_VA_OFFSET
 }
 
 fn gicr_addr() -> u64 {
-    GICR_BASE_PHYS + KERNEL_VA_OFFSET
+    super::platform::info().gic_secondary_base + KERNEL_VA_OFFSET
 }
 
 unsafe fn mmio_read32(addr: u64) -> u32 {
@@ -106,6 +101,11 @@ unsafe fn mmio_write32(addr: u64, val: u32) {
 /// # Safety
 /// Must be called after MMU + higher-half mapping is active.
 pub unsafe fn init_distributor() {
+    // Guard: GICv2 requires a different driver (Phase C).
+    // If the DTB reported GICv2, we cannot proceed with the GICv3 init.
+    if super::platform::info().gic_v2 {
+        panic!("GICv2 detected but only GICv3 driver is implemented");
+    }
     let typer = mmio_read32(gicd_addr() + GICD_TYPER);
     let irq_lines = ((typer & 0x1F) + 1) * 32;
     crate::kprintln!("  GIC distributor: {} IRQ lines", irq_lines);

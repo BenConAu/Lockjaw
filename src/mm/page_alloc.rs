@@ -1,4 +1,4 @@
-use crate::mm::addr::{PhysAddr, PhysPage, RAM_START, TOTAL_PAGES, PAGE_SIZE};
+use crate::mm::addr::{PhysAddr, PhysPage, PAGE_SIZE};
 use crate::mm::kernel_ptr::KernelMut;
 use core::cell::UnsafeCell;
 use lockjaw_types::buddy::BuddyAllocator;
@@ -44,7 +44,7 @@ static ALLOCATOR: FrameAllocator = FrameAllocator::new();
 ///   2. [stacks_end, RAM_END)      — everything after the stacks
 ///
 /// Reserved regions (never freed):
-///   - [RAM_START, kernel_start)   — firmware, DTB
+///   - [crate::mm::addr::ram_start(), kernel_start)   — firmware, DTB
 ///   - [kernel_start, kernel_end)  — kernel image
 ///   - [stacks_start, stacks_end)  — per-CPU guard pages + stacks
 ///
@@ -59,7 +59,7 @@ pub unsafe fn init_with_gap(
     stacks_end: PhysAddr,
 ) {
     let buddy = &mut *ALLOCATOR.buddy.get();
-    buddy.init(TOTAL_PAGES);
+    buddy.init(crate::mm::addr::total_pages());
 
     // Round up to next page boundary
     let kernel_end_page = round_up_page(kernel_end);
@@ -73,12 +73,12 @@ pub unsafe fn init_with_gap(
     }
 
     // Region 2: everything after the stacks
-    if TOTAL_PAGES > stacks_end_page {
-        let post_count = TOTAL_PAGES - stacks_end_page;
+    if crate::mm::addr::total_pages() > stacks_end_page {
+        let post_count = crate::mm::addr::total_pages() - stacks_end_page;
         buddy.add_range(stacks_end_page, post_count);
     }
 
-    let reserved = TOTAL_PAGES - buddy.free_count();
+    let reserved = crate::mm::addr::total_pages() - buddy.free_count();
     crate::kprintln!("  Page allocator: {} reserved, {} free",
         reserved, buddy.free_count());
 }
@@ -142,9 +142,9 @@ pub fn zero_page(paddr: PhysAddr) {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a physical address to a page index relative to RAM_START.
+/// Convert a physical address to a page index relative to crate::mm::addr::ram_start().
 fn page_index(addr: PhysAddr) -> usize {
-    ((addr.as_u64() - RAM_START.as_u64()) / PAGE_SIZE) as usize
+    ((addr.as_u64() - crate::mm::addr::ram_start().as_u64()) / PAGE_SIZE) as usize
 }
 
 /// Page index rounded up (for end-of-region addresses).
@@ -155,5 +155,5 @@ fn round_up_page(addr: PhysAddr) -> usize {
 
 /// Convert a page index back to a PhysPage.
 fn index_to_page(idx: usize) -> PhysPage {
-    PhysPage::containing(PhysAddr::new(RAM_START.as_u64() + (idx as u64) * PAGE_SIZE))
+    PhysPage::containing(PhysAddr::new(crate::mm::addr::ram_start().as_u64() + (idx as u64) * PAGE_SIZE))
 }

@@ -3,11 +3,25 @@ pub use lockjaw_types::addr::*;
 
 // Kernel-specific constants (not in lockjaw-types).
 
-/// QEMU virt RAM: 128 MB starting at 0x4000_0000.
-pub const RAM_START: PhysAddr = PhysAddr::new(0x4000_0000);
-pub const RAM_END: PhysAddr = PhysAddr::new(0x4800_0000);
-pub const RAM_SIZE: u64 = 0x0800_0000;
-pub const TOTAL_PAGES: usize = (RAM_SIZE / PAGE_SIZE) as usize; // 32768
+/// RAM layout — read from platform discovery at runtime.
+/// These functions replace the old compile-time constants.
+pub fn ram_start() -> PhysAddr {
+    PhysAddr::new(crate::arch::aarch64::platform::info().ram_base)
+}
+
+pub fn ram_size() -> u64 {
+    crate::arch::aarch64::platform::info().ram_size
+}
+
+pub fn ram_end() -> PhysAddr {
+    PhysAddr::new(crate::arch::aarch64::platform::info().ram_base
+                + crate::arch::aarch64::platform::info().ram_size)
+}
+
+pub fn total_pages() -> usize {
+    (ram_size() / PAGE_SIZE) as usize
+}
+
 
 /// Offset added to physical addresses to produce kernel virtual addresses.
 pub const KERNEL_VA_OFFSET: u64 = 0xFFFF_0000_0000_0000;

@@ -695,7 +695,7 @@ mod tests {
     fn walk_1gb_block_at_l1() {
         // VA 0x4000_1234: L0=0, L1=1, offset within 1GB = 0x1234
         let va = 0x4000_1234;
-        let (mut w, r) = PageTableWalk::start(0x1_0000, va);
+        let (mut w, _) = PageTableWalk::start(0x1_0000, va);
 
         // L0 table
         let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
@@ -716,7 +716,7 @@ mod tests {
         let va = 0x0060_5678;
         let (mut w, _) = PageTableWalk::start(0x1_0000, va);
 
-        let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        let _r = w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
         let r = w.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
         // Should read L2[3]
         assert_eq!(r, WalkResult::Continue(0x3_0000 + 3 * 8));

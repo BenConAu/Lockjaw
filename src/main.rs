@@ -96,6 +96,19 @@ pub extern "C" fn kmain() -> ! {
         arch::aarch64::platform::RAM_BASE
     };
     kprintln!("DTB: paddr {:#x}", dtb_paddr);
+
+    // Discover platform hardware from DTB (pre-MMU, physical addresses).
+    arch::aarch64::platform::discover(dtb_paddr);
+    let plat = arch::aarch64::platform::info();
+
+    // Update UART base from DTB before any further prints go through
+    // the old default address. Safe: single-core, pre-MMU, sequential.
+    unsafe { arch::aarch64::uart::Uart::set_base(plat.uart0_base); }
+
+    kprintln!("Platform: UART={:#x} GICD={:#x} GICv{} RAM={:#x}+{:#x}",
+        plat.uart0_base, plat.gicd_base,
+        if plat.gic_v2 { "2" } else { "3" },
+        plat.ram_base, plat.ram_size);
     kprintln!();
 
     unsafe {
@@ -119,9 +132,9 @@ pub extern "C" fn kmain() -> ! {
 
     kprintln!();
     kprintln!("Physical memory: {:#x} - {:#x} ({} pages)",
-        mm::addr::RAM_START.as_u64(),
-        mm::addr::RAM_END.as_u64(),
-        mm::addr::TOTAL_PAGES);
+        mm::addr::ram_start().as_u64(),
+        mm::addr::ram_end().as_u64(),
+        mm::addr::total_pages());
 
     // Initialize page allocator — reserve firmware + kernel + per-CPU stacks.
     // The 2 MB alignment of __per_cpu_stacks creates a gap between

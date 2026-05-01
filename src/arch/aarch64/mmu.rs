@@ -304,7 +304,7 @@ pub unsafe fn enable_mmu_secondary() {
 /// must be a valid guard page physical address from a linker symbol.
 pub unsafe fn setup_guard_pages(guard_pages: &[PhysAddr]) {
     assert!(!guard_pages.is_empty(), "need at least one guard page");
-    let ram_base: u64 = 0x4000_0000;
+    let ram_base: u64 = super::platform::info().ram_base;
 
     // Step 1: Fill L2 with 2 MB block descriptors covering the 1 GB RAM region
     for i in 0..512 {

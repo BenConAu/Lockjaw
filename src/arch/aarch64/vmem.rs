@@ -61,7 +61,7 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     // Kernel identity map in L1 (workaround: kernel linked at phys addrs):
     // L1[1] = 1GB block at RAM_BASE (kernel-only)
     (*l1_va).entries[1] = PageTableEntry::new_block(
-        PhysAddr::new(super::platform::RAM_BASE),
+        PhysAddr::new(super::platform::info().ram_base),
         MAIR_NORMAL,
         AP_RW_EL1,
         SH_INNER,
@@ -76,14 +76,32 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     // L1[0] → L2
     (*l1_va).entries[0] = PageTableEntry::new_table(l2_page.start_addr());
 
-    // Device MMIO (GIC at 0x0800_0000, UART at 0x0900_0000) — kernel-only
-    let device_l2_idx = (super::platform::DEVICE_MMIO_BASE >> 21) as usize;
-    (*l2_va).entries[device_l2_idx] = PageTableEntry::new_block(
-        PhysAddr::new(super::platform::DEVICE_MMIO_BASE),
-        MAIR_DEVICE,
-        AP_RW_EL1,
-        SH_NON,
-    );
+    // Device MMIO — kernel-only, device memory attributes.
+    // On QEMU virt: GIC at 0x0800_0000, UART at 0x0900_0000 (first 1GB).
+    // On Pi 4B: peripherals at 0xFE00_0000 (fourth 1GB).
+    let device_mmio_base = super::platform::info().device_mmio_base;
+    let device_l1_idx = (device_mmio_base >> 30) as usize; // which 1GB slot
+    if device_l1_idx == 0 {
+        // Device MMIO in the first 1GB — use the L2 table (shared with
+        // user pages). Index is within the 512-entry L2.
+        let device_l2_idx = ((device_mmio_base >> 21) & 0x1FF) as usize;
+        (*l2_va).entries[device_l2_idx] = PageTableEntry::new_block(
+            PhysAddr::new(device_mmio_base),
+            MAIR_DEVICE,
+            AP_RW_EL1,
+            SH_NON,
+        );
+    } else {
+        // Device MMIO in a higher 1GB slot — map as a 1GB L1 block.
+        // Aligns down to the 1GB boundary containing device_mmio_base.
+        let block_base = device_l1_idx as u64 * (1 << 30);
+        (*l1_va).entries[device_l1_idx] = PageTableEntry::new_block(
+            PhysAddr::new(block_base),
+            MAIR_DEVICE,
+            AP_RW_EL1,
+            SH_NON,
+        );
+    }
 
     // Map each user page. Group by L2 index (2MB region) and allocate
     // L3 tables as needed.
