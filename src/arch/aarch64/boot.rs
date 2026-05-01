@@ -6,6 +6,12 @@ global_asm!(
 .global _start                       // Export _start for the linker ENTRY directive
 
 _start:
+    // Save x0 (firmware DTB pointer) before any clobber.
+    // QEMU may or may not pass DTB here; Pi firmware always does.
+    // Stored in x20 (callee-saved) until BSS is zeroed, then written
+    // to the BOOT_DTB_PADDR global.
+    mov     x20, x0                  // Preserve DTB pointer
+
     msr     DAIFSet, #0xf            // Mask all exceptions (Debug, Async, IRQ, FIQ)
 
     // --- Determine current exception level ---
@@ -46,7 +52,12 @@ _start:
     b       .Lbss_loop               // Repeat
 
 .Lbss_done:
-    // Store DTB paddr to global (after BSS zeroing so we don't clobber it).
+    // Store firmware DTB pointer to global (after BSS zeroing so we
+    // don't clobber it). x20 was saved from x0 at _start entry.
+    ldr     x0, =BOOT_DTB_PADDR     // Address of the global
+    str     x20, [x0]               // Store the saved DTB pointer
+
+    mov     x0, x20                  // Pass DTB pointer as first arg to kmain
     bl      kmain                    // Call Rust entry point
 
     // --- Halt if kmain ever returns ---

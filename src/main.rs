@@ -58,6 +58,11 @@ impl BootOnce {
     }
 }
 
+/// Firmware DTB pointer saved by boot.rs assembly. Written after BSS
+/// zeroing so the zero doesn't clobber it. Read by kmain to find the DTB.
+#[no_mangle]
+static mut BOOT_DTB_PADDR: u64 = 0;
+
 /// DTB PageSet ID, set once at boot. Returned by sys_get_boot_info.
 static DTB_PAGESET_ID: BootOnce = BootOnce::new();
 
@@ -69,11 +74,27 @@ pub fn dtb_pageset_id() -> u64 {
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
     kprintln!("=== Lockjaw Microkernel v{} ===", env!("CARGO_PKG_VERSION"));
-    kprintln!("Target: AArch64 (ARMv8-A), QEMU virt");
+    kprintln!("Target: AArch64 (ARMv8-A)");
 
-    // QEMU bare-metal boot places the DTB at the start of RAM.
-    // Ref: https://wiki.osdev.org/QEMU_AArch64_Virt_Bare_Bones
-    let dtb_paddr = arch::aarch64::platform::RAM_BASE;
+    // Use firmware DTB pointer if valid, fall back to RAM_BASE (QEMU).
+    // This runs BEFORE enable_mmu(), so we read the raw physical address
+    // directly — no KERNEL_VA_OFFSET translation.
+    let fw_dtb = unsafe { BOOT_DTB_PADDR };
+    let dtb_paddr = if fw_dtb != 0 {
+        // Check DTB magic at the firmware-provided address to validate.
+        let magic = unsafe {
+            // SAFETY: fw_dtb is from firmware (x0 at boot); pre-MMU physical address
+            let ptr = fw_dtb as *const u32;
+            u32::from_be(core::ptr::read_volatile(ptr))
+        };
+        if magic == 0xd00dfeed {
+            fw_dtb
+        } else {
+            arch::aarch64::platform::RAM_BASE
+        }
+    } else {
+        arch::aarch64::platform::RAM_BASE
+    };
     kprintln!("DTB: paddr {:#x}", dtb_paddr);
     kprintln!();
 
