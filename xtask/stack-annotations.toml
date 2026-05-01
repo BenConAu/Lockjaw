@@ -61,6 +61,8 @@
 "_start" = 0
 # _secondary_start: sets per-CPU SP, no frame allocation.
 "_secondary_start" = 0
+# _pivot_to_higher_half: adds KERNEL_VA_OFFSET to SP/FP/LR, no frame.
+"_pivot_to_higher_half" = 0
 
 # Compiler builtins — leaf functions, no stack frame.
 "memcpy" = 0

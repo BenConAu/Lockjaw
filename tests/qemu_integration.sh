@@ -3,7 +3,13 @@
 # Boots the kernel, captures serial output, and asserts expected strings.
 set -e
 
-TIMEOUT=30
+# GICv2 on QEMU is significantly slower (1 IPC round-trip/tick vs 135
+# on GICv3), so give it more time.
+if [ "${GIC_VERSION}" = "2" ]; then
+    TIMEOUT=60
+else
+    TIMEOUT=30
+fi
 QEMU="qemu-system-aarch64"
 GIC_VERSION="${GIC_VERSION:-3}"
 QEMU_FLAGS="-machine virt,gic-version=${GIC_VERSION} -cpu cortex-a53 -nographic"

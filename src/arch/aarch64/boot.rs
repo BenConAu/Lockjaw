@@ -14,6 +14,15 @@ _start:
 
     msr     DAIFSet, #0xf            // Mask all exceptions (Debug, Async, IRQ, FIQ)
 
+    // --- Compute physical offset ---
+    // The linker assigns symbols at fixed addresses (e.g., 0x40200000).
+    // The actual load address may differ (Pi 4B loads at 0x80000).
+    // phys_offset = actual_addr(_start) - linked_addr(_start)
+    // All pre-MMU symbol references must add this offset.
+    adr     x21, _start              // x21 = actual physical address of _start
+    ldr     x22, =_start             // x22 = linker-assigned address of _start
+    sub     x21, x21, x22           // x21 = phys_offset (0 on QEMU, negative/positive on Pi)
+
     // --- Determine current exception level ---
     mrs     x0, CurrentEL            // Read CurrentEL register
     lsr     x0, x0, #2              // Shift right to get EL number in bits [1:0]
@@ -27,7 +36,7 @@ _start:
     mov     x0, #0x3c5              // SPSR_EL2: EL1h (SP_EL1), DAIF bits all masked
     msr     SPSR_EL2, x0            // Set Saved Program Status Register for EL2
 
-    adr     x0, .Lat_el1            // Load address of EL1 entry point
+    adr     x0, .Lat_el1            // Load address of EL1 entry point (PC-relative, correct)
     msr     ELR_EL2, x0             // Set Exception Link Register — where eret jumps to
 
     eret                             // Return from EL2 → EL1 at .Lat_el1
@@ -39,12 +48,16 @@ _start:
     isb                              // Ensure CPACR is active before any FP use
 
     // --- Set up the kernel stack ---
-    ldr     x0, =__stack_top         // Load stack top address from linker symbol
+    // Apply phys_offset to the linker-assigned stack address.
+    ldr     x0, =__stack_top         // Linked address
+    add     x0, x0, x21             // Adjusted to actual physical address
     mov     sp, x0                   // Initialize stack pointer (grows downward)
 
     // --- Zero the BSS section ---
-    ldr     x0, =__bss_start         // x0 = start of BSS region
-    ldr     x1, =__bss_end           // x1 = end of BSS region
+    ldr     x0, =__bss_start         // Linked address
+    add     x0, x0, x21             // Adjust to physical
+    ldr     x1, =__bss_end           // Linked address
+    add     x1, x1, x21             // Adjust to physical
 .Lbss_loop:
     cmp     x0, x1                   // Have we reached the end?
     b.ge    .Lbss_done               // If so, stop
@@ -54,7 +67,8 @@ _start:
 .Lbss_done:
     // Store firmware DTB pointer to global (after BSS zeroing so we
     // don't clobber it). x20 was saved from x0 at _start entry.
-    ldr     x0, =BOOT_DTB_PADDR     // Address of the global
+    ldr     x0, =BOOT_DTB_PADDR     // Linked address
+    add     x0, x0, x21             // Adjust to physical
     str     x20, [x0]               // Store the saved DTB pointer
 
     mov     x0, x20                  // Pass DTB pointer as first arg to kmain
@@ -80,6 +94,11 @@ _secondary_start:
     // x0 = cpu_id (from PSCI context_id), preserve across EL2 drop
     mov     x19, x0                  // Save cpu_id in callee-saved register
 
+    // Compute phys_offset (same as primary)
+    adr     x21, _start
+    ldr     x22, =_start
+    sub     x21, x21, x22
+
     // --- EL2 → EL1 drop (same as primary) ---
     mrs     x1, CurrentEL            // Read CurrentEL
     lsr     x1, x1, #2              // EL number in bits [1:0]
@@ -103,7 +122,8 @@ _secondary_start:
     // --- Set per-CPU stack ---
     // Stack layout: __per_cpu_stacks + (cpu_id + 1) * 12288
     // Each CPU block: 4 KB guard + 8 KB stack = 12 KB = 12288 bytes.
-    ldr     x1, =__per_cpu_stacks    // Base of all per-CPU stacks
+    ldr     x1, =__per_cpu_stacks    // Linked address
+    add     x1, x1, x21             // Adjust to physical
     add     x2, x19, #1             // cpu_id + 1
     movz    x3, #12288               // Per-CPU block stride (4K guard + 8K stack)
     mul     x2, x2, x3              // (cpu_id + 1) * 12288
@@ -117,5 +137,25 @@ _secondary_start:
 .Lsec_halt:
     wfi
     b       .Lsec_halt
+
+// ---------------------------------------------------------------------------
+// Higher-half pivot — transitions SP, FP, and PC to TTBR1 addresses
+// ---------------------------------------------------------------------------
+// Called after TTBR1 is installed. Adds KERNEL_VA_OFFSET to SP, FP (x29),
+// and LR (x30), then returns via `ret`. The caller resumes at its
+// higher-half return address — all subsequent PC-relative references
+// resolve to higher-half (TTBR1) addresses.
+//
+// x0 = KERNEL_VA_OFFSET (passed as first argument)
+//
+// After this call, the kernel runs entirely in the upper VA half.
+// VBAR_EL1 (set later) gets a higher-half address automatically,
+// so exception entry works even when TTBR0 holds a user page table.
+.global _pivot_to_higher_half
+_pivot_to_higher_half:
+    add     sp, sp, x0              // SP → higher-half
+    add     x29, x29, x0           // FP → higher-half (for frame walks)
+    add     x30, x30, x0           // LR → higher-half (return address)
+    ret                              // Return to higher-half caller
 "#
 );

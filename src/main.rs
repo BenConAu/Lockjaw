@@ -252,6 +252,18 @@ pub extern "C" fn kmain() -> ! {
         for _ in 0..100_000 { core::hint::spin_loop(); }
     }
 
+    // Pivot PC, SP, and FP to higher-half (TTBR1) addresses.
+    // After this call, all PC-relative references resolve to higher-half
+    // VAs — VBAR gets a higher-half address, exception handlers run via
+    // TTBR1, and the kernel no longer depends on TTBR0 identity mapping.
+    // Must happen AFTER secondary CPU boot (PSCI needs physical entry
+    // address) and BEFORE exceptions::init (VBAR must be higher-half).
+    unsafe {
+        extern "C" { fn _pivot_to_higher_half(offset: u64); }
+        _pivot_to_higher_half(mm::addr::KERNEL_VA_OFFSET);
+    }
+    kprintln!("Pivoted to higher-half (TTBR1).");
+
     // Install exception vector table
     kprintln!();
     unsafe { arch::aarch64::exceptions::init(); }
@@ -478,8 +490,8 @@ pub extern "C" fn kmain() -> ! {
         // This thread drops to EL0 and becomes the init process, so it
         // gets its own user process (created later in the ELF loading path).
         // For now it belongs to the kernel process.
-        // SAFETY: linker symbol
-        let idle_stack_base = &__stack_bottom as *const u8 as u64 + mm::addr::KERNEL_VA_OFFSET;
+        // SAFETY: linker symbol — post-pivot, &__symbol gives higher-half VA directly
+        let idle_stack_base = &__stack_bottom as *const u8 as u64;
         cap::process_obj::process_inc_thread_count(kernel_proc_page);
 
         let idle_tcb_page = create_idle_tcb(
@@ -499,13 +511,15 @@ pub extern "C" fn kmain() -> ! {
         // saved_sp. When switched back, it resumes in secondary_main's
         // wfi loop.
         {
+            // Post-pivot: &__symbol gives higher-half VA directly (PC-relative
+            // from higher-half PC). No explicit + KERNEL_VA_OFFSET needed.
             let stack_bottoms = [
                 // SAFETY: linker symbol — per-CPU stack bottom for CPU 1
-                &__guard_page_1 as *const u8 as u64 + 4096 + mm::addr::KERNEL_VA_OFFSET,
+                &__guard_page_1 as *const u8 as u64 + 4096,
                 // SAFETY: linker symbol — per-CPU stack bottom for CPU 2
-                &__guard_page_2 as *const u8 as u64 + 4096 + mm::addr::KERNEL_VA_OFFSET,
+                &__guard_page_2 as *const u8 as u64 + 4096,
                 // SAFETY: linker symbol — per-CPU stack bottom for CPU 3
-                &__guard_page_3 as *const u8 as u64 + 4096 + mm::addr::KERNEL_VA_OFFSET,
+                &__guard_page_3 as *const u8 as u64 + 4096,
             ];
             for (i, &stack_base) in stack_bottoms.iter().enumerate() {
                 let cpu = i + 1;
@@ -796,6 +810,13 @@ fn idle_thread() -> ! {
 pub extern "C" fn secondary_main(cpu_id: u64) -> ! {
     // Enable MMU with the same page tables CPU 0 built
     unsafe { arch::aarch64::mmu::enable_mmu_secondary(); }
+
+    // Pivot to higher-half — same as CPU 0's pivot in kmain.
+    // After this, PC/SP/FP are at TTBR1 addresses.
+    unsafe {
+        extern "C" { fn _pivot_to_higher_half(offset: u64); }
+        _pivot_to_higher_half(mm::addr::KERNEL_VA_OFFSET);
+    }
 
     // Initialize per-CPU data (TPIDR_EL1)
     percpu::init_percpu(cpu_id as u32);

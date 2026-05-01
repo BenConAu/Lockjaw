@@ -1,4 +1,4 @@
-use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
+use crate::mm::addr::PhysAddr;
 use crate::mm::page_table::*;
 use core::arch::asm;
 
@@ -38,30 +38,47 @@ static mut KERNEL_L3_GUARD: PageTable = PageTable::empty();
 
 /// Build the identity-map page tables using 1 GB block descriptors.
 ///
-/// After this, the tables are ready for MMU enable:
-///   VA 0x0000_0000..0x3FFF_FFFF → PA 0x0000_0000 (device)
-///   VA 0x4000_0000..0x7FFF_FFFF → PA 0x4000_0000 (normal)
+/// Maps the first 4 GB of physical address space with attributes
+/// appropriate for both QEMU virt and Pi 4B:
+///   - The 1 GB block containing the kernel → normal memory
+///   - QEMU device range (0x00-0x3F) → device if kernel isn't there
+///   - Pi 4B device range (0xC0-0xFF) → device
 ///
 /// # Safety
 /// Must be called exactly once during boot, before `enable_mmu()`.
 pub unsafe fn init_boot_page_tables() {
-    // L1[0]: First 1 GB as device memory (covers UART at 0x0900_0000, GIC, flash)
-    BOOT_L1.entries[0] = PageTableEntry::new_block(
-        PhysAddr::new(0x0000_0000),
-        MAIR_DEVICE,
-        AP_RW_EL1,
-        SH_NON,
-    );
+    // Determine which 1 GB block the kernel is loaded in.
+    // AArch64 Rust emits PC-relative (adr/adrp) for &raw const, so
+    // this gives the actual runtime physical address regardless of
+    // the linker-assigned address. No phys_offset adjustment needed.
+    let kernel_phys = &raw const BOOT_L0 as u64;
+    let kernel_gb = (kernel_phys >> 30) as usize;
 
-    // L1[1]: Second 1 GB as normal memory (covers 128 MB RAM at 0x4000_0000)
-    BOOT_L1.entries[1] = PageTableEntry::new_block(
-        PhysAddr::new(0x4000_0000),
-        MAIR_NORMAL,
-        AP_RW_EL1,
-        SH_INNER,
-    );
+    // Map the first 4 L1 entries (4 GB total).
+    // The kernel's 1 GB block is normal memory; everything else is
+    // device. Covers QEMU (kernel in block 1, devices in block 0)
+    // and Pi 4B (kernel in block 0, devices in block 3).
+    for i in 0..4 {
+        let block_base = (i as u64) << 30;
+        if i == kernel_gb {
+            BOOT_L1.entries[i] = PageTableEntry::new_block(
+                PhysAddr::new(block_base),
+                MAIR_NORMAL,
+                AP_RW_EL1,
+                SH_INNER,
+            );
+        } else {
+            BOOT_L1.entries[i] = PageTableEntry::new_block(
+                PhysAddr::new(block_base),
+                MAIR_DEVICE,
+                AP_RW_EL1,
+                SH_NON,
+            );
+        }
+    }
 
-    // L0[0]: Table descriptor pointing to BOOT_L1
+    // L0[0]: Table descriptor pointing to BOOT_L1.
+    // &raw const gives the runtime physical address (adr on AArch64).
     BOOT_L0.entries[0] = PageTableEntry::new_table(
         PhysAddr::new(&raw const BOOT_L1 as u64),
     );
@@ -175,20 +192,28 @@ pub unsafe fn enable_mmu() {
 /// # Safety
 /// MMU must already be enabled with identity mapping.
 pub unsafe fn enable_higher_half() {
-    // Build KERNEL_L1 with the same physical mappings as BOOT_L1
-    KERNEL_L1.entries[0] = PageTableEntry::new_block(
-        PhysAddr::new(0x0000_0000),
-        MAIR_DEVICE,
-        AP_RW_EL1,
-        SH_NON,
-    );
+    // Build KERNEL_L1 with the same layout as BOOT_L1.
+    let kernel_phys = &raw const BOOT_L0 as u64;
+    let kernel_gb = (kernel_phys >> 30) as usize;
 
-    KERNEL_L1.entries[1] = PageTableEntry::new_block(
-        PhysAddr::new(0x4000_0000),
-        MAIR_NORMAL,
-        AP_RW_EL1,
-        SH_INNER,
-    );
+    for i in 0..4 {
+        let block_base = (i as u64) << 30;
+        if i == kernel_gb {
+            KERNEL_L1.entries[i] = PageTableEntry::new_block(
+                PhysAddr::new(block_base),
+                MAIR_NORMAL,
+                AP_RW_EL1,
+                SH_INNER,
+            );
+        } else {
+            KERNEL_L1.entries[i] = PageTableEntry::new_block(
+                PhysAddr::new(block_base),
+                MAIR_DEVICE,
+                AP_RW_EL1,
+                SH_NON,
+            );
+        }
+    }
 
     KERNEL_L0.entries[0] = PageTableEntry::new_table(
         PhysAddr::new(&raw const KERNEL_L1 as u64),
@@ -215,15 +240,10 @@ pub unsafe fn enable_higher_half() {
         "isb",                               // Sync before using new mappings
     );
 
-    // Move stack pointer to higher-half address.
-    // Both addresses map to the same physical page, so stack contents are unchanged.
-    asm!(
-        "mov {tmp}, sp",                     // Read current SP (identity-mapped address)
-        "add {tmp}, {tmp}, {offset}",        // Add higher-half offset
-        "mov sp, {tmp}",                     // Write new SP (higher-half address)
-        tmp = out(reg) _,
-        offset = in(reg) KERNEL_VA_OFFSET,
-    );
+    // SP and PC transition to higher-half is done by _pivot_to_higher_half
+    // (boot.rs assembly), called separately after this function returns.
+    // That stub adds KERNEL_VA_OFFSET to SP, FP, and LR atomically, so
+    // the caller resumes at a higher-half address.
 }
 
 // ---------------------------------------------------------------------------
@@ -274,14 +294,8 @@ pub unsafe fn enable_mmu_secondary() {
     asm!("msr SCTLR_EL1, {val}", val = in(reg) sctlr);
     asm!("isb");
 
-    // Transition SP to higher-half VA
-    asm!(
-        "mov {tmp}, sp",
-        "add {tmp}, {tmp}, {offset}",
-        "mov sp, {tmp}",
-        tmp = out(reg) _,
-        offset = in(reg) KERNEL_VA_OFFSET,
-    );
+    // SP and PC transition to higher-half is done by _pivot_to_higher_half
+    // (boot.rs assembly), called separately after this function returns.
 }
 
 // ---------------------------------------------------------------------------
