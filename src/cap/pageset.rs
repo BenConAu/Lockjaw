@@ -19,7 +19,7 @@ pub struct PageSet {
 }
 
 /// Errors from page allocation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub enum AllocError {
     OutOfMemory,
     TooManyPages,

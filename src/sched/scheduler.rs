@@ -224,7 +224,7 @@ pub fn current_tcb_paddr() -> PhysAddr {
         let cpu_id = crate::percpu::cpu_id() as usize;
         let idx = (*SCHEDULER.state_ptr()).current_for(cpu_id);
         (*SCHEDULER.threads_ptr())[idx]
-            .expect("current_tcb_paddr: no TCB for current thread")
+            .unwrap_or_else(|| panic!("current_tcb_paddr: no TCB for current thread"))
     }
 }
 
@@ -310,7 +310,8 @@ pub fn block_current(_token: BlockToken) {
     // switch because schedule() invalidates prior references (the
     // context switch may have mutated scheduler state on another path).
     unsafe {
-        (&mut *SCHEDULER.state_ptr()).block_current(cpu_id).expect("block_current: not Running");
+        (&mut *SCHEDULER.state_ptr()).block_current(cpu_id)
+            .unwrap_or_else(|_| panic!("block_current: not Running"));
     }
     // schedule() performs context_switch — when we resume here, another
     // thread ran and eventually switched back to us. If we're Running
@@ -351,11 +352,11 @@ pub fn block_current(_token: BlockToken) {
 /// unblocked, and the IPC state machine shouldn't have them otherwise).
 pub fn unblock_thread(tcb_paddr: PhysAddr) {
     let idx = thread_index_for(tcb_paddr)
-        .expect("unblock_thread: TCB paddr not registered in scheduler");
+        .unwrap_or_else(|| panic!("unblock_thread: TCB paddr not registered in scheduler"));
     // SAFETY: GKL held — exclusive access to scheduler state.
     unsafe {
         (&mut *SCHEDULER.state_ptr()).unblock(idx)
-            .expect("unblock_thread: thread not in Blocked state");
+            .unwrap_or_else(|_| panic!("unblock_thread: thread not in Blocked state"));
     }
 }
 
@@ -487,7 +488,7 @@ fn finish_exit() {
     // Step 2: Remove from scheduler array + model
     unsafe {
         (&mut *SCHEDULER.state_ptr()).remove_thread(pending.thread_idx)
-            .expect("finish_exit: remove_thread failed");
+            .unwrap_or_else(|_| panic!("finish_exit: remove_thread failed"));
         (*SCHEDULER.threads_ptr())[pending.thread_idx] = None;
     }
 
@@ -589,8 +590,7 @@ fn finish_exit() {
         }
     }
 
-    crate::kprintln!("[EXIT] Thread {} cleaned up ({} pages freed)",
-        pending.thread_idx, pages_freed);
+    crate::kprintln!("[EXIT] Thread ", pending.thread_idx, " cleaned up (", pages_freed, " pages freed)");
 }
 
 // ---------------------------------------------------------------------------
@@ -679,9 +679,14 @@ fn check_thread_canary(tcb: &Tcb) {
     // at the base of a kernel-owned page whose first u64 is the canary.
     let value = unsafe { ptr::read_volatile(tcb.stack_base as *const u64) };
     if value != lockjaw_types::constants::STACK_CANARY {
-        panic!(
-            "Thread stack canary corrupted! Expected {:#018x}, got {:#018x}",
-            lockjaw_types::constants::STACK_CANARY, value
-        );
+        use crate::print::{KPrint, Addr};
+        let uart = crate::arch::aarch64::uart::Uart::new();
+        uart.puts("[PANIC] Thread stack canary corrupted!\n");
+        uart.puts("  Expected: ");
+        KPrint::kprint(&Addr(lockjaw_types::constants::STACK_CANARY));
+        uart.puts("\n  Got:      ");
+        KPrint::kprint(&Addr(value));
+        uart.puts("\n");
+        panic!("thread stack canary corrupted");
     }
 }

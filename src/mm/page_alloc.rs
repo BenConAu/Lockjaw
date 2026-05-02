@@ -79,8 +79,7 @@ pub unsafe fn init_with_gap(
     }
 
     let reserved = crate::mm::addr::total_pages() - buddy.free_count();
-    crate::kprintln!("  Page allocator: {} reserved, {} free",
-        reserved, buddy.free_count());
+    crate::kprintln!("  Page allocator: ", reserved, " reserved, ", buddy.free_count(), " free");
 }
 
 /// Allocate a single physical page. Returns `None` if out of memory.

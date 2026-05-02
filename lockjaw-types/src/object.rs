@@ -68,7 +68,36 @@ pub enum HandleKind {
     PageSet { mapped_va_page: u32 } = 7,
 }
 
+impl ObjectType {
+    /// Return the variant name as a static string.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ObjectType::HandleTable => "HandleTable",
+            ObjectType::ThreadControlBlock => "ThreadControlBlock",
+            ObjectType::Endpoint => "Endpoint",
+            ObjectType::Notification => "Notification",
+            ObjectType::Reply => "Reply",
+            ObjectType::Process => "Process",
+            ObjectType::PageSet => "PageSet",
+        }
+    }
+}
+
 impl HandleKind {
+    /// Return the variant name as a static string.
+    pub fn name(&self) -> &'static str {
+        match self {
+            HandleKind::Empty => "Empty",
+            HandleKind::HandleTable => "HandleTable",
+            HandleKind::ThreadControlBlock => "ThreadControlBlock",
+            HandleKind::Endpoint { .. } => "Endpoint",
+            HandleKind::Notification => "Notification",
+            HandleKind::Reply => "Reply",
+            HandleKind::Process => "Process",
+            HandleKind::PageSet { .. } => "PageSet",
+        }
+    }
+
     /// True if this is the PageSet variant (any mapped_va_page value).
     pub fn is_pageset(&self) -> bool {
         matches!(self, HandleKind::PageSet { .. })

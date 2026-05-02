@@ -23,7 +23,7 @@ impl HeaderPageGuard {
     /// Claim the header page, preventing it from being freed on drop.
     /// Returns the physical address.
     fn take(&mut self) -> PhysAddr {
-        self.paddr.take().expect("HeaderPageGuard already taken")
+        self.paddr.take().unwrap_or_else(|| panic!("HeaderPageGuard already taken"))
     }
 }
 

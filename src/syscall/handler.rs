@@ -74,7 +74,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
             scheduler::exit_current(); // never returns
         }
         _ => {
-            crate::kprintln!("Unknown syscall {}", syscall_num);
+            crate::kprintln!("Unknown syscall ", syscall_num);
             SyscallReturn::Void(SyscallError::INVALID_PARAMETER)
         }
     };

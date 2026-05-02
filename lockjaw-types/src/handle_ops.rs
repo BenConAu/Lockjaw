@@ -21,6 +21,17 @@ pub enum HandleError {
     InsufficientRights,
 }
 
+impl HandleError {
+    /// Return the variant name as a static string.
+    pub fn name(&self) -> &'static str {
+        match self {
+            HandleError::TableFull => "TableFull",
+            HandleError::InvalidHandle => "InvalidHandle",
+            HandleError::InsufficientRights => "InsufficientRights",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Slot operations
 // ---------------------------------------------------------------------------

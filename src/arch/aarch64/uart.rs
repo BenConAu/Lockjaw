@@ -82,10 +82,3 @@ impl Uart {
         }
     }
 }
-
-impl core::fmt::Write for Uart {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.puts(s);
-        Ok(())
-    }
-}

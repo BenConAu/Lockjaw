@@ -82,9 +82,8 @@ impl BuddyAllocator {
     /// Panics if any page in the range is outside `total_pages`.
     pub fn add_range(&mut self, start_page: usize, count: usize) {
         let end = start_page.checked_add(count)
-            .expect("add_range: start + count overflows usize");
-        assert!(end <= self.total_pages,
-            "add_range: {}..{} exceeds total_pages {}", start_page, end, self.total_pages);
+            .unwrap_or_else(|| panic!("add_range: start + count overflows usize"));
+        assert!(end <= self.total_pages, "add_range: exceeds total_pages");
         // Mark as allocated first so free() can clear them normally.
         // One invariant, one code path — no special-case bypass.
         for i in 0..count {

@@ -58,7 +58,7 @@ impl HandleTableRef {
             handle_ops::slot_insert(slots, object_paddr.as_u64(), rights, kind)
                 .map_err(|e| {
                     if matches!(e, HandleError::TableFull) {
-                        crate::kprintln!("HANDLE TABLE FULL: {} slots, all occupied", slots.len());
+                        crate::kprintln!("HANDLE TABLE FULL: ", slots.len(), " slots, all occupied");
                     }
                     SyscallError::HANDLE_TABLE_FULL
                 })
@@ -177,7 +177,7 @@ pub unsafe fn handle_insert(
     handle_ops::slot_insert(slots, object_paddr.as_u64(), rights, kind)
         .map_err(|e| {
             if matches!(e, HandleError::TableFull) {
-                crate::kprintln!("HANDLE TABLE FULL: {} slots, all occupied", slots.len());
+                crate::kprintln!("HANDLE TABLE FULL: ", slots.len(), " slots, all occupied");
             }
             e
         })

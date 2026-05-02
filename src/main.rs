@@ -16,6 +16,7 @@ mod sched;
 mod syscall;
 
 use arch::aarch64::uart::Uart;
+use print::{Hex, Addr, Hex32, HexByte};
 
 extern "C" {
     static __kernel_start: u8;
@@ -74,7 +75,7 @@ pub fn dtb_pageset_id() -> u64 {
 
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
-    kprintln!("=== Lockjaw Microkernel v{} ===", env!("CARGO_PKG_VERSION"));
+    kprintln!("=== Lockjaw Microkernel v", env!("CARGO_PKG_VERSION"), " ===");
     kprintln!("Target: AArch64 (ARMv8-A)");
 
     // Use firmware DTB pointer if valid, fall back to RAM_BASE (QEMU).
@@ -96,7 +97,6 @@ pub extern "C" fn kmain() -> ! {
     } else {
         arch::aarch64::platform::RAM_BASE
     };
-    kprintln!("DTB: paddr {:#x}", dtb_paddr);
 
     // Discover platform hardware from DTB (pre-MMU, physical addresses).
     arch::aarch64::platform::discover(dtb_paddr);
@@ -106,10 +106,8 @@ pub extern "C" fn kmain() -> ! {
     // the old default address. Safe: single-core, pre-MMU, sequential.
     unsafe { arch::aarch64::uart::Uart::set_base(plat.uart0_base); }
 
-    kprintln!("Platform: UART={:#x} GICD={:#x} GICv{} RAM={:#x}+{:#x}",
-        plat.uart0_base, plat.gicd_base,
-        if plat.gic_v2 { "2" } else { "3" },
-        plat.ram_base, plat.ram_size);
+    kprintln!("Platform: UART=", Hex(plat.uart0_base), " GICD=", Hex(plat.gicd_base),
+        " GICv", if plat.gic_v2 { "2" } else { "3" }, " RAM=", Hex(plat.ram_base), "+", Hex(plat.ram_size));
     kprintln!();
 
     unsafe {
@@ -126,17 +124,14 @@ pub extern "C" fn kmain() -> ! {
 
         kprintln!("Memory layout:");
         // SAFETY: linker symbol
-        kprintln!("  Kernel load:  0x{:08x}", &__kernel_start as *const u8 as usize);
-        kprintln!("  BSS:          0x{:08x} - 0x{:08x} ({} bytes)", bss_start, bss_end, bss_end - bss_start);
-        kprintln!("  Kernel end:   0x{:08x}", kernel_end);
-        kprintln!("  Stack:        0x{:08x} - 0x{:08x} ({} bytes)", stack_bottom, stack_top, stack_top - stack_bottom);
+        kprintln!("  Kernel load:  ", Hex32(&__kernel_start as *const u8 as u64));
+        kprintln!("  BSS:          ", Hex32(bss_start as u64), " - ", Hex32(bss_end as u64), " (", bss_end - bss_start, " bytes)");
+        kprintln!("  Kernel end:   ", Hex32(kernel_end as u64));
+        kprintln!("  Stack:        ", Hex32(stack_bottom as u64), " - ", Hex32(stack_top as u64), " (", stack_top - stack_bottom, " bytes)");
     }
 
     kprintln!();
-    kprintln!("Physical memory: {:#x} - {:#x} ({} pages)",
-        mm::addr::ram_start().as_u64(),
-        mm::addr::ram_end().as_u64(),
-        mm::addr::total_pages());
+    kprintln!("Physical memory: ", Hex(mm::addr::ram_start().as_u64()), " - ", Hex(mm::addr::ram_end().as_u64()), " (", mm::addr::total_pages(), " pages)");
 
     // Initialize page allocator — reserve firmware + kernel + per-CPU stacks.
     // The 2 MB alignment of __per_cpu_stacks creates a gap between
@@ -170,7 +165,7 @@ pub extern "C" fn kmain() -> ! {
         arch::aarch64::mmu::enable_higher_half();
         Uart::use_high_addresses();
     }
-    kprintln!("Higher-half active — UART at {:#x}", 0xFFFF_0000_0900_0000u64);
+    kprintln!("Higher-half active — UART at ", Hex(0xFFFF_0000_0900_0000u64));
 
     // Verify DTB at RAM_BASE (placed there by QEMU bare-metal boot)
     unsafe {
@@ -179,8 +174,8 @@ pub extern "C" fn kmain() -> ! {
         let magic = u32::from_be_bytes([
             *dtb_va, *dtb_va.add(1), *dtb_va.add(2), *dtb_va.add(3),
         ]);
-        kprintln!("DTB: {:#x}, magic={:#010x} ({})", dtb_paddr, magic,
-            if magic == 0xd00dfeed { "valid" } else { "INVALID" });
+        kprintln!("DTB: ", Hex(dtb_paddr), ", magic=", Hex32(magic as u64), " (",
+            if magic == 0xd00dfeed { "valid" } else { "INVALID" }, ")");
     }
 
     // Register DTB pages as a PageSet so userspace can map them normally.
@@ -193,18 +188,21 @@ pub extern "C" fn kmain() -> ! {
             let h = (dtb_paddr + mm::addr::KERNEL_VA_OFFSET) as *const u8;
             let header = core::slice::from_raw_parts(h, 40);
             lockjaw_types::fdt::dtb_content_size(header)
-                .expect("DTB header invalid") as u64
+                .unwrap_or_else(|_| panic!("DTB header invalid")) as u64
         };
         let dtb_page_count = ((dtb_content_end + mm::addr::PAGE_SIZE - 1) / mm::addr::PAGE_SIZE) as usize;
-        assert!(dtb_page_count <= 16, "DTB content too large: {} pages", dtb_page_count);
+        if dtb_page_count > 16 {
+            kprintln!("DTB content too large: ", dtb_page_count, " pages");
+            panic!("DTB content too large");
+        }
         let mut dtb_pages = [mm::addr::PhysAddr::new(0); 16];
         for i in 0..dtb_page_count {
             dtb_pages[i] = mm::addr::PhysAddr::new(dtb_paddr + (i as u64) * mm::addr::PAGE_SIZE);
         }
         let dtb_ps_id = cap::pageset_table::register_existing(dtb_page_count, &dtb_pages[..dtb_page_count])
-            .expect("DTB PageSet registration failed");
+            .unwrap_or_else(|| panic!("DTB PageSet registration failed"));
         DTB_PAGESET_ID.set(dtb_ps_id);
-        kprintln!("DTB PageSet registered: id={}, {} pages ({} bytes content)", dtb_ps_id, dtb_page_count, dtb_content_end);
+        kprintln!("DTB PageSet registered: id=", dtb_ps_id, ", ", dtb_page_count, " pages (", dtb_content_end, " bytes content)");
     }
 
     // Set up guard pages (unmapped) for all per-CPU stacks and init canary
@@ -220,7 +218,7 @@ pub extern "C" fn kmain() -> ! {
             // SAFETY: linker symbol — per-CPU guard page physical address
             mm::addr::PhysAddr::new(&__guard_page_3 as *const u8 as u64),
         ];
-        kprintln!("Setting up {} guard pages...", guard_pages.len());
+        kprintln!("Setting up ", guard_pages.len(), " guard pages...");
         arch::aarch64::mmu::setup_guard_pages(&guard_pages);
         kprintln!("Guard pages active (unmapped).");
 
@@ -231,7 +229,7 @@ pub extern "C" fn kmain() -> ! {
 
     // Initialize per-CPU data for the boot CPU (CPU 0)
     percpu::init_percpu(0);
-    kprintln!("CPU {} initialized (TPIDR_EL1)", percpu::cpu_id());
+    kprintln!("CPU ", percpu::cpu_id(), " initialized (TPIDR_EL1)");
 
     // Boot secondary CPUs via PSCI CPU_ON
     {
@@ -244,9 +242,9 @@ pub extern "C" fn kmain() -> ! {
         for cpu in 1..arch::aarch64::platform::MAX_CPUS {
             let ret = unsafe { arch::aarch64::psci::cpu_on(cpu as u64, entry, cpu as u64) };
             if ret == 0 {
-                kprintln!("[SMP] CPU {} started (PSCI OK)", cpu);
+                kprintln!("[SMP] CPU ", cpu, " started (PSCI OK)");
             } else {
-                kprintln!("[SMP] CPU {} PSCI failed: {}", cpu, ret);
+                kprintln!("[SMP] CPU ", cpu, " PSCI failed: ", ret);
             }
         }
         // Brief delay for secondaries to print their online messages
@@ -289,7 +287,7 @@ pub extern "C" fn kmain() -> ! {
     while arch::aarch64::timer::tick_count() < 5 {
         core::hint::spin_loop();
     }
-    kprintln!("  {} ticks received!", arch::aarch64::timer::tick_count());
+    kprintln!("  ", arch::aarch64::timer::tick_count(), " ticks received!");
 
     // Verification: alloc 10 pages, dealloc, realloc — should get same addresses
     kprintln!();
@@ -297,15 +295,15 @@ pub extern "C" fn kmain() -> ! {
     let mut pages = [None; 10];
     for i in 0..10 {
         pages[i] = mm::page_alloc::alloc_page();
-        kprintln!("  alloc  {}: {:#x}", i, pages[i].unwrap().start_addr().as_u64());
+        kprintln!("  alloc  ", i, ": ", Hex(pages[i].unwrap().start_addr().as_u64()));
     }
     for i in 0..10 {
         mm::page_alloc::dealloc_page(pages[i].unwrap());
     }
     kprintln!("  (deallocated all 10)");
-    for i in 0..10 {
+    for i in 0usize..10 {
         let f = mm::page_alloc::alloc_page().unwrap();
-        kprintln!("  realloc {}: {:#x}", i, f.start_addr().as_u64());
+        kprintln!("  realloc ", i, ": ", Hex(f.start_addr().as_u64()));
     }
 
     // Page table entry verification
@@ -318,11 +316,11 @@ pub extern "C" fn kmain() -> ! {
         AP_RW_EL1,
         SH_INNER,
     );
-    kprintln!("  raw:  {:#018x}", entry.raw());
-    kprintln!("  {:?}", entry);
+    kprintln!("  raw:  ", Addr(entry.raw()));
+    kprintln!("  valid=", entry.is_valid(), " table=", entry.is_table(), " block=", entry.is_block(), " attr=", entry.attr_index());
 
     let table_entry = PageTableEntry::new_table(mm::addr::PhysAddr::new(0x4009_0000));
-    kprintln!("  table: {:#018x} valid={} is_table={}", table_entry.raw(), table_entry.is_valid(), table_entry.is_table());
+    kprintln!("  table: ", Addr(table_entry.raw()), " valid=", table_entry.is_valid(), " is_table=", table_entry.is_table());
 
     let block_entry = PageTableEntry::new_block(
         mm::addr::PhysAddr::new(0x0000_0000),
@@ -330,7 +328,7 @@ pub extern "C" fn kmain() -> ! {
         AP_RW_EL1,
         SH_NON,
     );
-    kprintln!("  block: {:#018x} is_block={} attr={}", block_entry.raw(), block_entry.is_block(), block_entry.attr_index());
+    kprintln!("  block: ", Addr(block_entry.raw()), " is_block=", block_entry.is_block(), " attr=", block_entry.attr_index());
 
     // Object model: PageSet → donate → create handle table
     kprintln!();
@@ -342,43 +340,42 @@ pub extern "C" fn kmain() -> ! {
 
     let ht_info = HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE };
     let ht_size = query_handle_table_size(&ht_info);
-    kprintln!("  HandleTable({} slots) needs {} page(s)", ht_info.slot_count, ht_size.pages);
+    kprintln!("  HandleTable(", ht_info.slot_count, " slots) needs ", ht_size.pages, " page(s)");
 
     // Allocate a pageset and donate it for the handle table
-    let ps = pageset::alloc_pages(ht_size.pages).expect("alloc_pages failed");
-    kprintln!("  PageSet allocated: {} page(s) at {:#x}", ps.count, ps.pages[0].as_u64());
+    let ps = pageset::alloc_pages(ht_size.pages).unwrap_or_else(|_| panic!("alloc_pages failed"));
+    kprintln!("  PageSet allocated: ", ps.count, " page(s) at ", Hex(ps.pages[0].as_u64()));
 
-    let ht_paddr = pageset::donate(&ps, ht_size.pages).expect("donate failed");
-    unsafe { create_handle_table(&ht_info, ht_paddr).expect("create failed"); }
+    let ht_paddr = pageset::donate(&ps, ht_size.pages).unwrap_or_else(|_| panic!("donate failed"));
+    unsafe { create_handle_table(&ht_info, ht_paddr).unwrap_or_else(|_| panic!("create failed")); }
 
     // Read back the header to verify
     let header_va = ht_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET;
     // SAFETY: kernel object at known VA
     let header = unsafe { &*(header_va as *const HandleTableHeader) };
-    kprintln!("  Created: type={:?}, pages={}, slots={}",
-        header.header.obj_type, header.header.page_count, header.slot_count);
+    kprintln!("  Created: type=", header.header.obj_type.name(), ", pages=", header.header.page_count, ", slots=", header.slot_count);
 
     // Insert a handle pointing to the table itself (for testing)
     let h0 = unsafe {
         handle_insert(ht_paddr, ht_paddr, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), HandleKind::HandleTable)
-    }.expect("insert failed");
-    kprintln!("  Inserted handle {} (RW)", h0);
+    }.unwrap_or_else(|_| panic!("insert failed"));
+    kprintln!("  Inserted handle ", h0, " (RW)");
 
     // Look up with matching rights — should succeed
-    let entry = unsafe { handle_lookup(ht_paddr, h0, Rights::from_bits(RIGHT_READ)) }.expect("lookup failed");
-    kprintln!("  Lookup h{}: kind={:?}, rights={:#04x}", h0, entry.kind, entry.rights.bits());
+    let entry = unsafe { handle_lookup(ht_paddr, h0, Rights::from_bits(RIGHT_READ)) }.unwrap_or_else(|_| panic!("lookup failed"));
+    kprintln!("  Lookup h", h0, ": kind=", entry.kind.name(), ", rights=", HexByte(entry.rights.bits() as u64));
 
     // Look up with Grant right — should fail (we only gave RW)
     let bad = unsafe { handle_lookup(ht_paddr, h0, Rights::from_bits(RIGHT_GRANT)) };
-    kprintln!("  Lookup h{} with Grant: {:?}", h0, bad.err().unwrap());
+    kprintln!("  Lookup h", h0, " with Grant: ", bad.err().unwrap().name());
 
     // Remove the handle
-    let removed = unsafe { handle_remove(ht_paddr, h0) }.expect("remove failed");
-    kprintln!("  Removed h{}: kind={:?}", h0, removed.kind);
+    let removed = unsafe { handle_remove(ht_paddr, h0) }.unwrap_or_else(|_| panic!("remove failed"));
+    kprintln!("  Removed h", h0, ": kind=", removed.kind.name());
 
     // Verify slot is now empty
     let empty = unsafe { handle_lookup(ht_paddr, h0, Rights::none()) };
-    kprintln!("  Lookup h{} after remove: {:?}", h0, empty.err().unwrap());
+    kprintln!("  Lookup h", h0, " after remove: ", empty.err().unwrap().name());
 
     // --- Process lifecycle test ---
     // Exercises the core new semantic: thread_count > 1, exit one
@@ -386,14 +383,14 @@ pub extern "C" fn kmain() -> ! {
     {
         use lockjaw_types::process::ProcessLifecycle;
 
-        let test_ht = mm::page_alloc::alloc_page().expect("test ht").start_addr();
+        let test_ht = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("test ht")).start_addr();
         unsafe {
             cap::object::create_handle_table(
                 &cap::object::HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
                 test_ht,
-            ).expect("test ht create");
+            ).unwrap_or_else(|_| panic!("test ht create"));
         }
-        let test_proc = mm::page_alloc::alloc_page().expect("test proc").start_addr();
+        let test_proc = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("test proc")).start_addr();
         cap::process_obj::create_process_object(
             test_proc, 0, test_ht.as_u64(), false, b"test-process\0\0\0\0",
         );
@@ -405,14 +402,20 @@ pub extern "C" fn kmain() -> ! {
         let r1 = cap::process_obj::process_dec_thread_count(test_proc);
         match r1 {
             ProcessLifecycle::ThreadsRemaining(1) => {}
-            other => panic!("expected ThreadsRemaining(1), got {:?}", other),
+            other => {
+                kprintln!("expected ThreadsRemaining(1), got ", other.name());
+                panic!("process lifecycle test failed");
+            }
         }
 
         // Second thread exits — process should be freed
         let r2 = cap::process_obj::process_dec_thread_count(test_proc);
         match r2 {
             ProcessLifecycle::LastThread => {}
-            other => panic!("expected LastThread, got {:?}", other),
+            other => {
+                kprintln!("expected LastThread, got ", other.name());
+                panic!("process lifecycle test failed");
+            }
         }
 
         // Clean up test pages (process would normally be freed by finish_exit)
@@ -432,25 +435,25 @@ pub extern "C" fn kmain() -> ! {
         use cap::handle_table;
 
         // Create endpoint object
-        let ep_page = mm::page_alloc::alloc_page().expect("endpoint alloc").start_addr();
-        ipc::endpoint::create_endpoint(mm::addr::ObjectInitPage::new(ep_page)).expect("create endpoint");
-        kprintln!("  Endpoint created at phys {:#x}", ep_page.as_u64());
+        let ep_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("endpoint alloc")).start_addr();
+        ipc::endpoint::create_endpoint(mm::addr::ObjectInitPage::new(ep_page)).unwrap_or_else(|_| panic!("create endpoint"));
+        kprintln!("  Endpoint created at phys ", Hex(ep_page.as_u64()));
 
         // Reply object for the ipc_sender benchmark thread. One page,
         // pre-allocated and stashed in a static so ipc_sender can pass it
         // on every call without needing a handle table lookup.
-        let bench_reply_page = mm::page_alloc::alloc_page().expect("bench reply alloc").start_addr();
-        ipc::reply::create_reply(mm::addr::ObjectInitPage::new(bench_reply_page)).expect("create bench reply");
+        let bench_reply_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("bench reply alloc")).start_addr();
+        ipc::reply::create_reply(mm::addr::ObjectInitPage::new(bench_reply_page)).unwrap_or_else(|_| panic!("create bench reply"));
         IPC_BENCH_REPLY_PADDR.set(bench_reply_page.as_u64());
 
         // Create kernel process — immortal, ttbr0=0, owns all kernel threads.
-        let kernel_ht_page = mm::page_alloc::alloc_page().expect("kernel ht alloc").start_addr();
+        let kernel_ht_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("kernel ht alloc")).start_addr();
         create_handle_table(
             &HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
             kernel_ht_page,
-        ).expect("kernel ht create");
+        ).unwrap_or_else(|_| panic!("kernel ht create"));
 
-        let kernel_proc_page = mm::page_alloc::alloc_page().expect("kernel proc alloc").start_addr();
+        let kernel_proc_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("kernel proc alloc")).start_addr();
         cap::process_obj::create_process_object(
             kernel_proc_page,
             0, // ttbr0 = 0 (kernel process)
@@ -470,24 +473,24 @@ pub extern "C" fn kmain() -> ! {
         };
         handle_table::handle_insert(kernel_ht_page, ep_page,
             cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
-            lockjaw_types::object::HandleKind::Endpoint { caller_token: ep_token }).expect("insert ep handle");
+            lockjaw_types::object::HandleKind::Endpoint { caller_token: ep_token }).unwrap_or_else(|_| panic!("insert ep handle"));
         handle_table::handle_insert(kernel_ht_page, bench_reply_page,
             cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
-            lockjaw_types::object::HandleKind::Reply).expect("insert reply handle");
+            lockjaw_types::object::HandleKind::Reply).unwrap_or_else(|_| panic!("insert reply handle"));
 
         // Thread A (sender) — kernel thread in the kernel process
         cap::process_obj::process_inc_thread_count(kernel_proc_page);
-        let stack_a = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
-        let tcb_a_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
+        let stack_a = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("stack alloc")).start_addr();
+        let tcb_a_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("tcb alloc")).start_addr();
         create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, process_paddr: kernel_proc_page, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_page)
-            .expect("create tcb a");
+            .unwrap_or_else(|_| panic!("create tcb a"));
 
         // Thread B (receiver) — kernel thread in the kernel process
         cap::process_obj::process_inc_thread_count(kernel_proc_page);
-        let stack_b = mm::page_alloc::alloc_page().expect("stack alloc").start_addr();
-        let tcb_b_page = mm::page_alloc::alloc_page().expect("tcb alloc").start_addr();
+        let stack_b = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("stack alloc")).start_addr();
+        let tcb_b_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("tcb alloc")).start_addr();
         create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, process_paddr: kernel_proc_page, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_page)
-            .expect("create tcb b");
+            .unwrap_or_else(|_| panic!("create tcb b"));
 
         // Register idle/init thread (index 0 = this boot thread).
         // This thread drops to EL0 and becomes the init process, so it
@@ -551,15 +554,15 @@ pub extern "C" fn kmain() -> ! {
     static INIT_ELF: &[u8] = include_bytes!("../user/init/target/aarch64-unknown-none/release/lockjaw-init");
 
     // Verify the init binary was built from the same source as the kernel
-    kprintln!("Build hash: {:#018x}", LOCKJAW_SOURCE_HASH);
+    kprintln!("Build hash: ", Addr(LOCKJAW_SOURCE_HASH));
     match lockjaw_types::elf::find_section_u64(INIT_ELF, ".lockjaw_hash") {
         Some(init_hash) if init_hash == LOCKJAW_SOURCE_HASH => {
-            kprintln!("Init hash:  {:#018x} (match)", init_hash);
+            kprintln!("Init hash:  ", Addr(init_hash), " (match)");
         }
         Some(init_hash) => {
             kprintln!("FATAL: init binary build hash mismatch!");
-            kprintln!("  kernel: {:#018x}", LOCKJAW_SOURCE_HASH);
-            kprintln!("  init:   {:#018x}", init_hash);
+            kprintln!("  kernel: ", Addr(LOCKJAW_SOURCE_HASH));
+            kprintln!("  init:   ", Addr(init_hash));
             kprintln!("  Run 'make build' to rebuild all binaries.");
             panic!("stale init binary");
         }
@@ -573,12 +576,12 @@ pub extern "C" fn kmain() -> ! {
         use arch::aarch64::vmem::{Mapping, create_address_space, MAPPINGS_PER_PAGE};
 
         // Parse the ELF
-        let elf_info = elf::parse_elf(INIT_ELF).expect("failed to parse init ELF");
-        kprintln!("  Entry point: {:#x}", elf_info.entry_point);
-        kprintln!("  {} loadable segment(s)", elf_info.segment_count);
+        let elf_info = elf::parse_elf(INIT_ELF).unwrap_or_else(|_| panic!("failed to parse init ELF"));
+        kprintln!("  Entry point: ", Hex(elf_info.entry_point));
+        kprintln!("  ", elf_info.segment_count, " loadable segment(s)");
 
         // Allocate a page for the mapping buffer (avoids large array on the kernel stack)
-        let map_buf = mm::page_alloc::alloc_page().expect("mapping buffer page");
+        let map_buf = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("mapping buffer page"));
         mm::page_alloc::zero_page(map_buf.start_addr());
         let mut map_buf_km = mm::kernel_ptr::KernelMut::<Mapping>::from_paddr(map_buf.start_addr());
         let mappings = core::slice::from_raw_parts_mut(map_buf_km.as_mut_ptr(), MAPPINGS_PER_PAGE);
@@ -587,14 +590,13 @@ pub extern "C" fn kmain() -> ! {
         for i in 0..elf_info.segment_count {
             let seg = &elf_info.segments[i];
             let num_pages = ((seg.mem_size + mm::addr::PAGE_SIZE - 1) / mm::addr::PAGE_SIZE) as usize;
-            kprintln!("  Segment {}: VA {:#x}, {} page(s), {}{}",
-                i, seg.vaddr, num_pages,
+            kprintln!("  Segment ", i, ": VA ", Hex(seg.vaddr), ", ", num_pages, " page(s), ",
                 if seg.executable { "X" } else { "-" },
                 if seg.writable { "W" } else { "R" });
 
             for p in 0..num_pages {
                 assert!(mapping_count < MAPPINGS_PER_PAGE, "init ELF has too many pages for mapping buffer");
-                let page = mm::page_alloc::alloc_page().expect("segment page");
+                let page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("segment page"));
 
                 // Copy file data into this page (if any)
                 let seg_page_offset = (p as u64) * mm::addr::PAGE_SIZE;
@@ -630,7 +632,7 @@ pub extern "C" fn kmain() -> ! {
         let user_stack_va: u64 = lockjaw_types::constants::USER_STACK_BASE;
         let user_stack_top: u64 = user_stack_va + (user_stack_pages as u64) * mm::addr::PAGE_SIZE;
         for s in 0..user_stack_pages {
-            let stack_page = mm::page_alloc::alloc_page().expect("user stack page");
+            let stack_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("user stack page"));
             mappings[mapping_count] = Mapping {
                 virt_addr: user_stack_va + (s as u64) * mm::addr::PAGE_SIZE,
                 phys_addr: stack_page.start_addr(),
@@ -642,19 +644,19 @@ pub extern "C" fn kmain() -> ! {
 
         // Create the address space (allocate page tables, map everything)
         let ttbr0 = create_address_space(&mappings[..mapping_count])
-            .expect("failed to create address space");
-        kprintln!("  Address space created: TTBR0 = {:#x}", ttbr0.as_u64());
+            .unwrap_or_else(|_| panic!("failed to create address space"));
+        kprintln!("  Address space created: TTBR0 = ", Hex(ttbr0.as_u64()));
 
         // Create init user process with its own handle table and address
         // space. Init's handle table starts empty — init creates its own
         // handles via syscalls from userspace (sys_create_endpoint, etc.).
-        let init_ht_page = mm::page_alloc::alloc_page().expect("init ht alloc").start_addr();
+        let init_ht_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("init ht alloc")).start_addr();
         cap::object::create_handle_table(
             &cap::object::HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
             init_ht_page,
-        ).expect("init ht create");
+        ).unwrap_or_else(|_| panic!("init ht create"));
 
-        let init_proc_page = mm::page_alloc::alloc_page().expect("init proc alloc").start_addr();
+        let init_proc_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("init proc alloc")).start_addr();
         cap::process_obj::create_process_object(
             init_proc_page,
             ttbr0.as_u64(),
@@ -696,7 +698,7 @@ pub extern "C" fn kmain() -> ! {
         // threads are kernel threads (ttbr0=0). No TTBR0 writes should
         // have occurred. This is the last kernel-only observation point.
         let (ctx_switches, ttbr0_writes) = sched::scheduler::scheduler_stats();
-        kprintln!("[SCHED-KERNEL-PHASE] {} context switches, TTBR0 writes: {}", ctx_switches, ttbr0_writes);
+        kprintln!("[SCHED-KERNEL-PHASE] ", ctx_switches, " context switches, TTBR0 writes: ", ttbr0_writes);
 
         kprintln!("Dropping to EL0...");
         arch::aarch64::mmu::drop_to_el0_with_ttbr0(
@@ -727,7 +729,7 @@ fn ipc_sender() -> ! {
     // Warm up
     for _ in 0..10 {
         cap::object_ops::call(0, 1, [counter, 0, 0, 0])
-            .expect("lookup").expect("call");
+            .unwrap_or_else(|_| panic!("lookup")).unwrap_or_else(|_| panic!("call"));
         counter += 1;
     }
 
@@ -735,10 +737,10 @@ fn ipc_sender() -> ! {
     let start_tick = arch::aarch64::timer::tick_count();
     for _ in 0..BENCHMARK_ROUNDS {
         let reply_msg = cap::object_ops::call(0, 1, [counter, 0, 0, 0])
-            .expect("lookup").expect("call");
+            .unwrap_or_else(|_| panic!("lookup")).unwrap_or_else(|_| panic!("call"));
         // Print first few to verify the server doubled our value
         if counter <= 13 {
-            kprintln!("[IPC] call({}) -> reply({})", counter, reply_msg[0]);
+            kprintln!("[IPC] call(", counter, ") -> reply(", reply_msg[0], ")");
         }
         counter += 1;
     }
@@ -746,14 +748,14 @@ fn ipc_sender() -> ! {
     let elapsed_ticks = end_tick - start_tick;
 
     kprintln!();
-    kprintln!("[IPC BENCHMARK] {} call/reply round-trips in {} ticks", BENCHMARK_ROUNDS, elapsed_ticks);
+    kprintln!("[IPC BENCHMARK] ", BENCHMARK_ROUNDS, " call/reply round-trips in ", elapsed_ticks, " ticks");
     if elapsed_ticks > 0 {
-        kprintln!("[IPC BENCHMARK] {} round-trips per tick", BENCHMARK_ROUNDS / elapsed_ticks);
+        kprintln!("[IPC BENCHMARK] ", BENCHMARK_ROUNDS / elapsed_ticks, " round-trips per tick");
     }
 
     loop {
         cap::object_ops::call(0, 1, [counter, 0, 0, 0])
-            .expect("lookup").expect("call");
+            .unwrap_or_else(|_| panic!("lookup")).unwrap_or_else(|_| panic!("call"));
         counter += 1;
     }
 }
@@ -762,9 +764,9 @@ fn ipc_sender() -> ! {
 fn ipc_receiver() -> ! {
     loop {
         let msg = cap::object_ops::receive(0)
-            .expect("lookup").expect("receive");
+            .unwrap_or_else(|_| panic!("lookup")).unwrap_or_else(|_| panic!("receive"));
         let reply = [msg[0] * 2, msg[1], msg[2], msg[3]];
-        ipc::reply::ipc_reply(reply).expect("reply");
+        ipc::reply::ipc_reply(reply).unwrap_or_else(|_| panic!("reply"));
     }
 }
 
@@ -777,7 +779,7 @@ unsafe fn create_idle_tcb(
     process_paddr: mm::addr::PhysAddr,
     name: [u8; 16],
 ) -> mm::addr::PhysAddr {
-    let tcb_page = mm::page_alloc::alloc_page().expect("idle tcb alloc").start_addr();
+    let tcb_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("idle tcb alloc")).start_addr();
     mm::page_alloc::zero_page(tcb_page);
     let mut tcb_km = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(tcb_page);
     // Idle TCBs don't use create_tcb() because they start directly
@@ -853,18 +855,20 @@ pub extern "C" fn secondary_main(cpu_id: u64) -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    use core::fmt::Write;
-    let mut uart = Uart::new();
+    let uart = Uart::new();
 
-    let _ = writeln!(uart, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    let _ = writeln!(uart, "[PANIC:KERN]  KERNEL PANIC");
+    uart.puts("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+    uart.puts("[PANIC:KERN]  KERNEL PANIC\n");
     mm::stack::check_canary_report("[PANIC:KERN]");
     crash::print_thread_context("[PANIC:KERN]");
     if let Some(location) = info.location() {
-        let _ = writeln!(uart, "[PANIC:KERN]  {}:{}", location.file(), location.line());
+        uart.puts("[PANIC:KERN]  ");
+        uart.puts(location.file());
+        uart.puts(":");
+        print::KPrint::kprint(&location.line());
+        uart.puts("\n");
     }
-    let _ = writeln!(uart, "[PANIC:KERN]  {}", info.message());
-    let _ = writeln!(uart, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    uart.puts("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
 
     loop {
         unsafe { core::arch::asm!("wfi") };

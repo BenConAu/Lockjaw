@@ -352,7 +352,7 @@ pub unsafe fn setup_guard_pages(guard_pages: &[PhysAddr]) {
     for &gp in guard_pages {
         let guard_offset = gp.as_u64() - ram_base;
         let gp_l2_index = (guard_offset >> 21) as usize;
-        assert_eq!(gp_l2_index, l2_index, "guard pages must be in same 2 MB region");
+        assert!(gp_l2_index == l2_index, "guard pages must be in same 2 MB region");
         let l3_index = ((guard_offset & 0x001F_FFFF) >> 12) as usize;
         KERNEL_L3_GUARD.entries[l3_index] = PageTableEntry::empty();
     }

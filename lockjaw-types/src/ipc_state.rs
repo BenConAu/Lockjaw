@@ -590,7 +590,7 @@ fn step_send(
         EpState::HasReceiver => {
             // Fast path — receiver is queued, dequeue & deliver.
             let mut next = state;
-            let head = next.queue.dequeue().expect("HasReceiver without queued receiver");
+            let head = next.queue.dequeue().unwrap_or_else(|| panic!("HasReceiver without queued receiver"));
             debug_assert_eq!(head.kind, WaitKind::Receive);
             let receiver = head.thread;
             next = next.with_thread(receiver, ThreadState::Ready);
@@ -647,7 +647,7 @@ fn step_receive(
         EpState::HasWaiters => {
             // Fast path — dequeue head, act on its kind.
             let mut next = state;
-            let head = next.queue.dequeue().expect("HasWaiters without queued waiter");
+            let head = next.queue.dequeue().unwrap_or_else(|| panic!("HasWaiters without queued waiter"));
             debug_assert!(matches!(head.kind, WaitKind::Send | WaitKind::Call));
 
             let mut effects = empty_effects();
@@ -662,7 +662,7 @@ fn step_receive(
                 }
                 WaitKind::Call => {
                     let client = head.thread.as_client()
-                        .expect("Call waiter must be a client");
+                        .unwrap_or_else(|| panic!("Call waiter must be a client"));
                     next.current_reply[who.as_index()] = Some(client);
                     effects[n] = IpcEffect::SetCurrentReply { receiver: who, caller: client }; n += 1;
                     // Caller stays Blocked awaiting Reply.
@@ -710,7 +710,7 @@ fn step_call(
         EpState::HasReceiver => {
             // Fast path — deliver msg to server, bind reply, block self.
             let mut next = state;
-            let head = next.queue.dequeue().expect("HasReceiver without queued receiver");
+            let head = next.queue.dequeue().unwrap_or_else(|| panic!("HasReceiver without queued receiver"));
             debug_assert_eq!(head.kind, WaitKind::Receive);
             let server = head.thread;
             next = next

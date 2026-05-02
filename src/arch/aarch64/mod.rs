@@ -32,6 +32,6 @@ pub fn irq_dispatch() {
     match intid {
         27 => timer::handle_tick(),
         1023 => {} // Spurious, silently ignore
-        _ => crate::kprintln!("WARNING: unexpected IRQ INTID={}", intid),
+        _ => crate::kprintln!("WARNING: unexpected IRQ INTID=", intid),
     }
 }

@@ -17,7 +17,6 @@ pub struct Mapping {
 }
 
 /// Errors returned by virtual memory operations.
-#[derive(Debug)]
 pub enum VmemError {
     TooManyMappings,
     TooManyL3Regions,

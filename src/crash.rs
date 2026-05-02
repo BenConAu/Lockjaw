@@ -2,11 +2,11 @@
 /// and the panic handler.
 ///
 /// IMPORTANT: These functions must never panic. They are called from
-/// the panic handler. We write directly to the UART via core::fmt::Write
-/// and discard errors with `let _ =`. No .unwrap() on any fallible path.
+/// the panic handler. We write directly to the UART via puts/putc.
+/// No core::fmt, no vtables, no .unwrap() on any fallible path.
 
 use crate::sched::tcb::Tcb;
-use core::fmt::Write;
+use crate::print::{KPrint, Hex};
 
 // syscall_name lives in lockjaw-types/src/syscall.rs (host-testable,
 // alongside the syscall number constants). Re-export for kernel use.
@@ -29,7 +29,7 @@ pub fn print_thread_context(prefix: &str) {
     if IN_CRASH.swap(true, Ordering::Relaxed) {
         return; // already in crash handler — don't recurse
     }
-    let mut uart = crate::arch::aarch64::uart::Uart::new();
+    let uart = crate::arch::aarch64::uart::Uart::new();
 
     unsafe {
         let thread_idx = crate::sched::scheduler::current_thread_index();
@@ -50,11 +50,15 @@ pub fn print_thread_context(prefix: &str) {
             }
             let name_len = name_buf.iter().position(|&b| b == 0).unwrap_or(16);
             let name = core::str::from_utf8_unchecked(&name_buf[..name_len]);
+            uart.puts(prefix);
+            uart.puts("  Thread: #");
+            KPrint::kprint(&thread_idx);
             if name_len > 0 {
-                let _ = writeln!(uart, "{}  Thread: #{} ({})", prefix, thread_idx, name);
-            } else {
-                let _ = writeln!(uart, "{}  Thread: #{}", prefix, thread_idx);
+                uart.puts(" (");
+                uart.puts(name);
+                uart.puts(")");
             }
+            uart.puts("\n");
 
             // Read the current_syscall field (u64) byte-by-byte.
             let sc_offset = core::mem::offset_of!(Tcb, current_syscall);
@@ -74,11 +78,24 @@ pub fn print_thread_context(prefix: &str) {
                     }
                     args[a] = u64::from_ne_bytes(arg_bytes);
                 }
-                let _ = writeln!(uart, "{}  During syscall: {} (x0={:#x}, x1={:#x}, x2={:#x}, x3={:#x})",
-                    prefix, syscall_name(sc), args[0], args[1], args[2], args[3]);
+                uart.puts(prefix);
+                uart.puts("  During syscall: ");
+                uart.puts(syscall_name(sc));
+                uart.puts(" (x0=");
+                KPrint::kprint(&Hex(args[0]));
+                uart.puts(", x1=");
+                KPrint::kprint(&Hex(args[1]));
+                uart.puts(", x2=");
+                KPrint::kprint(&Hex(args[2]));
+                uart.puts(", x3=");
+                KPrint::kprint(&Hex(args[3]));
+                uart.puts(")\n");
             }
         } else {
-            let _ = writeln!(uart, "{}  Thread: #{}", prefix, thread_idx);
+            uart.puts(prefix);
+            uart.puts("  Thread: #");
+            KPrint::kprint(&thread_idx);
+            uart.puts("\n");
         }
     }
 }

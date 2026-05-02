@@ -73,7 +73,7 @@ impl PageSetHeader {
     /// an address space via sys_map_pages.
     pub fn inc_map_count(&mut self) {
         self.map_count = self.map_count.checked_add(1)
-            .expect("map_count overflow");
+            .unwrap_or_else(|| panic!("map_count overflow"));
     }
 
     /// Decrement the mapping count. Called when pages are unmapped.
@@ -89,7 +89,7 @@ impl PageSetHeader {
     /// to this PageSet is inserted into a handle table.
     pub fn inc_refcount(&mut self) {
         self.refcount = self.refcount.checked_add(1)
-            .expect("refcount overflow");
+            .unwrap_or_else(|| panic!("refcount overflow"));
     }
 
     /// Decrement the handle reference count. Called when a handle to

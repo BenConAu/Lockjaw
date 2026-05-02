@@ -160,7 +160,7 @@ impl SchedState {
 
     /// Return the current thread index for a CPU, or panic if none assigned.
     pub fn current_for(&self, cpu_id: usize) -> usize {
-        self.current_per_cpu[cpu_id].expect("no current thread for this CPU")
+        self.current_per_cpu[cpu_id].unwrap_or_else(|| panic!("no current thread for this CPU"))
     }
 
     /// Add a new thread as Ready. Returns its index, or None if full.
@@ -279,7 +279,7 @@ impl SchedState {
 
         let decision = self.decide(cpu_id, reason);
         self.apply_decision(cpu_id, reason, decision)
-            .expect("internal: decide() produced a decision rejected by apply_decision");
+            .unwrap_or_else(|_| panic!("internal: decide() produced a decision rejected by apply_decision"));
 
         // Post-condition: invariants must hold.
         debug_assert!(self.check_invariants(),

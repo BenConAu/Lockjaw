@@ -19,6 +19,8 @@ use lockjaw_types::exception::{
     SyncExceptionAction, classify_sync_exception,
 };
 
+use crate::print::{Hex, Addr, Hex32, Dec02};
+
 /// Classify a virtual address into a known memory region.
 ///
 /// These ranges are specific to QEMU virt (aarch64) with our kernel config:
@@ -65,7 +67,7 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
     unsafe { core::arch::asm!("mrs {}, FAR_EL1", out(reg) far) };
 
     crate::kprintln!("========================================");
-    crate::kprintln!("{}  HARDWARE EXCEPTION", prefix);
+    crate::kprintln!(prefix, "  HARDWARE EXCEPTION");
 
     // Kernel stack canary check — if corrupted, register dump is unreliable
     crate::mm::stack::check_canary_report(prefix);
@@ -73,13 +75,12 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
     // Thread identification and syscall breadcrumb
     crate::crash::print_thread_context(prefix);
 
-    crate::kprintln!("{}  ESR:  {:#010x} — {} — {}", prefix, esr,
-        exception_class_name(ec), data_fault_name(dfsc));
-    crate::kprintln!("{}  ELR:  {:#018x} [{}]", prefix, ctx.elr, classify_address(ctx.elr));
-    crate::kprintln!("{}  FAR:  {:#018x} [{}]", prefix, far, classify_address(far));
-    crate::kprintln!("{}  SPSR: {:#018x}", prefix, ctx.spsr);
+    crate::kprintln!(prefix, "  ESR:  ", Hex32(esr), " — ", exception_class_name(ec), " — ", data_fault_name(dfsc));
+    crate::kprintln!(prefix, "  ELR:  ", Addr(ctx.elr), " [", classify_address(ctx.elr), "]");
+    crate::kprintln!(prefix, "  FAR:  ", Addr(far), " [", classify_address(far), "]");
+    crate::kprintln!(prefix, "  SPSR: ", Addr(ctx.spsr));
     if is_user {
-        crate::kprintln!("{}  SP_EL0: {:#018x}", prefix, ctx.sp_el0);
+        crate::kprintln!(prefix, "  SP_EL0: ", Addr(ctx.sp_el0));
     }
 
     // User stack overflow detection
@@ -93,17 +94,16 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
             let stack_base = (*tcb).user_stack_base;
             let stack_top = (*tcb).user_stack_top;
             if stack_base != 0 {
-                crate::kprintln!("{}  Stack: {:#x} - {:#x} ({} bytes)",
-                    prefix, stack_base, stack_top, stack_top - stack_base);
+                crate::kprintln!(prefix, "  Stack: ", Hex(stack_base), " - ", Hex(stack_top), " (", stack_top - stack_base, " bytes)");
                 // Check below stack base (normal downward overflow)
                 if far < stack_base && far >= stack_base.saturating_sub(crate::mm::addr::PAGE_SIZE) {
-                    crate::kprintln!("{}  *** USER STACK OVERFLOW DETECTED ***", prefix);
-                    crate::kprintln!("{}  Overflowed by {} bytes (below stack base)", prefix, stack_base - far);
+                    crate::kprintln!(prefix, "  *** USER STACK OVERFLOW DETECTED ***");
+                    crate::kprintln!(prefix, "  Overflowed by ", stack_base - far, " bytes (below stack base)");
                 }
                 // Check above stack top (abnormal, but still unmapped for small stacks)
                 if far >= stack_top && far < stack_top + crate::mm::addr::PAGE_SIZE {
-                    crate::kprintln!("{}  *** USER STACK OVERFLOW DETECTED ***", prefix);
-                    crate::kprintln!("{}  Fault {} bytes above stack top", prefix, far - stack_top);
+                    crate::kprintln!(prefix, "  *** USER STACK OVERFLOW DETECTED ***");
+                    crate::kprintln!(prefix, "  Fault ", far - stack_top, " bytes above stack top");
                 }
             }
         }
@@ -111,10 +111,10 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
 
     // Dump first 16 GPRs
     for i in 0..4 {
-        crate::kprintln!("{}  x{:02}={:#018x}  x{:02}={:#018x}  x{:02}={:#018x}  x{:02}={:#018x}",
-            prefix,
-            i*4, ctx.gpr[i*4], i*4+1, ctx.gpr[i*4+1],
-            i*4+2, ctx.gpr[i*4+2], i*4+3, ctx.gpr[i*4+3]);
+        crate::kprintln!(prefix, "  x", Dec02(i*4), "=", Addr(ctx.gpr[i*4]),
+            "  x", Dec02(i*4+1), "=", Addr(ctx.gpr[i*4+1]),
+            "  x", Dec02(i*4+2), "=", Addr(ctx.gpr[i*4+2]),
+            "  x", Dec02(i*4+3), "=", Addr(ctx.gpr[i*4+3]));
     }
 
     crate::kprintln!("========================================");
@@ -136,13 +136,13 @@ extern "C" fn handle_elr_corruption(ctx: &ExceptionContext) {
     // Print SP to see how much kernel stack was used
     let sp: u64;
     unsafe { core::arch::asm!("mov {}, sp", out(reg) sp); }
-    crate::kprintln!("[BUG:KERN]  Kernel SP: {:#018x}", sp);
+    crate::kprintln!("[BUG:KERN]  Kernel SP: ", Addr(sp));
     // SAFETY: printing address of exception context on kernel stack
-    crate::kprintln!("[BUG:KERN]  Exception frame at: {:#018x}", ctx as *const _ as u64);
+    crate::kprintln!("[BUG:KERN]  Exception frame at: ", Addr(ctx as *const _ as u64));
     // Print the GPRs from the exception context
     for i in 0..16 {
-        crate::kprintln!("[BUG:KERN]  x{:02}={:#018x}  x{:02}={:#018x}",
-            i*2, ctx.gpr[i*2], i*2+1, ctx.gpr[i*2+1]);
+        crate::kprintln!("[BUG:KERN]  x", Dec02(i*2), "=", Addr(ctx.gpr[i*2]),
+            "  x", Dec02(i*2+1), "=", Addr(ctx.gpr[i*2+1]));
     }
     crate::kprintln!("========================================");
     loop { unsafe { core::arch::asm!("wfi"); } }

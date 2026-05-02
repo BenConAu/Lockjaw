@@ -21,6 +21,17 @@ pub enum ProcessLifecycle {
     Immortal(u32),
 }
 
+impl ProcessLifecycle {
+    /// Return the variant name as a static string.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ProcessLifecycle::ThreadsRemaining(_) => "ThreadsRemaining",
+            ProcessLifecycle::LastThread => "LastThread",
+            ProcessLifecycle::Immortal(_) => "Immortal",
+        }
+    }
+}
+
 /// Pure decision: what happens when a thread in this process exits?
 ///
 /// Always decrements the count. `immortal` means "do not free process
@@ -42,7 +53,7 @@ pub fn on_thread_exit(thread_count: u32, immortal: bool) -> ProcessLifecycle {
 /// Pure increment for thread creation. Returns the new count.
 /// Panics on overflow.
 pub fn on_thread_create(thread_count: u32) -> u32 {
-    thread_count.checked_add(1).expect("thread count overflow")
+    thread_count.checked_add(1).unwrap_or_else(|| panic!("thread count overflow"))
 }
 
 // ---------------------------------------------------------------------------

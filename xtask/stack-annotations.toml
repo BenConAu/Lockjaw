@@ -8,29 +8,19 @@
 
 [indirect_calls]
 
-# core::fmt uses function pointers internally for formatter dispatch.
-# These are leaf-level formatting functions with bounded stack usage.
-# We accept them as unresolvable — their individual frame sizes are
-# already measured and small.
+# Residual core::fmt from panic_bounds_check / slice_index_fail
+# (release) and debug_assert! paths (debug). Only reachable on
+# panics or debug assertions. BLR instructions dispatch through
+# Formatter internals — unresolvable but bounded stack usage.
 "core::fmt::write" = "fmt-internal"
 "<core::fmt::Formatter>::pad" = "fmt-internal"
 "<core::fmt::Formatter>::pad_integral" = "fmt-internal"
 "<core::fmt::Formatter>::pad_integral::write_prefix" = "fmt-internal"
-"<lockjaw_types::syscall::SyscallError as core::fmt::Debug>::fmt" = "fmt-internal"
-"<core::fmt::builders::PadAdapter as core::fmt::Write>::write_str" = "fmt-internal"
-"<core::fmt::builders::PadAdapter as core::fmt::Write>::write_char" = "fmt-internal"
-"<core::fmt::Formatter>::debug_tuple_field1_finish" = "fmt-internal"
-"<core::fmt::builders::DebugStruct>::field" = "fmt-internal"
-"<core::fmt::Formatter>::debug_struct_field1_finish" = "fmt-internal"
-"<lockjaw_types::object::HandleKind as core::fmt::Debug>::fmt" = "fmt-internal"
+"<usize as core::fmt::Display>::fmt" = "fmt-internal"
 
 # Thread entry trampoline calls the thread's entry function via blr x19.
 # All possible targets listed here:
 "thread_entry" = ["ipc_sender", "ipc_receiver", "idle_thread", "process_entry"]
-
-# create_kernel_object calls init_fn (function pointer) for the specific
-# object type being created. All possible targets:
-"lockjaw::syscall::handler::create_kernel_object" = ["lockjaw::ipc::endpoint::create_endpoint", "lockjaw::ipc::notification::create_notification", "lockjaw::ipc::reply::create_reply"]
 
 # Cycles involving the crash handler are guarded at runtime by an
 # AtomicBool re-entry flag in print_thread_context. The call graph
@@ -88,9 +78,7 @@
 "core::panicking::panic_const::panic_const_mul_overflow" = 64
 "core::panicking::panic_const::panic_const_shl_overflow" = 64
 "core::panicking::panic_const::panic_const_sub_overflow" = 64
-"core::option::expect_failed" = 128
 "core::option::unwrap_failed" = 128
-"core::result::unwrap_failed" = 128
 "core::slice::index::slice_index_fail" = 128
 # core::panicking::assert_failed is generic — the checker resolves
 # the monomorphized instances via .llvm. suffix stripping.
@@ -101,7 +89,6 @@
 [allowed_cycles]
 # print_thread_context has a runtime AtomicBool re-entry guard.
 "lockjaw::crash::print_thread_context" = true
-# The panic handler (#[panic_handler]) uses writeln! for output,
-# which the compiler sees as potentially panicking again. This is
-# inherent to any panic handler that formats — not real recursion.
+# The panic handler calls uart.puts() + KPrint, which the compiler
+# sees as potentially panicking again. Not real recursion.
 "__rustc::rust_begin_unwind" = true

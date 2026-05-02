@@ -115,8 +115,7 @@ pub unsafe fn init() {
 
     let typer = mmio_read32(gicd_addr() + GICD_TYPER);
     let irq_lines = ((typer & 0x1F) + 1) * 32;
-    crate::kprintln!("  GIC{} distributor: {} IRQ lines",
-        gic.version_name(), irq_lines);
+    crate::kprintln!("  GIC", gic.version_name(), " distributor: ", irq_lines, " IRQ lines");
 
     gic.init_distributor();
     gic.init_cpu(0);
@@ -124,7 +123,7 @@ pub unsafe fn init() {
     // Store for future dispatch (init_cpu on secondary CPUs, handle_irq, enable_spi).
     *core::ptr::addr_of_mut!(GIC) = gic;
 
-    crate::kprintln!("  GIC initialized, timer PPI {} enabled", TIMER_PPI_INTID);
+    crate::kprintln!("  GIC initialized, timer PPI ", TIMER_PPI_INTID, " enabled");
 }
 
 /// Initialize the per-CPU interrupt interface for a secondary CPU.

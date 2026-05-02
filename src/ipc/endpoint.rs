@@ -94,7 +94,7 @@ pub fn ipc_send(
     caller_token: u64,
 ) -> Result<(), IpcError> {
     let ep_state = EpState::from_raw(unsafe { (*ep).state })
-        .expect("corrupted endpoint state");
+        .unwrap_or_else(|| panic!("corrupted endpoint state"));
     debug_assert_eq!(unsafe { (*ep).header.obj_type }, ObjectType::Endpoint);
 
     match decide_send(ep_state) {
@@ -102,7 +102,7 @@ pub fn ipc_send(
             // Fast path: receiver is queued. Dequeue, transfer, unblock.
             let ep_ref = unsafe { &mut *ep };
             let receiver = ep_queue::dequeue(ep_ref)
-                .expect("HasReceiver without queued waiter");
+                .unwrap_or_else(|| panic!("HasReceiver without queued waiter"));
             // SAFETY: receiver paddr from the endpoint queue — enqueue contract
             // guarantees it is a valid TCB.
             let mut receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver) };
@@ -163,7 +163,7 @@ pub fn ipc_receive(
 
     // Read kernel state for the decision function.
     let ep_state = EpState::from_raw(unsafe { (*ep).state })
-        .expect("corrupted endpoint state");
+        .unwrap_or_else(|| panic!("corrupted endpoint state"));
     let has_outstanding_reply = unsafe {
         KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr).get().current_reply_paddr != 0
     };
@@ -187,7 +187,7 @@ pub fn ipc_receive(
             // Dequeue head (was Send). Deliver msg, unblock sender.
             let ep_ref = unsafe { &mut *ep };
             let head = ep_queue::dequeue(ep_ref)
-                .expect("HasWaiters without queued waiter");
+                .unwrap_or_else(|| panic!("HasWaiters without queued waiter"));
             // SAFETY: head paddr from the endpoint queue — valid TCB.
             let mut head_tcb = unsafe { KernelMut::<Tcb>::from_paddr(head) };
             let msg = head_tcb.get().ipc_msg;
@@ -206,7 +206,7 @@ pub fn ipc_receive(
             // Caller stays blocked awaiting reply.
             let ep_ref = unsafe { &mut *ep };
             let head = ep_queue::dequeue(ep_ref)
-                .expect("HasWaiters without queued waiter");
+                .unwrap_or_else(|| panic!("HasWaiters without queued waiter"));
             // SAFETY: head paddr from the endpoint queue — valid TCB.
             let mut head_tcb = unsafe { KernelMut::<Tcb>::from_paddr(head) };
             let msg = head_tcb.get().ipc_msg;
@@ -267,7 +267,7 @@ pub fn ipc_call(
 
     let reply_is_fresh = unsafe { (*reply).state } == REPLY_STATE_FRESH;
     let ep_state = EpState::from_raw(unsafe { (*ep).state })
-        .expect("corrupted endpoint state");
+        .unwrap_or_else(|| panic!("corrupted endpoint state"));
 
     match decide_call(reply_is_fresh, ep_state) {
         CallDecision::DeliverToReceiver { next_ep_state } => {
@@ -287,7 +287,7 @@ pub fn ipc_call(
             {
                 let ep_ref = unsafe { scoped_mut(ep, &mut tok) };
                 let receiver = ep_queue::dequeue(ep_ref)
-                    .expect("HasReceiver without queued waiter");
+                    .unwrap_or_else(|| panic!("HasReceiver without queued waiter"));
                 // SAFETY: receiver paddr from the endpoint queue — valid TCB.
                 let mut receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver) };
                 {
@@ -360,7 +360,7 @@ pub fn ipc_call(
 pub fn ipc_receive_nb(ep: &mut EndpointObject) -> Result<[u64; 4], IpcError> {
     debug_assert_eq!(ep.header.obj_type, ObjectType::Endpoint);
     let ep_state = EpState::from_raw(ep.state)
-        .expect("corrupted endpoint state");
+        .unwrap_or_else(|| panic!("corrupted endpoint state"));
     if ep_state != EpState::HasWaiters {
         return Err(IpcError::WouldBlock);
     }
@@ -379,7 +379,7 @@ pub fn read_state(ep_paddr: PhysAddr) -> EpState {
     // SAFETY: ep_paddr is a trusted kernel object paddr (produced only via
     // handle-table lookup on an Endpoint handle).
     let ep = unsafe { KernelMut::<EndpointObject>::from_paddr(ep_paddr) };
-    EpState::from_raw(ep.get().state).expect("corrupted endpoint state")
+    EpState::from_raw(ep.get().state).unwrap_or_else(|| panic!("corrupted endpoint state"))
 }
 
 /// Register a thread as a readiness waiter on this endpoint.

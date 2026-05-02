@@ -36,7 +36,7 @@ unsafe fn arm_timer(duration_ms: u64) {
 /// Interrupts must be unmasked after this call for ticks to fire.
 pub unsafe fn init() {
     let freq = timer_freq();
-    crate::kprintln!("  Timer frequency: {} Hz", freq);
+    crate::kprintln!("  Timer frequency: ", freq, " Hz");
     arm_timer(lockjaw_types::constants::TIMER_TICK_MS);
     crate::kprintln!("  Timer armed (10ms interval)");
 }
