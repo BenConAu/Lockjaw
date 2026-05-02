@@ -31,7 +31,54 @@ const FDT_END: u32 = 0x00000009;
 const FDT_MAGIC: u32 = 0xd00dfeed;
 
 /// Maximum nesting depth tracked during FDT walk.
-const MAX_DEPTH: usize = 8;
+/// Nodes deeper than this are traversed but their properties aren't parsed.
+/// QEMU virt: devices at depth 1. Pi 4B: devices at depth 2 (root/soc/device).
+/// Reduced from 8 to limit stack usage in kernel boot (8 KB stack budget).
+const MAX_DEPTH: usize = 4;
+
+/// Maximum compatible strings tracked per node.
+const MAX_COMPAT: usize = 4;
+
+/// Maximum ranges entries tracked per bus node.
+/// Pi 4B soc has 3 ranges entries (main peripherals, PCIe, GIC area).
+const MAX_RANGES: usize = 3;
+
+/// A single entry from a DTB `ranges` property.
+#[derive(Clone, Copy)]
+struct RangeEntry {
+    child_addr: u64,
+    parent_addr: u64,
+    size: u64,
+}
+
+/// Per-depth address space tracking for correct reg/ranges parsing.
+/// Each node's `#address-cells` and `#size-cells` describe how its
+/// children encode addresses. Ranges map from this node's bus space
+/// to its parent's bus space.
+#[derive(Clone, Copy)]
+struct DepthCells {
+    address_cells: u32,
+    size_cells: u32,
+    ranges: [RangeEntry; MAX_RANGES],
+    range_count: u8,
+    has_ranges: bool,
+    /// Deferred ranges property data (parsed at first child's BEGIN_NODE,
+    /// when both this node's and parent's #address-cells are known).
+    ranges_start: usize,
+    ranges_len: usize,
+}
+
+impl DepthCells {
+    const DEFAULT: Self = Self {
+        address_cells: 2,
+        size_cells: 2,
+        ranges: [RangeEntry { child_addr: 0, parent_addr: 0, size: 0 }; 3],
+        range_count: 0,
+        has_ranges: false,
+        ranges_start: 0,
+        ranges_len: 0,
+    };
+}
 
 /// Errors from FDT parsing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,31 +137,40 @@ pub fn dtb_content_size(header: &[u8]) -> Result<usize, FdtError> {
 // Property extraction helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a compatible property: hash the first null-terminated string.
-fn parse_compatible(data: &[u8], prop_data_start: usize) -> u64 {
-    let compat_str = read_string(data, prop_data_start);
-    compatible_hash(compat_str)
+/// Parse a compatible property: hash ALL null-terminated strings.
+/// DTB compatible properties contain a list of strings from most-specific
+/// to most-generic (e.g., "brcm,bcm2835-pl011\0arm,pl011\0arm,primecell\0").
+/// Returns hashes for up to MAX_COMPAT strings so consumers can match
+/// against any of them.
+fn parse_all_compat(data: &[u8], start: usize, len: usize) -> ([u64; MAX_COMPAT], u8) {
+    let mut hashes = [0u64; MAX_COMPAT];
+    let mut count = 0u8;
+    let end = start + len;
+    let mut pos = start;
+    while pos < end && (count as usize) < MAX_COMPAT {
+        let s = read_string(data, pos);
+        if s.is_empty() {
+            break;
+        }
+        hashes[count as usize] = compatible_hash(s);
+        count += 1;
+        pos += s.len() + 1; // skip past null terminator
+    }
+    (hashes, count)
 }
 
-/// Parse a reg property with #address-cells=2, #size-cells=2.
-/// Returns (addr, size) from the first entry.
-fn parse_reg_first(data: &[u8], prop_data_start: usize) -> (u64, u64) {
-    let addr_hi = read_u32_be(data, prop_data_start) as u64;
-    let addr_lo = read_u32_be(data, prop_data_start + 4) as u64;
-    let size_hi = read_u32_be(data, prop_data_start + 8) as u64;
-    let size_lo = read_u32_be(data, prop_data_start + 12) as u64;
-    ((addr_hi << 32) | addr_lo, (size_hi << 32) | size_lo)
-}
-
-/// Parse the second entry of a reg property (if present).
-/// Returns the address from the second entry, or 0 if absent.
-fn parse_reg_second(data: &[u8], prop_data_start: usize, prop_len: usize) -> u64 {
-    if prop_len >= 32 {
-        let addr_hi = read_u32_be(data, prop_data_start + 16) as u64;
-        let addr_lo = read_u32_be(data, prop_data_start + 20) as u64;
-        (addr_hi << 32) | addr_lo
-    } else {
-        0
+/// Read 1 or 2 big-endian u32 cells as a u64 value.
+/// DTB properties encode addresses and sizes using a variable number
+/// of 32-bit cells specified by the parent's #address-cells / #size-cells.
+fn read_cells(data: &[u8], offset: usize, cells: u32) -> u64 {
+    match cells {
+        1 => read_u32_be(data, offset) as u64,
+        2 => {
+            let hi = read_u32_be(data, offset) as u64;
+            let lo = read_u32_be(data, offset + 4) as u64;
+            (hi << 32) | lo
+        }
+        _ => 0, // unsupported
     }
 }
 
@@ -134,9 +190,13 @@ fn parse_interrupt(data: &[u8], prop_data_start: usize) -> u32 {
 /// Reset at each BEGIN_NODE, populated by PROP tokens, consumed at END_NODE.
 #[derive(Clone, Copy)]
 struct NodeState {
-    /// FNV-1a hash of the first compatible string. 0 = no compatible property.
-    compat_hash: u64,
-    /// First reg entry: address.
+    /// FNV-1a hashes of all compatible strings (up to MAX_COMPAT).
+    /// DTB lists them most-specific to most-generic; consumers can match
+    /// against any entry to find a known device type.
+    compat_hashes: [u64; MAX_COMPAT],
+    /// Number of valid entries in compat_hashes.
+    compat_count: u8,
+    /// First reg entry: address (translated to root physical space).
     reg_addr: u64,
     /// First reg entry: size.
     reg_size: u64,
@@ -146,13 +206,95 @@ struct NodeState {
     intid: u32,
     /// True if this node had a compatible property.
     has_compat: bool,
+    /// Deferred reg property position and length.
+    /// Parsed at END_NODE when parent's #address-cells is known.
+    reg_start: usize,
+    reg_len: usize,
 }
 
 impl NodeState {
     const EMPTY: Self = Self {
-        compat_hash: 0, reg_addr: 0, reg_size: 0, reg_addr2: 0,
+        compat_hashes: [0; MAX_COMPAT], compat_count: 0,
+        reg_addr: 0, reg_size: 0, reg_addr2: 0,
         intid: 0, has_compat: false,
+        reg_start: 0, reg_len: 0,
     };
+
+    /// Check if any compatible hash matches the given hash.
+    fn has_compat_hash(&self, hash: u64) -> bool {
+        let mut i = 0;
+        while i < self.compat_count as usize {
+            if self.compat_hashes[i] == hash {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
+/// Parse deferred ranges property data for the node at depth `d`.
+/// Called when all properties at depth `d` are complete (triggered by
+/// the first child's BEGIN_NODE or at END_NODE).
+///
+/// Uses this node's #address-cells + parent's #address-cells to decode
+/// (child_addr, parent_addr, length) triples from the raw ranges data.
+fn parse_ranges_at(data: &[u8], d: usize, cells: &mut [DepthCells; MAX_DEPTH]) {
+    let child_ac = cells[d].address_cells;
+    let parent_ac = if d > 0 { cells[d - 1].address_cells } else { 2 };
+    let child_sc = cells[d].size_cells;
+    let entry_bytes = (child_ac + parent_ac + child_sc) as usize * 4;
+
+    if entry_bytes == 0 {
+        return;
+    }
+
+    let start = cells[d].ranges_start;
+    let end = start + cells[d].ranges_len;
+    let mut off = start;
+
+    while off + entry_bytes <= end && (cells[d].range_count as usize) < MAX_RANGES {
+        let ca = read_cells(data, off, child_ac);
+        let pa = read_cells(data, off + child_ac as usize * 4, parent_ac);
+        let sz = read_cells(data, off + (child_ac + parent_ac) as usize * 4, child_sc);
+        cells[d].ranges[cells[d].range_count as usize] = RangeEntry {
+            child_addr: ca,
+            parent_addr: pa,
+            size: sz,
+        };
+        cells[d].range_count += 1;
+        off += entry_bytes;
+    }
+}
+
+/// Translate an address from a node's parent bus space to root physical space.
+///
+/// A node at depth `d` has its reg encoded in the parent's (d-1) address
+/// space. This function walks up the tree, applying each bus node's ranges
+/// to translate from child space to parent space, until reaching the root
+/// (depth 0 = physical addresses).
+fn translate_address(addr: u64, node_depth: usize, cells: &[DepthCells; MAX_DEPTH]) -> u64 {
+    let mut a = addr;
+    // Walk from the parent level down to depth 1 (root has no parent).
+    // At each level, apply ranges to translate from that bus space
+    // to the parent's bus space.
+    let mut level = if node_depth > 0 { node_depth - 1 } else { return a };
+    while level > 0 {
+        let dc = &cells[level];
+        if dc.range_count > 0 {
+            let mut i = 0;
+            while i < dc.range_count as usize {
+                let r = &dc.ranges[i];
+                if a >= r.child_addr && a.wrapping_sub(r.child_addr) < r.size {
+                    a = r.parent_addr.wrapping_add(a.wrapping_sub(r.child_addr));
+                    break;
+                }
+                i += 1;
+            }
+        }
+        level -= 1;
+    }
+    a
 }
 
 /// Walk the FDT structure block, calling `on_node` for each completed node.
@@ -179,6 +321,8 @@ fn walk_fdt(
     // Per-depth node name start/end for passing to callback
     let mut name_start: [usize; MAX_DEPTH] = [0; MAX_DEPTH];
     let mut name_end: [usize; MAX_DEPTH] = [0; MAX_DEPTH];
+    // Per-depth address space tracking (#address-cells, #size-cells, ranges)
+    let mut cells: [DepthCells; MAX_DEPTH] = [DepthCells::DEFAULT; MAX_DEPTH];
 
     loop {
         if pos + 4 > data.len() {
@@ -189,6 +333,16 @@ fn walk_fdt(
 
         match token {
             FDT_BEGIN_NODE => {
+                // Finalize parent's deferred ranges before processing children.
+                // By this point, all properties of the parent node are complete.
+                if depth > 0 && depth <= MAX_DEPTH {
+                    let pd = depth - 1;
+                    if pd < MAX_DEPTH && cells[pd].has_ranges && cells[pd].range_count == 0
+                       && cells[pd].ranges_len > 0 {
+                        parse_ranges_at(data, pd, &mut cells);
+                    }
+                }
+
                 // Read node name (null-terminated, padded to 4 bytes)
                 let ns = pos;
                 while pos < data.len() && data[pos] != 0 {
@@ -200,6 +354,7 @@ fn walk_fdt(
                 // Reset state for this depth level
                 if depth < MAX_DEPTH {
                     state[depth] = NodeState::EMPTY;
+                    cells[depth] = DepthCells::DEFAULT;
                     name_start[depth] = ns;
                     name_end[depth] = ne;
                 }
@@ -213,6 +368,36 @@ fn walk_fdt(
                 depth -= 1;
                 // Deliver completed node to the callback
                 if depth < MAX_DEPTH {
+                    // Parse deferred reg using parent's #address-cells / #size-cells
+                    if state[depth].reg_len > 0 {
+                        let (ac, sc) = if depth > 0 {
+                            (cells[depth - 1].address_cells, cells[depth - 1].size_cells)
+                        } else {
+                            (2, 2) // DTB spec defaults
+                        };
+                        let entry_size = (ac + sc) as usize * 4;
+                        let start = state[depth].reg_start;
+                        if state[depth].reg_len >= entry_size {
+                            state[depth].reg_addr = read_cells(data, start, ac);
+                            state[depth].reg_size = read_cells(
+                                data, start + ac as usize * 4, sc);
+                            if state[depth].reg_len >= entry_size * 2 {
+                                state[depth].reg_addr2 = read_cells(
+                                    data, start + entry_size, ac);
+                            }
+                        }
+                    }
+
+                    // Translate addresses through ranges chain to root physical
+                    if state[depth].reg_addr != 0 {
+                        state[depth].reg_addr = translate_address(
+                            state[depth].reg_addr, depth, &cells);
+                    }
+                    if state[depth].reg_addr2 != 0 {
+                        state[depth].reg_addr2 = translate_address(
+                            state[depth].reg_addr2, depth, &cells);
+                    }
+
                     let name = &data[name_start[depth]..name_end[depth]];
                     on_node(name, &state[depth]);
                 }
@@ -242,16 +427,29 @@ fn walk_fdt(
 
                 if d < MAX_DEPTH {
                     if str_eq(prop_name, b"compatible") {
-                        // Hash the first compatible string (null-terminated within prop data)
-                        state[d].compat_hash = parse_compatible(data, prop_data_start);
+                        // Hash all compatible strings (most-specific first)
+                        let (hashes, count) = parse_all_compat(
+                            data, prop_data_start, prop_len);
+                        state[d].compat_hashes = hashes;
+                        state[d].compat_count = count;
                         state[d].has_compat = true;
-                    } else if str_eq(prop_name, b"reg") && prop_len >= 16 {
-                        let (addr, size) = parse_reg_first(data, prop_data_start);
-                        state[d].reg_addr = addr;
-                        state[d].reg_size = size;
-                        state[d].reg_addr2 = parse_reg_second(data, prop_data_start, prop_len);
+                    } else if str_eq(prop_name, b"#address-cells") && prop_len >= 4 {
+                        cells[d].address_cells = read_u32_be(data, prop_data_start);
+                    } else if str_eq(prop_name, b"#size-cells") && prop_len >= 4 {
+                        cells[d].size_cells = read_u32_be(data, prop_data_start);
+                    } else if str_eq(prop_name, b"reg") {
+                        // Defer parsing until END_NODE — parent's #address-cells
+                        // may not have been seen yet in property order
+                        state[d].reg_start = prop_data_start;
+                        state[d].reg_len = prop_len;
                     } else if str_eq(prop_name, b"interrupts") && prop_len >= 12 {
                         state[d].intid = parse_interrupt(data, prop_data_start);
+                    } else if str_eq(prop_name, b"ranges") {
+                        // Defer parsing — need both this node's and parent's
+                        // #address-cells, which may appear later in property order
+                        cells[d].has_ranges = true;
+                        cells[d].ranges_start = prop_data_start;
+                        cells[d].ranges_len = prop_len;
                     }
                 }
 
@@ -292,10 +490,11 @@ pub fn parse_fdt(data: &[u8]) -> Result<FdtDevices, FdtError> {
     };
 
     walk_fdt(data, off_dt_struct, off_dt_strings, |_name, node| {
-        // Save every node that had a compatible string
+        // Save every node that had a compatible string.
+        // Use the first (most-specific) compatible hash for DeviceInfo.
         if node.has_compat && result.count < MAX_DEVICES {
             result.devices[result.count] = DeviceInfo {
-                compatible_hash: node.compat_hash,
+                compatible_hash: node.compat_hashes[0],
                 mmio_addr: node.reg_addr,
                 mmio_size: node.reg_size,
                 intid: node.intid,
@@ -338,6 +537,11 @@ pub struct PlatformHw {
 /// Walks the FDT structure block once, matching only the compatible
 /// strings and node names the kernel needs at boot. No device array
 /// allocation — just fills in the fixed PlatformHw struct.
+///
+/// `#[inline(never)]` prevents LTO from merging this function's stack
+/// frame (which includes the walk_fdt local arrays) into kmain's frame,
+/// keeping both under the per-function 1536-byte stack cap.
+#[inline(never)]
 pub fn scan_platform(data: &[u8]) -> Result<PlatformHw, FdtError> {
     let (off_dt_struct, off_dt_strings) = validate_header(data)?;
 
@@ -359,13 +563,15 @@ pub fn scan_platform(data: &[u8]) -> Result<PlatformHw, FdtError> {
         if is_memory && node.reg_addr != 0 && hw.ram_base == 0 {
             hw.ram_base = node.reg_addr;
             hw.ram_size = node.reg_size;
-        } else if node.compat_hash == pl011_hash && hw.uart_base == 0 {
+        } else if node.has_compat_hash(pl011_hash) && hw.uart_base == 0 {
+            // Match any compatible string (e.g., "arm,pl011-axi" first,
+            // "arm,pl011" second on Pi 4B; "arm,pl011" first on QEMU).
             hw.uart_base = node.reg_addr;
-        } else if node.compat_hash == gicv3_hash && hw.gicd_base == 0 {
+        } else if node.has_compat_hash(gicv3_hash) && hw.gicd_base == 0 {
             hw.gicd_base = node.reg_addr;
             hw.gic_secondary_base = node.reg_addr2;
             hw.gic_v2 = false;
-        } else if (node.compat_hash == gicv2_hash || node.compat_hash == gic400_hash)
+        } else if (node.has_compat_hash(gicv2_hash) || node.has_compat_hash(gic400_hash))
                   && hw.gicd_base == 0 {
             hw.gicd_base = node.reg_addr;
             hw.gic_secondary_base = node.reg_addr2;
@@ -456,33 +662,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_reg_first_test() {
-        // reg = <0x00000000 0x09000000 0x00000000 0x00001000>
+    fn read_cells_one() {
+        // #address-cells=1: single 32-bit value
+        let data = [0x09, 0x00, 0x00, 0x00];
+        assert_eq!(read_cells(&data, 0, 1), 0x0900_0000);
+    }
+
+    #[test]
+    fn read_cells_two() {
+        // #address-cells=2: two 32-bit values → 64-bit
         let data = [
-            0x00, 0x00, 0x00, 0x00,  // addr_hi
-            0x09, 0x00, 0x00, 0x00,  // addr_lo
-            0x00, 0x00, 0x00, 0x00,  // size_hi
-            0x00, 0x00, 0x10, 0x00,  // size_lo
+            0x00, 0x00, 0x00, 0x00,  // hi
+            0x09, 0x00, 0x00, 0x00,  // lo
         ];
-        let (addr, size) = parse_reg_first(&data, 0);
-        assert_eq!(addr, 0x0900_0000);
-        assert_eq!(size, 0x1000);
+        assert_eq!(read_cells(&data, 0, 2), 0x0900_0000);
     }
 
     #[test]
-    fn parse_reg_second_present() {
-        // Two reg entries, each 16 bytes
-        let mut data = [0u8; 32];
-        // Second entry addr = 0x080A0000
-        data[16] = 0x00; data[17] = 0x00; data[18] = 0x00; data[19] = 0x00;
-        data[20] = 0x08; data[21] = 0x0A; data[22] = 0x00; data[23] = 0x00;
-        assert_eq!(parse_reg_second(&data, 0, 32), 0x080A_0000);
-    }
-
-    #[test]
-    fn parse_reg_second_absent() {
-        let data = [0u8; 16];
-        assert_eq!(parse_reg_second(&data, 0, 16), 0);
+    fn read_cells_two_high() {
+        // High bits set
+        let data = [
+            0x00, 0x00, 0x00, 0x01,  // hi = 1
+            0x00, 0x00, 0x00, 0x00,  // lo = 0
+        ];
+        assert_eq!(read_cells(&data, 0, 2), 0x1_0000_0000);
     }
 
     #[test]
@@ -737,5 +940,55 @@ mod tests {
             .iter()
             .find(|d| d.compatible_hash == gic_hash);
         assert_eq!(hw.gicd_base, gic.unwrap().mmio_addr);
+    }
+
+    // --- Pi 4B DTB tests (address translation + multi-compatible) ---
+
+    static PI4B_DTB: &[u8] = include_bytes!("../test-data/pi4b.dtb");
+
+    #[test]
+    fn pi4b_header_valid() {
+        assert!(validate_header(PI4B_DTB).is_ok());
+    }
+
+    #[test]
+    fn pi4b_scan_finds_uart_translated() {
+        // Pi 4B UART: compatible = "arm,pl011-axi", "arm,pl011", ...
+        // DTB reg = 0x7e201000 (bus address), ranges translate to 0xfe201000
+        let hw = scan_platform(PI4B_DTB).unwrap();
+        assert_eq!(hw.uart_base, 0xfe20_1000,
+            "UART should be translated from bus 0x7e201000 to physical 0xfe201000");
+    }
+
+    #[test]
+    fn pi4b_scan_finds_gic400() {
+        // Pi 4B GIC-400: compatible = "arm,gic-400"
+        // DTB reg = 0x40041000 (bus), ranges translate to 0xff841000
+        let hw = scan_platform(PI4B_DTB).unwrap();
+        assert!(hw.gic_v2, "Pi 4B should have GICv2 (gic-400)");
+        assert_eq!(hw.gicd_base, 0xff84_1000,
+            "GICD should be translated from bus 0x40041000 to physical 0xff841000");
+        assert_eq!(hw.gic_secondary_base, 0xff84_2000,
+            "GIC CPU interface should be at 0xff842000");
+    }
+
+    #[test]
+    fn pi4b_multi_compat_matches() {
+        // parse_fdt stores first compat hash. Pi UART first compat is
+        // "arm,pl011-axi", not "arm,pl011". But scan_platform should
+        // still find it via the second compat string.
+        let devs = parse_fdt(PI4B_DTB).unwrap();
+        let pl011_axi_hash = compatible_hash(b"arm,pl011-axi");
+        let uart = devs.devices[..devs.count]
+            .iter()
+            .find(|d| d.compatible_hash == pl011_axi_hash && d.mmio_addr == 0xfe20_1000);
+        assert!(uart.is_some(),
+            "parse_fdt should find Pi UART with first compat hash (arm,pl011-axi)");
+    }
+
+    #[test]
+    fn pi4b_parse_succeeds() {
+        let devs = parse_fdt(PI4B_DTB).unwrap();
+        assert!(devs.count > 0, "Pi 4B DTB should have devices");
     }
 }
