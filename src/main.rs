@@ -18,6 +18,7 @@ mod syscall;
 use arch::aarch64::uart::Uart;
 
 extern "C" {
+    static __kernel_start: u8;
     static __bss_start: u8;
     static __bss_end: u8;
     static __kernel_end: u8;
@@ -124,7 +125,8 @@ pub extern "C" fn kmain() -> ! {
         let stack_top = &__stack_top as *const u8 as usize;
 
         kprintln!("Memory layout:");
-        kprintln!("  Kernel load:  0x{:08x}", arch::aarch64::platform::KERNEL_LOAD_ADDR);
+        // SAFETY: linker symbol
+        kprintln!("  Kernel load:  0x{:08x}", &__kernel_start as *const u8 as usize);
         kprintln!("  BSS:          0x{:08x} - 0x{:08x} ({} bytes)", bss_start, bss_end, bss_end - bss_start);
         kprintln!("  Kernel end:   0x{:08x}", kernel_end);
         kprintln!("  Stack:        0x{:08x} - 0x{:08x} ({} bytes)", stack_bottom, stack_top, stack_top - stack_bottom);
@@ -141,8 +143,9 @@ pub extern "C" fn kmain() -> ! {
     // __kernel_end and the stacks. We must free that gap explicitly so
     // those pages aren't silently wasted.
     unsafe {
-        let kernel_start = mm::addr::PhysAddr::new(arch::aarch64::platform::KERNEL_LOAD_ADDR);
-        // SAFETY: linker symbols
+        // SAFETY: linker symbol
+        let kernel_start = mm::addr::PhysAddr::new(&__kernel_start as *const u8 as u64);
+        // SAFETY: linker symbol
         let kernel_end = mm::addr::PhysAddr::new(&__kernel_end as *const u8 as u64);
         // SAFETY: linker symbol — 2 MB-aligned start of per-CPU stacks
         let stacks_start = mm::addr::PhysAddr::new(&__per_cpu_stacks as *const u8 as u64);

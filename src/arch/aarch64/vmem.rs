@@ -58,8 +58,16 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     // L0[0] → L1
     (*l0_va).entries[0] = PageTableEntry::new_table(l1_page.start_addr());
 
-    // Kernel identity map in L1 (workaround: kernel linked at phys addrs):
-    // L1[1] = 1GB block at RAM_BASE (kernel-only)
+    // Kernel physical RAM in user TTBR0 (kernel-only, normal memory).
+    // Required: some kernel exception handling path accesses TTBR0-range
+    // addresses in the kernel physical range. Removing this causes
+    // immediate crash on EL0 entry — must investigate which code path.
+    //
+    // QEMU: kernel at 0x4020_0000 in L1[1], ram_base = 0x4000_0000.
+    // Pi 4B: kernel at 0x8_0000 in L1[0], ram_base = 0x0. L1[0] is
+    // already used for user pages (L1[0] → L2), so a 1GB block won't
+    // work. Pi 4B fix requires identifying the TTBR0 access and either
+    // eliminating it or mapping kernel pages via L2/L3 entries.
     (*l1_va).entries[1] = PageTableEntry::new_block(
         PhysAddr::new(super::platform::info().ram_base),
         MAIR_NORMAL,

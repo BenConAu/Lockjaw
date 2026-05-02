@@ -28,9 +28,6 @@ pub const DEFAULT_RAM_BASE: u64 = 0x4000_0000;
 /// Device MMIO region base (QEMU virt default).
 pub const DEFAULT_DEVICE_MMIO_BASE: u64 = 0x0800_0000;
 
-/// Kernel load address (QEMU virt default).
-pub const KERNEL_LOAD_ADDR: u64 = 0x4020_0000;
-
 /// Virtual timer PPI interrupt ID (generic ARMv8, platform-independent).
 pub const VIRTUAL_TIMER_INTID: u32 = 27;
 

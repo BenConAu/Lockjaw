@@ -16,6 +16,7 @@ MEMORY
 SECTIONS
 {
     . = 0x40200000;
+    __kernel_start = .;
 
     /* Kernel code — _start entry point placed first */
     .text : {

@@ -20,7 +20,7 @@ QEMU_DISPLAY_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -m 128M \
 
 USER_CRATES := user/hello user/uart-driver user/device-manager user/ramfb-driver user/display-test user/virtio-blk-driver user/init
 
-.PHONY: build build-release build-user build-hash clean-all run run-release run-display run-blk objdump nm check-stack check-pointers test test-unit test-qemu-gicv3 test-qemu-gicv2 clean
+.PHONY: build build-release build-user build-hash clean-all run run-release run-display run-blk objdump nm check-stack check-pointers test test-unit test-qemu-gicv3 test-qemu-gicv2 clean pi4
 
 clean-all:
 	cargo clean
@@ -86,6 +86,12 @@ test-qemu-gicv3: build
 
 test-qemu-gicv2: build
 	GIC_VERSION=2 bash tests/qemu_integration.sh
+
+kernel8.img: build-release
+	llvm-objcopy -O binary $(KERNEL_ELF_RELEASE) kernel8.img
+
+pi4: kernel8.img
+	@echo "kernel8.img ready — copy to Pi 4B SD card boot partition"
 
 clean:
 	cargo clean
