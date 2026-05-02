@@ -480,7 +480,8 @@ pub fn parse_fdt(data: &[u8]) -> Result<FdtDevices, FdtError> {
 
     let mut result = FdtDevices {
         devices: [DeviceInfo {
-            compatible_hash: 0,
+            compat_hashes: [0; MAX_COMPAT],
+            compat_count: 0,
             mmio_addr: 0,
             mmio_size: 0,
             intid: 0,
@@ -491,10 +492,12 @@ pub fn parse_fdt(data: &[u8]) -> Result<FdtDevices, FdtError> {
 
     walk_fdt(data, off_dt_struct, off_dt_strings, |_name, node| {
         // Save every node that had a compatible string.
-        // Use the first (most-specific) compatible hash for DeviceInfo.
+        // Store all compat hashes so consumers can match any of them
+        // (e.g., Pi 4B UART has "arm,pl011-axi" first, "arm,pl011" second).
         if node.has_compat && result.count < MAX_DEVICES {
             result.devices[result.count] = DeviceInfo {
-                compatible_hash: node.compat_hashes[0],
+                compat_hashes: node.compat_hashes,
+                compat_count: node.compat_count,
                 mmio_addr: node.reg_addr,
                 mmio_size: node.reg_size,
                 intid: node.intid,
@@ -526,7 +529,8 @@ pub struct PlatformHw {
     pub gic_secondary_base: u64,
     /// True if GIC is v2 (arm,cortex-a15-gic or arm,gic-400).
     pub gic_v2: bool,
-    /// RAM base physical address from /memory node. 0 = not found.
+    /// RAM base physical address from /memory node.
+    /// Can legitimately be 0 (Pi 4B). Use ram_size to detect "not found".
     pub ram_base: u64,
     /// RAM size in bytes from /memory node. 0 = not found.
     pub ram_size: u64,
@@ -560,7 +564,9 @@ pub fn scan_platform(data: &[u8]) -> Result<PlatformHw, FdtError> {
         let is_memory = str_eq(name, b"memory") ||
             (name.len() > 7 && str_eq(&name[..7], b"memory@"));
 
-        if is_memory && node.reg_addr != 0 && hw.ram_base == 0 {
+        // Guard on reg_size, not reg_addr — Pi 4B has RAM at physical 0x0,
+        // so reg_addr == 0 is valid. reg_size == 0 means "not populated".
+        if is_memory && node.reg_size != 0 && hw.ram_size == 0 {
             hw.ram_base = node.reg_addr;
             hw.ram_size = node.reg_size;
         } else if node.has_compat_hash(pl011_hash) && hw.uart_base == 0 {
@@ -723,7 +729,7 @@ mod tests {
         let devs = parse_fdt(QEMU_DTB).unwrap();
         let pl011_count = devs.devices[..devs.count]
             .iter()
-            .filter(|d| d.compatible_hash == PL011_HASH)
+            .filter(|d| d.has_compat(PL011_HASH))
             .count();
         assert_eq!(pl011_count, 2, "QEMU virt should have 2 PL011 UARTs");
     }
@@ -733,7 +739,7 @@ mod tests {
         let devs = parse_fdt(QEMU_DTB).unwrap();
         let uart0 = devs.devices[..devs.count]
             .iter()
-            .find(|d| d.compatible_hash == PL011_HASH && d.mmio_addr == 0x0900_0000);
+            .find(|d| d.has_compat(PL011_HASH) && d.mmio_addr == 0x0900_0000);
         assert!(uart0.is_some(), "UART0 should be at 0x09000000");
         let uart0 = uart0.unwrap();
         assert_eq!(uart0.mmio_size, 0x1000);
@@ -745,7 +751,7 @@ mod tests {
         let devs = parse_fdt(QEMU_DTB).unwrap();
         let uart1 = devs.devices[..devs.count]
             .iter()
-            .find(|d| d.compatible_hash == PL011_HASH && d.mmio_addr == 0x0904_0000);
+            .find(|d| d.has_compat(PL011_HASH) && d.mmio_addr == 0x0904_0000);
         assert!(uart1.is_some(), "UART1 should be at 0x09040000");
         let uart1 = uart1.unwrap();
         assert_eq!(uart1.mmio_size, 0x1000);
@@ -758,7 +764,7 @@ mod tests {
         let gic_hash = compatible_hash(b"arm,gic-v3");
         let gic = devs.devices[..devs.count]
             .iter()
-            .find(|d| d.compatible_hash == gic_hash);
+            .find(|d| d.has_compat(gic_hash));
         assert!(gic.is_some(), "Should find GICv3");
         let gic = gic.unwrap();
         assert_eq!(gic.mmio_addr, 0x0800_0000);
@@ -927,7 +933,7 @@ mod tests {
         let devs = parse_fdt(QEMU_DTB).unwrap();
         let uart0 = devs.devices[..devs.count]
             .iter()
-            .find(|d| d.compatible_hash == PL011_HASH);
+            .find(|d| d.has_compat(PL011_HASH));
         assert_eq!(hw.uart_base, uart0.unwrap().mmio_addr);
     }
 
@@ -938,7 +944,7 @@ mod tests {
         let gic_hash = compatible_hash(b"arm,gic-v3");
         let gic = devs.devices[..devs.count]
             .iter()
-            .find(|d| d.compatible_hash == gic_hash);
+            .find(|d| d.has_compat(gic_hash));
         assert_eq!(hw.gicd_base, gic.unwrap().mmio_addr);
     }
 
@@ -974,16 +980,17 @@ mod tests {
 
     #[test]
     fn pi4b_multi_compat_matches() {
-        // parse_fdt stores first compat hash. Pi UART first compat is
-        // "arm,pl011-axi", not "arm,pl011". But scan_platform should
-        // still find it via the second compat string.
+        // Pi 4B UART has compatible = "arm,pl011-axi", "arm,pl011".
+        // parse_fdt now stores all compat hashes. Both should match.
         let devs = parse_fdt(PI4B_DTB).unwrap();
-        let pl011_axi_hash = compatible_hash(b"arm,pl011-axi");
         let uart = devs.devices[..devs.count]
             .iter()
-            .find(|d| d.compatible_hash == pl011_axi_hash && d.mmio_addr == 0xfe20_1000);
+            .find(|d| d.has_compat(PL011_HASH) && d.mmio_addr == 0xfe20_1000);
         assert!(uart.is_some(),
-            "parse_fdt should find Pi UART with first compat hash (arm,pl011-axi)");
+            "parse_fdt should find Pi UART via arm,pl011 (second compat string)");
+        let pl011_axi_hash = compatible_hash(b"arm,pl011-axi");
+        assert!(uart.unwrap().has_compat(pl011_axi_hash),
+            "Pi UART should also match arm,pl011-axi (first compat string)");
     }
 
     #[test]

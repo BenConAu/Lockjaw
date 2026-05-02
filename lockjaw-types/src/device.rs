@@ -25,6 +25,10 @@ pub const PL011_HASH: u64 = compatible_hash(b"arm,pl011");
 /// Pre-computed hash for "qemu,fw-cfg-mmio" — used by the ramfb display driver.
 pub const FW_CFG_HASH: u64 = compatible_hash(b"qemu,fw-cfg-mmio");
 
+/// Maximum compatible strings per device node in the DTB.
+/// Must match fdt.rs MAX_COMPAT.
+pub const MAX_COMPAT: usize = 4;
+
 /// Maximum number of devices the device manager can track.
 /// QEMU virt has 32 virtio-mmio devices alone, plus UARTs, GIC, etc.
 pub const MAX_DEVICES: usize = 64;
@@ -32,8 +36,12 @@ pub const MAX_DEVICES: usize = 64;
 /// A device entry parsed from the DTB.
 #[derive(Clone, Copy)]
 pub struct DeviceInfo {
-    /// FNV-1a hash of the first compatible string.
-    pub compatible_hash: u64,
+    /// FNV-1a hashes of all compatible strings (up to MAX_COMPAT).
+    /// Pi 4B UART has "arm,pl011-axi" first, "arm,pl011" second —
+    /// matching must check all entries, not just [0].
+    pub compat_hashes: [u64; MAX_COMPAT],
+    /// Number of valid entries in compat_hashes.
+    pub compat_count: u8,
     /// Physical MMIO base address.
     pub mmio_addr: u64,
     /// MMIO region size in bytes.
@@ -42,6 +50,21 @@ pub struct DeviceInfo {
     pub intid: u32,
     /// Whether this device has been claimed by a driver.
     pub claimed: bool,
+}
+
+impl DeviceInfo {
+    /// Check if any compatible string matches the given hash.
+    /// Same semantics as the FDT walker's NodeInfo::has_compat_hash.
+    pub fn has_compat(&self, hash: u64) -> bool {
+        let mut i = 0;
+        while i < self.compat_count as usize {
+            if self.compat_hashes[i] == hash {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
 }
 
 /// Pre-computed hash for "virtio,mmio" — used by virtio drivers.
@@ -135,7 +158,9 @@ mod tests {
     #[test]
     fn device_info_size() {
         // Ensure it's a reasonable size for array storage
-        assert!(core::mem::size_of::<DeviceInfo>() <= 40);
+        // 4 compat hashes (32) + count (1) + padding + mmio_addr (8) +
+        // mmio_size (8) + intid (4) + claimed (1) + padding = 64
+        assert!(core::mem::size_of::<DeviceInfo>() <= 64);
     }
 
     #[test]

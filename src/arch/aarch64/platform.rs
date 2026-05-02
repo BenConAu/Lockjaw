@@ -1,32 +1,20 @@
 /// Platform discovery from DTB.
 ///
-/// At boot, the DTB is parsed to discover hardware addresses. Before
-/// this runs, QEMU-compatible defaults are used. After discover(),
-/// all platform constants come from the DTB.
-///
-/// The old hardcoded constants are kept as compile-time defaults for
-/// the pre-discovery window (early boot prints, MMU setup).
+/// The DTB is the single source of truth for all hardware addresses.
+/// No defaults, no prints before discovery. If DTB is missing or
+/// malformed, the kernel halts — without DTB we don't know where
+/// any hardware is.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
-// Compile-time defaults (QEMU virt, used before DTB discovery)
+// Constants
 // ---------------------------------------------------------------------------
 
-/// PL011 UART0 physical base address (QEMU virt default).
-pub const DEFAULT_UART0_BASE: u64 = 0x0900_0000;
-
-/// GIC distributor physical base address (QEMU virt default).
-pub const DEFAULT_GICD_BASE: u64 = 0x0800_0000;
-
-/// GIC redistributor / CPU interface physical base address (QEMU virt default).
-pub const DEFAULT_GICR_BASE: u64 = 0x080A_0000;
-
-/// Physical base address of RAM (QEMU virt default).
-pub const DEFAULT_RAM_BASE: u64 = 0x4000_0000;
-
-/// Device MMIO region base (QEMU virt default).
-pub const DEFAULT_DEVICE_MMIO_BASE: u64 = 0x0800_0000;
+/// QEMU `-kernel` bare-metal boot places the DTB at the start of RAM.
+/// If the firmware DTB pointer (x0) is zero, search here as a fallback.
+/// This is NOT a default for any MMIO — it's purely a DTB search address.
+pub const QEMU_DTB_SEARCH_ADDR: u64 = 0x4000_0000;
 
 /// Virtual timer PPI interrupt ID (generic ARMv8, platform-independent).
 pub const VIRTUAL_TIMER_INTID: u32 = 27;
@@ -38,8 +26,8 @@ pub const MAX_CPUS: usize = 4;
 // Runtime platform info (populated from DTB)
 // ---------------------------------------------------------------------------
 
-/// Discovered platform information. Populated by discover() from DTB.
-/// Before discover() runs, all fields hold QEMU virt defaults.
+/// Discovered platform information. All fields are zero until discover()
+/// populates them from the DTB. Zero means "not discovered".
 pub struct PlatformInfo {
     pub uart0_base: u64,
     pub gicd_base: u64,
@@ -51,51 +39,64 @@ pub struct PlatformInfo {
     pub gic_v2: bool,
 }
 
-/// Global platform info. Initialized with QEMU virt defaults, then
-/// overwritten by discover() before any consumer reads it.
+/// Errors from platform discovery.
+#[derive(Debug)]
+pub enum PlatformError {
+    /// DTB pointer invalid or magic mismatch.
+    NoDtb,
+    /// DTB structure unparseable.
+    ParseFailed,
+    /// No PL011 UART found in DTB.
+    MissingUart,
+    /// No GIC distributor found in DTB.
+    MissingGic,
+    /// No memory node found in DTB.
+    MissingRam,
+}
+
+/// Global platform info. All zeros until discover() populates from DTB.
 static mut PLATFORM: PlatformInfo = PlatformInfo {
-    uart0_base: DEFAULT_UART0_BASE,
-    gicd_base: DEFAULT_GICD_BASE,
-    gic_secondary_base: DEFAULT_GICR_BASE,
-    ram_base: DEFAULT_RAM_BASE,
-    ram_size: 0x0800_0000, // 128 MB default
-    device_mmio_base: DEFAULT_DEVICE_MMIO_BASE,
+    uart0_base: 0,
+    gicd_base: 0,
+    gic_secondary_base: 0,
+    ram_base: 0,
+    ram_size: 0,
+    device_mmio_base: 0,
     gic_v2: false,
 };
 
 static DISCOVERED: AtomicBool = AtomicBool::new(false);
 
-/// Read platform info. Before discover() runs, returns QEMU virt defaults.
-/// After discover(), returns DTB-discovered values.
-/// All consumers must call this — never read the old constants directly.
+/// Read platform info. Only valid after discover() succeeds.
+/// In debug builds, asserts that discovery has run.
 pub fn info() -> &'static PlatformInfo {
-    // SAFETY: PLATFORM is written once by discover() before any concurrent
-    // access. After DISCOVERED is set, it is read-only.
+    debug_assert!(DISCOVERED.load(Ordering::Acquire), "platform::info() called before discover()");
     // SAFETY: PLATFORM is written once by discover() during single-core
     // boot, then read-only. No concurrent mutation after DISCOVERED is set.
     unsafe { &*core::ptr::addr_of!(PLATFORM) }
 }
 
-// Legacy constant — still used by DTB fallback path in main.rs.
-pub const RAM_BASE: u64 = DEFAULT_RAM_BASE;
-
 /// Discover platform hardware from a DTB at the given physical address.
 /// Must be called pre-MMU (raw physical address) or with identity mapping.
 ///
-/// Extracts: UART address, GIC addresses + version, RAM layout.
-/// Falls back to QEMU virt defaults for anything not found in the DTB.
-pub fn discover(dtb_paddr: u64) {
-    // Construct a byte slice from the physical DTB address.
-    // SAFETY: dtb_paddr was validated by the caller (DTB magic check).
-    // Pre-MMU, physical addresses are directly accessible.
+/// Owns all DTB validation: magic check, size check, parsing, and
+/// required-field validation. Returns `Err` if any essential hardware
+/// is missing — the caller should halt immediately.
+pub fn discover(dtb_paddr: u64) -> Result<(), PlatformError> {
+    // Validate DTB magic before reading the full blob.
     let header = unsafe {
-        // SAFETY: dtb_paddr validated by caller (magic check); pre-MMU physical address
+        // SAFETY: pre-MMU physical address; caller guarantees dtb_paddr
+        // points to at least 40 bytes of readable memory.
         core::slice::from_raw_parts(dtb_paddr as *const u8, 40)
     };
-    let dtb_size = match lockjaw_types::fdt::dtb_content_size(header) {
-        Ok(size) => size,
-        Err(_) => return, // invalid DTB, keep defaults
-    };
+    let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if magic != 0xd00dfeed {
+        return Err(PlatformError::NoDtb);
+    }
+
+    let dtb_size = lockjaw_types::fdt::dtb_content_size(header)
+        .map_err(|_| PlatformError::NoDtb)?;
+
     let dtb = unsafe {
         // SAFETY: dtb_paddr + dtb_size within DTB blob; pre-MMU physical address
         core::slice::from_raw_parts(dtb_paddr as *const u8, dtb_size)
@@ -103,32 +104,39 @@ pub fn discover(dtb_paddr: u64) {
 
     // Use the lightweight scanner — fixed-size output, no large array
     // on the kernel boot stack.
-    let hw = match lockjaw_types::fdt::scan_platform(dtb) {
-        Ok(hw) => hw,
-        Err(_) => return, // parse failed, keep defaults
-    };
+    let hw = lockjaw_types::fdt::scan_platform(dtb)
+        .map_err(|_| PlatformError::ParseFailed)?;
 
-    // SAFETY: single-core boot, no concurrent access yet.
+    // Validate required fields — all essential hardware must be present.
+    if hw.uart_base == 0 {
+        return Err(PlatformError::MissingUart);
+    }
+    if hw.gicd_base == 0 {
+        return Err(PlatformError::MissingGic);
+    }
+    if hw.ram_size == 0 {
+        return Err(PlatformError::MissingRam);
+    }
+
     // SAFETY: single-core boot, no concurrent access yet.
     let p = unsafe { &mut *core::ptr::addr_of_mut!(PLATFORM) };
 
-    if hw.uart_base != 0 {
-        p.uart0_base = hw.uart_base;
-    }
-    if hw.gicd_base != 0 {
-        p.gicd_base = hw.gicd_base;
-        p.gic_secondary_base = hw.gic_secondary_base;
-        p.gic_v2 = hw.gic_v2;
-    }
-    if hw.ram_base != 0 || hw.ram_size != 0 {
-        p.ram_base = hw.ram_base;
-        p.ram_size = hw.ram_size;
-        // Infer device MMIO base from platform layout.
-        // Pi 4B: peripherals at 0xFE000000. QEMU virt: 0x08000000.
-        if hw.uart_base >= 0xFE00_0000 {
-            p.device_mmio_base = 0xFE00_0000;
-        }
+    p.uart0_base = hw.uart_base;
+    p.gicd_base = hw.gicd_base;
+    p.gic_secondary_base = hw.gic_secondary_base;
+    p.gic_v2 = hw.gic_v2;
+    p.ram_base = hw.ram_base;
+    p.ram_size = hw.ram_size;
+
+    // Heuristic: infer device MMIO region from UART address range.
+    // Works for QEMU virt (0x08000000) and Pi 4B (0xFE000000).
+    // Future platforms may need explicit MMIO range discovery from DTB.
+    if hw.uart_base >= 0xFE00_0000 {
+        p.device_mmio_base = 0xFE00_0000;
+    } else {
+        p.device_mmio_base = 0x0800_0000;
     }
 
     DISCOVERED.store(true, Ordering::Release);
+    Ok(())
 }

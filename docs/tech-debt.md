@@ -246,6 +246,18 @@ The eventual design is a **device manager** process that:
 
 ---
 
+## DTB-driven baud rate computation
+
+**Where:** `src/arch/aarch64/uart.rs` (init_baud)
+
+**What:** `init_baud()` hardcodes IBRD=26 / FBRD=3 for a 48 MHz UARTCLK (Pi 4B and QEMU). Future platforms with a different UARTCLK will produce the wrong baud rate. The proper fix is to read `clock-frequency` from the DTB's UART node and compute the divisors dynamically.
+
+**Why bootstrap:** The Pi 4B DTB does not expose `clock-frequency` directly on the UART node — it uses phandle references into the VideoCore clock controller, which would require a full clock framework to resolve. Both currently supported platforms (QEMU virt, Pi 4B) use 48 MHz UARTCLK.
+
+**Fix:** Implement a minimal clock resolution pass: follow the UART node's `clocks` phandle to its parent clock node and read `clock-frequency`. Compute IBRD/FBRD from the discovered clock rate. Until then, init_baud is called unconditionally with fixed 48 MHz divisors.
+
+---
+
 ## Audit: push kernel state into lockjaw-types
 
 **Where:** Kernel-side modules in `src/` that contain pure state machines, data structures, or decision logic with no hardware or `unsafe` dependencies.

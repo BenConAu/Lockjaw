@@ -20,8 +20,6 @@ use lockjaw_types::device::{CMD_PROBE_DEVICE, CMD_CLAIM_BY_ADDR, CLAIM_OK, CLAIM
 const DTB_MAX_PAGES: usize = 16;
 
 
-/// UART0 physical address — reserved for kernel debug output.
-const KERNEL_UART0_PHYS: u64 = 0x0900_0000;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -90,18 +88,21 @@ pub extern "C" fn _start() -> ! {
     puts(" devices\n");
 
     // Step 3: Print PL011 device addresses found in the DTB.
-    // Reserve UART0 for the kernel (it uses 0x0900_0000 for debug output).
+    // Reserve the first PL011 for the kernel — scan_platform() takes the
+    // first one it finds, so the device manager must match that policy.
     let pl011_hash = PL011_HASH;
+    let mut first_pl011 = true;
     for i in 0..devices.count {
         let dev = &devices.devices[i];
-        if dev.compatible_hash == pl011_hash {
+        if dev.has_compat(pl011_hash) {
             puts("devmgr: PL011 at ");
             put_hex(dev.mmio_addr);
             puts(" intid=");
             put_decimal(dev.intid as u64);
-            if dev.mmio_addr == KERNEL_UART0_PHYS {
+            if first_pl011 {
                 puts(" (kernel, reserved)");
                 devices.devices[i].claimed = true;
+                first_pl011 = false;
             }
             putc(b'\n');
         }
@@ -121,7 +122,7 @@ pub extern "C" fn _start() -> ! {
             let mut found = false;
             for i in 0..devices.count {
                 let dev = devices.devices[i];
-                if dev.compatible_hash == requested_hash && !dev.claimed {
+                if dev.has_compat(requested_hash) && !dev.claimed {
                     // Register the MMIO page as a tracked PageSet
                     let mmio_ps = match sys_register_device_page(dev.mmio_addr) {
                         Ok(id) => id,
@@ -192,7 +193,7 @@ fn handle_probe_device(devices: &mut lockjaw_types::fdt::FdtDevices, msg: &[u64;
     let mut matched = 0;
     let mut target_idx = None;
     for i in 0..devices.count {
-        if devices.devices[i].compatible_hash == requested_hash {
+        if devices.devices[i].has_compat(requested_hash) {
             if matched == index {
                 target_idx = Some(i);
                 break;

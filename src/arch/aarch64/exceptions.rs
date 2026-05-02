@@ -34,7 +34,7 @@ use crate::print::{Hex, Addr, Hex32, Dec02};
 ///   User processes are mapped in this range (code at 0x0040_0000, stack at
 ///   0x0080_0000). Constrained by L0[0]/L1[0] in create_address_space.
 /// - RAM: 0x4000_0000 - 0x47FF_FFFF, 128MB physical RAM on QEMU virt default.
-///   RAM_BASE is defined in platform.rs. Kernel is loaded at 0x4020_0000.
+///   ram_base comes from DTB discovery (platform::info()). Kernel is loaded at 0x4020_0000.
 fn classify_address(addr: u64) -> &'static str {
     if addr >= 0xFFFF_0000_0000_0000 {
         "KERNEL higher-half"

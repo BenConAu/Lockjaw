@@ -75,37 +75,35 @@ pub fn dtb_pageset_id() -> u64 {
 
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
-    kprintln!("=== Lockjaw Microkernel v", env!("CARGO_PKG_VERSION"), " ===");
-    kprintln!("Target: AArch64 (ARMv8-A)");
-
-    // Use firmware DTB pointer if valid, fall back to RAM_BASE (QEMU).
-    // This runs BEFORE enable_mmu(), so we read the raw physical address
+    // Discover platform hardware from DTB BEFORE any prints.
+    // On Pi 4B, the QEMU default UART address (0x09000000) is plain RAM —
+    // putc would spin forever on a fake TXFF flag. We must find the
+    // real UART address from the DTB first.
+    //
+    // This runs BEFORE enable_mmu(), so we read raw physical addresses
     // directly — no KERNEL_VA_OFFSET translation.
     let fw_dtb = unsafe { BOOT_DTB_PADDR };
-    let dtb_paddr = if fw_dtb != 0 {
-        // Check DTB magic at the firmware-provided address to validate.
-        let magic = unsafe {
-            // SAFETY: fw_dtb is from firmware (x0 at boot); pre-MMU physical address
-            let ptr = fw_dtb as *const u32;
-            u32::from_be(core::ptr::read_volatile(ptr))
-        };
-        if magic == 0xd00dfeed {
-            fw_dtb
-        } else {
-            arch::aarch64::platform::RAM_BASE
-        }
-    } else {
-        arch::aarch64::platform::RAM_BASE
+    // QEMU `-kernel` bare-metal boot places the DTB at the start of RAM.
+    // If firmware didn't pass a DTB pointer in x0, search there.
+    let dtb_paddr = if fw_dtb != 0 { fw_dtb } else {
+        arch::aarch64::platform::QEMU_DTB_SEARCH_ADDR
     };
 
-    // Discover platform hardware from DTB (pre-MMU, physical addresses).
-    arch::aarch64::platform::discover(dtb_paddr);
+    // discover() owns all DTB validation: magic check, size, parsing,
+    // and required-field validation. On failure, halt — we have no
+    // UART and cannot print diagnostics.
+    if arch::aarch64::platform::discover(dtb_paddr).is_err() {
+        loop { unsafe { core::arch::asm!("wfi"); } }
+    }
     let plat = arch::aarch64::platform::info();
 
-    // Update UART base from DTB before any further prints go through
-    // the old default address. Safe: single-core, pre-MMU, sequential.
-    unsafe { arch::aarch64::uart::Uart::set_base(plat.uart0_base); }
+    // UART is now safe to use — set_base + init_baud, then first print.
+    unsafe { Uart::set_base(plat.uart0_base); }
+    unsafe { Uart::new().init_baud(); }
 
+    // First print happens here — banner + platform info.
+    kprintln!("=== Lockjaw Microkernel v", env!("CARGO_PKG_VERSION"), " ===");
+    kprintln!("Target: AArch64 (ARMv8-A)");
     kprintln!("Platform: UART=", Hex(plat.uart0_base), " GICD=", Hex(plat.gicd_base),
         " GICv", if plat.gic_v2 { "2" } else { "3" }, " RAM=", Hex(plat.ram_base), "+", Hex(plat.ram_size));
     kprintln!();
@@ -165,9 +163,9 @@ pub extern "C" fn kmain() -> ! {
         arch::aarch64::mmu::enable_higher_half();
         Uart::use_high_addresses();
     }
-    kprintln!("Higher-half active — UART at ", Hex(0xFFFF_0000_0900_0000u64));
+    kprintln!("Higher-half active — UART at ", Hex(plat.uart0_base + mm::addr::KERNEL_VA_OFFSET));
 
-    // Verify DTB at RAM_BASE (placed there by QEMU bare-metal boot)
+    // Verify DTB is readable at its higher-half VA (DTB discovered by platform::discover)
     unsafe {
         // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let dtb_va = (dtb_paddr + mm::addr::KERNEL_VA_OFFSET) as *const u8;

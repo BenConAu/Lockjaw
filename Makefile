@@ -58,11 +58,13 @@ run-display: build
 
 run-blk: build
 	@test -f test.img || dd if=/dev/zero of=test.img bs=1M count=1 2>/dev/null
-	$(QEMU) $(QEMU_FLAGS) \
+	$(QEMU) -machine virt,gic-version=3 -cpu cortex-a53 -display none \
+		-chardev stdio,mux=on,id=char0 -mon chardev=char0,mode=readline \
+		-serial chardev:char0 -serial chardev:char0 \
 		-global virtio-mmio.force-legacy=false \
 		-drive file=test.img,format=raw,if=none,id=blk0 \
 		-device virtio-blk-device,drive=blk0 \
-		$(KERNEL_ELF)
+		-kernel $(KERNEL_ELF)
 
 objdump: build
 	cargo objdump -- -d | head -80
@@ -88,7 +90,7 @@ test-qemu-gicv2: build
 	GIC_VERSION=2 bash tests/qemu_integration.sh
 
 kernel8.img: build-release
-	llvm-objcopy -O binary $(KERNEL_ELF_RELEASE) kernel8.img
+	rust-objcopy -O binary $(KERNEL_ELF_RELEASE) kernel8.img
 
 pi4: kernel8.img
 	@echo "kernel8.img ready — copy to Pi 4B SD card boot partition"
