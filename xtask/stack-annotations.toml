@@ -98,6 +98,7 @@
 # The "+" suffix restricts to intra-function offsets (jump table
 # entries), not function pointers to gic::init itself.
 "gic::init+" = "compiler jump table"
+"uart::Uart>::puts" = "kprintln infrastructure function pointer"
 
 # Specific Debug::fmt impls pulled in by assert_eq! in the kernel.
 # Each new type requires its own entry — keeps the gate narrow.

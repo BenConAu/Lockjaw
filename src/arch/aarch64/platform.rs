@@ -6,6 +6,7 @@
 /// any hardware is.
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use lockjaw_types::fdt::{CpuInfo, SmpMethod};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -37,6 +38,12 @@ pub struct PlatformInfo {
     pub ram_size: u64,
     pub device_mmio_base: u64,
     pub gic_v2: bool,
+    /// How to boot secondary CPUs (PSCI, spin-table, or none).
+    pub smp_method: SmpMethod,
+    /// Per-CPU identity and release addresses from DTB.
+    pub cpus: [CpuInfo; MAX_CPUS],
+    /// Number of CPUs described in DTB.
+    pub cpu_count: u8,
 }
 
 /// Errors from platform discovery.
@@ -63,6 +70,9 @@ static mut PLATFORM: PlatformInfo = PlatformInfo {
     ram_size: 0,
     device_mmio_base: 0,
     gic_v2: false,
+    smp_method: SmpMethod::None,
+    cpus: [CpuInfo::EMPTY; MAX_CPUS],
+    cpu_count: 0,
 };
 
 static DISCOVERED: AtomicBool = AtomicBool::new(false);
@@ -136,6 +146,12 @@ pub fn discover(dtb_paddr: u64) -> Result<(), PlatformError> {
     } else {
         p.device_mmio_base = 0x0800_0000;
     }
+
+    p.smp_method = hw.smp_method;
+    p.cpu_count = hw.cpu_count;
+    let count = hw.cpu_count as usize;
+    let copy_count = if count <= MAX_CPUS { count } else { MAX_CPUS };
+    p.cpus[..copy_count].copy_from_slice(&hw.cpus[..copy_count]);
 
     DISCOVERED.store(true, Ordering::Release);
     Ok(())

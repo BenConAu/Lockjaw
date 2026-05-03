@@ -80,19 +80,21 @@ _start:
     b       .Lhalt                   // Loop forever
 
 // ---------------------------------------------------------------------------
-// Secondary CPU entry point — called by PSCI CPU_ON
+// Secondary CPU entry point — called by PSCI CPU_ON or spin-table release
 // ---------------------------------------------------------------------------
-// PSCI delivers x0 = context_id (we pass the cpu_id here).
-// The secondary must: mask exceptions, drop to EL1 if at EL2, enable
-// FP/NEON, set its per-CPU stack, and call secondary_main(cpu_id).
+// Derives cpu_id from MPIDR_EL1.Aff0 — works for both PSCI (where x0 =
+// context_id) and spin-table (where x0 is undefined). Single-cluster
+// linear topology assumed (Aff0 = 0..3). Multi-cluster would need
+// Aff1:Aff0 mapping.
 // No BSS zeroing — CPU 0 already did that.
 
 .global _secondary_start
 _secondary_start:
     msr     DAIFSet, #0xf            // Mask all exceptions
 
-    // x0 = cpu_id (from PSCI context_id), preserve across EL2 drop
-    mov     x19, x0                  // Save cpu_id in callee-saved register
+    // Read cpu_id from hardware — not from x0, which is only valid for PSCI
+    mrs     x19, mpidr_el1           // Read MPIDR (CPU affinity register)
+    and     x19, x19, #0xFF         // Extract Aff0 = linear CPU index
 
     // Compute phys_offset (same as primary)
     adr     x21, _start

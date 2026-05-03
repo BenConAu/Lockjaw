@@ -20,6 +20,36 @@
 
 use crate::device::{DeviceInfo, MAX_DEVICES, compatible_hash};
 
+// ---------------------------------------------------------------------------
+// SMP boot method types (discovered from DTB)
+// ---------------------------------------------------------------------------
+
+/// How secondary CPUs are started, as described by the DTB.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SmpMethod {
+    /// No SMP boot method found in DTB.
+    None,
+    /// PSCI (Power State Coordination Interface).
+    /// `hvc`: true = HVC conduit (QEMU virt), false = SMC conduit.
+    Psci { hvc: bool },
+    /// Spin-table: write entry point to cpu-release-addr, dsb, sev.
+    SpinTable,
+}
+
+/// Per-CPU info extracted from DTB /cpus/cpu@N nodes.
+#[derive(Clone, Copy, Debug)]
+pub struct CpuInfo {
+    /// MPIDR affinity value from the cpu node's reg property.
+    /// Used as target_cpu for PSCI CPU_ON and as identity key.
+    pub mpidr: u64,
+    /// Physical address to write for spin-table release. 0 if N/A.
+    pub release_addr: u64,
+}
+
+impl CpuInfo {
+    pub const EMPTY: Self = Self { mpidr: 0, release_addr: 0 };
+}
+
 // FDT structure block tokens
 const FDT_BEGIN_NODE: u32 = 0x00000001;
 const FDT_END_NODE: u32 = 0x00000002;
@@ -187,6 +217,23 @@ fn parse_interrupt(data: &[u8], prop_data_start: usize) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Per-node state accumulated during an FDT walk.
+/// CPU enable-method property from DTB cpu@N nodes.
+#[derive(Clone, Copy, PartialEq)]
+enum EnableMethod {
+    None,
+    Psci,
+    SpinTable,
+}
+
+/// PSCI conduit from DTB /psci node's "method" property.
+#[derive(Clone, Copy, PartialEq)]
+enum PsciConduit {
+    /// No method property, or unrecognized value.
+    Unknown,
+    Hvc,
+    Smc,
+}
+
 /// Reset at each BEGIN_NODE, populated by PROP tokens, consumed at END_NODE.
 #[derive(Clone, Copy)]
 struct NodeState {
@@ -210,6 +257,11 @@ struct NodeState {
     /// Parsed at END_NODE when parent's #address-cells is known.
     reg_start: usize,
     reg_len: usize,
+    enable_method: EnableMethod,
+    /// cpu-release-addr for spin-table CPUs (always 2 cells per binding spec)
+    cpu_release_addr: u64,
+    /// /psci node's "method" property conduit.
+    psci_conduit: PsciConduit,
 }
 
 impl NodeState {
@@ -218,6 +270,9 @@ impl NodeState {
         reg_addr: 0, reg_size: 0, reg_addr2: 0,
         intid: 0, has_compat: false,
         reg_start: 0, reg_len: 0,
+        enable_method: EnableMethod::None,
+        cpu_release_addr: 0,
+        psci_conduit: PsciConduit::Unknown,
     };
 
     /// Check if any compatible hash matches the given hash.
@@ -450,6 +505,26 @@ fn walk_fdt(
                         cells[d].has_ranges = true;
                         cells[d].ranges_start = prop_data_start;
                         cells[d].ranges_len = prop_len;
+                    } else if str_eq(prop_name, b"enable-method") {
+                        let val = read_string(data, prop_data_start);
+                        if str_eq(val, b"psci") {
+                            state[d].enable_method = EnableMethod::Psci;
+                        } else if str_eq(val, b"spin-table") {
+                            state[d].enable_method = EnableMethod::SpinTable;
+                        }
+                    } else if str_eq(prop_name, b"cpu-release-addr") && prop_len >= 8 {
+                        // Per DTB binding spec, cpu-release-addr is always a
+                        // 64-bit physical address (2 × 32-bit cells), regardless
+                        // of parent #address-cells.
+                        state[d].cpu_release_addr = read_cells(data, prop_data_start, 2);
+                    } else if str_eq(prop_name, b"method") {
+                        let val = read_string(data, prop_data_start);
+                        if str_eq(val, b"hvc") {
+                            state[d].psci_conduit = PsciConduit::Hvc;
+                        } else if str_eq(val, b"smc") {
+                            state[d].psci_conduit = PsciConduit::Smc;
+                        }
+                        // Unrecognized values stay PsciConduit::Unknown
                     }
                 }
 
@@ -534,6 +609,13 @@ pub struct PlatformHw {
     pub ram_base: u64,
     /// RAM size in bytes from /memory node. 0 = not found.
     pub ram_size: u64,
+    /// SMP boot method detected from /psci node and cpu enable-method.
+    pub smp_method: SmpMethod,
+    /// Per-CPU info (MPIDR + release address). Indexed by discovery
+    /// order; use mpidr field for identity, not array index.
+    pub cpus: [CpuInfo; 4],
+    /// Number of valid entries in cpus[].
+    pub cpu_count: u8,
 }
 
 /// Scan a DTB for kernel-essential hardware: UART, GIC, memory.
@@ -557,6 +639,7 @@ pub fn scan_platform(data: &[u8]) -> Result<PlatformHw, FdtError> {
     let mut hw = PlatformHw {
         uart_base: 0, gicd_base: 0, gic_secondary_base: 0,
         gic_v2: false, ram_base: 0, ram_size: 0,
+        smp_method: SmpMethod::None, cpus: [CpuInfo::EMPTY; 4], cpu_count: 0,
     };
 
     walk_fdt(data, off_dt_struct, off_dt_strings, |name, node| {
@@ -582,6 +665,36 @@ pub fn scan_platform(data: &[u8]) -> Result<PlatformHw, FdtError> {
             hw.gicd_base = node.reg_addr;
             hw.gic_secondary_base = node.reg_addr2;
             hw.gic_v2 = true;
+        }
+
+        // /psci node: only set PSCI method if conduit is recognized.
+        // A /psci node with missing or unrecognized method property is
+        // treated as no valid boot method — don't guess SMC vs HVC.
+        if str_eq(name, b"psci") {
+            match node.psci_conduit {
+                PsciConduit::Hvc => hw.smp_method = SmpMethod::Psci { hvc: true },
+                PsciConduit::Smc => hw.smp_method = SmpMethod::Psci { hvc: false },
+                PsciConduit::Unknown => {} // malformed — leave as None
+            }
+        }
+
+        // cpu@N nodes: extract MPIDR identity and spin-table release address
+        let is_cpu = name.len() >= 4 && str_eq(&name[..4], b"cpu@");
+        if is_cpu && (hw.cpu_count as usize) < 4 {
+            let idx = hw.cpu_count as usize;
+            hw.cpus[idx] = CpuInfo {
+                mpidr: node.reg_addr,
+                release_addr: node.cpu_release_addr,
+            };
+            hw.cpu_count += 1;
+
+            // Derive SpinTable from cpu enable-method only if no /psci node
+            // overrides it. PSCI requires an explicit /psci node.
+            if node.enable_method == EnableMethod::SpinTable
+                && !matches!(hw.smp_method, SmpMethod::Psci { .. })
+            {
+                hw.smp_method = SmpMethod::SpinTable;
+            }
         }
     })?;
 
@@ -997,5 +1110,54 @@ mod tests {
     fn pi4b_parse_succeeds() {
         let devs = parse_fdt(PI4B_DTB).unwrap();
         assert!(devs.count > 0, "Pi 4B DTB should have devices");
+    }
+
+    // -----------------------------------------------------------------------
+    // SMP boot method detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn qemu_smp_detects_psci_hvc() {
+        let hw = scan_platform(QEMU_DTB).unwrap();
+        assert_eq!(hw.smp_method, SmpMethod::Psci { hvc: true });
+    }
+
+    #[test]
+    fn qemu_smp_finds_four_cpus() {
+        let hw = scan_platform(QEMU_DTB).unwrap();
+        assert_eq!(hw.cpu_count, 4);
+        // MPIDR values 0..3 from cpu reg property
+        for i in 0..4 {
+            assert_eq!(hw.cpus[i].mpidr, i as u64);
+        }
+    }
+
+    #[test]
+    fn pi4b_smp_detects_spin_table() {
+        let hw = scan_platform(PI4B_DTB).unwrap();
+        assert_eq!(hw.smp_method, SmpMethod::SpinTable);
+    }
+
+    #[test]
+    fn pi4b_smp_finds_four_cpus_with_release_addrs() {
+        let hw = scan_platform(PI4B_DTB).unwrap();
+        assert_eq!(hw.cpu_count, 4);
+        // MPIDR values 0..3
+        for i in 0..4 {
+            assert_eq!(hw.cpus[i].mpidr, i as u64);
+        }
+        // cpu-release-addr: 0xd8, 0xe0, 0xe8, 0xf0
+        assert_eq!(hw.cpus[0].release_addr, 0xd8);
+        assert_eq!(hw.cpus[1].release_addr, 0xe0);
+        assert_eq!(hw.cpus[2].release_addr, 0xe8);
+        assert_eq!(hw.cpus[3].release_addr, 0xf0);
+    }
+
+    #[test]
+    fn qemu_cpus_have_no_release_addr() {
+        let hw = scan_platform(QEMU_DTB).unwrap();
+        for i in 0..4 {
+            assert_eq!(hw.cpus[i].release_addr, 0);
+        }
     }
 }

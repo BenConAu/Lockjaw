@@ -229,22 +229,62 @@ pub extern "C" fn kmain() -> ! {
     percpu::init_percpu(0);
     kprintln!("CPU ", percpu::cpu_id(), " initialized (TPIDR_EL1)");
 
-    // Boot secondary CPUs via PSCI CPU_ON
+    // Boot secondary CPUs using method detected from DTB
     {
+        use lockjaw_types::fdt::SmpMethod;
+
         extern "C" { fn _secondary_start(); }
         // SAFETY: _secondary_start is the assembly entry point for secondaries.
         // It is a physical address (identity-mapped) that sets up the per-CPU
         // stack and calls secondary_main(cpu_id).
         // SAFETY: _secondary_start is the assembly entry point symbol
         let entry = _secondary_start as *const () as u64;
-        for cpu in 1..arch::aarch64::platform::MAX_CPUS {
-            let ret = unsafe { arch::aarch64::psci::cpu_on(cpu as u64, entry, cpu as u64) };
-            if ret == 0 {
-                kprintln!("[SMP] CPU ", cpu, " started (PSCI OK)");
-            } else {
-                kprintln!("[SMP] CPU ", cpu, " PSCI failed: ", ret);
+
+        // Read boot CPU's MPIDR to skip it in the loop.
+        // Mask to Aff0 — sufficient for single-cluster linear topology.
+        // Multi-cluster would need Aff1:Aff0, documented as a known limitation.
+        let boot_mpidr: u64;
+        unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) boot_mpidr) };
+        let boot_mpidr = boot_mpidr & 0xFF;
+
+        let plat = arch::aarch64::platform::info();
+        match plat.smp_method {
+            SmpMethod::Psci { hvc } => {
+                for i in 0..plat.cpu_count as usize {
+                    let cpu = &plat.cpus[i];
+                    if cpu.mpidr == boot_mpidr { continue; }
+                    let ret = unsafe {
+                        arch::aarch64::psci::cpu_on(cpu.mpidr, entry, cpu.mpidr, hvc)
+                    };
+                    if ret == 0 {
+                        kprintln!("[SMP] CPU ", cpu.mpidr, " started (PSCI)");
+                    } else {
+                        kprintln!("[SMP] CPU ", cpu.mpidr, " PSCI failed: ", ret);
+                    }
+                }
+            }
+            SmpMethod::SpinTable => {
+                for i in 0..plat.cpu_count as usize {
+                    let cpu = &plat.cpus[i];
+                    if cpu.mpidr == boot_mpidr { continue; }
+                    unsafe {
+                        arch::aarch64::spin_table::write_release_addr(
+                            cpu.release_addr, entry,
+                        );
+                    }
+                    kprintln!("[SMP] CPU ", cpu.mpidr, " released (spin-table)");
+                }
+                // Single SEV after all writes to wake all secondaries at once
+                unsafe { core::arch::asm!("sev"); }
+            }
+            SmpMethod::None => {
+                if plat.cpu_count > 1 {
+                    kprintln!("[SMP] DTB has ", plat.cpu_count,
+                              " CPUs but no boot method — single-core only");
+                }
             }
         }
+
         // Brief delay for secondaries to print their online messages
         // before boot continues. Not correctness-critical — just keeps
         // serial output readable.
@@ -506,18 +546,19 @@ pub extern "C" fn kmain() -> ! {
         sched::scheduler::add_thread(tcb_a_page);      // index 1: thread A
         sched::scheduler::add_thread(tcb_b_page);      // index 2: thread B
 
-        // Per-CPU idle threads for secondary CPUs. Constructed manually
-        // (not via create_tcb) because secondary_main IS the idle thread:
-        // the TCB uses the per-CPU boot stack from the linker script, and
-        // saved_sp=0 (same as the boot thread — never been switched out).
-        // When the scheduler first context-switches away from a secondary,
-        // it saves the real SP (which is on the per-CPU boot stack) into
-        // saved_sp. When switched back, it resumes in secondary_main's
-        // wfi loop.
+        // Per-CPU idle threads for secondary CPUs described by the DTB.
+        // Constructed manually (not via create_tcb) because secondary_main
+        // IS the idle thread: the TCB uses the per-CPU boot stack from the
+        // linker script, and saved_sp=0 (same as the boot thread — never
+        // been switched out). When the scheduler first context-switches
+        // away from a secondary, it saves the real SP into saved_sp.
         {
             // Post-pivot: &__symbol gives higher-half VA directly (PC-relative
             // from higher-half PC). No explicit + KERNEL_VA_OFFSET needed.
-            let stack_bottoms = [
+            // Indexed by MPIDR (= linear CPU index on single-cluster).
+            let stack_bottoms: [u64; 4] = [
+                // SAFETY: linker symbol — per-CPU stack bottom for CPU 0
+                &__guard_page_0 as *const u8 as u64 + 4096,
                 // SAFETY: linker symbol — per-CPU stack bottom for CPU 1
                 &__guard_page_1 as *const u8 as u64 + 4096,
                 // SAFETY: linker symbol — per-CPU stack bottom for CPU 2
@@ -525,13 +566,17 @@ pub extern "C" fn kmain() -> ! {
                 // SAFETY: linker symbol — per-CPU stack bottom for CPU 3
                 &__guard_page_3 as *const u8 as u64 + 4096,
             ];
-            for (i, &stack_base) in stack_bottoms.iter().enumerate() {
-                let cpu = i + 1;
+            let plat = arch::aarch64::platform::info();
+            for i in 0..plat.cpu_count as usize {
+                let mpidr = plat.cpus[i].mpidr as usize;
+                if mpidr == 0 { continue; } // skip boot CPU
+                if mpidr >= 4 { continue; } // safety bound
                 cap::process_obj::process_inc_thread_count(kernel_proc_page);
                 let mut name = *b"idle-cpu0\0\0\0\0\0\0\0";
-                name[8] = b'0' + cpu as u8;
-                let tcb_page = create_idle_tcb(stack_base, kernel_proc_page, name);
-                sched::scheduler::add_thread_for_cpu(tcb_page, cpu);
+                name[8] = b'0' + mpidr as u8;
+                let tcb_page = create_idle_tcb(
+                    stack_bottoms[mpidr], kernel_proc_page, name);
+                sched::scheduler::add_thread_for_cpu(tcb_page, mpidr);
             }
         }
 
