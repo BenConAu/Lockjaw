@@ -7,11 +7,12 @@
 //! Pure logic — no pointers, no VA access. The kernel wrapper maps page
 //! indices to physical addresses.
 
-/// Maximum pages the allocator can manage (128MB / 4KB).
-pub const MAX_PAGES: usize = 32768;
+/// Maximum pages the allocator can manage (1GB / 4KB).
+/// Pi 4B 1GB model reports ~948MB usable (VideoCore GPU takes the rest).
+pub const MAX_PAGES: usize = 262144;
 
-/// Maximum order: log2(MAX_PAGES). A single order-15 block covers all RAM.
-pub const MAX_ORDER: usize = 15;
+/// Maximum order: log2(MAX_PAGES). A single order-18 block covers all RAM.
+pub const MAX_ORDER: usize = 18;
 
 /// Bytes needed for order k's bitmap: ceil(MAX_PAGES / 2^k / 8).
 const fn bitmap_bytes_for_order(order: usize) -> usize {
@@ -37,7 +38,7 @@ const BITMAP_TOTAL: usize = bitmap_offset(MAX_ORDER + 1);
 const ALLOC_BITMAP_SIZE: usize = (MAX_PAGES + 7) / 8;
 
 /// Bitmap-per-order buddy allocator. All state is flat byte arrays
-/// suitable for static allocation in kernel BSS (~12KB).
+/// suitable for static allocation in kernel BSS (~98KB).
 pub struct BuddyAllocator {
     /// Buddy free-block bitmaps. Order k starts at offset bitmap_offset(k).
     bitmap: [u8; BITMAP_TOTAL],
@@ -415,7 +416,7 @@ mod tests {
 
     #[test]
     fn framebuffer_scenario() {
-        // Simulate Lockjaw boot: 32768 pages, 640 reserved at bottom
+        // Simulate Lockjaw boot: MAX_PAGES pages, 640 reserved at bottom
         let mut b = BuddyAllocator::new();
         b.init(MAX_PAGES);
         b.add_range(640, MAX_PAGES - 640);

@@ -8,7 +8,7 @@ use lockjaw_types::buddy::BuddyAllocator;
 // ---------------------------------------------------------------------------
 
 /// The kernel's physical page allocator. A buddy allocator tracks which
-/// of the 32768 pages in RAM are free, supporting both single-page and
+/// pages in RAM are free (up to 1GB), supporting both single-page and
 /// contiguous multi-page allocation. All state lives in `UnsafeCell`;
 /// the single `unsafe impl Sync` documents the "single-core, IRQs
 /// masked" invariant in one place.
