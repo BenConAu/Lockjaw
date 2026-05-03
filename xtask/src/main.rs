@@ -4,9 +4,10 @@ use std::process::{self, Command, Stdio};
 
 /// Per-function stack frame cap in bytes. Any single function exceeding
 /// this fails immediately — catches large locals before they interact
-/// with call depth. Set to 1536 to accommodate kmain's boot-time init
-/// frame (~1408 in debug). See docs/stack-budget.md.
-const PER_FUNCTION_CAP: u64 = 1536;
+/// with call depth. Set to 1600 to accommodate create_process's frame
+/// (~1552 in debug) — the AddressSpaceBuilder struct lives on its stack.
+/// See docs/stack-budget.md.
+const PER_FUNCTION_CAP: u64 = 1600;
 
 /// Total kernel stack budget: normal path + worst-case nested exception.
 const TOTAL_BUDGET: u64 = 8192;

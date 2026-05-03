@@ -3,7 +3,21 @@
 /// Computes indices and determines what action the kernel should take
 /// when mapping pages — no pointers, no MMIO, no unsafe.
 
-use crate::addr::PAGE_SIZE;
+use crate::addr::{PhysAddr, PAGE_SIZE};
+
+/// A single virtual-to-physical page mapping with access permissions.
+/// Used by the kernel's address space builder to create page tables.
+#[derive(Clone, Copy)]
+pub struct Mapping {
+    pub virt_addr: u64,
+    pub phys_addr: PhysAddr,
+    pub user_accessible: bool,
+    pub executable: bool,
+}
+
+/// How many Mapping structs fit in a single 4KB page.
+/// Callers allocate page(s) for the mapping buffer rather than using the stack.
+pub const MAPPINGS_PER_PAGE: usize = PAGE_SIZE as usize / core::mem::size_of::<Mapping>();
 
 /// Mapping flags for map_pages_in_existing. Shared between kernel and userspace.
 /// Device memory: use MAIR_DEVICE (strongly ordered, non-cacheable) instead of
@@ -134,6 +148,183 @@ pub fn build_user_page(phys: crate::addr::PhysAddr, attr: u8, sh: u8) -> crate::
     PageTableEntry::new_page(phys, attr, AP_RW_ALL, sh)
         .with_uxn()
         .with_pxn()
+}
+
+// ---------------------------------------------------------------------------
+// L3 region tracker — pure dedup cache for create_address_space
+// ---------------------------------------------------------------------------
+
+/// Hard limit on distinct 2MB L2 regions a single address space can span.
+/// Each region requires an L3 page table (4KB). With user VA 0x400000-
+/// 0x800000 (4MB), typical binaries need 2-3 regions. 8 covers ~16MB of
+/// non-contiguous VA. If a binary exceeds this, the tracker returns Full
+/// and the kernel must allocate dynamically.
+pub const MAX_L3_TABLES: usize = 8;
+
+/// Result of looking up an L2 index in the L3 region tracker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum L3Lookup {
+    /// Already tracked at this slot. Kernel should reuse its cached
+    /// L3 table pointer for this slot.
+    Existing { slot: usize },
+    /// Not tracked yet. Kernel should allocate a new L3 table, store
+    /// the pointer at this slot, then call `register()`.
+    NeedAlloc { slot: usize },
+    /// Capacity exceeded — too many distinct 2MB regions.
+    Full,
+}
+
+/// Pure fixed-size associative cache tracking which L2 indices have
+/// L3 tables allocated. The kernel keeps a parallel pointer array
+/// indexed by the same slot numbers.
+pub struct L3RegionTracker {
+    indices: [usize; MAX_L3_TABLES],
+    count: usize,
+}
+
+impl L3RegionTracker {
+    pub const fn new() -> Self {
+        Self {
+            indices: [usize::MAX; MAX_L3_TABLES],
+            count: 0,
+        }
+    }
+
+    /// Look up an L2 index. Returns what the kernel should do.
+    pub fn lookup(&self, l2_idx: usize) -> L3Lookup {
+        for i in 0..self.count {
+            if self.indices[i] == l2_idx {
+                return L3Lookup::Existing { slot: i };
+            }
+        }
+        if self.count >= MAX_L3_TABLES {
+            L3Lookup::Full
+        } else {
+            L3Lookup::NeedAlloc { slot: self.count }
+        }
+    }
+
+    /// Register a newly allocated L3 table for this L2 index.
+    /// Only valid after `lookup` returned `NeedAlloc { slot }`.
+    pub fn register(&mut self, slot: usize, l2_idx: usize) {
+        debug_assert!(slot == self.count, "register must use the slot from NeedAlloc");
+        debug_assert!(slot < MAX_L3_TABLES, "register beyond capacity");
+        self.indices[slot] = l2_idx;
+        self.count += 1;
+    }
+
+    /// Number of distinct L3 regions tracked.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+}
+
+// ---------------------------------------------------------------------------
+// build_process_page — current process-page permission policy
+// ---------------------------------------------------------------------------
+
+/// Build a page table entry for process address space construction.
+///
+/// Current permission policy (may grow exceptions later):
+/// - kernel-only (`user_accessible=false`): AP_RW_EL1, no UXN/PXN
+/// - user executable: AP_RW_ALL + PXN (user can execute, kernel cannot)
+/// - user non-executable: AP_RW_ALL + UXN + PXN (no one executes)
+///
+/// All pages use MAIR_NORMAL + inner-shareable attributes.
+pub fn build_process_page(
+    phys: crate::addr::PhysAddr,
+    user_accessible: bool,
+    executable: bool,
+) -> crate::page_table::PageTableEntry {
+    use crate::page_table::*;
+    if !user_accessible {
+        // Kernel-only page — no execute restrictions
+        PageTableEntry::new_page(phys, MAIR_NORMAL, AP_RW_EL1, SH_INNER)
+    } else if executable {
+        // User executable — kernel cannot execute (PXN)
+        PageTableEntry::new_page(phys, MAIR_NORMAL, AP_RW_ALL, SH_INNER)
+            .with_pxn()
+    } else {
+        // User non-executable — no one executes (UXN + PXN)
+        PageTableEntry::new_page(phys, MAIR_NORMAL, AP_RW_ALL, SH_INNER)
+            .with_uxn()
+            .with_pxn()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ScratchCursor — pagination state machine for multi-page scratch buffers
+// ---------------------------------------------------------------------------
+
+/// What the kernel should do after writing a mapping into the scratch buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScratchAction {
+    /// Continue writing into the current page.
+    Continue,
+    /// Current page is full. Kernel should flush
+    /// `mappings[..MAPPINGS_PER_PAGE]` to the builder, then set up the
+    /// scratch page at `next_page_idx`.
+    FlushAndAdvance { next_page_idx: usize },
+}
+
+/// Pure pagination state machine for multi-page scratch buffers.
+/// Drives the kernel's flush/advance cycle without the kernel managing
+/// any offset or page index arithmetic.
+pub struct ScratchCursor {
+    page_idx: usize,
+    offset: usize,
+    total_pages: usize,
+    total_written: usize,
+}
+
+impl ScratchCursor {
+    pub const fn new(total_scratch_pages: usize) -> Self {
+        Self {
+            page_idx: 0,
+            offset: 0,
+            total_pages: total_scratch_pages,
+            total_written: 0,
+        }
+    }
+
+    /// Current write offset within the active scratch page.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Total mappings written across all pages so far.
+    pub fn total_written(&self) -> usize {
+        self.total_written
+    }
+
+    /// Record that one mapping was written at `offset()`. Returns what
+    /// the kernel should do next.
+    pub fn advance(&mut self) -> ScratchAction {
+        self.offset += 1;
+        self.total_written += 1;
+        if self.offset >= MAPPINGS_PER_PAGE && self.page_idx + 1 < self.total_pages {
+            ScratchAction::FlushAndAdvance { next_page_idx: self.page_idx + 1 }
+        } else {
+            ScratchAction::Continue
+        }
+    }
+
+    /// Confirm that the kernel flushed and advanced to the next page.
+    /// Must be called after `FlushAndAdvance` before the next write.
+    pub fn did_advance(&mut self) {
+        self.page_idx += 1;
+        self.offset = 0;
+    }
+
+    /// True if there are un-flushed mappings in the current page.
+    pub fn has_pending(&self) -> bool {
+        self.offset > 0
+    }
+
+    /// Number of pending (un-flushed) mappings in the current page.
+    pub fn pending_count(&self) -> usize {
+        self.offset
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -364,5 +555,175 @@ mod tests {
     #[test]
     fn intra_page_zero_size() {
         assert!(validate_intra_page(0x1FFF, 0));
+    }
+
+    // --- L3RegionTracker tests ---
+
+    #[test]
+    fn l3_tracker_first_lookup_returns_need_alloc() {
+        let tracker = L3RegionTracker::new();
+        assert_eq!(tracker.lookup(5), L3Lookup::NeedAlloc { slot: 0 });
+    }
+
+    #[test]
+    fn l3_tracker_same_index_returns_existing() {
+        let mut tracker = L3RegionTracker::new();
+        assert_eq!(tracker.lookup(5), L3Lookup::NeedAlloc { slot: 0 });
+        tracker.register(0, 5);
+        assert_eq!(tracker.lookup(5), L3Lookup::Existing { slot: 0 });
+    }
+
+    #[test]
+    fn l3_tracker_different_indices_get_consecutive_slots() {
+        let mut tracker = L3RegionTracker::new();
+        for i in 0..MAX_L3_TABLES {
+            assert_eq!(tracker.lookup(i * 10), L3Lookup::NeedAlloc { slot: i });
+            tracker.register(i, i * 10);
+        }
+        assert_eq!(tracker.count(), MAX_L3_TABLES);
+    }
+
+    #[test]
+    fn l3_tracker_ninth_distinct_returns_full() {
+        let mut tracker = L3RegionTracker::new();
+        for i in 0..MAX_L3_TABLES {
+            tracker.register(i, i);
+        }
+        assert_eq!(tracker.lookup(99), L3Lookup::Full);
+    }
+
+    #[test]
+    fn l3_tracker_dedup_across_batches() {
+        let mut tracker = L3RegionTracker::new();
+        // Batch 1: register index 3
+        tracker.register(0, 3);
+        // Batch 2: same index 3 should return Existing
+        assert_eq!(tracker.lookup(3), L3Lookup::Existing { slot: 0 });
+        // Different index should get next slot
+        assert_eq!(tracker.lookup(7), L3Lookup::NeedAlloc { slot: 1 });
+    }
+
+    // --- build_process_page tests ---
+
+    #[test]
+    fn build_process_page_kernel_only() {
+        let pte = build_process_page(PhysAddr::new(0x1000), false, false);
+        assert_eq!(pte.ap(), AP_RW_EL1);
+        assert_eq!(pte.attr_index(), MAIR_NORMAL);
+        assert_eq!(pte.sh(), SH_INNER);
+        // No UXN or PXN for kernel-only
+        assert!(!pte.is_uxn());
+        assert!(!pte.is_pxn());
+    }
+
+    #[test]
+    fn build_process_page_user_executable() {
+        let pte = build_process_page(PhysAddr::new(0x2000), true, true);
+        assert_eq!(pte.ap(), AP_RW_ALL);
+        // PXN set (kernel cannot execute), UXN clear (user can execute)
+        assert!(pte.is_pxn());
+        assert!(!pte.is_uxn());
+    }
+
+    #[test]
+    fn build_process_page_user_non_executable() {
+        let pte = build_process_page(PhysAddr::new(0x3000), true, false);
+        assert_eq!(pte.ap(), AP_RW_ALL);
+        // Both UXN and PXN set
+        assert!(pte.is_uxn());
+        assert!(pte.is_pxn());
+    }
+
+    #[test]
+    fn build_process_page_matches_build_user_page() {
+        // User non-executable should produce the same PTE as build_user_page
+        let phys = PhysAddr::new(0x5000);
+        let process = build_process_page(phys, true, false);
+        let user = build_user_page(phys, MAIR_NORMAL, SH_INNER);
+        assert_eq!(process.raw(), user.raw());
+    }
+
+    #[test]
+    fn build_process_page_kernel_only_executable_ignored() {
+        // Even with executable=true, kernel-only pages have no UXN/PXN
+        let pte = build_process_page(PhysAddr::new(0x4000), false, true);
+        assert_eq!(pte.ap(), AP_RW_EL1);
+        assert!(!pte.is_uxn());
+        assert!(!pte.is_pxn());
+    }
+
+    // --- ScratchCursor tests ---
+
+    #[test]
+    fn scratch_cursor_single_page_no_flush() {
+        let mut cursor = ScratchCursor::new(1);
+        // Write MAPPINGS_PER_PAGE entries — no flush triggered (only one page)
+        for i in 0..MAPPINGS_PER_PAGE {
+            assert_eq!(cursor.offset(), i);
+            assert_eq!(cursor.advance(), ScratchAction::Continue);
+        }
+        assert_eq!(cursor.total_written(), MAPPINGS_PER_PAGE);
+        // All entries are pending since single page never triggers FlushAndAdvance
+        assert!(cursor.has_pending());
+        assert_eq!(cursor.pending_count(), MAPPINGS_PER_PAGE);
+    }
+
+    #[test]
+    fn scratch_cursor_two_pages_flush_at_boundary() {
+        let mut cursor = ScratchCursor::new(2);
+        // Fill first page
+        for _ in 0..MAPPINGS_PER_PAGE - 1 {
+            assert_eq!(cursor.advance(), ScratchAction::Continue);
+        }
+        // Last entry on first page triggers flush
+        assert_eq!(
+            cursor.advance(),
+            ScratchAction::FlushAndAdvance { next_page_idx: 1 }
+        );
+        cursor.did_advance();
+        // Now on second page, offset reset
+        assert_eq!(cursor.offset(), 0);
+        assert!(!cursor.has_pending());
+    }
+
+    #[test]
+    fn scratch_cursor_total_written_spans_pages() {
+        let mut cursor = ScratchCursor::new(3);
+        // Fill first page + trigger flush
+        for _ in 0..MAPPINGS_PER_PAGE {
+            cursor.advance();
+        }
+        cursor.did_advance();
+        // Write 5 more on second page
+        for _ in 0..5 {
+            cursor.advance();
+        }
+        assert_eq!(cursor.total_written(), MAPPINGS_PER_PAGE + 5);
+        assert_eq!(cursor.pending_count(), 5);
+    }
+
+    #[test]
+    fn scratch_cursor_exact_capacity() {
+        let mut cursor = ScratchCursor::new(2);
+        // Fill both pages exactly
+        for _ in 0..MAPPINGS_PER_PAGE {
+            cursor.advance();
+        }
+        cursor.did_advance();
+        for _ in 0..MAPPINGS_PER_PAGE {
+            // Second page, no more pages to advance to
+            assert_eq!(cursor.advance(), ScratchAction::Continue);
+        }
+        assert_eq!(cursor.total_written(), 2 * MAPPINGS_PER_PAGE);
+        assert_eq!(cursor.pending_count(), MAPPINGS_PER_PAGE);
+    }
+
+    #[test]
+    fn scratch_cursor_has_pending_after_partial_fill() {
+        let mut cursor = ScratchCursor::new(1);
+        assert!(!cursor.has_pending());
+        cursor.advance();
+        assert!(cursor.has_pending());
+        assert_eq!(cursor.pending_count(), 1);
     }
 }

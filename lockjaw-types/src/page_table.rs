@@ -138,6 +138,14 @@ impl PageTableEntry {
     pub const fn with_uxn(self) -> Self {
         Self(self.0 | PTE_UXN)
     }
+
+    pub const fn is_pxn(self) -> bool {
+        self.0 & PTE_PXN != 0
+    }
+
+    pub const fn is_uxn(self) -> bool {
+        self.0 & PTE_UXN != 0
+    }
 }
 
 impl fmt::Debug for PageTableEntry {

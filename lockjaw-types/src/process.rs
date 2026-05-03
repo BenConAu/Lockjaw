@@ -9,6 +9,28 @@
 /// sys_create_process fails cleanly if this limit is exceeded.
 pub const MAX_OWNED_PAGES: usize = 128;
 
+/// A mapping entry provided by userspace in the sys_create_process call.
+/// Lives in the caller's mapped memory — the kernel reads it one at a time.
+/// Shared between kernel and userspace (single source of truth).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcessMapping {
+    /// Virtual address in the new process's address space.
+    pub virt_addr: u64,
+    /// PageSet handle (from sys_alloc_pages) containing the physical page.
+    pub pageset_id: u64,
+    /// Index of the page within the PageSet (0 for single-page sets).
+    pub page_index: u64,
+    /// Flags: bit 0 = executable.
+    pub flags: u64,
+}
+
+/// ProcessMapping flag: page contains executable code.
+pub const PROCESS_MAP_FLAG_EXECUTABLE: u64 = 1 << 0;
+
+// SAFETY: ProcessMapping is repr(C) with only u64 fields — every bit pattern valid.
+unsafe impl crate::user_pod::UserPod for ProcessMapping {}
+
 /// Outcome of a thread exiting from a process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessLifecycle {

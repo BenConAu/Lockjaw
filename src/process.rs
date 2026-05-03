@@ -1,4 +1,4 @@
-use crate::arch::aarch64::vmem::{Mapping, create_address_space, MAPPINGS_PER_PAGE};
+use crate::arch::aarch64::vmem::{AddressSpaceBuilder, Mapping, MAPPINGS_PER_PAGE};
 use crate::cap::handle_table::HandleTableRef;
 use crate::cap::object::{HandleTableCreateInfo, create_handle_table};
 use crate::cap::pageset_table::PageSetRef;
@@ -10,25 +10,9 @@ use crate::sched::current::CurrentThread;
 use crate::sched::tcb::{Tcb, TcbCreateInfo, create_tcb};
 use crate::sched::scheduler;
 
-/// A mapping entry provided by userspace in the sys_create_process call.
-/// Lives in the caller's mapped memory — the kernel reads it one at a time.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ProcessMapping {
-    /// Virtual address in the new process's address space.
-    pub virt_addr: u64,
-    /// PageSet handle (from sys_alloc_pages) containing the physical page.
-    pub pageset_id: u64,
-    /// Index of the page within the PageSet (0 for single-page sets).
-    pub page_index: u64,
-    /// Flags: bit 0 = executable, bit 1 = writable.
-    pub flags: u64,
-}
-
-// SAFETY: ProcessMapping is repr(C) with only u64 fields — every bit pattern valid.
-unsafe impl lockjaw_types::user_pod::UserPod for ProcessMapping {}
-
-const FLAG_EXECUTABLE: u64 = 1 << 0;
+// Re-export from lockjaw-types — single source of truth.
+use lockjaw_types::process::{ProcessMapping, PROCESS_MAP_FLAG_EXECUTABLE};
+use lockjaw_types::vmem::{ScratchAction, ScratchCursor};
 
 /// Drop guard for a kernel page — freed on drop unless defused.
 struct PageGuard(Option<crate::mm::addr::PhysPage>);
@@ -97,27 +81,31 @@ pub fn create_process(
     // SAFETY: object_paddr from a PageSet handle — valid header page.
     let stack_ps = unsafe { PageSetRef::from_header_paddr(stack_entry.object_paddr) };
 
-    // Validate that user mappings + stack pages fit in the scratch buffer
-    if !lockjaw_types::vmem::validate_process_mappings(mapping_count, stack_ps.count(), MAPPINGS_PER_PAGE) {
-        return Err("mapping count exceeds buffer capacity");
-    }
-
-    // Use the caller-provided scratch page as the Mapping buffer.
+    // Use the caller-provided scratch pages as the Mapping buffer.
     let scratch_entry = ht.lookup(scratch_pageset_id as u32,
         crate::cap::rights::Rights::from_bits(crate::cap::rights::RIGHT_READ),
         crate::cap::object::ObjectType::PageSet)
         .map_err(|_| "invalid scratch handle")?;
     let scratch_ps = unsafe { PageSetRef::from_header_paddr(scratch_entry.object_paddr) };
-    if scratch_ps.count() != 1 {
-        return Err("scratch must be 1 page");
+    let scratch_count = scratch_ps.count();
+    if scratch_count == 0 {
+        return Err("scratch must have at least 1 page");
     }
+
+    // Validate that user mappings + stack pages fit in total scratch capacity
+    let total_capacity = scratch_count * MAPPINGS_PER_PAGE;
+    if !lockjaw_types::vmem::validate_process_mappings(mapping_count, stack_ps.count(), total_capacity) {
+        return Err("mapping count exceeds buffer capacity");
+    }
+
+    // Set up first scratch page
     let scratch_paddr = scratch_ps.page(0).ok_or("scratch page missing")?;
     page_alloc::zero_page(scratch_paddr);
     // SAFETY: scratch_paddr is a kernel-allocated page; we use it as a
-    // temporary Mapping buffer for create_address_space.
+    // temporary Mapping buffer for AddressSpaceBuilder.
     let mut buf = unsafe { KernelMut::<Mapping>::from_paddr(scratch_paddr) };
-    let mappings = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), MAPPINGS_PER_PAGE) };
-    let mut count = 0;
+    let mut mappings = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), MAPPINGS_PER_PAGE) };
+    let mut cursor = ScratchCursor::new(scratch_count);
 
     // Allocate process page early so we can write owned_pages directly
     // into it during mapping resolution (avoids large stack arrays).
@@ -131,6 +119,10 @@ pub fn create_process(
     // lockjaw-types with host tests.
     use lockjaw_types::process::ProcessTransferPlan;
     let mut plan = ProcessTransferPlan::new();
+
+    // Create incremental address space builder — Drop handles cleanup on failure.
+    let mut builder = unsafe { AddressSpaceBuilder::new() }
+        .map_err(|_| "address space builder alloc failed")?;
 
     for i in 0..mapping_count {
         // Read ProcessMapping from user memory via page table walk (TTBR1).
@@ -148,13 +140,27 @@ pub fn create_process(
         let page_idx = user_mapping.page_index as usize;
         let phys = ps.page(page_idx).ok_or("page index out of range")?;
 
-        mappings[count] = Mapping {
+        mappings[cursor.offset()] = Mapping {
             virt_addr: user_mapping.virt_addr,
             phys_addr: phys,
             user_accessible: true,
-            executable: (user_mapping.flags & FLAG_EXECUTABLE) != 0,
+            executable: (user_mapping.flags & PROCESS_MAP_FLAG_EXECUTABLE) != 0,
         };
-        count += 1;
+
+        match cursor.advance() {
+            ScratchAction::Continue => {}
+            ScratchAction::FlushAndAdvance { next_page_idx } => {
+                unsafe { builder.map_batch(&mappings[..MAPPINGS_PER_PAGE]) }
+                    .map_err(|_| "address space mapping failed")?;
+                let next = scratch_ps.page(next_page_idx).ok_or("scratch page missing")?;
+                page_alloc::zero_page(next);
+                buf = unsafe { KernelMut::<Mapping>::from_paddr(next) };
+                mappings = unsafe {
+                    core::slice::from_raw_parts_mut(buf.as_mut_ptr(), MAPPINGS_PER_PAGE)
+                };
+                cursor.did_advance();
+            }
+        }
 
         // Record data page directly in ProcessObject (no stack array)
         if !crate::cap::process_obj::process_push_owned_page(
@@ -169,13 +175,27 @@ pub fn create_process(
     let stack_va: u64 = lockjaw_types::constants::USER_STACK_BASE;
     for s in 0..stack_ps.count() {
         let phys = stack_ps.page(s).ok_or("stack page missing")?;
-        mappings[count] = Mapping {
+        mappings[cursor.offset()] = Mapping {
             virt_addr: stack_va + (s as u64) * PAGE_SIZE,
             phys_addr: phys,
             user_accessible: true,
             executable: false,
         };
-        count += 1;
+
+        match cursor.advance() {
+            ScratchAction::Continue => {}
+            ScratchAction::FlushAndAdvance { next_page_idx } => {
+                unsafe { builder.map_batch(&mappings[..MAPPINGS_PER_PAGE]) }
+                    .map_err(|_| "address space mapping failed")?;
+                let next = scratch_ps.page(next_page_idx).ok_or("scratch page missing")?;
+                page_alloc::zero_page(next);
+                buf = unsafe { KernelMut::<Mapping>::from_paddr(next) };
+                mappings = unsafe {
+                    core::slice::from_raw_parts_mut(buf.as_mut_ptr(), MAPPINGS_PER_PAGE)
+                };
+                cursor.did_advance();
+            }
+        }
 
         // Record stack pages directly in ProcessObject
         if !crate::cap::process_obj::process_push_owned_page(
@@ -186,10 +206,12 @@ pub fn create_process(
     }
     plan.add_header(stack_entry.object_paddr).map_err(|_| "too many PageSets")?;
 
-    // Create address space
-    // SAFETY: all physical addresses in mappings are from validated PageSets.
-    let ttbr0 = unsafe { create_address_space(&mappings[..count]) }
-        .map_err(|_| "address space creation failed")?;
+    // Final flush of pending mappings and finalize address space
+    if cursor.has_pending() {
+        unsafe { builder.map_batch(&mappings[..cursor.pending_count()]) }
+            .map_err(|_| "address space mapping failed")?;
+    }
+    let ttbr0 = builder.finish();
     let mut ttbr0_guard = Ttbr0Guard::new(ttbr0);
 
     // Flush I-cache

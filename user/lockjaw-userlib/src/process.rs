@@ -1,12 +1,5 @@
-/// A mapping entry for sys_create_process.
-/// Must match the kernel's process::ProcessMapping layout.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ProcessMapping {
-    pub virt_addr: u64,
-    pub pageset_id: u64,
-    pub page_index: u64,
-    pub flags: u64,
-}
+// Re-export from lockjaw-types — single source of truth.
+pub use lockjaw_types::process::{ProcessMapping, PROCESS_MAP_FLAG_EXECUTABLE};
 
-pub const FLAG_EXECUTABLE: u64 = 1 << 0;
+/// Backwards-compatible alias.
+pub const FLAG_EXECUTABLE: u64 = PROCESS_MAP_FLAG_EXECUTABLE;
