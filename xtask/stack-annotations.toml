@@ -92,3 +92,14 @@
 # The panic handler calls uart.puts() + KPrint, which the compiler
 # sees as potentially panicking again. Not real recursion.
 "__rustc::rust_begin_unwind" = true
+
+[allowed_vtables]
+# Compiler jump table inside GIC init (match on GIC version).
+# The "+" suffix restricts to intra-function offsets (jump table
+# entries), not function pointers to gic::init itself.
+"gic::init+" = "compiler jump table"
+
+# Specific Debug::fmt impls pulled in by assert_eq! in the kernel.
+# Each new type requires its own entry — keeps the gate narrow.
+"<&lockjaw_types::object::ObjectType as core::fmt::Debug>::fmt" = "assert_eq panic formatting"
+"<&u64 as core::fmt::Debug>::fmt" = "assert_eq panic formatting"

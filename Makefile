@@ -20,7 +20,7 @@ QEMU_DISPLAY_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -m 128M \
 
 USER_CRATES := user/hello user/uart-driver user/device-manager user/ramfb-driver user/display-test user/virtio-blk-driver user/init
 
-.PHONY: build build-release build-user build-hash clean-all run run-release run-display run-blk objdump nm check-stack check-pointers test test-unit test-qemu-gicv3 test-qemu-gicv2 clean pi4
+.PHONY: build build-release build-user build-hash clean-all run run-release run-display run-blk objdump nm check-stack check-pointers check-vtables test test-unit test-qemu-gicv3 test-qemu-gicv2 clean pi4
 
 clean-all:
 	cargo clean
@@ -43,6 +43,7 @@ build-user: clean-all build-hash
 
 build: build-user check-stack check-pointers
 	cargo build
+	cargo xtask check-vtables
 
 build-release: build-user check-stack
 	cargo build --release
@@ -77,6 +78,9 @@ check-stack:
 
 check-pointers:
 	cargo xtask check-pointers
+
+check-vtables:
+	cargo xtask check-vtables
 
 test: test-unit test-qemu-gicv3 test-qemu-gicv2
 

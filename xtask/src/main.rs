@@ -26,11 +26,13 @@ fn main() {
     match env::args().nth(1).as_deref() {
         Some("check-stack") => check_stack(),
         Some("check-pointers") => check_pointers(),
+        Some("check-vtables") => check_vtables(),
         _ => {
             eprintln!("Usage: cargo xtask <command>");
             eprintln!("Commands:");
             eprintln!("  check-stack      Verify stack depth budgets and no recursion");
             eprintln!("  check-pointers   Verify all pointer casts have SAFETY comments");
+            eprintln!("  check-vtables    Scan data sections for absolute code pointers");
             process::exit(1);
         }
     }
@@ -493,6 +495,7 @@ struct Annotations {
     indirect_calls: HashMap<String, IndirectAnnotation>,
     allowed_cycles: HashSet<String>,
     known_assembly: HashMap<String, u64>,
+    allowed_vtables: HashMap<String, String>,
 }
 
 fn load_annotations() -> Annotations {
@@ -507,12 +510,14 @@ fn load_annotations() -> Annotations {
     let mut indirect_calls = HashMap::new();
     let mut allowed_cycles = HashSet::new();
     let mut known_assembly = HashMap::new();
+    let mut allowed_vtables = HashMap::new();
 
     enum Section {
         None,
         IndirectCalls,
         AllowedCycles,
         KnownAssembly,
+        AllowedVtables,
     }
     let mut section = Section::None;
 
@@ -532,6 +537,10 @@ fn load_annotations() -> Annotations {
             }
             "[known_assembly]" => {
                 section = Section::KnownAssembly;
+                continue;
+            }
+            "[allowed_vtables]" => {
+                section = Section::AllowedVtables;
                 continue;
             }
             _ if line.starts_with('[') => {
@@ -570,6 +579,10 @@ fn load_annotations() -> Annotations {
                     known_assembly.insert(key, size);
                 }
             }
+            Section::AllowedVtables => {
+                let reason = value.trim_matches('"').to_string();
+                allowed_vtables.insert(key, reason);
+            }
             Section::None => {}
         }
     }
@@ -578,6 +591,7 @@ fn load_annotations() -> Annotations {
         indirect_calls,
         allowed_cycles,
         known_assembly,
+        allowed_vtables,
     }
 }
 
@@ -857,6 +871,230 @@ fn ensure_tool(name: &str, install_hint: &str) {
             eprintln!("FAIL: '{}' not found. Install with: {}", name, install_hint);
             process::exit(1);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Data-to-code pointer check (vtable / jump table / fn pointer detection)
+// ---------------------------------------------------------------------------
+
+/// Scan .rodata and .data for 8-byte aligned values that fall within
+/// the .text virtual address range. These are absolute code pointers
+/// baked in at link time — the exact mechanism behind vtable hazards,
+/// jump tables, and function pointer arrays that break when the kernel
+/// is loaded at a different physical address than the link address.
+fn check_vtables() {
+    println!("=== Data-to-Code Pointer Check ===");
+    println!("  Scans .rodata/.data for absolute code pointers.");
+    println!();
+
+    let elf_path = KERNEL_ELF_DEBUG;
+    let elf = match std::fs::read(elf_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("FAIL: cannot read {}: {}", elf_path, e);
+            eprintln!("Run `cargo build` first.");
+            process::exit(1);
+        }
+    };
+
+    if elf.len() < 64 || &elf[..4] != b"\x7fELF" {
+        eprintln!("FAIL: {} is not a valid ELF file", elf_path);
+        process::exit(1);
+    }
+
+    let sections = parse_elf_sections(&elf);
+
+    let text = sections.iter().find(|s| s.name == ".text");
+    let text = match text {
+        Some(s) => s,
+        None => {
+            eprintln!("FAIL: .text section not found in {}", elf_path);
+            process::exit(1);
+        }
+    };
+    let text_start = text.vaddr;
+    let text_end = text.vaddr + text.size as u64;
+
+    println!("  .text range: {:#x}..{:#x} ({} bytes)", text_start, text_end, text.size);
+
+    // Scan .rodata, .data, and .data.rel.ro for code pointers
+    let scan_names = [".rodata", ".data", ".data.rel.ro"];
+    let data_sections: Vec<&ElfSection> = sections
+        .iter()
+        .filter(|s| scan_names.contains(&s.name.as_str()))
+        .collect();
+
+    let mut hits: Vec<(String, u64, u64)> = Vec::new();
+    for sec in &data_sections {
+        let end = sec.file_offset + sec.size;
+        if end > elf.len() {
+            eprintln!("WARN: {} extends past EOF, skipping", sec.name);
+            continue;
+        }
+        let bytes = &elf[sec.file_offset..end];
+        let mut off = 0;
+        while off + 8 <= sec.size {
+            let val = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+            if val >= text_start && val < text_end {
+                hits.push((sec.name.clone(), sec.vaddr + off as u64, val));
+            }
+            off += 8;
+        }
+    }
+
+    if hits.is_empty() {
+        println!("  No code pointers in data sections.");
+        println!();
+        println!("=== Data-to-code check PASSED ===");
+        return;
+    }
+
+    // Resolve target addresses to symbol names via rust-nm
+    let nm_map = build_symbol_map(elf_path);
+
+    let annotations = load_annotations();
+
+    // Filter against allowlist
+    let mut violations = Vec::new();
+    for (sec, offset, target) in &hits {
+        let name = resolve_code_pointer(*target, &nm_map);
+        let allowed = annotations.allowed_vtables.iter().any(|(pattern, _)| {
+            name.contains(pattern.as_str())
+        });
+        if !allowed {
+            violations.push((sec.clone(), *offset, *target, name));
+        }
+    }
+
+    println!(
+        "  {} code pointer(s) in data, {} allowed, {} violation(s)",
+        hits.len(),
+        hits.len() - violations.len(),
+        violations.len()
+    );
+    println!();
+
+    if violations.is_empty() {
+        println!("=== Data-to-code check PASSED ===");
+    } else {
+        eprintln!("=== Data-to-code check FAILED ===");
+        eprintln!();
+        for (sec, offset, target, name) in &violations {
+            eprintln!("  {} @ {:#x} -> {:#x} ({})", sec, offset, target, name);
+        }
+        eprintln!();
+        eprintln!(
+            "Add to [allowed_vtables] in {} if unavoidable.",
+            ANNOTATIONS_PATH
+        );
+        process::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Minimal ELF64 section parser
+// ---------------------------------------------------------------------------
+
+struct ElfSection {
+    name: String,
+    vaddr: u64,
+    file_offset: usize,
+    size: usize,
+}
+
+/// Parse ELF64 section headers. Only extracts name, vaddr, file offset,
+/// and size — enough to locate .text and data sections for scanning.
+fn parse_elf_sections(elf: &[u8]) -> Vec<ElfSection> {
+    // ELF64 header offsets (little-endian)
+    let e_shoff = u64::from_le_bytes(elf[40..48].try_into().unwrap()) as usize;
+    let e_shentsize = u16::from_le_bytes(elf[58..60].try_into().unwrap()) as usize;
+    let e_shnum = u16::from_le_bytes(elf[60..62].try_into().unwrap()) as usize;
+    let e_shstrndx = u16::from_le_bytes(elf[62..64].try_into().unwrap()) as usize;
+
+    // Locate .shstrtab (section header string table) for name resolution
+    let shstr_hdr = e_shoff + e_shstrndx * e_shentsize;
+    let shstr_off =
+        u64::from_le_bytes(elf[shstr_hdr + 24..shstr_hdr + 32].try_into().unwrap()) as usize;
+    let shstr_size =
+        u64::from_le_bytes(elf[shstr_hdr + 32..shstr_hdr + 40].try_into().unwrap()) as usize;
+    let shstrtab = &elf[shstr_off..shstr_off + shstr_size];
+
+    let mut sections = Vec::new();
+    for i in 0..e_shnum {
+        let base = e_shoff + i * e_shentsize;
+        let name_off =
+            u32::from_le_bytes(elf[base..base + 4].try_into().unwrap()) as usize;
+        let vaddr = u64::from_le_bytes(elf[base + 16..base + 24].try_into().unwrap());
+        let file_offset =
+            u64::from_le_bytes(elf[base + 24..base + 32].try_into().unwrap()) as usize;
+        let size =
+            u64::from_le_bytes(elf[base + 32..base + 40].try_into().unwrap()) as usize;
+        sections.push(ElfSection {
+            name: read_cstr(shstrtab, name_off),
+            vaddr,
+            file_offset,
+            size,
+        });
+    }
+    sections
+}
+
+/// Read a NUL-terminated string from a byte slice at the given offset.
+fn read_cstr(data: &[u8], offset: usize) -> String {
+    let start = &data[offset..];
+    let len = start.iter().position(|&b| b == 0).unwrap_or(start.len());
+    String::from_utf8_lossy(&start[..len]).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Symbol map for code pointer resolution
+// ---------------------------------------------------------------------------
+
+/// Build an address→name map from `rust-nm --defined-only --demangle`.
+fn build_symbol_map(elf_path: &str) -> HashMap<u64, String> {
+    let output = Command::new("rust-nm")
+        .args(["--defined-only", "--demangle", elf_path])
+        .output()
+        .expect("failed to run rust-nm — is cargo-binutils installed?");
+
+    let mut map = HashMap::new();
+    if !output.status.success() {
+        eprintln!("WARN: rust-nm failed, code pointers will show as <unknown>");
+        return map;
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        // Format: "00000000400801a0 T symbol_name"
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        if parts.len() >= 3 {
+            if let Ok(addr) = u64::from_str_radix(parts[0], 16) {
+                map.insert(addr, parts[2].to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Resolve a code pointer to the best matching symbol name.
+/// Tries exact match first, then finds the nearest preceding symbol.
+fn resolve_code_pointer(addr: u64, nm_map: &HashMap<u64, String>) -> String {
+    // Exact match
+    if let Some(name) = nm_map.get(&addr) {
+        return name.clone();
+    }
+    // Nearest preceding symbol (addr is inside a function body)
+    let mut best_addr = 0u64;
+    let mut best_name = None;
+    for (&sym_addr, name) in nm_map {
+        if sym_addr <= addr && sym_addr > best_addr {
+            best_addr = sym_addr;
+            best_name = Some(name);
+        }
+    }
+    match best_name {
+        Some(name) => format!("{}+{:#x}", name, addr - best_addr),
+        None => format!("<unknown @ {:#x}>", addr),
     }
 }
 
