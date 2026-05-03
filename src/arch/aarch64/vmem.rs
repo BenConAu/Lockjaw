@@ -38,9 +38,6 @@ pub enum VmemError {
 /// # Safety
 /// All physical addresses in mappings must be valid allocated pages.
 pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, VmemError> {
-    if mappings.len() > MAPPINGS_PER_PAGE {
-        return Err(VmemError::TooManyMappings);
-    }
     // Allocate L0
     let l0_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
     // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
@@ -113,8 +110,14 @@ pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, Vme
     // Map each user page. Group by L2 index (2MB region) and allocate
     // L3 tables as needed.
     // Track which L2 entries already have L3 tables.
-    // Only need to track the few L2 indices that user pages fall in.
-    // With our VA layout (pages around 0x400000-0x800000), at most ~4 L2 regions.
+    //
+    // LIMIT: Each L2 entry covers 2MB, so MAX_L3_TABLES caps the number
+    // of distinct 2MB regions a process can span. With user VA 0x400000-
+    // 0x800000 (4MB), typical binaries need 2-3 regions; init with ~10MB
+    // of embedded binaries needs ~6. If a binary's VA footprint exceeds
+    // 16MB (8 × 2MB), this will fail with TooManyL3Regions. Fix by
+    // switching to a dynamic Vec-like allocator or walking the L2 table
+    // directly instead of caching L3 pointers in a fixed array.
     const MAX_L3_TABLES: usize = 8;
     let mut l3_indices: [usize; MAX_L3_TABLES] = [usize::MAX; MAX_L3_TABLES];
     let mut l3_ptrs: [*mut PageTable; MAX_L3_TABLES] = [core::ptr::null_mut(); MAX_L3_TABLES];

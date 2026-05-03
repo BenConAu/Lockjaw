@@ -623,11 +623,19 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("  Entry point: ", Hex(elf_info.entry_point));
         kprintln!("  ", elf_info.segment_count, " loadable segment(s)");
 
-        // Allocate a page for the mapping buffer (avoids large array on the kernel stack)
-        let map_buf = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("mapping buffer page"));
-        mm::page_alloc::zero_page(map_buf.start_addr());
+        // Allocate 16 contiguous pages for the mapping buffer — enough for
+        // ~2720 mappings (~10.6 MB of init binaries via include_bytes!).
+        const MAP_BUF_PAGES: usize = 16;
+        let map_buf_capacity = MAP_BUF_PAGES * MAPPINGS_PER_PAGE;
+        let map_buf = mm::page_alloc::alloc_pages_contiguous(MAP_BUF_PAGES)
+            .unwrap_or_else(|| panic!("mapping buffer pages"));
+        // SAFETY: contiguous pages → contiguous kernel VA; zero all of them.
+        for i in 0..MAP_BUF_PAGES {
+            let page_addr = mm::addr::PhysAddr::new(map_buf.start_addr().as_u64() + (i as u64) * mm::addr::PAGE_SIZE);
+            mm::page_alloc::zero_page(page_addr);
+        }
         let mut map_buf_km = mm::kernel_ptr::KernelMut::<Mapping>::from_paddr(map_buf.start_addr());
-        let mappings = core::slice::from_raw_parts_mut(map_buf_km.as_mut_ptr(), MAPPINGS_PER_PAGE);
+        let mappings = core::slice::from_raw_parts_mut(map_buf_km.as_mut_ptr(), map_buf_capacity);
         let mut mapping_count = 0;
 
         for i in 0..elf_info.segment_count {
@@ -638,7 +646,7 @@ pub extern "C" fn kmain() -> ! {
                 if seg.writable { "W" } else { "R" });
 
             for p in 0..num_pages {
-                assert!(mapping_count < MAPPINGS_PER_PAGE, "init ELF has too many pages for mapping buffer");
+                assert!(mapping_count < map_buf_capacity, "init ELF has too many pages for mapping buffer");
                 let page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("segment page"));
 
                 // Copy file data into this page (if any)
