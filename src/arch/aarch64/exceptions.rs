@@ -4,7 +4,7 @@ use core::arch::global_asm;
 // lockjaw-types (host-testable). Re-export so existing kernel imports work.
 pub use lockjaw_types::exception::{
     ExceptionContext, EXCEPTION_FRAME_SIZE,
-    OFF_ELR, OFF_SPSR, OFF_ESR, OFF_SP_EL0,
+    OFF_ELR, OFF_SPSR, OFF_ESR, OFF_SP_EL0, OFF_TPIDR_EL0,
 };
 
 // ---------------------------------------------------------------------------
@@ -81,6 +81,7 @@ fn print_fault(prefix: &str, ctx: &ExceptionContext, is_user: bool) {
     crate::kprintln!(prefix, "  SPSR: ", Addr(ctx.spsr));
     if is_user {
         crate::kprintln!(prefix, "  SP_EL0: ", Addr(ctx.sp_el0));
+        crate::kprintln!(prefix, "  TPIDR_EL0: ", Addr(ctx.tpidr_el0));
     }
 
     // User stack overflow detection
@@ -209,11 +210,12 @@ global_asm!(
 // Frame layout offsets and size are set by .equ from Rust consts below.
 // This ensures the assembly always matches the ExceptionContext struct.
 
-.equ FRAME_SIZE, {frame_size}
-.equ OFF_ELR,    {off_elr}
-.equ OFF_SPSR,   {off_spsr}
-.equ OFF_ESR,    {off_esr}
-.equ OFF_SP_EL0, {off_sp_el0}
+.equ FRAME_SIZE,     {frame_size}
+.equ OFF_ELR,        {off_elr}
+.equ OFF_SPSR,       {off_spsr}
+.equ OFF_ESR,        {off_esr}
+.equ OFF_SP_EL0,     {off_sp_el0}
+.equ OFF_TPIDR_EL0,  {off_tpidr_el0}
 
 // Save all registers + ELR/SPSR/ESR/SP_EL0 onto the stack.
 // Creates an ExceptionContext struct on the stack and passes its
@@ -246,6 +248,9 @@ global_asm!(
     stp     x0, x1,   [sp, #OFF_ELR]    // Save ELR, SPSR
     stp     x2, x3,   [sp, #OFF_ESR]    // Save ESR, SP_EL0
 
+    mrs     x0, TPIDR_EL0               // Read user thread-local storage pointer
+    str     x0, [sp, #OFF_TPIDR_EL0]    // Save TPIDR_EL0
+
     mov     x0, sp                       // x0 = pointer to ExceptionContext (arg for handler)
 .endm
 
@@ -258,6 +263,9 @@ global_asm!(
 
     ldp     x2, x3,   [sp, #OFF_ESR]    // Load saved ESR (unused), SP_EL0
     msr     SP_EL0, x3                   // Restore user stack pointer
+
+    ldr     x2, [sp, #OFF_TPIDR_EL0]    // Load saved TPIDR_EL0
+    msr     TPIDR_EL0, x2               // Restore user thread-local storage pointer
 
     ldp     x0,  x1,  [sp, #(0  * 8)]   // Restore x0, x1
     ldp     x2,  x3,  [sp, #(2  * 8)]   // Restore x2, x3
@@ -365,6 +373,7 @@ __vec_sync_lower:
     off_spsr = const OFF_SPSR,
     off_esr = const OFF_ESR,
     off_sp_el0 = const OFF_SP_EL0,
+    off_tpidr_el0 = const OFF_TPIDR_EL0,
 );
 
 /// Install the exception vector table by writing VBAR_EL1.

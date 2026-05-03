@@ -39,8 +39,10 @@ pub struct ExceptionContext {
     /// switches during IRQs or syscalls don't lose the interrupted thread's
     /// user SP.
     pub sp_el0: u64,
-    /// Padding to keep the frame 16-byte aligned (AArch64 ABI requirement).
-    pub _pad: u64,
+    /// User thread-local storage pointer (TPIDR_EL0). musl libc stores the
+    /// TLS block address here during __init_tls at startup. Must be
+    /// saved/restored so context switches don't clobber another thread's TLS.
+    pub tpidr_el0: u64,
 }
 
 /// Frame size for SAVE_REGS: `sub sp, sp, #EXCEPTION_FRAME_SIZE`.
@@ -52,6 +54,7 @@ pub const OFF_ELR: usize = core::mem::offset_of!(ExceptionContext, elr);
 pub const OFF_SPSR: usize = core::mem::offset_of!(ExceptionContext, spsr);
 pub const OFF_ESR: usize = core::mem::offset_of!(ExceptionContext, esr);
 pub const OFF_SP_EL0: usize = core::mem::offset_of!(ExceptionContext, sp_el0);
+pub const OFF_TPIDR_EL0: usize = core::mem::offset_of!(ExceptionContext, tpidr_el0);
 
 // Compile-time assertions tying struct layout to the assembly.
 const _: () = {
@@ -60,6 +63,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ExceptionContext, spsr) == 256);
     assert!(core::mem::offset_of!(ExceptionContext, esr) == 264);
     assert!(core::mem::offset_of!(ExceptionContext, sp_el0) == 272);
+    assert!(core::mem::offset_of!(ExceptionContext, tpidr_el0) == 280);
 };
 
 // ---------------------------------------------------------------------------
@@ -194,6 +198,14 @@ mod tests {
         // WHY: SAVE_REGS stores SP_EL0 at [sp, #OFF_SP_EL0].
         // RESTORE_REGS reads it back and writes MSR SP_EL0.
         assert_eq!(core::mem::offset_of!(ExceptionContext, sp_el0), 272);
+    }
+
+    #[test]
+    fn exception_context_tpidr_el0_at_offset_280() {
+        // WHY: SAVE_REGS stores TPIDR_EL0 at [sp, #OFF_TPIDR_EL0].
+        // RESTORE_REGS reads it back and writes MSR TPIDR_EL0.
+        // Required for musl TLS pointer preservation across context switches.
+        assert_eq!(core::mem::offset_of!(ExceptionContext, tpidr_el0), 280);
     }
 
     #[test]

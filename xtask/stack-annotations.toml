@@ -35,7 +35,7 @@
 [known_assembly]
 # Exception vector stubs: SAVE_REGS allocates EXCEPTION_FRAME_SIZE
 # = size_of::<ExceptionContext>() = 288 bytes (31 GPRs + ELR + SPSR
-# + ESR + SP_EL0 + pad = 36 × 8).
+# + ESR + SP_EL0 + TPIDR_EL0 = 36 × 8).
 "__vec_sync" = 288
 "__vec_irq" = 288
 "__vec_fiq" = 288

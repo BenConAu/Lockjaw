@@ -434,6 +434,7 @@ pub unsafe fn drop_to_el0_with_ttbr0(
         "mov x28, xzr",
         "mov x29, xzr",
         "mov x30, xzr",
+        "msr TPIDR_EL0, xzr",                // Zero TLS pointer — prevent kernel leak to EL0
         "eret",                               // Drop to EL0
         ttbr0 = in(reg) ttbr0,
         sp = in(reg) stack_top,
