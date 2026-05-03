@@ -34,20 +34,11 @@ native Lockjaw, etc.) could coexist.
 
 Ordered by phase dependency, not front-loaded.
 
-### Blocks Phase 0 (hello world)
+### ~~Blocks Phase 0 (hello world)~~ DONE
 
-**TPIDR_EL0 save/restore.** musl's `__init_tls` writes TPIDR_EL0
-in `_start`. Currently NOT saved/restored — not in
-`ExceptionContext` and not in `SAVE_REGS`/`RESTORE_REGS`.
-
-Fix: add `tpidr_el0: u64` field to `ExceptionContext` (replaces
-`_pad`), add `mrs`/`msr` pair in SAVE_REGS/RESTORE_REGS (same
-pattern as SP_EL0), zero TPIDR_EL0 in `drop_to_el0_with_ttbr0` to
-prevent kernel pointer leak.
-
-Files: `lockjaw-types/src/exception.rs`,
-`src/arch/aarch64/exceptions.rs`, `src/arch/aarch64/mmu.rs`,
-`xtask/stack-annotations.toml`
+**TPIDR_EL0 save/restore.** Landed in `ac09c77`. ExceptionContext
+`_pad` replaced with `tpidr_el0`, mrs/msr pairs added in
+SAVE_REGS/RESTORE_REGS, zeroed in `drop_to_el0_with_ttbr0`.
 
 ### Blocks Phase 3 (time/random)
 
@@ -75,6 +66,7 @@ server creates a notification per POSIX process. Kernel's
 
 ### Already available (no changes needed)
 
+- **TPIDR_EL0 save/restore**: landed in `ac09c77`
 - **Multi-handle bootstrap**: existing call/reply bootstrap protocol
   (every child calls handle 0 at startup, parent exports handles via
   `sys_export_handle` + reply)
@@ -183,7 +175,7 @@ calling `sys_create_process`. Required auxv entries:
 
 **Gate:** `puts("hello, lockjaw")` compiled with musl runs.
 
-Kernel: TPIDR_EL0 save/restore.
+Kernel pre-work: none (TPIDR_EL0 already landed).
 
 New userspace:
 - `user/posix-server/` — syscall dispatch loop, FD 0/1/2 wired to
