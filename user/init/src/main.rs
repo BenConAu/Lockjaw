@@ -34,6 +34,10 @@ static DISPLAY_TEST_ELF: &[u8] = include_bytes!("../../display-test/target/aarch
 /// Built by: cd user/virtio-blk-driver && cargo build --release
 static BLK_ELF: &[u8] = include_bytes!("../../virtio-blk-driver/target/aarch64-unknown-none/release/lockjaw-virtio-blk-driver");
 
+/// The POSIX personality server ELF binary, embedded at compile time.
+/// Built by: cd user/posix-server && cargo build --release
+static POSIX_SERVER_ELF: &[u8] = include_bytes!("../../posix-server/target/aarch64-unknown-none/release/lockjaw-posix-server");
+
 // ---------------------------------------------------------------------------
 // ELF spawn helper
 // ---------------------------------------------------------------------------
@@ -282,6 +286,7 @@ pub extern "C" fn _start() -> ! {
     let display_test_boot_ep = alloc_endpoint("dtest boot");
     let blk_srv_ep = alloc_endpoint("blk srv");
     let blk_boot_ep = alloc_endpoint("blk boot");
+    let posix_boot_ep = alloc_endpoint("posix boot");
 
     // Spawn child processes.
     // Allocate temp VAs for ELF loading. Each spawn needs:
@@ -296,6 +301,7 @@ pub extern "C" fn _start() -> ! {
     spawn_elf(UART_ELF, "uart-driver", map_array_va, temp_base_va, scratch_ps, uart_boot_ep, 4);
     spawn_elf(RAMFB_ELF, "ramfb-driver", map_array_va, temp_base_va, scratch_ps, ramfb_boot_ep, 4);
     spawn_elf(BLK_ELF, "blk-driver", map_array_va, temp_base_va, scratch_ps, blk_boot_ep, 4);
+    spawn_elf(POSIX_SERVER_ELF, "posix-server", map_array_va, temp_base_va, scratch_ps, posix_boot_ep, 8);
     spawn_elf(DISPLAY_TEST_ELF, "display-test", map_array_va, temp_base_va, scratch_ps, display_test_boot_ep, 1);
 
     // Bootstrap hello: export a test notification into its handle table.
@@ -393,6 +399,12 @@ pub extern "C" fn _start() -> ! {
     };
     sys_reply(blk_srv_idx, blk_devmgr_idx, 0, 0);
     puts("[BOOTSTRAP] blk\n");
+
+    // Bootstrap posix-server: no handles to export, just acknowledge.
+    puts("init: waiting for posix-server bootstrap...\n");
+    let _ = sys_receive(posix_boot_ep);
+    sys_reply(0, 0, 0, 0);
+    puts("[BOOTSTRAP] posix-server\n");
 
     // Allocate a Reply object for init's own outbound calls (ipc_puts to
     // the uart server). Each client that issues sys_call needs one.
