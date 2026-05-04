@@ -12,6 +12,7 @@ use lockjaw_userlib::*;
 use lockjaw_userlib::elf::parse_elf;
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_types::constants::USER_STACK_BASE;
+use lockjaw_types::elf_loader::{plan_elf_load, ElfLoadEntry};
 
 /// Pre-built statically-linked musl hello binary.
 /// Built with patched musl (see musl-lockjaw/).
@@ -51,87 +52,87 @@ fn halt() -> ! {
 // ELF loading — ported from user/init/src/main.rs:spawn_elf
 // ---------------------------------------------------------------------------
 
+/// Apply one [`ElfLoadEntry`] from a load plan: allocate a fresh page,
+/// map it temporarily at `temp_va`, zero it, copy the file slice (if
+/// any) into the right in-page offset, and append a `ProcessMapping`
+/// for the child's address space at `map_array[mapping_idx]`.
+///
+/// All planning decisions (page count, file ranges, in-page offsets,
+/// bounds checks) live in `lockjaw_types::elf_loader::plan_elf_load`.
+/// This function is mechanical execution.
+fn apply_elf_load_entry(
+    entry: &ElfLoadEntry,
+    elf_data: &[u8],
+    map_array: *mut ProcessMapping,
+    mapping_idx: usize,
+    temp_va: u64,
+) {
+    let ps = match sys_alloc_pages(1) {
+        Ok(ps) => ps,
+        Err(_) => { puts("posix: seg alloc FAILED\n"); halt(); }
+    };
+    if !sys_map_pages(ps, temp_va, 0).is_ok() {
+        puts("posix: seg map FAILED\n");
+        halt();
+    }
+    unsafe { zero_page_at_va(temp_va); }
+
+    let (src_start, src_end) = entry.src_file_range;
+    if src_end > src_start {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                elf_data[src_start..src_end].as_ptr(),
+                (temp_va + entry.in_page_offset as u64) as *mut u8,
+                src_end - src_start,
+            );
+        }
+    }
+
+    unsafe {
+        core::ptr::write(map_array.add(mapping_idx), ProcessMapping {
+            virt_addr: entry.page_va,
+            pageset_id: ps.0,
+            page_index: 0,
+            flags: if entry.executable { FLAG_EXECUTABLE } else { 0 },
+        });
+    }
+}
+
 /// Load ELF segments into freshly allocated pages. Returns mapping count.
 /// `map_array_va` must point to a mapped page for ProcessMapping entries.
 /// `temp_base_va` must have enough free VA for all segment pages.
 ///
-/// Handles segments whose `vaddr` is not page-aligned: a segment that starts
-/// mid-page or crosses a page boundary is split across however many pages
-/// are needed, with file data placed at the correct in-page offset and the
-/// rest of each page zeroed (BSS / pre-data padding).
+/// All structural decisions live in `plan_elf_load`: page count for
+/// each segment, file-range slicing, in-page offsets for unaligned
+/// vaddrs, BSS-only pages, bounds and overflow checks. This function
+/// just allocates a plan buffer, iterates the plan, and applies each
+/// entry.
+///
+/// The plan buffer is sized for the binaries posix-server expects to
+/// spawn (Phase 0: a tiny musl static "hello, lockjaw"). 64 entries =
+/// ~2.5 KB on the stack — fits comfortably in posix-server's 8-page
+/// stack. Larger binaries that overflow this cap surface as a clean
+/// `TooManyEntries` error, not a stack overflow.
+const POSIX_ELF_LOAD_BUF: usize = 64;
+
 fn load_elf_segments(
     elf_data: &[u8],
     elf_info: &lockjaw_types::elf::ElfInfo,
     map_array_va: u64,
     temp_base_va: u64,
 ) -> usize {
+    let mut planbuf = [ElfLoadEntry::EMPTY; POSIX_ELF_LOAD_BUF];
+    let plan = match plan_elf_load(elf_info, elf_data.len(), &mut planbuf) {
+        Ok(p) => p,
+        Err(_) => { puts("posix: elf load plan FAILED\n"); halt(); }
+    };
+
     let map_array = map_array_va as *mut ProcessMapping;
-    let mut mapping_count: usize = 0;
-
-    for i in 0..elf_info.segment_count {
-        let seg = &elf_info.segments[i];
-        if seg.mem_size == 0 {
-            continue;
-        }
-
-        // Cover the full VA range [seg.vaddr, seg.vaddr+mem_size) in
-        // page-sized chunks anchored to page boundaries.
-        let seg_start_va = seg.vaddr;
-        let seg_end_va = seg.vaddr + seg.mem_size;
-        let first_page_va = seg_start_va & !(PAGE_SIZE - 1);
-        let last_page_va = (seg_end_va - 1) & !(PAGE_SIZE - 1);
-        let num_pages = ((last_page_va - first_page_va) / PAGE_SIZE + 1) as usize;
-        let seg_file_end_va = seg.vaddr + seg.file_size;
-
-        for p in 0..num_pages {
-            let page_va = first_page_va + (p as u64) * PAGE_SIZE;
-
-            let ps = match sys_alloc_pages(1) {
-                Ok(ps) => ps,
-                Err(_) => { puts("posix: seg alloc FAILED\n"); halt(); }
-            };
-
-            let temp_va = temp_base_va + (mapping_count as u64) * PAGE_SIZE;
-            if !sys_map_pages(ps, temp_va, 0).is_ok() {
-                puts("posix: seg map FAILED\n");
-                halt();
-            }
-
-            // Zero the whole page first — covers BSS and any pre-segment
-            // padding when seg.vaddr is mid-page.
-            unsafe { zero_page_at_va(temp_va); }
-
-            // Intersect this page with the segment's file-backed range.
-            let page_end_va = page_va + PAGE_SIZE;
-            let copy_start_va = page_va.max(seg_start_va);
-            let copy_end_va = page_end_va.min(seg_file_end_va);
-
-            if copy_end_va > copy_start_va {
-                let in_page_off = (copy_start_va - page_va) as usize;
-                let copy_len = (copy_end_va - copy_start_va) as usize;
-                let src_start = (seg.file_offset + (copy_start_va - seg_start_va)) as usize;
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        elf_data[src_start..src_start + copy_len].as_ptr(),
-                        (temp_va + in_page_off as u64) as *mut u8,
-                        copy_len,
-                    );
-                }
-            }
-
-            unsafe {
-                core::ptr::write(map_array.add(mapping_count), ProcessMapping {
-                    virt_addr: page_va,
-                    pageset_id: ps.0,
-                    page_index: 0,
-                    flags: if seg.executable { FLAG_EXECUTABLE } else { 0 },
-                });
-            }
-            mapping_count += 1;
-        }
+    for (i, entry) in plan.entries().iter().enumerate() {
+        let temp_va = temp_base_va + (i as u64) * PAGE_SIZE;
+        apply_elf_load_entry(entry, elf_data, map_array, i, temp_va);
     }
-
-    mapping_count
+    plan.page_count()
 }
 
 // ---------------------------------------------------------------------------

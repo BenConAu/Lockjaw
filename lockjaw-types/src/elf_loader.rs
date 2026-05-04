@@ -50,29 +50,42 @@ pub struct ElfLoadEntry {
     pub executable: bool,
 }
 
-/// Maximum entries a plan can hold. Sized for current init's mapping
-/// budget (16 scratch pages = 2720 mappings; this cap covers ELF segments
-/// only — the stack mappings are appended by the caller).
-pub const MAX_LOAD_ENTRIES: usize = 256;
-
-/// A fully validated load plan. Construct via [`plan_elf_load`].
-#[derive(Debug)]
-pub struct ElfLoadPlan {
-    entries: [ElfLoadEntry; MAX_LOAD_ENTRIES],
-    count: usize,
+impl ElfLoadEntry {
+    /// Zero-initialized entry suitable for filling a buffer before
+    /// passing it to [`plan_elf_load`]. The plan overwrites populated
+    /// entries; trailing entries are unused and left at this value.
+    pub const EMPTY: Self = Self {
+        page_va: 0,
+        src_file_range: (0, 0),
+        in_page_offset: 0,
+        executable: false,
+    };
 }
 
-impl ElfLoadPlan {
+/// A fully validated load plan, borrowing a caller-provided slice of
+/// [`ElfLoadEntry`]. Construct via [`plan_elf_load`].
+///
+/// Caller owns the storage. Posix-server can use a small stack array
+/// (~64 entries, 2.5 KB); init's loader can use a larger buffer or a
+/// donated page. The cap is the caller's choice — if the plan needs
+/// more entries than the buffer holds, [`plan_elf_load`] returns
+/// [`ElfLoadError::TooManyEntries`].
+#[derive(Debug)]
+pub struct ElfLoadPlan<'a> {
+    entries: &'a [ElfLoadEntry],
+}
+
+impl<'a> ElfLoadPlan<'a> {
     /// All page-sized work units in iteration order. Caller iterates and
     /// applies each one as a side effect.
     pub fn entries(&self) -> &[ElfLoadEntry] {
-        &self.entries[..self.count]
+        self.entries
     }
 
     /// Number of entries the plan produced (i.e. number of pages the
     /// caller must allocate and map).
     pub fn page_count(&self) -> usize {
-        self.count
+        self.entries.len()
     }
 }
 
@@ -86,9 +99,10 @@ pub enum ElfLoadError {
     /// Indicates a truncated or adversarial ELF — the caller would
     /// otherwise index out of the byte slice.
     FileRangeOutOfBounds { seg_idx: usize, file_end: u64, elf_len: usize },
-    /// Segment expansion would produce more page entries than
-    /// [`MAX_LOAD_ENTRIES`]. Indicates a pathological `mem_size` (e.g.
-    /// 4 GB BSS).
+    /// Segment expansion would produce more page entries than the
+    /// caller-provided buffer can hold. `cap` is the buffer's length.
+    /// Indicates either a pathological `mem_size` (e.g. 4 GB BSS) or
+    /// an under-sized buffer for the binary being loaded.
     TooManyEntries { needed: usize, cap: usize },
     /// `vaddr` falls outside the user VA range
     /// (`[0, USER_VA_END)`). Defense in depth — the kernel side validates
@@ -103,12 +117,19 @@ pub enum ElfLoadError {
     FileSizeExceedsMemSize { seg_idx: usize, file_size: u64, mem_size: u64 },
 }
 
-/// Build a load plan from parsed ELF info.
+/// Build a load plan from parsed ELF info into a caller-provided buffer.
 ///
 /// `elf_len` is the length of the ELF byte slice the caller will use to
 /// resolve each entry's `src_file_range`. The plan only references bytes
 /// that fit within `elf_len`; bounds violations are reported via
 /// [`ElfLoadError::FileRangeOutOfBounds`].
+///
+/// `out` is the storage for entries. The plan writes into the prefix of
+/// this slice and returns an [`ElfLoadPlan`] borrowing the populated
+/// portion. If the binary requires more entries than `out` can hold,
+/// returns [`ElfLoadError::TooManyEntries`]. The buffer's contents on
+/// error are unspecified (partially populated; the borrow is released
+/// when the error is returned).
 ///
 /// The plan walks each `PT_LOAD` segment, computes the page-aligned VA
 /// range it covers, and emits one [`ElfLoadEntry`] per destination page.
@@ -116,16 +137,13 @@ pub enum ElfLoadError {
 /// `[vaddr, vaddr+file_size)` to determine whether (and from where) file
 /// data should be copied; the rest of the page is zeroed (BSS, pre-data
 /// padding, or trailing padding when file_size doesn't fill a page).
-pub fn plan_elf_load(info: &ElfInfo, elf_len: usize) -> Result<ElfLoadPlan, ElfLoadError> {
-    let mut plan = ElfLoadPlan {
-        entries: [ElfLoadEntry {
-            page_va: 0,
-            src_file_range: (0, 0),
-            in_page_offset: 0,
-            executable: false,
-        }; MAX_LOAD_ENTRIES],
-        count: 0,
-    };
+pub fn plan_elf_load<'a>(
+    info: &ElfInfo,
+    elf_len: usize,
+    out: &'a mut [ElfLoadEntry],
+) -> Result<ElfLoadPlan<'a>, ElfLoadError> {
+    let cap = out.len();
+    let mut count: usize = 0;
 
     for i in 0..info.segment_count {
         let seg = &info.segments[i];
@@ -192,15 +210,14 @@ pub fn plan_elf_load(info: &ElfInfo, elf_len: usize) -> Result<ElfLoadPlan, ElfL
         let last_page_va = (seg_end_va - 1) & !(PAGE_SIZE - 1);
         let num_pages = ((last_page_va - first_page_va) / PAGE_SIZE + 1) as usize;
 
-        // Refuse to emit a plan that doesn't fit.
-        if plan
-            .count
+        // Refuse to emit a plan that doesn't fit in the caller's buffer.
+        if count
             .checked_add(num_pages)
-            .map_or(true, |n| n > MAX_LOAD_ENTRIES)
+            .map_or(true, |n| n > cap)
         {
             return Err(ElfLoadError::TooManyEntries {
-                needed: plan.count + num_pages,
-                cap: MAX_LOAD_ENTRIES,
+                needed: count + num_pages,
+                cap,
             });
         }
 
@@ -222,17 +239,17 @@ pub fn plan_elf_load(info: &ElfInfo, elf_len: usize) -> Result<ElfLoadPlan, ElfL
                 ((0, 0), 0)
             };
 
-            plan.entries[plan.count] = ElfLoadEntry {
+            out[count] = ElfLoadEntry {
                 page_va,
                 src_file_range,
                 in_page_offset,
                 executable: seg.executable,
             };
-            plan.count += 1;
+            count += 1;
         }
     }
 
-    Ok(plan)
+    Ok(ElfLoadPlan { entries: &out[..count] })
 }
 
 // ---------------------------------------------------------------------------
@@ -276,12 +293,17 @@ mod tests {
         }
     }
 
+    /// Default buffer size for happy-path tests. Generous enough that
+    /// any reasonable test ELF fits without triggering TooManyEntries.
+    const TEST_BUF_LEN: usize = 32;
+
     // ---- Happy paths ----
 
     #[test]
     fn page_aligned_full_page_segment() {
         let info = make_info(&[seg(0x40_0000, 0x1000, PAGE_SIZE, PAGE_SIZE, true)]);
-        let plan = plan_elf_load(&info, 0x10000).unwrap();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let plan = plan_elf_load(&info, 0x10000, &mut buf).unwrap();
         assert_eq!(plan.page_count(), 1);
         let e = plan.entries()[0];
         assert_eq!(e.page_va, 0x40_0000);
@@ -294,7 +316,8 @@ mod tests {
     fn bss_tail_in_same_page() {
         // file_size 0x100, mem_size 0x500 — same page, bss tail
         let info = make_info(&[seg(0x40_0000, 0x1000, 0x100, 0x500, false)]);
-        let plan = plan_elf_load(&info, 0x10000).unwrap();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let plan = plan_elf_load(&info, 0x10000, &mut buf).unwrap();
         assert_eq!(plan.page_count(), 1);
         let e = plan.entries()[0];
         assert_eq!(e.src_file_range, (0x1000, 0x1100));
@@ -306,7 +329,8 @@ mod tests {
         // vaddr 0x41ffa8, file_size 0x150, mem_size 0x7b8
         // (the actual musl Phase 0 case)
         let info = make_info(&[seg(0x41_ffa8, 0xffa8, 0x150, 0x7b8, false)]);
-        let plan = plan_elf_load(&info, 0x20_0000).unwrap();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let plan = plan_elf_load(&info, 0x20_0000, &mut buf).unwrap();
         // Spans pages 0x41f000 and 0x420000.
         assert_eq!(plan.page_count(), 2);
 
@@ -328,7 +352,8 @@ mod tests {
         // vaddr 0x400ff0, file_size+mem_size 0x100 — last 16 bytes of
         // page 0, first 0xf0 bytes of page 1.
         let info = make_info(&[seg(0x40_0ff0, 0x1000, 0x100, 0x100, false)]);
-        let plan = plan_elf_load(&info, 0x10000).unwrap();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let plan = plan_elf_load(&info, 0x10000, &mut buf).unwrap();
         assert_eq!(plan.page_count(), 2);
         assert_eq!(plan.entries()[0].in_page_offset, 0xff0);
         assert_eq!(plan.entries()[0].src_file_range, (0x1000, 0x1010));
@@ -346,7 +371,8 @@ mod tests {
             seg(0x40_1000, 0x2000, 0x800, 0x800, false),
             seg(0x40_2000, 0x3000, 0x100, 0x1000, false), // mostly BSS
         ]);
-        let plan = plan_elf_load(&info, 0x10000).unwrap();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let plan = plan_elf_load(&info, 0x10000, &mut buf).unwrap();
         assert_eq!(plan.page_count(), 3);
         assert!(plan.entries()[0].executable);
         assert!(!plan.entries()[1].executable);
@@ -359,7 +385,8 @@ mod tests {
     #[test]
     fn empty_segment_list() {
         let info = make_info(&[]);
-        let plan = plan_elf_load(&info, 0x1000).unwrap();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let plan = plan_elf_load(&info, 0x1000, &mut buf).unwrap();
         assert_eq!(plan.page_count(), 0);
         assert!(plan.entries().is_empty());
     }
@@ -371,7 +398,8 @@ mod tests {
             seg(0x40_0000, 0x1000, 0, 0, false),
             seg(0x40_1000, 0x1000, PAGE_SIZE, PAGE_SIZE, false),
         ]);
-        let plan = plan_elf_load(&info, 0x10000).unwrap();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let plan = plan_elf_load(&info, 0x10000, &mut buf).unwrap();
         assert_eq!(plan.page_count(), 1);
         assert_eq!(plan.entries()[0].page_va, 0x40_1000);
     }
@@ -382,7 +410,8 @@ mod tests {
         // emitted; bytes 0..0x800 of the page are zero (no file data),
         // file_data begins at in_page_offset 0x800.
         let info = make_info(&[seg(0x40_0800, 0x1000, 0x400, 0x400, false)]);
-        let plan = plan_elf_load(&info, 0x10000).unwrap();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let plan = plan_elf_load(&info, 0x10000, &mut buf).unwrap();
         assert_eq!(plan.page_count(), 1);
         let e = plan.entries()[0];
         assert_eq!(e.page_va, 0x40_0000);
@@ -395,7 +424,8 @@ mod tests {
     #[test]
     fn vaddr_plus_mem_size_overflows() {
         let info = make_info(&[seg(u64::MAX - 0x100, 0, 0, 0x200, false)]);
-        let err = plan_elf_load(&info, 0x10000).unwrap_err();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let err = plan_elf_load(&info, 0x10000, &mut buf).unwrap_err();
         assert_eq!(err, ElfLoadError::VaddrRangeOverflow { seg_idx: 0 });
     }
 
@@ -405,7 +435,8 @@ mod tests {
         // but the file_size > mem_size invariant violation is detected
         // first (file_size = 0x200, mem_size = 0x100).
         let info = make_info(&[seg(u64::MAX - 0x100, 0, 0x200, 0x100, false)]);
-        let err = plan_elf_load(&info, 0x10000).unwrap_err();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let err = plan_elf_load(&info, 0x10000, &mut buf).unwrap_err();
         assert_eq!(
             err,
             ElfLoadError::FileSizeExceedsMemSize {
@@ -420,7 +451,8 @@ mod tests {
     fn file_range_past_end_of_elf() {
         let info = make_info(&[seg(0x40_0000, 0x900, 0x800, 0x800, false)]);
         // elf_len=0x1000; segment wants bytes [0x900, 0x1100) — past end.
-        let err = plan_elf_load(&info, 0x1000).unwrap_err();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let err = plan_elf_load(&info, 0x1000, &mut buf).unwrap_err();
         match err {
             ElfLoadError::FileRangeOutOfBounds { seg_idx, file_end, elf_len } => {
                 assert_eq!(seg_idx, 0);
@@ -435,25 +467,32 @@ mod tests {
     fn file_offset_past_end_of_elf() {
         let info = make_info(&[seg(0x40_0000, 0x9999, 0, 0x100, false)]);
         // Empty file_size but file_offset itself is past elf_len.
-        let err = plan_elf_load(&info, 0x1000).unwrap_err();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let err = plan_elf_load(&info, 0x1000, &mut buf).unwrap_err();
         assert!(matches!(err, ElfLoadError::FileRangeOutOfBounds { seg_idx: 0, .. }));
     }
 
     #[test]
     fn file_offset_plus_file_size_overflow_u64() {
         let info = make_info(&[seg(0x40_0000, u64::MAX - 0x100, 0x200, 0x200, false)]);
-        let err = plan_elf_load(&info, 0x1000).unwrap_err();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let err = plan_elf_load(&info, 0x1000, &mut buf).unwrap_err();
         assert!(matches!(err, ElfLoadError::FileRangeOutOfBounds { seg_idx: 0, .. }));
     }
 
     #[test]
     fn pathological_bss_too_many_entries() {
-        // mem_size requires more than MAX_LOAD_ENTRIES pages.
-        let huge_mem = (MAX_LOAD_ENTRIES as u64 + 1) * PAGE_SIZE;
+        // mem_size requires more pages than the caller's buffer holds.
+        // Caller buffer is 4 entries; segment expands to 5 pages.
+        let huge_mem = 5u64 * PAGE_SIZE;
         let info = make_info(&[seg(0x40_0000, 0x1000, 0x100, huge_mem, false)]);
-        let err = plan_elf_load(&info, 0x10000).unwrap_err();
+        let mut buf = [ElfLoadEntry::EMPTY; 4];
+        let err = plan_elf_load(&info, 0x10000, &mut buf).unwrap_err();
         match err {
-            ElfLoadError::TooManyEntries { cap, .. } => assert_eq!(cap, MAX_LOAD_ENTRIES),
+            ElfLoadError::TooManyEntries { needed, cap } => {
+                assert_eq!(needed, 5);
+                assert_eq!(cap, 4);
+            }
             other => panic!("expected TooManyEntries, got {:?}", other),
         }
     }
@@ -464,7 +503,8 @@ mod tests {
         // invariant check running before the mem_size==0 skip, this
         // would be silently dropped — a malformed ELF passing through.
         let info = make_info(&[seg(0x40_0000, 0x1000, 0x100, 0, false)]);
-        let err = plan_elf_load(&info, 0x10000).unwrap_err();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let err = plan_elf_load(&info, 0x10000, &mut buf).unwrap_err();
         assert_eq!(
             err,
             ElfLoadError::FileSizeExceedsMemSize {
@@ -483,7 +523,8 @@ mod tests {
         // destination page (because num_pages comes from mem_size and
         // the copy range comes from file_size).
         let info = make_info(&[seg(0x40_0000, 0x1000, 0x500, 0x100, false)]);
-        let err = plan_elf_load(&info, 0x10000).unwrap_err();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let err = plan_elf_load(&info, 0x10000, &mut buf).unwrap_err();
         assert_eq!(
             err,
             ElfLoadError::FileSizeExceedsMemSize {
@@ -498,7 +539,8 @@ mod tests {
     fn vaddr_in_kernel_range_rejected() {
         // 0x40000000 = USER_VA_END; anything >= rejected.
         let info = make_info(&[seg(0x4000_0000, 0x1000, PAGE_SIZE, PAGE_SIZE, false)]);
-        let err = plan_elf_load(&info, 0x10000).unwrap_err();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let err = plan_elf_load(&info, 0x10000, &mut buf).unwrap_err();
         assert_eq!(
             err,
             ElfLoadError::VaddrOutOfUserRange {
@@ -512,22 +554,31 @@ mod tests {
     fn vaddr_just_below_kernel_with_mem_size_crossing() {
         // vaddr fine, but vaddr+mem_size crosses USER_VA_END.
         let info = make_info(&[seg(0x3FFF_F000, 0x1000, PAGE_SIZE, 2 * PAGE_SIZE, false)]);
-        let err = plan_elf_load(&info, 0x10000).unwrap_err();
+        let mut buf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let err = plan_elf_load(&info, 0x10000, &mut buf).unwrap_err();
         // seg_end_va = 0x4000_1000 > USER_VA_END
         assert!(matches!(err, ElfLoadError::VaddrOutOfUserRange { seg_idx: 0, .. }));
     }
 
     #[test]
-    fn segment_count_alone_fills_max_entries() {
-        // Many tiny single-page segments would still expand to one entry
-        // each — verify the per-segment cap path. ElfInfo::MAX_SEGMENTS
-        // is 8, so we can't cause TooManyEntries this way directly;
-        // instead, use a single segment whose mem_size requires exactly
-        // MAX_LOAD_ENTRIES + 1 pages (boundary case).
-        let big = (MAX_LOAD_ENTRIES as u64) * PAGE_SIZE + 1;
+    fn buffer_exactly_fits_at_capacity() {
+        // Edge case: caller buffer = exactly the page count needed.
+        // A 5-page segment fills a 5-entry buffer with no error.
+        let big = 5u64 * PAGE_SIZE;
         let info = make_info(&[seg(0x40_0000, 0, 0, big, false)]);
-        let err = plan_elf_load(&info, 0x10000).unwrap_err();
-        assert!(matches!(err, ElfLoadError::TooManyEntries { .. }));
+        let mut buf = [ElfLoadEntry::EMPTY; 5];
+        let plan = plan_elf_load(&info, 0x10000, &mut buf).unwrap();
+        assert_eq!(plan.page_count(), 5);
+    }
+
+    #[test]
+    fn buffer_one_short_returns_too_many() {
+        // Same 5-page segment, 4-entry buffer → TooManyEntries.
+        let big = 5u64 * PAGE_SIZE;
+        let info = make_info(&[seg(0x40_0000, 0, 0, big, false)]);
+        let mut buf = [ElfLoadEntry::EMPTY; 4];
+        let err = plan_elf_load(&info, 0x10000, &mut buf).unwrap_err();
+        assert_eq!(err, ElfLoadError::TooManyEntries { needed: 5, cap: 4 });
     }
 
     // ---- Round-trip apply ----
@@ -549,7 +600,8 @@ mod tests {
         // segment at vaddr 0x40_0040 (mid-page), file 0x300 bytes,
         // mem_size 0x500 (BSS tail of 0x200 zeros).
         let info = make_info(&[seg(0x40_0040, 0x2000, 0x300, 0x500, false)]);
-        let plan = plan_elf_load(&info, elf.len()).unwrap();
+        let mut planbuf = [ElfLoadEntry::EMPTY; TEST_BUF_LEN];
+        let plan = plan_elf_load(&info, elf.len(), &mut planbuf).unwrap();
         assert_eq!(plan.page_count(), 1);
 
         // Apply: zero a page, copy file bytes per the plan.
