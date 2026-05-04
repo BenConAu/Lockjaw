@@ -39,7 +39,7 @@ build-user: clean-all build-hash
 	cd user/ramfb-driver && cargo build --release
 	cd user/display-test && cargo build --release
 	cd user/virtio-blk-driver && cargo build --release
-	./user/posix-hello/build-standalone.sh
+	./musl-lockjaw/build.sh
 	cd user/posix-server && cargo build --release
 	cd user/init && cargo build --release
 

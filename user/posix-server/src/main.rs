@@ -54,6 +54,11 @@ fn halt() -> ! {
 /// Load ELF segments into freshly allocated pages. Returns mapping count.
 /// `map_array_va` must point to a mapped page for ProcessMapping entries.
 /// `temp_base_va` must have enough free VA for all segment pages.
+///
+/// Handles segments whose `vaddr` is not page-aligned: a segment that starts
+/// mid-page or crosses a page boundary is split across however many pages
+/// are needed, with file data placed at the correct in-page offset and the
+/// rest of each page zeroed (BSS / pre-data padding).
 fn load_elf_segments(
     elf_data: &[u8],
     elf_info: &lockjaw_types::elf::ElfInfo,
@@ -65,9 +70,22 @@ fn load_elf_segments(
 
     for i in 0..elf_info.segment_count {
         let seg = &elf_info.segments[i];
-        let num_pages = ((seg.mem_size + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
+        if seg.mem_size == 0 {
+            continue;
+        }
+
+        // Cover the full VA range [seg.vaddr, seg.vaddr+mem_size) in
+        // page-sized chunks anchored to page boundaries.
+        let seg_start_va = seg.vaddr;
+        let seg_end_va = seg.vaddr + seg.mem_size;
+        let first_page_va = seg_start_va & !(PAGE_SIZE - 1);
+        let last_page_va = (seg_end_va - 1) & !(PAGE_SIZE - 1);
+        let num_pages = ((last_page_va - first_page_va) / PAGE_SIZE + 1) as usize;
+        let seg_file_end_va = seg.vaddr + seg.file_size;
 
         for p in 0..num_pages {
+            let page_va = first_page_va + (p as u64) * PAGE_SIZE;
+
             let ps = match sys_alloc_pages(1) {
                 Ok(ps) => ps,
                 Err(_) => { puts("posix: seg alloc FAILED\n"); halt(); }
@@ -79,32 +97,31 @@ fn load_elf_segments(
                 halt();
             }
 
+            // Zero the whole page first — covers BSS and any pre-segment
+            // padding when seg.vaddr is mid-page.
             unsafe { zero_page_at_va(temp_va); }
 
-            // Copy file data into the page
-            let seg_page_offset = (p as u64) * PAGE_SIZE;
-            let file_remaining = if seg.file_size > seg_page_offset {
-                let r = seg.file_size - seg_page_offset;
-                if r > PAGE_SIZE { PAGE_SIZE } else { r }
-            } else {
-                0
-            };
+            // Intersect this page with the segment's file-backed range.
+            let page_end_va = page_va + PAGE_SIZE;
+            let copy_start_va = page_va.max(seg_start_va);
+            let copy_end_va = page_end_va.min(seg_file_end_va);
 
-            if file_remaining > 0 {
-                let src_start = (seg.file_offset + seg_page_offset) as usize;
-                let src_end = src_start + file_remaining as usize;
+            if copy_end_va > copy_start_va {
+                let in_page_off = (copy_start_va - page_va) as usize;
+                let copy_len = (copy_end_va - copy_start_va) as usize;
+                let src_start = (seg.file_offset + (copy_start_va - seg_start_va)) as usize;
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        elf_data[src_start..src_end].as_ptr(),
-                        temp_va as *mut u8,
-                        file_remaining as usize,
+                        elf_data[src_start..src_start + copy_len].as_ptr(),
+                        (temp_va + in_page_off as u64) as *mut u8,
+                        copy_len,
                     );
                 }
             }
 
             unsafe {
                 core::ptr::write(map_array.add(mapping_count), ProcessMapping {
-                    virt_addr: seg.vaddr + seg_page_offset,
+                    virt_addr: page_va,
                     pageset_id: ps.0,
                     page_index: 0,
                     flags: if seg.executable { FLAG_EXECUTABLE } else { 0 },
