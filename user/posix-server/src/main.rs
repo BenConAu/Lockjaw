@@ -13,16 +13,14 @@ use lockjaw_userlib::elf::parse_elf;
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_types::constants::USER_STACK_BASE;
 use lockjaw_userlib::elf_loader::{plan_elf_load, ElfLoadEntry};
-use lockjaw_types::posix::{dispatch, neg_errno, Action, DispatchInputs, ENOSYS};
+use lockjaw_types::posix::{
+    dispatch, neg_errno, write_linux_stack, Action, DispatchInputs, StackInputs,
+    ENOSYS, STACK_LAYOUT_FIXED_BYTES,
+};
 
 /// Pre-built statically-linked musl hello binary.
 /// Built with patched musl (see musl-lockjaw/).
 static POSIX_HELLO: &[u8] = include_bytes!("../../posix-hello/hello");
-
-// Linux auxv entry types
-const AT_NULL: u64 = 0;
-const AT_PAGESZ: u64 = 6;
-const AT_RANDOM: u64 = 25;
 
 fn halt() -> ! {
     loop { unsafe { asm!("wfi"); } }
@@ -119,54 +117,43 @@ fn load_elf_segments(
 // Stack layout — Linux initial stack for musl _start
 // ---------------------------------------------------------------------------
 
-/// Write the Linux initial stack layout into the top stack page.
-/// musl's patched `_start` does `sub sp, sp, #4096` then reads from SP.
-/// We write at `stack_va + 3 * PAGE_SIZE` (= 4096 bytes below the top of
-/// a 4-page stack allocation).
-///
-/// Layout (all u64 on aarch64):
-///   +0:  argc = 1
-///   +8:  argv[0] pointer
-///   +16: 0 (argv terminator)
-///   +24: 0 (envp terminator)
-///   +32: AT_PAGESZ, 4096
-///   +48: AT_RANDOM, pointer to 16 random bytes
-///   +64: AT_NULL, 0
-///   +80: 16 pseudo-random bytes
-///   +96: "hello\0"
+/// Phase 0 AT_RANDOM seed. Fixed; later phases should plumb real entropy.
+/// "Lockjaw!POSIX000" — 16 bytes, deterministic so tests that read the
+/// child's view of the seed see the same value every run.
+const PHASE0_RANDOM_SEED: [u8; 16] = [
+    0x4c, 0x6f, 0x63, 0x6b, 0x6a, 0x61, 0x77, 0x21, // "Lockjaw!"
+    0x50, 0x4f, 0x53, 0x49, 0x58, 0x30, 0x30, 0x30, // "POSIX000"
+];
+
+/// Build the Linux initial stack the musl child reads from SP. The
+/// pure layout writer lives in `lockjaw_types::posix::write_linux_stack`
+/// (host-tested); this function is just the side-effect glue:
+/// `stack_va` is the personality server's temp mapping of the 4-page
+/// stack PageSet, and the layout goes in the top page (which the child
+/// sees at `USER_STACK_BASE + 3 * PAGE_SIZE`).
 fn write_stack_layout(stack_va: u64) {
     let layout_va = stack_va + 3 * PAGE_SIZE;
-    // Child sees this page at USER_STACK_BASE + 3 * PAGE_SIZE
     let child_layout_va = USER_STACK_BASE + 3 * PAGE_SIZE;
 
-    let argv0_ptr = child_layout_va + 96;
-    let random_ptr = child_layout_va + 80;
+    // SAFETY: stack_va points to a 4-page mapping the personality server
+    // owns; the top page is reserved for the initial stack image.
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(layout_va as *mut u8, PAGE_SIZE as usize)
+    };
 
-    unsafe {
-        let base = layout_va as *mut u64;
-        core::ptr::write(base.add(0), 1);           // argc
-        core::ptr::write(base.add(1), argv0_ptr);   // argv[0]
-        core::ptr::write(base.add(2), 0);            // argv terminator
-        core::ptr::write(base.add(3), 0);            // envp terminator
-        core::ptr::write(base.add(4), AT_PAGESZ);   // auxv[0].a_type
-        core::ptr::write(base.add(5), 4096);         // auxv[0].a_val
-        core::ptr::write(base.add(6), AT_RANDOM);    // auxv[1].a_type
-        core::ptr::write(base.add(7), random_ptr);   // auxv[1].a_val
-        core::ptr::write(base.add(8), AT_NULL);      // auxv terminator
-        core::ptr::write(base.add(9), 0);
-
-        // 16 pseudo-random bytes at +80 (fixed seed, Phase 0)
-        let random = (layout_va + 80) as *mut u8;
-        let seed: [u8; 16] = [
-            0x4c, 0x6f, 0x63, 0x6b, 0x6a, 0x61, 0x77, 0x21, // "Lockjaw!"
-            0x50, 0x4f, 0x53, 0x49, 0x58, 0x30, 0x30, 0x30, // "POSIX000"
-        ];
-        core::ptr::copy_nonoverlapping(seed.as_ptr(), random, 16);
-
-        // "hello\0" at +96
-        let argv0 = (layout_va + 96) as *mut u8;
-        core::ptr::copy_nonoverlapping(b"hello\0".as_ptr(), argv0, 6);
+    let argv0 = b"hello\0";
+    if let Err(_) = write_linux_stack(buf, &StackInputs {
+        argv0,
+        random_seed: PHASE0_RANDOM_SEED,
+        child_layout_va,
+        page_size: PAGE_SIZE,
+    }) {
+        puts("posix: stack layout FAILED\n");
+        halt();
     }
+    // Sanity check the layout actually fits — surfaces a buffer-size
+    // regression here rather than as a child segfault.
+    debug_assert!((PAGE_SIZE as usize) >= STACK_LAYOUT_FIXED_BYTES + argv0.len());
 }
 
 // ---------------------------------------------------------------------------

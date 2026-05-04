@@ -127,6 +127,118 @@ pub fn dispatch(inp: &DispatchInputs) -> Action {
 }
 
 // ---------------------------------------------------------------------------
+// Linux initial stack layout (musl _start ABI)
+// ---------------------------------------------------------------------------
+
+// auxv entry types musl actually reads at startup.
+pub const AT_NULL: u64 = 0;
+pub const AT_PAGESZ: u64 = 6;
+pub const AT_RANDOM: u64 = 25;
+
+// Field offsets in the stack layout. Each u64 is 8 bytes. The auxv
+// section is three (type, val) pairs — 48 bytes — followed by the
+// 16-byte AT_RANDOM seed and the argv0 string.
+const OFF_ARGC: usize = 0;
+const OFF_ARGV0_PTR: usize = 8;
+const OFF_ARGV_TERM: usize = 16;
+const OFF_ENVP_TERM: usize = 24;
+const OFF_AUXV: usize = 32;
+const AUXV_BYTES: usize = 3 * 16; // PAGESZ, RANDOM, NULL — each 16 bytes
+const OFF_RANDOM: usize = OFF_AUXV + AUXV_BYTES; // 80
+const OFF_ARGV0_STR: usize = OFF_RANDOM + 16;     // 96
+
+/// Minimum bytes required to hold the fixed part of the layout (argc,
+/// argv pointer, argv/envp terminators, three auxv entries, AT_RANDOM
+/// seed). Add `argv0.len()` for the variable-length argv0 string.
+pub const STACK_LAYOUT_FIXED_BYTES: usize = OFF_ARGV0_STR;
+
+/// Inputs to [`write_linux_stack`].
+pub struct StackInputs<'a> {
+    /// argv[0] bytes, including the trailing null. musl's `_start`
+    /// reads strings via the argv pointers and stops at the first
+    /// `\0`; we require the caller to include it explicitly so a
+    /// missing terminator can't slip past as a silent off-by-one.
+    pub argv0: &'a [u8],
+    /// 16 bytes of entropy exposed via AT_RANDOM. musl seeds its TLS
+    /// canary and stack guard from here. Phase 0 uses a fixed seed;
+    /// later phases should pass real entropy.
+    pub random_seed: [u8; 16],
+    /// VA the *child* sees this page mapped at. argv[0] and the
+    /// AT_RANDOM auxv pointer are absolute addresses into this page,
+    /// so they must reflect the child's view, not whatever temp VA
+    /// the personality server used to write the layout.
+    pub child_layout_va: u64,
+    /// Value to publish in the AT_PAGESZ auxv entry.
+    pub page_size: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum StackError {
+    /// `buf` is too small to hold the fixed layout plus `argv0`.
+    /// `required` is `STACK_LAYOUT_FIXED_BYTES + argv0.len()`.
+    BufferTooSmall { required: usize, given: usize },
+    /// `argv0` is empty or its last byte isn't `\0`. Every other
+    /// terminator in the layout (argv, envp, auxv) is written by this
+    /// function, but argv0's trailing null is part of the caller's
+    /// string and easy to forget.
+    Argv0NotNullTerminated,
+}
+
+/// Write the Linux initial-stack layout musl's `_start` reads from SP
+/// into `buf`. Pure: no I/O, no syscalls. Caller maps a stack page,
+/// passes a `&mut [u8]` view of it, and copies the page to its final
+/// location.
+///
+/// Layout (byte offsets, all u64 fields little-endian):
+///
+/// ```text
+/// +0  argc = 1
+/// +8  argv[0] pointer            -> child_layout_va + 96
+/// +16 argv terminator (0)
+/// +24 envp terminator (0)
+/// +32 auxv[0].a_type = AT_PAGESZ
+/// +40 auxv[0].a_val  = page_size
+/// +48 auxv[1].a_type = AT_RANDOM
+/// +56 auxv[1].a_val  -> child_layout_va + 80
+/// +64 auxv[2].a_type = AT_NULL
+/// +72 auxv[2].a_val  = 0
+/// +80 random_seed[0..16]
+/// +96 argv0 bytes (including the trailing \0)
+/// ```
+pub fn write_linux_stack(buf: &mut [u8], inp: &StackInputs) -> Result<(), StackError> {
+    if inp.argv0.is_empty() || *inp.argv0.last().unwrap() != 0 {
+        return Err(StackError::Argv0NotNullTerminated);
+    }
+    let required = STACK_LAYOUT_FIXED_BYTES + inp.argv0.len();
+    if buf.len() < required {
+        return Err(StackError::BufferTooSmall { required, given: buf.len() });
+    }
+
+    let argv0_ptr = inp.child_layout_va + OFF_ARGV0_STR as u64;
+    let random_ptr = inp.child_layout_va + OFF_RANDOM as u64;
+
+    write_u64(buf, OFF_ARGC, 1);
+    write_u64(buf, OFF_ARGV0_PTR, argv0_ptr);
+    write_u64(buf, OFF_ARGV_TERM, 0);
+    write_u64(buf, OFF_ENVP_TERM, 0);
+    write_u64(buf, OFF_AUXV, AT_PAGESZ);
+    write_u64(buf, OFF_AUXV + 8, inp.page_size);
+    write_u64(buf, OFF_AUXV + 16, AT_RANDOM);
+    write_u64(buf, OFF_AUXV + 24, random_ptr);
+    write_u64(buf, OFF_AUXV + 32, AT_NULL);
+    write_u64(buf, OFF_AUXV + 40, 0);
+
+    buf[OFF_RANDOM..OFF_RANDOM + 16].copy_from_slice(&inp.random_seed);
+    buf[OFF_ARGV0_STR..OFF_ARGV0_STR + inp.argv0.len()].copy_from_slice(inp.argv0);
+
+    Ok(())
+}
+
+fn write_u64(buf: &mut [u8], offset: usize, value: u64) {
+    buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -136,6 +248,21 @@ mod tests {
 
     fn inp(nr: u64, arg1: u64, arg2: u64) -> DispatchInputs {
         DispatchInputs { nr, arg1, arg2 }
+    }
+
+    fn read_u64(buf: &[u8], offset: usize) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&buf[offset..offset + 8]);
+        u64::from_le_bytes(bytes)
+    }
+
+    fn make_inputs(argv0: &[u8]) -> StackInputs<'_> {
+        StackInputs {
+            argv0,
+            random_seed: *b"random_seed_1234",
+            child_layout_va: 0x1000_0000,
+            page_size: 4096,
+        }
     }
 
     #[test]
@@ -258,5 +385,132 @@ mod tests {
         assert_eq!(neg_errno(EBADF), (-9i64) as u64);
         assert_eq!(neg_errno(ENOSYS), (-38i64) as u64);
         assert_eq!(neg_errno(EINVAL), (-22i64) as u64);
+    }
+
+    // ---- write_linux_stack ----
+
+    #[test]
+    fn stack_argc_at_offset_zero() {
+        let mut buf = [0xAAu8; 256];
+        write_linux_stack(&mut buf, &make_inputs(b"hello\0")).unwrap();
+        assert_eq!(read_u64(&buf, 0), 1);
+    }
+
+    #[test]
+    fn stack_argv0_pointer_targets_in_page_string() {
+        let mut buf = [0u8; 256];
+        let inputs = make_inputs(b"hello\0");
+        write_linux_stack(&mut buf, &inputs).unwrap();
+        // argv[0] pointer must point at where the string lives in the
+        // child's view (child_layout_va + 96).
+        assert_eq!(read_u64(&buf, 8), inputs.child_layout_va + 96);
+    }
+
+    #[test]
+    fn stack_argv_terminator_present() {
+        let mut buf = [0xAAu8; 256];
+        write_linux_stack(&mut buf, &make_inputs(b"x\0")).unwrap();
+        assert_eq!(read_u64(&buf, 16), 0);
+    }
+
+    #[test]
+    fn stack_envp_terminator_present() {
+        let mut buf = [0xAAu8; 256];
+        write_linux_stack(&mut buf, &make_inputs(b"x\0")).unwrap();
+        assert_eq!(read_u64(&buf, 24), 0);
+    }
+
+    #[test]
+    fn stack_at_pagesz_carries_input_value() {
+        let mut buf = [0u8; 256];
+        let inputs = StackInputs {
+            argv0: b"hello\0",
+            random_seed: [0; 16],
+            child_layout_va: 0x1000_0000,
+            page_size: 16384, // unusual value to prove it's plumbed through
+        };
+        write_linux_stack(&mut buf, &inputs).unwrap();
+        assert_eq!(read_u64(&buf, 32), AT_PAGESZ);
+        assert_eq!(read_u64(&buf, 40), 16384);
+    }
+
+    #[test]
+    fn stack_at_random_pointer_targets_seed() {
+        let mut buf = [0u8; 256];
+        let inputs = make_inputs(b"x\0");
+        write_linux_stack(&mut buf, &inputs).unwrap();
+        assert_eq!(read_u64(&buf, 48), AT_RANDOM);
+        // Pointer must reference the seed bytes at +80 in the child view.
+        assert_eq!(read_u64(&buf, 56), inputs.child_layout_va + 80);
+    }
+
+    #[test]
+    fn stack_at_null_terminator_present() {
+        let mut buf = [0xAAu8; 256];
+        write_linux_stack(&mut buf, &make_inputs(b"x\0")).unwrap();
+        assert_eq!(read_u64(&buf, 64), AT_NULL);
+        assert_eq!(read_u64(&buf, 72), 0);
+    }
+
+    #[test]
+    fn stack_random_seed_copied_verbatim() {
+        let mut buf = [0u8; 256];
+        let seed = *b"0123456789abcdef";
+        write_linux_stack(&mut buf, &StackInputs {
+            argv0: b"x\0",
+            random_seed: seed,
+            child_layout_va: 0x1000_0000,
+            page_size: 4096,
+        }).unwrap();
+        assert_eq!(&buf[80..96], &seed);
+    }
+
+    #[test]
+    fn stack_argv0_string_copied_verbatim_with_null() {
+        let mut buf = [0u8; 256];
+        write_linux_stack(&mut buf, &make_inputs(b"hello\0")).unwrap();
+        assert_eq!(&buf[96..96 + 6], b"hello\0");
+    }
+
+    #[test]
+    fn stack_long_argv0_extends_required_size() {
+        // 32-byte argv0 — required = 96 + 32 = 128.
+        let argv0 = b"this-is-a-longer-program-name\x00\x00\x00";
+        let mut buf = [0u8; 128];
+        write_linux_stack(&mut buf, &make_inputs(argv0)).unwrap();
+        assert_eq!(&buf[96..96 + argv0.len()], argv0);
+    }
+
+    #[test]
+    fn stack_buffer_too_small_returns_error() {
+        let mut buf = [0u8; 100]; // need 96 + 6 = 102
+        assert_eq!(
+            write_linux_stack(&mut buf, &make_inputs(b"hello\0")),
+            Err(StackError::BufferTooSmall { required: 102, given: 100 }),
+        );
+    }
+
+    #[test]
+    fn stack_buffer_exactly_required_size_ok() {
+        let mut buf = [0u8; 102];
+        assert!(write_linux_stack(&mut buf, &make_inputs(b"hello\0")).is_ok());
+    }
+
+    #[test]
+    fn stack_argv0_missing_null_terminator_rejected() {
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            write_linux_stack(&mut buf, &make_inputs(b"hello")),
+            Err(StackError::Argv0NotNullTerminated),
+        );
+    }
+
+    #[test]
+    fn stack_argv0_empty_rejected() {
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            write_linux_stack(&mut buf, &make_inputs(b"")),
+            Err(StackError::Argv0NotNullTerminated),
+        );
     }
 }
