@@ -4,6 +4,7 @@ pub mod addr;
 pub mod buddy;
 pub mod constants;
 pub mod elf;
+pub mod elf_loader;
 pub mod ipc_state;
 pub mod notification_state;
 pub mod object;
