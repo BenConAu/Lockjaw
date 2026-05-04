@@ -13,36 +13,16 @@ use lockjaw_userlib::elf::parse_elf;
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_types::constants::USER_STACK_BASE;
 use lockjaw_userlib::elf_loader::{plan_elf_load, ElfLoadEntry};
+use lockjaw_types::posix::{dispatch, neg_errno, Action, DispatchInputs, ENOSYS};
 
 /// Pre-built statically-linked musl hello binary.
 /// Built with patched musl (see musl-lockjaw/).
 static POSIX_HELLO: &[u8] = include_bytes!("../../posix-hello/hello");
 
-/// Sentinel syscall number for shim bootstrap handshake.
-/// No real Linux syscall uses this value.
-const POSIX_INIT: u64 = 0xFFFF_FFFF_FFFF_FF00;
-
-// Linux syscall numbers (aarch64, asm-generic/unistd.h)
-const NR_IOCTL: u64 = 29;
-const NR_WRITE: u64 = 64;
-const NR_WRITEV: u64 = 66;
-const NR_EXIT_GROUP: u64 = 94;
-const NR_SET_TID_ADDRESS: u64 = 96;
-
 // Linux auxv entry types
 const AT_NULL: u64 = 0;
 const AT_PAGESZ: u64 = 6;
 const AT_RANDOM: u64 = 25;
-
-// Linux errno values
-const ENOSYS: u64 = 38;
-const ENOTTY: u64 = 25;
-const EBADF: u64 = 9;
-
-/// Return a negative errno as a u64 (two's complement), matching Linux convention.
-fn neg_errno(e: u64) -> u64 {
-    (-(e as i64)) as u64
-}
 
 fn halt() -> ! {
     loop { unsafe { asm!("wfi"); } }
@@ -190,31 +170,24 @@ fn write_stack_layout(stack_va: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall dispatch
+// Side effects for dispatch actions
 // ---------------------------------------------------------------------------
 
-/// Handle write/writev: read data from shared buffer, emit to kernel UART.
-/// The whole user write lands in one sys_debug_puts so other threads
-/// can't interleave between bytes (an interrupted line would still be
-/// "correct" output, but tests get cleaner streams).
-fn handle_write(server_shared_va: u64, fd: u64, len: u64) {
-    if fd != 1 && fd != 2 {
-        sys_reply(neg_errno(EBADF), 0, 0, 0);
-        return;
-    }
-    if len > PAGE_SIZE {
-        puts("posix: write len > PAGE_SIZE — shim bug\n");
-        halt();
-    }
+/// Apply an [`Action::EmitFromShared`]: copy `len` bytes out of the server's
+/// mapping of the shared buffer into one atomic sys_debug_puts, then reply.
+/// Splitting the read pointer / length / reply value out of the action lets
+/// `dispatch` decide policy (which fds are valid, length cap) without
+/// pulling syscalls into lockjaw-types.
+fn apply_emit_from_shared(server_shared_va: u64, len: u64, then_reply: u64) {
     // SAFETY: server_shared_va is the personality server's mapping of
-    // the shared buffer; the child wrote `len` bytes there before
-    // the IPC and is blocked waiting on our reply, so the buffer is
-    // stable for the duration of this read.
+    // the shared buffer; the child wrote `len` bytes there before the
+    // IPC and is blocked waiting on our reply, so the buffer is stable
+    // for the duration of this read.
     let data = unsafe {
         core::slice::from_raw_parts(server_shared_va as *const u8, len as usize)
     };
     sys_debug_puts(data);
-    sys_reply(len, 0, 0, 0);
+    sys_reply(then_reply, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -340,10 +313,16 @@ pub extern "C" fn _start() -> ! {
             Err(_) => { puts("posix: receive FAILED\n"); halt(); }
         };
 
-        let nr = msg[0];
+        // Pure decision lives in lockjaw_types::posix::dispatch (host-tested).
+        // This loop is mechanical execution of the returned Action.
+        let action = dispatch(&DispatchInputs {
+            nr: msg[0],
+            arg1: msg[1],
+            arg2: msg[2],
+        });
 
-        match nr {
-            POSIX_INIT => {
+        match action {
+            Action::PosixInit => {
                 // First call from child — set up shared buffer.
                 // Allocate page, map in our VA space (server_shared_va).
                 let shared_ps = match sys_alloc_pages(1) {
@@ -367,31 +346,23 @@ pub extern "C" fn _start() -> ! {
                 puts("posix-server: POSIX_INIT OK\n");
             }
 
-            NR_WRITE | NR_WRITEV => {
-                // msg[1] = fd, msg[2] = byte count in shared buffer
-                handle_write(server_shared_va, msg[1], msg[2]);
+            Action::EmitFromShared { fd: _, len, then_reply } => {
+                apply_emit_from_shared(server_shared_va, len, then_reply);
             }
 
-            NR_EXIT_GROUP => {
+            Action::Exit => {
                 puts("posix-server: child exit\n");
                 break;
             }
 
-            NR_SET_TID_ADDRESS => {
-                // Stub: return 1 (thread ID)
-                sys_reply(1, 0, 0, 0);
+            Action::Reply { words } => {
+                sys_reply(words[0], words[1], words[2], words[3]);
             }
 
-            NR_IOCTL => {
-                // Stub: return -ENOTTY (not a terminal)
-                sys_reply(neg_errno(ENOTTY), 0, 0, 0);
-            }
-
-            _ => {
-                // Unknown syscall — return -ENOSYS
+            Action::Unknown { nr } => {
                 puts("posix: unknown nr=");
                 put_hex(nr);
-                puts(" → ENOSYS\n");
+                puts(" -> ENOSYS\n");
                 sys_reply(neg_errno(ENOSYS), 0, 0, 0);
             }
         }

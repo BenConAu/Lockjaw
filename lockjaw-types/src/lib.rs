@@ -19,6 +19,7 @@ pub mod fdt;
 pub mod vmem;
 pub mod wait;
 pub mod page_table;
+pub mod posix;
 pub mod exception;
 pub mod handle_ops;
 pub mod rights;
