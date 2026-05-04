@@ -23,13 +23,19 @@ architectural correctness and code isolation that humans cannot
 achieve at this scale. Development speed is already 100x a human
 team — use that leverage for correctness, not throughput.
 
+The architecture is documented in three places:
+- `docs/book-of-lockjaw/01-architecture.md` — philosophy and the
+  push/pull/plan-apply taxonomy.
+- `docs/patterns/` — technique catalog with canonical examples.
+- `docs/extraction-roadmap.md` — what's left to extract, ranked.
+
 When choosing what to work on next:
 - **Prefer hard wins over fast wins.** The value is in making the
   architecture safer, not in inflating test counts with easy
   extractions.
 - **Follow the push→pull rubric.** Convert the riskiest push-shaped
-  kernel code to pull or plan/apply first. See
-  `docs/types-extraction-plan.md` for the integration shapes.
+  kernel code to pull or plan/apply first. See `docs/patterns/` for
+  the four shapes and how to recognize them.
 - **Make illegal states unrepresentable.** If the type system can
   prevent a bug class, prefer that over runtime assertions. Narrow
   return types, distinct step variants, and construction-safe APIs

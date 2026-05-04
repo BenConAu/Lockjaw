@@ -232,6 +232,8 @@ user/                        # Userspace binaries (separate Cargo projects)
   lockjaw-userlib/           # Shared library (syscalls, display DDI, block DDI, virtqueue, PageSetGuard)
 
 docs/                        # Book of Lockjaw -- design documentation
+  book-of-lockjaw/           # Architecture chapters (philosophy + taxonomy)
+  patterns/                  # Pattern catalog: 4 shapes for kernel↔types integration
   memory-model.md            # Why the kernel never allocates
   object-model.md            # PageSets, handles, the create-info pattern
   higher-half-kernel.md      # Why the kernel lives in the upper VA half
@@ -242,7 +244,7 @@ docs/                        # Book of Lockjaw -- design documentation
   process-creation.md        # Userspace-driven process creation
   stack-budget.md            # Stack budget analysis and rationale for 8KB
   tech-debt.md               # Known limitations and planned fixes
-  types-extraction-plan.md   # Extraction roadmap: what moves to lockjaw-types
+  extraction-roadmap.md      # Push-shaped code remaining to extract, ranked
   yagni-parking-lot.md       # Removed code tracked for future phases
   development-journal.md     # Journal entries from the AI collaborator (1-6)
 
