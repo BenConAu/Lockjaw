@@ -110,6 +110,7 @@ assert_contains "\[BOOTSTRAP\] uart" "Init-uart bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] ramfb" "Init-ramfb bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] blk" "Init-blk bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] display-test" "Init-display-test bootstrap IPC completed"
+assert_contains "\[BOOTSTRAP\] fat32" "Init-fat32 bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] posix-server" "Init-posix-server bootstrap IPC completed"
 
 echo "Phase 9 — Thread Exit:"
@@ -151,6 +152,19 @@ assert_contains "blk: IRQ bound" "blk driver bound IRQ → notification"
 assert_contains "blk: selftest read OK, sector 0 = \[eb 58 90" "blk driver read sector 0 from disk"
 assert_contains "blk: serving" "blk driver entered server loop after selftest"
 assert_not_contains "blk: no virtio-blk device found" "blk driver did NOT take the no-device path"
+
+echo "Phase 15 — FAT32 Filesystem Server (mount):"
+assert_contains "fat32: starting" "fat32-server started"
+assert_contains "fat32: bootstrapped" "fat32-server completed bootstrap"
+# Mounts the disk: reads sector 0 via the block driver, parses the BPB.
+# Don't pin formatter-dependent geometry (cluster size depends on
+# mformat's heuristic for the 64 MiB image and could shift across
+# mtools versions). Two robust facts:
+#   - "fat32: mounted" only appears if parse_bpb succeeded
+#   - root cluster is stable: mformat follows the FAT32 spec recommendation
+#     of 2 (the first usable data cluster) for every volume it produces
+assert_contains "fat32: mounted" "fat32-server mounted disk and parsed BPB"
+assert_contains "root_cluster=2" "fat32-server identified root cluster as 2"
 
 echo "Phase 16 — POSIX Personality (Phase 0):"
 assert_contains "posix-server: starting" "posix-server started"

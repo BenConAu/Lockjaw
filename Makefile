@@ -18,7 +18,7 @@ QEMU_DISPLAY_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -m 128M \
 	-device ramfb -display cocoa \
 	-kernel
 
-USER_CRATES := user/hello user/uart-driver user/device-manager user/ramfb-driver user/display-test user/virtio-blk-driver user/posix-server user/init
+USER_CRATES := user/hello user/uart-driver user/device-manager user/ramfb-driver user/display-test user/virtio-blk-driver user/fat32-server user/posix-server user/init
 
 .PHONY: build build-release build-user build-hash clean-all run run-release run-display run-blk objdump nm check-stack check-pointers check-vtables check-init-size test test-unit test-qemu-gicv3 test-qemu-gicv2 clean pi4 test-img
 
@@ -39,6 +39,7 @@ build-user: clean-all build-hash
 	cd user/ramfb-driver && cargo build --release
 	cd user/display-test && cargo build --release
 	cd user/virtio-blk-driver && cargo build --release
+	cd user/fat32-server && cargo build --release
 	./musl-lockjaw/build.sh
 	cd user/posix-server && cargo build --release
 	cd user/init && cargo build --release
@@ -87,11 +88,14 @@ test-img:
 		need=1; \
 	elif [ "$$(head -c 3 test.img | xxd -p)" != "eb5890" ]; then \
 		need=1; \
+	elif ! mdir -i test.img ::HELLO.TXT >/dev/null 2>&1; then \
+		need=1; \
 	fi; \
 	if [ $$need -eq 1 ]; then \
-		echo "Creating 64 MiB FAT32 test.img..."; \
+		echo "Creating 64 MiB FAT32 test.img with HELLO.TXT..."; \
 		dd if=/dev/zero of=test.img bs=1M count=64 status=none; \
 		mformat -F -i test.img -v LOCKJAW ::; \
+		printf 'hello from fat32\n' | mcopy -i test.img -o - ::HELLO.TXT; \
 	fi
 
 objdump: build

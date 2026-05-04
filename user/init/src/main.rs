@@ -61,6 +61,10 @@ static BLK_ELF: &[u8] = include_bytes!("../../virtio-blk-driver/target/aarch64-u
 /// Built by: cd user/posix-server && cargo build --release
 static POSIX_SERVER_ELF: &[u8] = include_bytes!("../../posix-server/target/aarch64-unknown-none/release/lockjaw-posix-server");
 
+/// The FAT32 filesystem server ELF binary, embedded at compile time.
+/// Built by: cd user/fat32-server && cargo build --release
+static FAT32_ELF: &[u8] = include_bytes!("../../fat32-server/target/aarch64-unknown-none/release/lockjaw-fat32-server");
+
 // ---------------------------------------------------------------------------
 // ELF spawn helper
 // ---------------------------------------------------------------------------
@@ -332,6 +336,8 @@ pub extern "C" fn _start() -> ! {
     let display_test_boot_ep = alloc_endpoint("dtest boot");
     let blk_srv_ep = alloc_endpoint("blk srv");
     let blk_boot_ep = alloc_endpoint("blk boot");
+    let fat32_srv_ep = alloc_endpoint("fat32 srv");
+    let fat32_boot_ep = alloc_endpoint("fat32 boot");
     let posix_boot_ep = alloc_endpoint("posix boot");
 
     // Spawn child processes.
@@ -366,6 +372,7 @@ pub extern "C" fn _start() -> ! {
     spawn_elf(UART_ELF, "uart-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, uart_boot_ep, 4);
     spawn_elf(RAMFB_ELF, "ramfb-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, ramfb_boot_ep, 4);
     spawn_elf(BLK_ELF, "blk-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, blk_boot_ep, 4);
+    spawn_elf(FAT32_ELF, "fat32-server", map_array_va, temp_base_va, plan_buf_va, scratch_ps, fat32_boot_ep, 4);
     spawn_elf(POSIX_SERVER_ELF, "posix-server", map_array_va, temp_base_va, plan_buf_va, scratch_ps, posix_boot_ep, 8);
     spawn_elf(DISPLAY_TEST_ELF, "display-test", map_array_va, temp_base_va, plan_buf_va, scratch_ps, display_test_boot_ep, 1);
 
@@ -464,6 +471,22 @@ pub extern "C" fn _start() -> ! {
     };
     sys_reply(blk_srv_idx, blk_devmgr_idx, 0, 0);
     puts("[BOOTSTRAP] blk\n");
+
+    // Bootstrap fat32-server: export its own server endpoint (so it
+    // can sys_receive on it once Phase E wires up clients) plus the
+    // block-driver endpoint (so it can read sectors).
+    puts("init: waiting for fat32 bootstrap...\n");
+    let _ = sys_receive(fat32_boot_ep);
+    let fat32_srv_idx = match sys_export_handle(fat32_srv_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export fat32_srv_ep FAILED\n"); loop { sys_yield(); } }
+    };
+    let fat32_blk_idx = match sys_export_handle(blk_srv_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export blk to fat32 FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(fat32_srv_idx, fat32_blk_idx, 0, 0);
+    puts("[BOOTSTRAP] fat32\n");
 
     // Bootstrap posix-server: no handles to export, just acknowledge.
     puts("init: waiting for posix-server bootstrap...\n");
