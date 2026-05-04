@@ -353,6 +353,192 @@ const fn classify_entry(value: u32) -> FatEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Directory entries (8.3 short names; LFN entries are skipped)
+// ---------------------------------------------------------------------------
+
+// Directory entry attribute bits (one byte at offset 11 of a dirent).
+pub const ATTR_READ_ONLY: u8 = 0x01;
+pub const ATTR_HIDDEN: u8 = 0x02;
+pub const ATTR_SYSTEM: u8 = 0x04;
+pub const ATTR_VOLUME_ID: u8 = 0x08;
+pub const ATTR_DIRECTORY: u8 = 0x10;
+pub const ATTR_ARCHIVE: u8 = 0x20;
+
+/// LFN entries set all four of READ_ONLY | HIDDEN | SYSTEM | VOLUME_ID
+/// simultaneously (a value never used by real attributes), so the low
+/// 4 bits of `attr` distinguish them. Check this *before* checking
+/// `ATTR_VOLUME_ID` alone, since LFN sets that bit too.
+pub const ATTR_LFN_MASK: u8 =
+    ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID;
+
+/// One parsed directory entry. The 11-byte `name` is the raw on-disk
+/// 8.3 form: bytes 0-7 are the name (space-padded), bytes 8-10 are
+/// the extension (space-padded). Byte 0 == 0x05 in the on-disk
+/// representation is the escape for files whose real first byte is
+/// 0xE5; [`parse_dirent`] decodes that escape into the actual byte
+/// before returning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: [u8; 11],
+    pub attr: u8,
+    pub first_cluster: u32,
+    pub size: u32,
+}
+
+impl DirEntry {
+    /// True iff the entry refers to a subdirectory (rather than a file).
+    pub const fn is_directory(&self) -> bool {
+        (self.attr & ATTR_DIRECTORY) != 0
+    }
+}
+
+/// Result of inspecting a 32-byte slot in a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirEntryStatus {
+    /// First byte is 0x00. The directory has no more entries past
+    /// this slot — stop walking.
+    EndOfDir,
+    /// Slot should be skipped (deleted file, LFN entry, or volume
+    /// label). Continue walking.
+    Skip,
+    /// A valid file or subdirectory entry.
+    Entry(DirEntry),
+}
+
+/// Classify and decode a 32-byte directory slot.
+pub fn parse_dirent(bytes: &[u8; 32]) -> DirEntryStatus {
+    let first = bytes[0];
+    if first == 0x00 {
+        return DirEntryStatus::EndOfDir;
+    }
+    if first == 0xE5 {
+        return DirEntryStatus::Skip;
+    }
+    let attr = bytes[11];
+    // LFN check before VOLUME_ID — LFN sets the VOLUME_ID bit too.
+    if (attr & ATTR_LFN_MASK) == ATTR_LFN_MASK {
+        return DirEntryStatus::Skip;
+    }
+    if (attr & ATTR_VOLUME_ID) != 0 {
+        return DirEntryStatus::Skip;
+    }
+    let mut name = [0u8; 11];
+    name.copy_from_slice(&bytes[..11]);
+    // 0x05 escape: real first byte is 0xE5 (which would otherwise be
+    // misread as "deleted").
+    if name[0] == 0x05 {
+        name[0] = 0xE5;
+    }
+    let cluster_hi = u16::from_le_bytes([bytes[20], bytes[21]]) as u32;
+    let cluster_lo = u16::from_le_bytes([bytes[26], bytes[27]]) as u32;
+    let first_cluster = (cluster_hi << 16) | cluster_lo;
+    let size = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+    DirEntryStatus::Entry(DirEntry { name, attr, first_cluster, size })
+}
+
+/// Iterator over parsed directory entries in a byte buffer. Skips
+/// `Skip` slots and stops at `EndOfDir` (or when the buffer is
+/// exhausted). Caller provides one or more clusters' worth of bytes
+/// concatenated; the iterator processes 32-byte slots in order.
+pub struct DirIter<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    done: bool,
+}
+
+impl<'a> DirIter<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0, done: false }
+    }
+}
+
+impl<'a> Iterator for DirIter<'a> {
+    type Item = DirEntry;
+    fn next(&mut self) -> Option<DirEntry> {
+        while !self.done {
+            if self.offset + 32 > self.bytes.len() {
+                return None;
+            }
+            // SAFETY of unwrap: bounds checked just above.
+            let chunk: &[u8; 32] = self.bytes[self.offset..self.offset + 32]
+                .try_into()
+                .unwrap();
+            self.offset += 32;
+            match parse_dirent(chunk) {
+                DirEntryStatus::EndOfDir => {
+                    self.done = true;
+                    return None;
+                }
+                DirEntryStatus::Skip => continue,
+                DirEntryStatus::Entry(e) => return Some(e),
+            }
+        }
+        None
+    }
+}
+
+/// Convenience: iterate parsed entries in a directory cluster (or
+/// concatenation of clusters). Equivalent to `DirIter::new(bytes)`.
+pub fn iter_dir(bytes: &[u8]) -> DirIter<'_> {
+    DirIter::new(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// 8.3 path matching
+// ---------------------------------------------------------------------------
+
+/// Case-insensitive ASCII match of a path component against an
+/// on-disk 8.3 directory entry. Splits `query` on the first `.` to
+/// separate name from extension, uppercases each side, and pads
+/// to 8 + 3 with spaces before comparing the 11-byte `entry.name`.
+///
+/// Returns false if the name part exceeds 8 bytes or the extension
+/// exceeds 3 bytes (those queries can't refer to an 8.3 file). The
+/// special "." and ".." directory entries match queries `b"."` and
+/// `b".."` respectively.
+pub fn match_8_3(query: &[u8], entry: &DirEntry) -> bool {
+    // "." and ".." are stored on disk as ".          " and "..         "
+    // (the dot characters in the name field, no extension). The
+    // dot-split logic below would otherwise treat "." as name="" ext="".
+    if query == b"." {
+        return entry.name[0] == b'.' && entry.name[1] == b' ';
+    }
+    if query == b".." {
+        return entry.name[0] == b'.' && entry.name[1] == b'.' && entry.name[2] == b' ';
+    }
+
+    let dot_pos = query.iter().position(|&b| b == b'.');
+    let (name_part, ext_part) = match dot_pos {
+        Some(p) => (&query[..p], &query[p + 1..]),
+        None => (query, &[][..]),
+    };
+    // Reject empty name (e.g. ".txt", "."). The `.` and `..` cases
+    // are handled above as explicit exceptions; every other valid
+    // 8.3 entry has a non-empty name part. An all-spaces on-disk
+    // name field that happens to share the extension bytes shouldn't
+    // be reachable from a POSIX path.
+    if name_part.is_empty() {
+        return false;
+    }
+    if name_part.len() > 8 || ext_part.len() > 3 {
+        return false;
+    }
+
+    let mut canon = [b' '; 11];
+    for (i, &b) in name_part.iter().enumerate() {
+        canon[i] = ascii_uppercase(b);
+    }
+    for (i, &b) in ext_part.iter().enumerate() {
+        canon[8 + i] = ascii_uppercase(b);
+    }
+    canon == entry.name
+}
+
+const fn ascii_uppercase(b: u8) -> u8 {
+    if b >= b'a' && b <= b'z' { b - 32 } else { b }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -877,5 +1063,280 @@ mod tests {
     fn fat_entry_buffer_too_small_returns_none() {
         let buf = [0u8; 3];
         assert_eq!(decode_fat_entry(&buf, 0), None);
+    }
+
+    // ---- Directory entries ----
+
+    /// Build a synthetic 32-byte dirent for a regular file.
+    /// `name11` must already be the on-disk 8.3 form (11 bytes,
+    /// space-padded). `cluster` is the first cluster (32-bit, split
+    /// across the high/low fields). `size` is the file size in bytes.
+    fn make_file_dirent(name11: &[u8; 11], cluster: u32, size: u32) -> [u8; 32] {
+        let mut e = [0u8; 32];
+        e[..11].copy_from_slice(name11);
+        e[11] = ATTR_ARCHIVE;
+        let cluster_hi = (cluster >> 16) as u16;
+        let cluster_lo = (cluster & 0xFFFF) as u16;
+        e[20..22].copy_from_slice(&cluster_hi.to_le_bytes());
+        e[26..28].copy_from_slice(&cluster_lo.to_le_bytes());
+        e[28..32].copy_from_slice(&size.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn dirent_end_of_dir_when_first_byte_zero() {
+        let e = [0u8; 32];
+        assert_eq!(parse_dirent(&e), DirEntryStatus::EndOfDir);
+    }
+
+    #[test]
+    fn dirent_deleted_when_first_byte_e5() {
+        let mut e = [0u8; 32];
+        e[0] = 0xE5;
+        e[1] = b'A';
+        e[11] = ATTR_ARCHIVE;
+        assert_eq!(parse_dirent(&e), DirEntryStatus::Skip);
+    }
+
+    #[test]
+    fn dirent_lfn_skipped() {
+        let mut e = [0u8; 32];
+        e[0] = 0x42; // LFN sequence number
+        e[11] = ATTR_LFN_MASK; // 0x0F
+        assert_eq!(parse_dirent(&e), DirEntryStatus::Skip);
+    }
+
+    #[test]
+    fn dirent_volume_label_skipped() {
+        let mut e = [0u8; 32];
+        e[0] = b'L';
+        e[11] = ATTR_VOLUME_ID;
+        assert_eq!(parse_dirent(&e), DirEntryStatus::Skip);
+    }
+
+    #[test]
+    fn dirent_regular_file_decoded() {
+        let e = make_file_dirent(b"HELLO   TXT", 5, 17);
+        match parse_dirent(&e) {
+            DirEntryStatus::Entry(d) => {
+                assert_eq!(&d.name, b"HELLO   TXT");
+                assert_eq!(d.attr, ATTR_ARCHIVE);
+                assert_eq!(d.first_cluster, 5);
+                assert_eq!(d.size, 17);
+                assert!(!d.is_directory());
+            }
+            other => panic!("expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dirent_directory_entry_recognized() {
+        let mut e = make_file_dirent(b"SUBDIR     ", 7, 0);
+        e[11] = ATTR_DIRECTORY;
+        match parse_dirent(&e) {
+            DirEntryStatus::Entry(d) => assert!(d.is_directory()),
+            other => panic!("expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dirent_first_cluster_combines_hi_and_lo_fields() {
+        let e = make_file_dirent(b"BIGFILE    ", 0x12345678, 0);
+        match parse_dirent(&e) {
+            DirEntryStatus::Entry(d) => assert_eq!(d.first_cluster, 0x12345678),
+            other => panic!("expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dirent_first_byte_05_decoded_as_e5() {
+        // Files whose real name starts with 0xE5 store 0x05 in the
+        // first byte to avoid collision with the deleted marker.
+        // 11-byte on-disk name: 0x05 + "BCDE" + 3 spaces + "TXT".
+        let mut e = make_file_dirent(b"\x05BCDE   TXT", 2, 0);
+        match parse_dirent(&e) {
+            DirEntryStatus::Entry(d) => assert_eq!(d.name[0], 0xE5),
+            other => panic!("expected Entry, got {:?}", other),
+        }
+        // Sanity: change byte 0 to a normal char and confirm no escape happens.
+        e[0] = b'A';
+        match parse_dirent(&e) {
+            DirEntryStatus::Entry(d) => assert_eq!(d.name[0], b'A'),
+            other => panic!("expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dirent_size_decoded() {
+        let e = make_file_dirent(b"SIZED   TXT", 2, 0xCAFEBABE);
+        match parse_dirent(&e) {
+            DirEntryStatus::Entry(d) => assert_eq!(d.size, 0xCAFEBABE),
+            other => panic!("expected Entry, got {:?}", other),
+        }
+    }
+
+    // ---- Directory iteration ----
+
+    /// Collect at most N dirents from `iter_dir`. Returns `(count, names)`.
+    /// Avoids needing alloc — fixed-size array, asserts on overflow.
+    fn collect_dirents<const N: usize>(buf: &[u8]) -> (usize, [[u8; 11]; N]) {
+        let mut names = [[0u8; 11]; N];
+        let mut count = 0;
+        for e in iter_dir(buf) {
+            assert!(count < N, "test bug: collect_dirents capacity {} exceeded", N);
+            names[count] = e.name;
+            count += 1;
+        }
+        (count, names)
+    }
+
+    #[test]
+    fn dir_iter_yields_entries_then_stops_at_end_of_dir() {
+        // Three slots: file, deleted, file, end-of-dir, garbage.
+        let mut buf = [0u8; 32 * 5];
+        buf[0..32].copy_from_slice(&make_file_dirent(b"FILE1   TXT", 2, 1));
+        // Deleted slot
+        buf[32] = 0xE5;
+        buf[32 + 11] = ATTR_ARCHIVE;
+        buf[64..96].copy_from_slice(&make_file_dirent(b"FILE2   TXT", 3, 2));
+        // EndOfDir at offset 96 (byte 0 is 0)
+        // Garbage past EOD shouldn't be seen.
+        buf[128..160].copy_from_slice(&make_file_dirent(b"NEVER   TXT", 4, 3));
+
+        let (count, names) = collect_dirents::<4>(&buf);
+        assert_eq!(count, 2);
+        assert_eq!(&names[0], b"FILE1   TXT");
+        assert_eq!(&names[1], b"FILE2   TXT");
+    }
+
+    #[test]
+    fn dir_iter_skips_lfn_and_volume_label() {
+        let mut buf = [0u8; 32 * 4];
+        // LFN entry
+        buf[0] = 0x42;
+        buf[11] = ATTR_LFN_MASK;
+        // Volume label
+        buf[32] = b'L';
+        buf[32 + 11] = ATTR_VOLUME_ID;
+        // Real file
+        buf[64..96].copy_from_slice(&make_file_dirent(b"REAL    TXT", 2, 0));
+        // EndOfDir at offset 96.
+        let (count, names) = collect_dirents::<4>(&buf);
+        assert_eq!(count, 1);
+        assert_eq!(&names[0], b"REAL    TXT");
+    }
+
+    #[test]
+    fn dir_iter_handles_partial_trailing_slot() {
+        // Buffer ends mid-slot — iterator stops cleanly without panicking.
+        let mut buf = [0u8; 50];
+        buf[0..32].copy_from_slice(&make_file_dirent(b"ONLY    TXT", 2, 0));
+        // Bytes 32..50 are a 18-byte fragment; not enough for another slot.
+        let (count, _) = collect_dirents::<2>(&buf);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn dir_iter_empty_buffer() {
+        let buf = [0u8; 0];
+        assert_eq!(iter_dir(&buf).count(), 0);
+    }
+
+    // ---- 8.3 path matching ----
+
+    fn fake_entry(name11: &[u8; 11]) -> DirEntry {
+        let mut name = [0u8; 11];
+        name.copy_from_slice(name11);
+        DirEntry { name, attr: 0, first_cluster: 0, size: 0 }
+    }
+
+    #[test]
+    fn match_8_3_basic_lowercase_query() {
+        let e = fake_entry(b"HELLO   TXT");
+        assert!(match_8_3(b"hello.txt", &e));
+    }
+
+    #[test]
+    fn match_8_3_uppercase_query() {
+        let e = fake_entry(b"HELLO   TXT");
+        assert!(match_8_3(b"HELLO.TXT", &e));
+    }
+
+    #[test]
+    fn match_8_3_mixed_case_query() {
+        let e = fake_entry(b"HELLO   TXT");
+        assert!(match_8_3(b"HeLLo.TxT", &e));
+    }
+
+    #[test]
+    fn match_8_3_no_extension() {
+        let e = fake_entry(b"README     ");
+        assert!(match_8_3(b"readme", &e));
+    }
+
+    #[test]
+    fn match_8_3_short_name_padded_correctly() {
+        // 5-char name padded with 3 spaces; no extension.
+        let e = fake_entry(b"ABC        ");
+        assert!(match_8_3(b"abc", &e));
+    }
+
+    #[test]
+    fn match_8_3_extension_only_query_rejected() {
+        // ".txt" has an empty name part. A malformed on-disk entry with
+        // an all-spaces name and a real extension shouldn't be reachable
+        // from a POSIX path lookup. Only "." and ".." are valid "empty
+        // name" forms, and they're special-cased above.
+        let e = fake_entry(b"        TXT");
+        assert!(!match_8_3(b".txt", &e));
+    }
+
+    #[test]
+    fn match_8_3_lone_dot_query_rejected_against_normal_entry() {
+        // A bare "." should only match the on-disk "." dirent (which
+        // has byte 0 = '.', byte 1 = ' '). It must not match a normal
+        // entry whose name happens to start with a dot byte but isn't
+        // the "." special directory.
+        let e = fake_entry(b".OTHER     ");
+        assert!(!match_8_3(b".", &e));
+    }
+
+    #[test]
+    fn match_8_3_full_8_3_length() {
+        // Maximum 8-char name + 3-char extension.
+        let e = fake_entry(b"FILENAMEEXT");
+        assert!(match_8_3(b"filename.ext", &e));
+    }
+
+    #[test]
+    fn match_8_3_name_too_long_returns_false() {
+        let e = fake_entry(b"OVERFLOWTXT");
+        assert!(!match_8_3(b"overflowx.txt", &e));
+    }
+
+    #[test]
+    fn match_8_3_extension_too_long_returns_false() {
+        let e = fake_entry(b"FILE    TXT");
+        assert!(!match_8_3(b"file.text", &e));
+    }
+
+    #[test]
+    fn match_8_3_no_match_for_different_name() {
+        let e = fake_entry(b"HELLO   TXT");
+        assert!(!match_8_3(b"world.txt", &e));
+    }
+
+    #[test]
+    fn match_8_3_dot_matches_dot_dirent() {
+        // "." entry on disk is ".          " (dot + 10 spaces).
+        let e = fake_entry(b".          ");
+        assert!(match_8_3(b".", &e));
+    }
+
+    #[test]
+    fn match_8_3_dotdot_matches_dotdot_dirent() {
+        // ".." entry on disk is "..         " (two dots + 9 spaces).
+        let e = fake_entry(b"..         ");
+        assert!(match_8_3(b"..", &e));
     }
 }
