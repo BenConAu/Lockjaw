@@ -14,8 +14,8 @@ use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_types::constants::USER_STACK_BASE;
 use lockjaw_userlib::elf_loader::{plan_elf_load, ElfLoadEntry};
 use lockjaw_types::posix::{
-    dispatch, neg_errno, write_linux_stack, Action, DispatchInputs, StackInputs,
-    ENOSYS, STACK_LAYOUT_FIXED_BYTES,
+    compute_va_layout, dispatch, neg_errno, write_linux_stack, Action, DispatchInputs,
+    StackInputs, ENOSYS, STACK_LAYOUT_FIXED_BYTES,
 };
 
 /// Pre-built statically-linked musl hello binary.
@@ -203,24 +203,17 @@ pub extern "C" fn _start() -> ! {
     };
 
     // --- Compute dynamic VAs from ELF layout ---
-    //   elf_end_aligned = align_up(max(seg.vaddr + seg.mem_size))
-    //   child_shared_va = elf_end_aligned + PAGE_SIZE  (1-page guard)
-    //   brk_base        = child_shared_va + PAGE_SIZE  (heap after shared buf)
-    let mut elf_end: u64 = 0;
-    for i in 0..elf_info.segment_count {
-        let seg = &elf_info.segments[i];
-        let seg_end = seg.vaddr + seg.mem_size;
-        if seg_end > elf_end {
-            elf_end = seg_end;
+    // Pure decision (and overflow / stack-overlap checks) live in
+    // lockjaw_types::posix::compute_va_layout (host-tested).
+    let layout = match compute_va_layout(&elf_info, USER_STACK_BASE) {
+        Ok(l) => l,
+        Err(_) => {
+            puts("posix: ELF layout overlaps stack or overflows\n");
+            halt();
         }
-    }
-    let elf_end_aligned = (elf_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let child_shared_va = elf_end_aligned + PAGE_SIZE;
-    let brk_base = child_shared_va + PAGE_SIZE;
-    if brk_base >= USER_STACK_BASE {
-        puts("posix: ELF layout + shared buf + brk overlaps stack\n");
-        halt();
-    }
+    };
+    let child_shared_va = layout.child_shared_va;
+    let brk_base = layout.brk_base;
 
     // --- Allocate working pages for ELF loading ---
     let map_array_va = VMEM.alloc(1).expect("VA exhausted");

@@ -23,6 +23,7 @@
 //! ```
 
 use crate::addr::PAGE_SIZE;
+use crate::elf::ElfInfo;
 
 /// Sentinel syscall number for the shim's bootstrap handshake. No real
 /// Linux syscall uses this value (it sits at the top of the u64 range).
@@ -124,6 +125,81 @@ pub fn dispatch(inp: &DispatchInputs) -> Action {
 
         nr => Action::Unknown { nr },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic VA layout (where to put the shared buffer + brk after the ELF)
+// ---------------------------------------------------------------------------
+
+/// Resolved VA layout for a POSIX child: where the ELF image ends, where
+/// the personality server's shared buffer goes, and where the heap (brk)
+/// starts. All addresses are page-aligned.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PosixVaLayout {
+    /// First page-aligned VA strictly after every loaded segment. Doubles
+    /// as the lower bound for placing dynamic regions.
+    pub elf_end_aligned: u64,
+    /// VA at which the child sees the personality server's shared buffer
+    /// (one page above `elf_end_aligned`, leaving a guard page).
+    pub child_shared_va: u64,
+    /// First VA musl can grow brk into (one page above the shared buffer).
+    pub brk_base: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LayoutError {
+    /// `seg.vaddr + seg.mem_size` overflows u64 for some segment. The
+    /// ELF parser shouldn't produce this, but the layout function owns
+    /// the policy of refusing rather than wrapping silently.
+    SegmentEndOverflow { seg_idx: usize },
+    /// Page-aligning the largest segment end overflows u64.
+    AlignOverflow,
+    /// `brk_base` would overlap (or sit above) the user stack. The
+    /// personality server has no place to put the heap if this fires.
+    OverflowsStack { brk_base: u64, user_stack_base: u64 },
+}
+
+/// Compute where to place the shared buffer and brk for a POSIX child.
+///
+/// Layout (in ascending VA):
+///
+/// ```text
+/// [ELF segments] elf_end_aligned [guard page] child_shared_va [shared] brk_base [...] user_stack_base
+/// ```
+///
+/// Pure: no I/O, no syscalls. The personality server uses the result to
+/// allocate and map the shared page and to seed musl's brk pointer.
+pub fn compute_va_layout(
+    info: &ElfInfo,
+    user_stack_base: u64,
+) -> Result<PosixVaLayout, LayoutError> {
+    let mut elf_end: u64 = 0;
+    for i in 0..info.segment_count {
+        let seg = &info.segments[i];
+        let seg_end = seg
+            .vaddr
+            .checked_add(seg.mem_size)
+            .ok_or(LayoutError::SegmentEndOverflow { seg_idx: i })?;
+        if seg_end > elf_end {
+            elf_end = seg_end;
+        }
+    }
+    let elf_end_aligned = elf_end
+        .checked_add(PAGE_SIZE - 1)
+        .ok_or(LayoutError::AlignOverflow)?
+        & !(PAGE_SIZE - 1);
+
+    let child_shared_va = elf_end_aligned
+        .checked_add(PAGE_SIZE)
+        .ok_or(LayoutError::AlignOverflow)?;
+    let brk_base = child_shared_va
+        .checked_add(PAGE_SIZE)
+        .ok_or(LayoutError::AlignOverflow)?;
+
+    if brk_base >= user_stack_base {
+        return Err(LayoutError::OverflowsStack { brk_base, user_stack_base });
+    }
+    Ok(PosixVaLayout { elf_end_aligned, child_shared_va, brk_base })
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +321,7 @@ fn write_u64(buf: &mut [u8], offset: usize, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elf::{LoadSegment, MAX_SEGMENTS};
 
     fn inp(nr: u64, arg1: u64, arg2: u64) -> DispatchInputs {
         DispatchInputs { nr, arg1, arg2 }
@@ -264,6 +341,38 @@ mod tests {
             page_size: 4096,
         }
     }
+
+    /// Build an `ElfInfo` directly from a list of (vaddr, mem_size)
+    /// pairs. file_offset/file_size aren't read by compute_va_layout
+    /// so they're left at zero.
+    fn make_info(segs: &[(u64, u64)]) -> ElfInfo {
+        let mut segments = [LoadSegment {
+            vaddr: 0,
+            file_offset: 0,
+            file_size: 0,
+            mem_size: 0,
+            executable: false,
+            writable: false,
+        }; MAX_SEGMENTS];
+        for (i, (vaddr, mem_size)) in segs.iter().enumerate() {
+            segments[i] = LoadSegment {
+                vaddr: *vaddr,
+                file_offset: 0,
+                file_size: 0,
+                mem_size: *mem_size,
+                executable: false,
+                writable: false,
+            };
+        }
+        ElfInfo {
+            entry_point: 0,
+            segments,
+            segment_count: segs.len(),
+        }
+    }
+
+    // Use a stack base well above any test ELF.
+    const TEST_STACK_BASE: u64 = 0x0000_0040_0000_0000;
 
     #[test]
     fn write_fd1_emits_from_shared() {
@@ -511,6 +620,117 @@ mod tests {
         assert_eq!(
             write_linux_stack(&mut buf, &make_inputs(b"")),
             Err(StackError::Argv0NotNullTerminated),
+        );
+    }
+
+    // ---- compute_va_layout ----
+
+    #[test]
+    fn layout_typical_elf_text_data_bss() {
+        // text at 0x40_0000 (1 page), data at 0x41_0000 (1 page),
+        // bss extending data's mem_size to 2 pages.
+        let info = make_info(&[
+            (0x40_0000, 0x1000),
+            (0x41_0000, 0x2000),
+        ]);
+        let l = compute_va_layout(&info, TEST_STACK_BASE).unwrap();
+        // Largest seg_end is 0x41_0000 + 0x2000 = 0x412000 (already page aligned).
+        assert_eq!(l.elf_end_aligned, 0x41_2000);
+        assert_eq!(l.child_shared_va, 0x41_3000);
+        assert_eq!(l.brk_base, 0x41_4000);
+    }
+
+    #[test]
+    fn layout_unaligned_segment_end_rounds_up() {
+        // Segment ends at 0x40_1234 → aligned to 0x40_2000.
+        let info = make_info(&[(0x40_0000, 0x1234)]);
+        let l = compute_va_layout(&info, TEST_STACK_BASE).unwrap();
+        assert_eq!(l.elf_end_aligned, 0x40_2000);
+        assert_eq!(l.child_shared_va, 0x40_3000);
+        assert_eq!(l.brk_base, 0x40_4000);
+    }
+
+    #[test]
+    fn layout_results_are_page_aligned() {
+        let info = make_info(&[(0x40_0001, 0x789)]);
+        let l = compute_va_layout(&info, TEST_STACK_BASE).unwrap();
+        let mask = PAGE_SIZE - 1;
+        assert_eq!(l.elf_end_aligned & mask, 0);
+        assert_eq!(l.child_shared_va & mask, 0);
+        assert_eq!(l.brk_base & mask, 0);
+    }
+
+    #[test]
+    fn layout_empty_segments_starts_at_origin() {
+        // No segments — elf_end_aligned is 0; layout still places the
+        // shared buffer and brk in the lowest two non-null pages.
+        let info = make_info(&[]);
+        let l = compute_va_layout(&info, TEST_STACK_BASE).unwrap();
+        assert_eq!(l.elf_end_aligned, 0);
+        assert_eq!(l.child_shared_va, PAGE_SIZE);
+        assert_eq!(l.brk_base, 2 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn layout_picks_max_over_segments_not_last() {
+        // Out-of-order segments — max isn't the final entry.
+        let info = make_info(&[
+            (0x42_0000, 0x1000),  // ends at 0x42_1000 — the highest
+            (0x40_0000, 0x1000),  // ends at 0x40_1000
+            (0x41_0000, 0x1000),  // ends at 0x41_1000
+        ]);
+        let l = compute_va_layout(&info, TEST_STACK_BASE).unwrap();
+        assert_eq!(l.elf_end_aligned, 0x42_1000);
+    }
+
+    #[test]
+    fn layout_brk_overlapping_stack_is_error() {
+        // ELF ends just below the stack base; brk_base would step over.
+        let stack_base = 0x40_3000;
+        let info = make_info(&[(0x40_0000, 0x2000)]); // ends 0x40_2000
+        // elf_end_aligned = 0x40_2000, child = 0x40_3000, brk = 0x40_4000.
+        // brk (0x40_4000) >= stack (0x40_3000) → error.
+        assert_eq!(
+            compute_va_layout(&info, stack_base),
+            Err(LayoutError::OverflowsStack {
+                brk_base: 0x40_4000,
+                user_stack_base: stack_base,
+            }),
+        );
+    }
+
+    #[test]
+    fn layout_brk_equal_to_stack_is_error() {
+        // brk_base == user_stack_base is also a conflict — the heap
+        // would start at the very first page of the stack region.
+        let stack_base = 0x40_4000;
+        let info = make_info(&[(0x40_0000, 0x2000)]); // brk_base = 0x40_4000
+        assert!(matches!(
+            compute_va_layout(&info, stack_base),
+            Err(LayoutError::OverflowsStack { .. }),
+        ));
+    }
+
+    #[test]
+    fn layout_segment_end_overflow_is_error() {
+        // vaddr + mem_size overflows u64.
+        let info = make_info(&[(u64::MAX - 100, 200)]);
+        assert_eq!(
+            compute_va_layout(&info, TEST_STACK_BASE),
+            Err(LayoutError::SegmentEndOverflow { seg_idx: 0 }),
+        );
+    }
+
+    #[test]
+    fn layout_align_overflow_is_error() {
+        // seg_end = u64::MAX exactly — seg_end + (PAGE_SIZE - 1) overflows.
+        // (Synthetic case; real ELFs would never get here, but the
+        // bounds policy catches it cleanly.)
+        let info = make_info(&[(u64::MAX & !(PAGE_SIZE - 1), PAGE_SIZE - 1)]);
+        // seg_end = u64::MAX, +PAGE_SIZE-1 overflows.
+        assert_eq!(
+            compute_va_layout(&info, TEST_STACK_BASE),
+            Err(LayoutError::AlignOverflow),
         );
     }
 }
