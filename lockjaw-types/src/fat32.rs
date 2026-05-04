@@ -20,7 +20,13 @@ pub enum Fat32Error {
     /// File-system type field at offset 82 isn't "FAT32   " (with two
     /// trailing spaces). Lockjaw doesn't read FAT12 or FAT16.
     NotFat32,
-    /// `bytes_per_sector` isn't 512, 1024, 2048, or 4096.
+    /// `bytes_per_sector` isn't 512. The FAT32 spec allows 1024,
+    /// 2048, and 4096 too, but Lockjaw's block layer (`lockjaw_types::
+    /// block::SECTOR_SIZE`), virtio-blk driver, and fat32-server all
+    /// hardcode 512 throughout. Accepting other sector sizes here
+    /// would let the parser succeed on volumes the rest of the stack
+    /// can't actually read; narrowing the parser keeps the layers
+    /// consistent.
     InvalidBytesPerSector { value: u16 },
     /// `sectors_per_cluster` isn't a power of two between 1 and 128.
     InvalidSectorsPerCluster { value: u8 },
@@ -136,7 +142,9 @@ pub fn parse_bpb(sector0: &[u8; 512]) -> Result<Fat32Geometry, Fat32Error> {
     }
 
     let bytes_per_sector = read_u16(sector0, 11);
-    if !matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096) {
+    // Phase 1 only supports 512-byte sectors (matches the rest of the
+    // stack — see InvalidBytesPerSector docs).
+    if bytes_per_sector != 512 {
         return Err(Fat32Error::InvalidBytesPerSector { value: bytes_per_sector });
     }
 
@@ -334,6 +342,15 @@ pub fn decode_fat_entry(fat_bytes: &[u8], cluster: u32) -> Option<FatEntry> {
     ]);
     let value = raw & FAT32_ENTRY_MASK;
     Some(classify_entry(value))
+}
+
+/// Decode a raw 32-bit FAT entry value (the top 4 bits are masked
+/// off internally). Lower-level than [`decode_fat_entry`] for callers
+/// that already have just the 4 bytes — e.g. a server reading one
+/// FAT sector at a time and extracting the entry at a known offset
+/// rather than indexing by cluster.
+pub const fn decode_fat_entry_value(raw: u32) -> FatEntry {
+    classify_entry(raw & FAT32_ENTRY_MASK)
 }
 
 /// Classify a 28-bit FAT32 entry value (already masked).
@@ -668,12 +685,31 @@ mod tests {
     #[test]
     fn bpb_invalid_bytes_per_sector_rejected() {
         let mut s = make_bpb();
-        // 256 isn't in {512, 1024, 2048, 4096}.
+        // 256 isn't 512 (and isn't FAT32-spec-legal at all).
         s[11] = 0x00; s[12] = 0x01;
         assert!(matches!(
             parse_bpb(&s),
             Err(Fat32Error::InvalidBytesPerSector { value: 256 }),
         ));
+    }
+
+    #[test]
+    fn bpb_non_512_byte_sectors_rejected() {
+        // FAT32 spec allows 1024 / 2048 / 4096 as well, but the rest
+        // of the Lockjaw stack hardcodes 512-byte sectors. Narrow the
+        // parser to match.
+        for value in [1024u16, 2048, 4096] {
+            let mut s = make_bpb();
+            s[11..13].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                matches!(
+                    parse_bpb(&s),
+                    Err(Fat32Error::InvalidBytesPerSector { value: v }) if v == value,
+                ),
+                "expected InvalidBytesPerSector for {} bytes/sector",
+                value,
+            );
+        }
     }
 
     #[test]
@@ -1063,6 +1099,19 @@ mod tests {
     fn fat_entry_buffer_too_small_returns_none() {
         let buf = [0u8; 3];
         assert_eq!(decode_fat_entry(&buf, 0), None);
+    }
+
+    #[test]
+    fn fat_entry_value_helper_matches_decode_fat_entry() {
+        // decode_fat_entry_value should classify identically to
+        // decode_fat_entry on the same raw u32.
+        for raw in [0u32, 1, 2, 0xABCDEF, 0xFFFFFF7, 0xFFFFFFF, 0xF0000000] {
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(&raw.to_le_bytes());
+            let from_bytes = decode_fat_entry(&buf, 0).unwrap();
+            let from_value = decode_fat_entry_value(raw);
+            assert_eq!(from_bytes, from_value, "raw=0x{:x}", raw);
+        }
     }
 
     // ---- Directory entries ----

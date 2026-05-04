@@ -77,6 +77,11 @@ pub const FS_ERR_ALLOC: u64 = 7;
 /// Path was a directory but caller asked to open it as a file
 /// (or vice-versa). Phase E only opens files.
 pub const FS_ERR_IS_DIRECTORY: u64 = 8;
+/// Path required a directory but landed on a non-directory entry.
+/// Fired when an intermediate component of a multi-component path
+/// is a file ("/file.txt/foo"), or when a trailing slash ("/file.txt/")
+/// asserts that the final entry must be a directory and it isn't.
+pub const FS_ERR_NOT_DIRECTORY: u64 = 9;
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -245,6 +250,7 @@ mod tests {
             FS_ERR_INVALID_BUFFER_PAGES,
             FS_ERR_ALLOC,
             FS_ERR_IS_DIRECTORY,
+            FS_ERR_NOT_DIRECTORY,
         ];
         for i in 0..errs.len() {
             for j in (i + 1)..errs.len() {
