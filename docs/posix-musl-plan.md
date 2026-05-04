@@ -4,6 +4,11 @@ Binary compatibility with `aarch64-unknown-linux-musl`. Any
 statically-linked Linux binary built against musl libc runs on
 Lockjaw without recompilation.
 
+**Status (2026-05-03):** Phase 0 done — a real musl-built
+`puts("hello, lockjaw")` runs end-to-end through the personality
+server (`23f18f1` + `b454770`). Phases 1+ still aspirational. See
+[Phase 0 status and notes](#phase-0-hello-world) below.
+
 ## Architecture
 
 ```
@@ -92,51 +97,72 @@ Solution: **shared buffer page per client** (same as seL4 CAmkES).
 3. IPC shim copies user data into shared page before `sys_call`.
 4. Personality server reads/writes the shared page directly.
 
-IPC message format (4 u64 words via `sys_call` x2-x5):
+IPC message format (4 u64 words via `sys_call`):
 - Word 0: Linux syscall number
 - Words 1-3: scalar arguments (fd, len, offset, flags)
 - Pointer arguments are implicit — data is in the shared buffer.
 
+The Lockjaw `sys_call` ABI is asymmetric: 4 message words go in via
+`x2-x5`, but the reply lands in `x1-x4` (`x0` is the kernel transport
+error code, written only on return). Phase 0a's first shim got this
+wrong (read reply from `x2-x5`) and silently shifted every reply word
+by one register. The shim now reads `x1-x4` correctly, and `lj_call`
+treats a nonzero `x0` as a fatal transport failure (no way for libc
+to recover from an unbound endpoint).
+
 ## musl Patching
 
-Replace `arch/aarch64/syscall_arch.h` — the only file that touches
-hardware. Stock musl:
+Three replacement files in `musl-lockjaw/` — everything else in musl is
+untouched.
 
-```c
-static inline long __syscall0(long n) {
-    register long x8 __asm__("x8") = n;
-    register long x0 __asm__("x0");
-    __asm__ volatile("svc 0" : "=r"(x0) : "r"(x8) : "memory", "cc");
-    return x0;
-}
+### `arch/aarch64/syscall_arch.h`
+
+Replaces stock musl's `__syscallN` inline-asm SVC wrappers with calls
+to `lockjaw_syscall(n, a, b, c, d, e, f)` (defined in `shim.c`).
+
+### `arch/aarch64/crt_arch.h`
+
+Patched `_start` to land on the personality server's stack layout:
+
+```asm
+_start:
+    mov x29, #0
+    mov x30, #0
+    sub sp, sp, #4096       // Lockjaw: stack layout is one page below top
+    mov x0, sp
+    b _start_c
 ```
 
-Replace with:
+Lockjaw's kernel sets `SP = USER_STACK_BASE + stack_pages * PAGE_SIZE`
+(top of allocation). The personality server writes
+argc/argv/envp/auxv at `top - PAGE_SIZE`. Patched `_start` subtracts
+4096 to land there.
 
-```c
-extern long lockjaw_syscall(long n, long a, long b, long c,
-                             long d, long e, long f);
+### `src/lockjaw/shim.c`
 
-static inline long __syscall0(long n) {
-    return lockjaw_syscall(n, 0, 0, 0, 0, 0, 0);
-}
-static inline long __syscall1(long n, long a) {
-    return lockjaw_syscall(n, a, 0, 0, 0, 0, 0);
-}
-// ... through __syscall6
-```
+Implements `lockjaw_syscall`:
 
-`lockjaw_syscall` (in `lockjaw_shim.c`):
-1. Copy pointer arguments into shared buffer page
-2. Pack syscall number + args into 4 IPC words
-3. `sys_call` (real SVC #0 to Lockjaw kernel) on personality server
-   endpoint
-4. Unpack reply, copy data from shared buffer if needed
-5. Return result (translate Lockjaw errors to Linux errno)
+1. `ensure_init()` on first call — bootstrap a Reply object, send
+   `POSIX_INIT` (sentinel `0xFFFF_FFFF_FFFF_FF00`) to handle 0
+   (the personality-server endpoint), receive shared buffer handle
+   + VA + brk base, map shared buffer locally. Every fallible step
+   checked; any failure halts via `lj_die()` (prints diagnostic via
+   `sys_debug_putc` and `wfi` forever — libc init has no recovery
+   path for a botched bootstrap).
+2. Handle `__NR_brk` locally via direct Lockjaw SVCs (`sys_alloc_pages`
+   + `sys_map_pages`) — no IPC round-trip.
+3. For `write`/`writev`: copy/gather user data into the shared
+   buffer (clamped to `PAGE_SIZE`), then IPC.
+4. For everything else: pass scalar args through, IPC, return reply.
 
-Everything else in musl is untouched.
+`lj_call` treats a nonzero kernel transport return (x0) as fatal —
+the personality server didn't get the call, so any value in x1 is
+meaningless and would be misinterpreted as a Linux syscall result.
 
-Build: `./configure --target=aarch64-linux-musl --disable-shared`
+Build: `musl-lockjaw/build.sh` downloads musl 1.2.5, applies the three
+patches, builds with `aarch64-linux-musl-gcc` (incremental — only
+rebuilds libc.a when patches/shim are newer), then compiles
+`hello.c` against patched musl.
 
 ## Linux ELF Loader
 
@@ -158,6 +184,16 @@ calling `sys_create_process`. Required auxv entries:
 
 **Static binaries only.** Reject `PT_INTERP`. No dynamic loader.
 
+**Unaligned LOAD segments.** Musl produces tightly-packed binaries — its
+second LOAD typically starts mid-page (e.g. `vaddr=0x41ffa8`,
+`mem_size=0x7b8`) and crosses page boundaries. The personality server's
+ELF loader (`load_elf_segments` in `posix-server/src/main.rs`) walks the
+page-aligned VA range covered by each segment, places file data at the
+correct in-page offset, and zeros the rest (covers BSS and pre-data
+padding). The naive "one mapping per segment, vaddr is page-aligned"
+approach used by `init/spawn_elf` works for Rust binaries with
+`ALIGN(4K)` linker directives but is broken for musl.
+
 ## Design Decisions
 
 | Decision | Choice | Why |
@@ -171,20 +207,59 @@ calling `sys_create_process`. Required auxv entries:
 
 ## Phase Breakdown
 
-### Phase 0: Hello World
+### Phase 0: Hello World — DONE
 
-**Gate:** `puts("hello, lockjaw")` compiled with musl runs.
+**Gate met:** `puts("hello, lockjaw")` compiled with musl runs in
+QEMU end-to-end. See commits `23f18f1` (Phase 0a: server scaffolding
++ freestanding test) and `b454770` (Phase 0b: real musl wired up).
 
-Kernel pre-work: none (TPIDR_EL0 already landed).
+Kernel pre-work: none (TPIDR_EL0 was already landed in `ac09c77`).
 
-New userspace:
-- `user/posix-server/` — syscall dispatch loop, FD 0/1/2 wired to
-  UART, shared buffer, Linux ELF loader with auxv
-- musl fork: `syscall_arch.h` + `lockjaw_shim.c`
-- `user/init/` spawns posix-server
+What was built:
+- `user/posix-server/` — bootstrap + ELF loader + dynamic VA layout
+  (ELF end → guard → shared buffer → brk base) + Linux initial
+  stack construction (argc/argv/auxv with AT_PAGESZ + AT_RANDOM) +
+  syscall dispatch loop. FD 1/2 → kernel UART via `sys_debug_putc`.
+- `musl-lockjaw/` — three patches (`crt_arch.h`, `syscall_arch.h`)
+  plus `shim.c`, a build script that builds patched musl 1.2.5 and
+  compiles `hello.c` against it.
+- `user/posix-hello/` — `hello.c` (the gate program), plus a
+  freestanding `standalone.c` debug client (no musl dependency,
+  used during shim development).
+- `user/init/` updated to spawn posix-server alongside other servers.
 
-Syscalls: `write`, `writev`, `exit_group`, `brk` (fixed value),
-`set_tid_address` (stub), `ioctl(TIOCGWINSZ)` (stub)
+Implemented Phase 0 syscalls: `write`, `writev`, `exit_group`,
+`set_tid_address` (returns 1), `ioctl` (returns -ENOTTY).
+`brk` is local-only in the shim (no IPC, uses `sys_alloc_pages` +
+`sys_map_pages`); the brk base VA is computed by the personality
+server from the child's ELF layout and delivered in the
+POSIX_INIT reply.
+
+#### Implementation notes (lessons learned)
+
+- **IPC reply ABI is asymmetric** — see Shared Buffer section above.
+  Cost about an hour to track down via the silent fault.
+- **Every SVC return must be checked.** The original shim used
+  `let _ = sys_call(...)` and `lj_svc3(...)`-without-checking
+  patterns. A failed `sys_map_pages` left `shared_buf` pointing at
+  an unmapped VA; the next `memcpy` faulted. Fix: `lj_die()` helper
+  uses `sys_debug_putc` (kernel UART, no IPC) so unrecoverable
+  errors at any layer can produce a diagnostic before halting.
+- **Build with `initialized = 1` LAST.** The original `ensure_init`
+  set the flag before any fallible work, which would have turned a
+  bootstrap failure into a latent half-initialized state instead of
+  a hard failure.
+- **CRT object link order matters.** `crt1.o crti.o <user> -lc -lgcc
+  crtn.o`. The first build had user objects before `crt1.o` and
+  `crtn.o` before `-lc`, which would seal `.init`/`.fini` before
+  libc constructors could land.
+- **musl's second LOAD is unaligned.** `init/spawn_elf` assumed
+  page-aligned vaddrs (works for Rust `ALIGN(4K)` linker scripts);
+  it's a latent bug that the posix-server's loader had to fix.
+  The same fix should land in `init/spawn_elf` if any future
+  user binary is built without page-aligned segments.
+- **Build script portability.** `sysctl -n hw.ncpu` is macOS-only;
+  the script now falls through `nproc` → `sysctl` → `4`.
 
 ### Phase 1: Filesystem
 
