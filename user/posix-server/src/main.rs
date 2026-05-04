@@ -193,7 +193,10 @@ fn write_stack_layout(stack_va: u64) {
 // Syscall dispatch
 // ---------------------------------------------------------------------------
 
-/// Handle write/writev: read data from shared buffer, emit via putc (UART).
+/// Handle write/writev: read data from shared buffer, emit to kernel UART.
+/// The whole user write lands in one sys_debug_puts so other threads
+/// can't interleave between bytes (an interrupted line would still be
+/// "correct" output, but tests get cleaner streams).
 fn handle_write(server_shared_va: u64, fd: u64, len: u64) {
     if fd != 1 && fd != 2 {
         sys_reply(neg_errno(EBADF), 0, 0, 0);
@@ -203,13 +206,14 @@ fn handle_write(server_shared_va: u64, fd: u64, len: u64) {
         puts("posix: write len > PAGE_SIZE — shim bug\n");
         halt();
     }
-    // Emit bytes from shared buffer via kernel UART
-    for i in 0..len {
-        let byte = unsafe {
-            core::ptr::read_volatile((server_shared_va + i) as *const u8)
-        };
-        putc(byte);
-    }
+    // SAFETY: server_shared_va is the personality server's mapping of
+    // the shared buffer; the child wrote `len` bytes there before
+    // the IPC and is blocked waiting on our reply, so the buffer is
+    // stable for the duration of this read.
+    let data = unsafe {
+        core::slice::from_raw_parts(server_shared_va as *const u8, len as usize)
+    };
+    sys_debug_puts(data);
     sys_reply(len, 0, 0, 0);
 }
 
@@ -385,7 +389,7 @@ pub extern "C" fn _start() -> ! {
 
             _ => {
                 // Unknown syscall — return -ENOSYS
-                puts("posix: unknown nr=0x");
+                puts("posix: unknown nr=");
                 put_hex(nr);
                 puts(" → ENOSYS\n");
                 sys_reply(neg_errno(ENOSYS), 0, 0, 0);
@@ -397,19 +401,7 @@ pub extern "C" fn _start() -> ! {
     sys_exit();
 }
 
-/// Print a u64 in hex (for debugging unknown syscall numbers).
-fn put_hex(val: u64) {
-    let hex = b"0123456789abcdef";
-    // Skip leading zeros, but always print at least one digit
-    let mut started = false;
-    for i in (0..16).rev() {
-        let nibble = ((val >> (i * 4)) & 0xF) as usize;
-        if nibble != 0 || started || i == 0 {
-            putc(hex[nibble]);
-            started = true;
-        }
-    }
-}
+// put_hex is imported from lockjaw_userlib (atomic emit).
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

@@ -29,6 +29,16 @@ SECTIONS
         *(.rodata .rodata.*)
     } > RAM
 
+    /* Embedded user-binary blobs (include_bytes! of init.elf etc.).
+     * Separate section so check-vtables can skip it: u64-aligned bytes
+     * inside an embedded user ELF may coincidentally match the kernel's
+     * own text address range (the embedded binary's own data tables
+     * and sub-binaries) but they are opaque user data, not kernel
+     * function pointers. */
+    .user_elf_blob : ALIGN(4K) {
+        *(.user_elf_blob .user_elf_blob.*)
+    } > RAM
+
     /* Initialized mutable data */
     .data : ALIGN(4K) {
         *(.data .data.*)

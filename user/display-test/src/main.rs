@@ -37,18 +37,18 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("[DISPLAY-TEST] list_modes FAILED\n"); sys_exit(); }
     };
     puts("[DISPLAY-TEST] modes: ");
-    putc(b'0' + mode_count as u8);
-    putc(b'\n');
+    put_decimal(mode_count as u64);
+    puts("\n");
 
     let mode = match display.get_mode(0) {
         Ok(m) => m,
         Err(_) => { puts("[DISPLAY-TEST] get_mode FAILED\n"); sys_exit(); }
     };
     puts("[DISPLAY-TEST] preferred: ");
-    print_u32(mode.width);
-    putc(b'x');
-    print_u32(mode.height);
-    putc(b'\n');
+    put_decimal(mode.width as u64);
+    puts("x");
+    put_decimal(mode.height as u64);
+    puts("\n");
 
     // Create a display session (prevents races with other clients).
     let session = match display.create_session() {
@@ -103,24 +103,7 @@ pub extern "C" fn _start() -> ! {
     loop { sys_yield(); }
 }
 
-/// Print a u32 as decimal digits.
-fn print_u32(mut val: u32) {
-    if val == 0 {
-        putc(b'0');
-        return;
-    }
-    let mut buf = [0u8; 10];
-    let mut i = 0;
-    while val > 0 {
-        buf[i] = b'0' + (val % 10) as u8;
-        val /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        putc(buf[i]);
-    }
-}
+// Decimal printing uses lockjaw_userlib::put_decimal (atomic emit).
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

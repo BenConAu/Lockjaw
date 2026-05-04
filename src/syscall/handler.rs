@@ -44,7 +44,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
     // Message syscalls return SyscallReturn::Message with x1-x4 pre-set.
     // x0 = error (always), x1 = value (Value), x1-x4 = msg (Message).
     let ret = match syscall_num {
-        SYS_DEBUG_PUTC => SyscallReturn::Void(sys_debug_putc(ctx.gpr[0])),
+        SYS_DEBUG_PUTS => SyscallReturn::Void(sys_debug_puts(ctx)),
         SYS_YIELD => SyscallReturn::Void(sys_yield()),
         SYS_SEND => SyscallReturn::Void(sys_send(ctx)),
         SYS_RECEIVE => sys_receive(ctx),
@@ -141,9 +141,64 @@ fn create_kernel_object(
         .map(|h| h as u64)
 }
 
-fn sys_debug_putc(char_val: u64) -> SyscallError {
+fn sys_debug_puts(ctx: &mut ExceptionContext) -> SyscallError {
+    let buf_va = ctx.gpr[0];
+    let len = ctx.gpr[1] as usize;
+
+    if len == 0 {
+        return SyscallError::OK;
+    }
+    if len > lockjaw_types::addr::PAGE_SIZE as usize {
+        return SyscallError::INVALID_PARAMETER;
+    }
+    // Reject buffers that extend past the user VA range (also catches
+    // overflow on buf_va + len). Done before the page-table walk so a
+    // bad pointer can't even start a translation.
+    if !lockjaw_types::wait::validate_user_buffer(buf_va, len as u64) {
+        return SyscallError::INVALID_PARAMETER;
+    }
+
+    let addr_space = match CurrentThread::address_space() {
+        Some(a) => a,
+        None => return SyscallError::INVALID_PARAMETER,
+    };
+    let ttbr0 = addr_space.ttbr0();
+
+    // Atomic-emit contract: sys_debug_puts is all-or-nothing. Userspace's
+    // `puts`/`put_decimal`/`put_hex` wrappers depend on the kernel either
+    // emitting the entire buffer or none of it (so concurrent writers'
+    // output never interleaves mid-line). The buffer is capped at
+    // PAGE_SIZE, so it spans at most 2 pages — translate both up front
+    // and bail before writing any byte if either is unmapped.
+    let page_size = lockjaw_types::addr::PAGE_SIZE as u64;
+    let first_page_va = buf_va & !(page_size - 1);
+    let last_page_va = (buf_va + len as u64 - 1) & !(page_size - 1);
+
+    // SAFETY: ttbr0 is a live L0 from CurrentThread::address_space().
+    let kva_first = match unsafe { crate::arch::aarch64::vmem::translate_user_va(ttbr0, first_page_va) } {
+        Some(k) => k,
+        None => return SyscallError::INVALID_PARAMETER,
+    };
+    let kva_last = if last_page_va == first_page_va {
+        kva_first
+    } else {
+        // SAFETY: ttbr0 is a live L0 from CurrentThread::address_space().
+        match unsafe { crate::arch::aarch64::vmem::translate_user_va(ttbr0, last_page_va) } {
+            Some(k) => k,
+            None => return SyscallError::INVALID_PARAMETER,
+        }
+    };
+
+    // Both pages validated; emit cannot fault.
     let uart = Uart::new();
-    uart.putc(char_val as u8);
+    for i in 0..len {
+        let user_va = buf_va + i as u64;
+        let kva_base = if user_va & !(page_size - 1) == first_page_va { kva_first } else { kva_last };
+        let in_page_offset = user_va & (page_size - 1);
+        // SAFETY: kva_base is the TTBR1 translation of the user page (validated above); in_page_offset is < PAGE_SIZE.
+        let byte = unsafe { core::ptr::read((kva_base + in_page_offset) as *const u8) };
+        uart.putc(byte);
+    }
     SyscallError::OK
 }
 

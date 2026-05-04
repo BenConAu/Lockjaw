@@ -593,8 +593,22 @@ pub extern "C" fn kmain() -> ! {
     kprintln!();
     kprintln!("Loading init process...");
 
-    // The init ELF binary, built separately and embedded at compile time
-    static INIT_ELF: &[u8] = include_bytes!("../user/init/target/aarch64-unknown-none/release/lockjaw-init");
+    // The init ELF binary, built separately and embedded at compile time.
+    // The actual bytes go in `.user_elf_blob` so the check-vtables tool
+    // skips them — u64-aligned positions inside the binary may
+    // coincidentally fall in the kernel's text range (init's own data
+    // tables and sub-binaries it embeds) and would otherwise be
+    // misreported as kernel code pointers.
+    //
+    // `link_section` on a `&[u8]` would only relocate the slice
+    // descriptor; the bytes need to live in a named array so the
+    // attribute applies to them.
+    const INIT_ELF_SIZE: usize =
+        include_bytes!("../user/init/target/aarch64-unknown-none/release/lockjaw-init").len();
+    #[link_section = ".user_elf_blob"]
+    static INIT_ELF_BYTES: [u8; INIT_ELF_SIZE] =
+        *include_bytes!("../user/init/target/aarch64-unknown-none/release/lockjaw-init");
+    static INIT_ELF: &[u8] = &INIT_ELF_BYTES;
 
     // Verify the init binary was built from the same source as the kernel
     kprintln!("Build hash: ", Addr(LOCKJAW_SOURCE_HASH));

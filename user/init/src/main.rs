@@ -247,8 +247,7 @@ pub extern "C" fn _start() -> ! {
     match sys_alloc_pages(1) {
         Ok(test_ps) => {
             puts("init: alloc_pages(1) OK, id=");
-            putc(b'0' + test_ps.0 as u8);
-            putc(b'\n');
+            sys_debug_puts(&[b'0' + test_ps.0 as u8, b'\n']);
 
             // Test sys_map_pages
             let test_va = VMEM.alloc(1).expect("VA exhausted for test page");

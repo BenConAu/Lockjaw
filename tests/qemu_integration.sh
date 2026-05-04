@@ -3,10 +3,16 @@
 # Boots the kernel, captures serial output, and asserts expected strings.
 set -e
 
-TIMEOUT=30
+TIMEOUT=60
 QEMU="qemu-system-aarch64"
 GIC_VERSION="${GIC_VERSION:-3}"
-QEMU_FLAGS="-machine virt,gic-version=${GIC_VERSION} -cpu cortex-a53 -nographic"
+# Two UARTs muxed onto stdio: UART0 for kernel debug, UART1 for the
+# userspace UART driver to claim. Single `-nographic` only exposes one,
+# leaving the driver with nothing to claim and breaking the
+# uart-driver-related assertions further down.
+QEMU_FLAGS="-machine virt,gic-version=${GIC_VERSION} -cpu cortex-a53 -display none \
+    -chardev stdio,mux=on,id=char0 -mon chardev=char0,mode=readline \
+    -serial chardev:char0 -serial chardev:char0"
 KERNEL="target/aarch64-unknown-none/debug/lockjaw"
 
 echo "=== Lockjaw QEMU Integration Tests (GICv${GIC_VERSION}) ==="
@@ -94,6 +100,9 @@ assert_contains "\[BOOTSTRAP\] hello" "Init-hello bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] devmgr" "Init-devmgr bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] uart" "Init-uart bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] ramfb" "Init-ramfb bootstrap IPC completed"
+assert_contains "\[BOOTSTRAP\] blk" "Init-blk bootstrap IPC completed"
+assert_contains "\[BOOTSTRAP\] display-test" "Init-display-test bootstrap IPC completed"
+assert_contains "\[BOOTSTRAP\] posix-server" "Init-posix-server bootstrap IPC completed"
 
 echo "Phase 9 — Thread Exit:"
 assert_contains "\[EXIT\] Thread" "Thread cleanup ran (finish_exit)"
@@ -101,6 +110,42 @@ assert_contains "pages freed" "Thread exit freed resources"
 
 echo "Phase 10 — Thread Creation:"
 assert_contains "\[THREAD-TEST\] child wrote marker" "sys_create_thread works (shared memory + exit)"
+
+echo "Phase 10 — Device Manager:"
+assert_contains "devmgr: parsed DTB" "Device manager parsed DTB"
+assert_contains "devmgr: claimed device at 0x9040000" "Device manager claim-by-addr (UART)"
+assert_contains "devmgr: claimed device at 0x9020000" "Device manager claim-by-addr (fw_cfg)"
+assert_contains "devmgr: serving" "Device manager IPC loop running"
+
+echo "Phase 10 — UART Driver:"
+assert_contains "uart-driver: claimed PL011" "UART driver claimed PL011 from devmgr"
+assert_contains "uart-driver: MMIO mapped" "UART driver mapped MMIO PageSet"
+assert_contains "uart-driver: IRQ bound" "UART driver bound IRQ → notification"
+assert_contains "uart-driver: server ready" "UART driver server loop entered"
+
+echo "Phase 10 — ramfb Display Driver:"
+assert_contains "ramfb: claimed fw_cfg" "ramfb claimed fw_cfg from devmgr"
+assert_contains "ramfb: fw_cfg mapped" "ramfb mapped fw_cfg MMIO"
+
+echo "Phase 10 — Display Test Client:"
+assert_contains "\[DISPLAY-TEST\] starting" "Display test client started"
+assert_contains "\[DISPLAY-TEST\] bootstrapped" "Display test client bootstrapped"
+
+echo "Phase 14 — VirtIO Block Driver (no-disk path):"
+assert_contains "blk: starting" "blk driver started"
+assert_contains "blk: bootstrapped" "blk driver completed bootstrap"
+# Without -drive, probe finds no device. The "no device" path still
+# exercises bootstrap + probe IPC + device-manager round-trip. The
+# selftest path needs `make run-blk`.
+assert_contains "blk: no virtio-blk device found" "blk probe returns cleanly when no disk attached"
+
+echo "Phase 16 — POSIX Personality (Phase 0):"
+assert_contains "posix-server: starting" "posix-server started"
+assert_contains "posix-server: posix-hello spawned OK" "posix-server spawned musl child"
+assert_contains "posix-server: POSIX_INIT OK" "POSIX_INIT bootstrap handshake completed"
+assert_contains "hello, lockjaw" "musl puts() reached kernel UART (Phase 0 gate)"
+assert_contains "posix-server: child exit" "posix-server saw child exit_group"
+assert_contains "posix-server: done" "posix-server dispatch loop terminated cleanly"
 
 # Fail explicitly if the thread test reported failure
 if echo "$OUTPUT" | grep -q "\[THREAD-TEST\] FAILED"; then
@@ -113,6 +158,10 @@ echo "=== Results: $PASSED passed, $FAILED failed ==="
 
 if [ $FAILED -gt 0 ]; then
     echo "INTEGRATION TESTS FAILED"
+    echo
+    echo "--- Full QEMU output (for debugging missing assertions) ---"
+    echo "$OUTPUT"
+    echo "--- End of QEMU output ---"
     exit 1
 fi
 echo "All integration tests passed."

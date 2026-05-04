@@ -74,7 +74,7 @@ pub const SYS_ERR_WOULD_BLOCK: u64 = 10;
 pub const SYS_ERR_UNKNOWN: u64 = u64::MAX;
 
 /// Syscall numbers.
-pub const SYS_DEBUG_PUTC: u64 = 0;
+pub const SYS_DEBUG_PUTS: u64 = 0;
 pub const SYS_YIELD: u64 = 1;
 pub const SYS_SEND: u64 = 2;
 pub const SYS_RECEIVE: u64 = 3;
@@ -108,7 +108,7 @@ pub const ALLOC_FLAG_CONTIGUOUS: u64 = 1 << 0;
 /// Decode a syscall number to its name. Used by crash diagnostics.
 pub fn syscall_name(num: u64) -> &'static str {
     match num {
-        SYS_DEBUG_PUTC => "sys_debug_putc",
+        SYS_DEBUG_PUTS => "sys_debug_puts",
         SYS_YIELD => "sys_yield",
         SYS_SEND => "sys_send",
         SYS_RECEIVE => "sys_receive",

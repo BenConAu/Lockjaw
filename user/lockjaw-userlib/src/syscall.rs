@@ -3,12 +3,20 @@ use lockjaw_types::syscall::*;
 use lockjaw_types::syscall::SyscallError;
 use crate::handle::*;
 
-pub fn putc(c: u8) {
+/// Emit a byte slice to the kernel UART. Atomic w.r.t. other threads'
+/// debug output — the kernel holds the GKL for the entire emit loop
+/// so output never interleaves character-by-character.
+///
+/// This is the only userspace path to the kernel UART: there is no
+/// per-character `putc` syscall. Callers that need to emit a few bytes
+/// should build a small stack buffer and call this once.
+pub fn sys_debug_puts(buf: &[u8]) {
     unsafe {
         asm!(
             "svc #0",
-            inlateout("x0") c as u64 => _,
-            in("x8") SYS_DEBUG_PUTC,
+            inlateout("x0") buf.as_ptr() as u64 => _,
+            inlateout("x1") buf.len() as u64 => _,
+            in("x8") SYS_DEBUG_PUTS,
         );
     }
 }

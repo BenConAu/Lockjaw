@@ -272,7 +272,7 @@ pub extern "C" fn _start() -> ! {
     let irq_intid = claim[2];
     puts("blk: claimed device, intid=");
     put_decimal(irq_intid);
-    putc(b'\n');
+    puts("\n");
 
     // Map MMIO page. Multiple virtio-mmio devices share a single 4K page
     // (each device is 512 bytes), so add the intra-page offset.
@@ -418,17 +418,28 @@ pub extern "C" fn _start() -> ! {
         zero_page_at_va(test_va);
         match engine.read(0, 1, test_buf) {
             Ok(()) => {
-                puts("blk: selftest read OK, sector 0 = [");
+                // Emit the whole hex dump atomically via a stack buffer
+                // so concurrent driver output can't interleave between
+                // bytes.  16 bytes × ("XX" + space) - 1 trailing space
+                // = 47 chars, plus the leading prefix and trailing "]\n".
+                let prefix = b"blk: selftest read OK, sector 0 = [";
+                let mut buf = [0u8; 35 + 47 + 2];
+                let mut len = 0;
+                for &c in prefix { buf[len] = c; len += 1; }
                 let data = test_va as *const u8;
                 for i in 0..16 {
                     let b = core::ptr::read_volatile(data.add(i));
                     let hi = (b >> 4) & 0xF;
                     let lo = b & 0xF;
-                    if i > 0 { putc(b' '); }
-                    putc(if hi < 10 { b'0' + hi } else { b'a' + hi - 10 });
-                    putc(if lo < 10 { b'0' + lo } else { b'a' + lo - 10 });
+                    if i > 0 { buf[len] = b' '; len += 1; }
+                    buf[len] = if hi < 10 { b'0' + hi } else { b'a' + hi - 10 };
+                    len += 1;
+                    buf[len] = if lo < 10 { b'0' + lo } else { b'a' + lo - 10 };
+                    len += 1;
                 }
-                puts("]\n");
+                buf[len] = b']'; len += 1;
+                buf[len] = b'\n'; len += 1;
+                sys_debug_puts(&buf[..len]);
             }
             Err(_) => {
                 puts("blk: selftest read FAILED\n");
@@ -453,17 +464,7 @@ fn halt() -> ! {
     loop { unsafe { asm!("wfi"); } }
 }
 
-fn put_decimal(mut n: u64) {
-    if n == 0 { putc(b'0'); return; }
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-    while n > 0 {
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-    while i > 0 { i -= 1; putc(buf[i]); }
-}
+// put_decimal is imported from lockjaw_userlib (atomic emit).
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

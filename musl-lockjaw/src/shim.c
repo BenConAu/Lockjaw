@@ -16,7 +16,7 @@
 #include <sys/uio.h>
 
 /* ---------- Lockjaw syscall numbers ---------- */
-#define LJ_SYS_DEBUG_PUTC    0
+#define LJ_SYS_DEBUG_PUTS    0
 #define LJ_SYS_CALL          4
 #define LJ_SYS_ALLOC_PAGES   6
 #define LJ_SYS_MAP_PAGES     7
@@ -35,20 +35,28 @@
 /* ---------- Diagnostic helpers (no IPC required) ---------- */
 
 /*
- * Direct kernel UART putc — works before/without the IPC bootstrap.
- * Used only by lj_die() for fatal-error diagnostics.
+ * Direct kernel UART output — works before/without the IPC bootstrap.
+ * Atomic w.r.t. other threads' debug output (kernel holds GKL for the
+ * whole emit). Used only by lj_die() for fatal-error diagnostics.
  */
-static inline void lj_dbg_putc(char c) {
-    register long x0 __asm__("x0") = (long)(unsigned char)c;
-    register long x8 __asm__("x8") = LJ_SYS_DEBUG_PUTC;
+static inline void lj_dbg_puts_n(const char *buf, long n) {
+    register long x0 __asm__("x0") = (long)buf;
+    register long x1 __asm__("x1") = n;
+    register long x8 __asm__("x8") = LJ_SYS_DEBUG_PUTS;
     __asm__ volatile("svc #0"
-        : "+r"(x0)
+        : "+r"(x0), "+r"(x1)
         : "r"(x8)
         : "memory", "cc");
 }
 
+static inline void lj_dbg_putc(char c) {
+    lj_dbg_puts_n(&c, 1);
+}
+
 static void lj_dbg_print(const char *s) {
-    while (*s) lj_dbg_putc(*s++);
+    long n = 0;
+    while (s[n]) n++;
+    lj_dbg_puts_n(s, n);
 }
 
 static void lj_dbg_print_hex(unsigned long v) {

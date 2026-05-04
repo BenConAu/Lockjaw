@@ -10,7 +10,7 @@
 
 typedef unsigned long uint64_t;
 
-#define LJ_SYS_DEBUG_PUTC    0
+#define LJ_SYS_DEBUG_PUTS    0
 #define LJ_SYS_CALL          4
 #define LJ_SYS_ALLOC_PAGES   6
 #define LJ_SYS_MAP_PAGES     7
@@ -121,15 +121,23 @@ static void shim_memcpy(volatile char *dst, const char *src, long n) {
         dst[i] = src[i];
 }
 
-/* Direct kernel UART putc — for diagnostics before/after IPC is set up. */
+/* Direct kernel UART output — for diagnostics before/after IPC is
+ * set up. Atomic w.r.t. other threads' debug output. */
+static inline void dbg_puts_n(const char *buf, long n) {
+    register long x0 __asm__("x0") = (long)buf;
+    register long x1 __asm__("x1") = n;
+    register long x8 __asm__("x8") = LJ_SYS_DEBUG_PUTS;
+    __asm__ volatile("svc #0" : "+r"(x0), "+r"(x1) : "r"(x8) : "memory", "cc");
+}
+
 static inline void dbg_putc(char c) {
-    register long x0 __asm__("x0") = (long)(unsigned char)c;
-    register long x8 __asm__("x8") = LJ_SYS_DEBUG_PUTC;
-    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory", "cc");
+    dbg_puts_n(&c, 1);
 }
 
 static void dbg_print(const char *s) {
-    while (*s) dbg_putc(*s++);
+    long n = 0;
+    while (s[n]) n++;
+    dbg_puts_n(s, n);
 }
 
 static void dbg_print_hex(unsigned long v) {

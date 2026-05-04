@@ -45,7 +45,7 @@ pub extern "C" fn _start() -> ! {
     let server_ep = EndpointHandle(reply[0]);
     puts("devmgr: bootstrapped, server_ep=");
     put_decimal(reply[0]);
-    putc(b'\n');
+    puts("\n");
 
     // Step 1: Get the DTB PageSet from the kernel and map it.
     // sys_get_boot_info returns the PageSet ID for the DTB physical pages.
@@ -104,7 +104,7 @@ pub extern "C" fn _start() -> ! {
                 devices.devices[i].claimed = true;
                 first_pl011 = false;
             }
-            putc(b'\n');
+            puts("\n");
         }
     }
 
@@ -151,7 +151,7 @@ pub extern "C" fn _start() -> ! {
                     devices.devices[i].claimed = true;
                     puts("devmgr: claimed device at ");
                     put_hex(dev.mmio_addr);
-                    putc(b'\n');
+                    puts("\n");
                     sys_reply(CLAIM_OK, exported, dev.intid as u64, 0);
                     found = true;
                     break;
@@ -313,7 +313,7 @@ fn handle_claim_by_addr(devices: &mut lockjaw_types::fdt::FdtDevices, mmio_addr:
     devices.devices[idx].claimed = true;
     puts("devmgr: claimed device at ");
     put_hex(dev.mmio_addr);
-    putc(b'\n');
+    puts("\n");
     sys_reply(CLAIM_OK, exported, dev.intid as u64, 0);
 }
 
@@ -325,31 +325,7 @@ fn halt() -> ! {
     loop { unsafe { asm!("wfi"); } }
 }
 
-fn put_decimal(mut n: u64) {
-    if n == 0 { putc(b'0'); return; }
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-    while n > 0 {
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-    while i > 0 { i -= 1; putc(buf[i]); }
-}
-
-fn put_hex(mut n: u64) {
-    puts("0x");
-    if n == 0 { putc(b'0'); return; }
-    let mut buf = [0u8; 16];
-    let mut i = 0;
-    while n > 0 {
-        let d = (n & 0xF) as u8;
-        buf[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
-        n >>= 4;
-        i += 1;
-    }
-    while i > 0 { i -= 1; putc(buf[i]); }
-}
+// put_decimal / put_hex are imported from lockjaw_userlib (atomic emits).
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
