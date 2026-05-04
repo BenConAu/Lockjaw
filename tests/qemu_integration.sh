@@ -12,8 +12,16 @@ GIC_VERSION="${GIC_VERSION:-3}"
 # uart-driver-related assertions further down.
 QEMU_FLAGS="-machine virt,gic-version=${GIC_VERSION} -cpu cortex-a53 -display none \
     -chardev stdio,mux=on,id=char0 -mon chardev=char0,mode=readline \
-    -serial chardev:char0 -serial chardev:char0"
+    -serial chardev:char0 -serial chardev:char0 \
+    -global virtio-mmio.force-legacy=false \
+    -drive file=test.img,format=raw,if=none,id=blk0 \
+    -device virtio-blk-device,drive=blk0"
 KERNEL="target/aarch64-unknown-none/debug/lockjaw"
+
+if [ ! -f test.img ]; then
+    echo "ERROR: test.img not found. Run 'make test-img' first (or 'make test')." >&2
+    exit 1
+fi
 
 echo "=== Lockjaw QEMU Integration Tests (GICv${GIC_VERSION}) ==="
 echo "Booting kernel with ${TIMEOUT}s timeout..."
@@ -131,13 +139,18 @@ echo "Phase 10 — Display Test Client:"
 assert_contains "\[DISPLAY-TEST\] starting" "Display test client started"
 assert_contains "\[DISPLAY-TEST\] bootstrapped" "Display test client bootstrapped"
 
-echo "Phase 14 — VirtIO Block Driver (no-disk path):"
+echo "Phase 14 — VirtIO Block Driver (with disk):"
 assert_contains "blk: starting" "blk driver started"
 assert_contains "blk: bootstrapped" "blk driver completed bootstrap"
-# Without -drive, probe finds no device. The "no device" path still
-# exercises bootstrap + probe IPC + device-manager round-trip. The
-# selftest path needs `make run-blk`.
-assert_contains "blk: no virtio-blk device found" "blk probe returns cleanly when no disk attached"
+assert_contains "blk: IRQ bound" "blk driver bound IRQ → notification"
+# A real virtio-blk-device is attached (test.img, 64 MiB FAT32).
+# Driver probes, allocates a DMA buffer, reads sector 0, prints the
+# first 16 bytes. mformat-built FAT32 starts with "EB 58 90" (the
+# JMP+NOP boot stub); we just match the prefix to prove the IPC +
+# virtqueue + IRQ wait round-trip worked.
+assert_contains "blk: selftest read OK, sector 0 = \[eb 58 90" "blk driver read sector 0 from disk"
+assert_contains "blk: serving" "blk driver entered server loop after selftest"
+assert_not_contains "blk: no virtio-blk device found" "blk driver did NOT take the no-device path"
 
 echo "Phase 16 — POSIX Personality (Phase 0):"
 assert_contains "posix-server: starting" "posix-server started"

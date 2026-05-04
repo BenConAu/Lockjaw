@@ -20,7 +20,7 @@ QEMU_DISPLAY_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -m 128M \
 
 USER_CRATES := user/hello user/uart-driver user/device-manager user/ramfb-driver user/display-test user/virtio-blk-driver user/posix-server user/init
 
-.PHONY: build build-release build-user build-hash clean-all run run-release run-display run-blk objdump nm check-stack check-pointers check-vtables check-init-size test test-unit test-qemu-gicv3 test-qemu-gicv2 clean pi4
+.PHONY: build build-release build-user build-hash clean-all run run-release run-display run-blk objdump nm check-stack check-pointers check-vtables check-init-size test test-unit test-qemu-gicv3 test-qemu-gicv2 clean pi4 test-img
 
 clean-all:
 	cargo clean
@@ -59,8 +59,7 @@ run-release: build-release
 run-display: build
 	$(QEMU) $(QEMU_DISPLAY_FLAGS) $(KERNEL_ELF)
 
-run-blk: build
-	@test -f test.img || dd if=/dev/zero of=test.img bs=1M count=1 2>/dev/null
+run-blk: build test-img
 	$(QEMU) -machine virt,gic-version=3 -cpu cortex-a53 -display none \
 		-chardev stdio,mux=on,id=char0 -mon chardev=char0,mode=readline \
 		-serial chardev:char0 -serial chardev:char0 \
@@ -68,6 +67,32 @@ run-blk: build
 		-drive file=test.img,format=raw,if=none,id=blk0 \
 		-device virtio-blk-device,drive=blk0 \
 		-kernel $(KERNEL_ELF)
+
+# 64 MiB FAT32 image. 64 MiB sits comfortably above FAT32's
+# cluster-count minimum (~33 MiB) so mformat produces a clean FAT32
+# volume with no FAT12/16 fallback. Phase A only needs the image to
+# exist for the block driver's selftest read; later phases populate
+# it with files via mcopy.
+#
+# Rebuilds only if missing or if the file size doesn't match (so a
+# stale 1 MiB image from earlier runs gets replaced automatically).
+# Requires mtools installed on the host (mformat + mcopy):
+#   macOS: brew install mtools
+#   Debian/Ubuntu: apt install mtools
+test-img:
+	@need=0; \
+	if [ ! -f test.img ]; then \
+		need=1; \
+	elif [ "$$(wc -c < test.img | tr -d ' ')" != "67108864" ]; then \
+		need=1; \
+	elif [ "$$(head -c 3 test.img | xxd -p)" != "eb5890" ]; then \
+		need=1; \
+	fi; \
+	if [ $$need -eq 1 ]; then \
+		echo "Creating 64 MiB FAT32 test.img..."; \
+		dd if=/dev/zero of=test.img bs=1M count=64 status=none; \
+		mformat -F -i test.img -v LOCKJAW ::; \
+	fi
 
 objdump: build
 	cargo objdump -- -d | head -80
@@ -92,10 +117,10 @@ test: test-unit test-qemu-gicv3 test-qemu-gicv2
 test-unit:
 	cargo test -p lockjaw-types --target aarch64-apple-darwin
 
-test-qemu-gicv3: build
+test-qemu-gicv3: build test-img
 	GIC_VERSION=3 bash tests/qemu_integration.sh
 
-test-qemu-gicv2: build
+test-qemu-gicv2: build test-img
 	GIC_VERSION=2 bash tests/qemu_integration.sh
 
 kernel8.img: build-release
