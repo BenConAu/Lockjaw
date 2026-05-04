@@ -1,6 +1,6 @@
 # Lockjaw
 
-A capability-based microkernel written in Rust, targeting AArch64 (ARMv8-A). Runs on QEMU `virt` machine. Inspired by seL4 and Zircon, but with its own object model.
+A capability-based microkernel written in Rust, targeting AArch64 (ARMv8-A). Runs on QEMU `virt` machine and builds a kernel image suitable for Raspberry Pi 4B (DTB-driven platform discovery, GICv2 + spin-table SMP, position-independent boot). Inspired by seL4 and Zircon, but with its own object model.
 
 ## What is this?
 
@@ -20,7 +20,7 @@ The design follows a few core principles:
 
 ## What works today
 
-Lockjaw boots on QEMU with up to 4 cores (`-smp 4`), manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads across multiple CPUs with a Giant Kernel Lock, serves 27 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects and kernel-assigned caller tokens for multi-client isolation, runs six isolated userspace processes loaded from ELF binaries, has a device manager that discovers hardware from the DTB with probe and claim-by-address protocols, a UART driver, a ramfb display driver, and a VirtIO block driver that reads from a virtual disk via virtqueues.
+Lockjaw boots on QEMU with up to 4 cores (`-smp 4`), manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads across multiple CPUs with a Giant Kernel Lock, serves 28 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects and kernel-assigned caller tokens for multi-client isolation, runs eight isolated userspace processes loaded from ELF binaries (init, hello, device-manager, uart-driver, ramfb-driver, virtio-blk-driver, posix-server, plus a musl-built `hello, lockjaw` test client spawned by the personality server), has a device manager that discovers hardware from the DTB with probe and claim-by-address protocols, a UART driver, a ramfb display driver, a VirtIO block driver that reads from a virtual disk via virtqueues, and a POSIX personality server that runs statically-linked patched-musl binaries via shared-buffer IPC (Phase 0 done).
 
 ```
 === Lockjaw Microkernel v0.1.0 ===
@@ -46,6 +46,11 @@ ramfb: display configured
 blk: found virtio-blk device            # with -drive flag
 blk: selftest read OK, sector 0 = [4c 4f 43 4b ...]
 blk: serving
+posix-server: spawning posix-hello...
+posix-server: posix-hello spawned OK
+posix-server: POSIX_INIT OK
+hello, lockjaw                          # ← from a real musl-built static binary
+posix-server: child exit
 [IPC BENCHMARK] 10000 call/reply round-trips in 74 ticks
 [IPC BENCHMARK] 135 round-trips per tick
 ```
@@ -80,6 +85,10 @@ blk: serving
 
 **Phase 14 -- VirtIO Block Driver.** VirtIO MMIO transport with modern (non-legacy) device support. Pure types in lockjaw-types (register offsets, virtqueue layout calculator, feature negotiation model, block request types). Virtqueue runtime in userlib with volatile access and AArch64 memory barriers (dmb ishst/ish/ishld). BlockEngine trait + run_block_server() framework (same pattern as display DDI). Per-device GIC trigger mode (sys_bind_irq flags parameter). Device-manager probe protocol with explicit status codes (PROBE_OK/END/CLAIMED/ERR). Sub-page MMIO offset for virtio-mmio devices (8 per 4K page). Driver selftest reads sector 0 and prints content.
 
+**Phase 15 -- Real Hardware Portability (Raspberry Pi 4B).** Boot path made portable to real AArch64 hardware. Firmware DTB pointer preserved from `x0` at entry. Lightweight FDT platform scanner runs early in boot to discover RAM base/size, UART/GIC/timer MMIO addresses, GIC version (v2 vs v3), and SMP boot method (PSCI vs spin-table) from the device tree. All hardcoded MMIO addresses removed — platform consumers wired to DTB-discovered values. GIC split into v2 and v3 drivers with runtime enum dispatch (Pi 4B uses GICv2; QEMU virt uses GICv3). Position-independent boot with a higher-half pivot — kernel can load at any physical address; `__kernel_start` linker symbol replaces hardcoded `KERNEL_LOAD_ADDR`. DTB-driven SMP boot: PSCI/HVC for QEMU, spin-table (write entry to `cpu-release-addr`, dsb, sev) for Pi 4B. BuddyAllocator capacity bumped from 32 K pages (128 MB) to 262 K pages (1 GB) for real-hardware memory sizes. `core::fmt` replaced with a custom print module — 12% .text savings, removes a class of vtable function pointers in `.rodata` that real-hardware secure boot pipelines would have to allow-list. New `xtask check-vtables` build check scans `.rodata`/`.data` for absolute code pointers and fails the build on unauthorized ones (with an allow-list for legitimate cases like compiler jump tables). FDT parser hardened against real-hardware DTB layouts. `make pi4` produces `kernel8.img` ready to copy to a Pi 4B SD card boot partition.
+
+**Phase 16 -- POSIX Personality (Phase 0).** A real `puts("hello, lockjaw")` from a statically-linked patched-musl binary runs end-to-end. Personality server (`user/posix-server/`) bootstraps with init, parses an embedded ELF, builds the Linux initial stack (argc/argv/auxv with AT_PAGESZ + AT_RANDOM), spawns the child via sys_create_process with a syscall endpoint as handle 0, and dispatches Linux syscalls received over IPC. Three musl patches in `musl-lockjaw/`: `crt_arch.h` (SP adjustment), `syscall_arch.h` (SVC redirect), and `shim.c` (per-syscall dispatch + bootstrap handshake + local brk handling, with fail-fast `lj_die()` for any transport or bootstrap error). Shared-buffer IPC (one page per client) with the asymmetric Lockjaw reply ABI (messages in x2-x5, reply in x1-x4) used correctly. Real ELF loader handles unaligned LOAD segments (musl's tightly-packed second LOAD at vaddr 0x41ffa8 spans two pages with file data placed at the right in-page offset). Implemented: write, writev, exit_group, set_tid_address (stub), ioctl (stub), brk (local). Phases 1+ (filesystem, mmap, threads, processes, signals) still aspirational.
+
 ### Unsafe reduction
 
 The kernel's unsafe usage has been systematically hardened through a multi-round review process with a second AI reviewer (Codex):
@@ -96,9 +105,9 @@ Three layers of automated testing run on every build:
 
 | Layer | Count | What it tests |
 |-------|-------|---------------|
-| Unit tests (host) | 417 | Scheduler model, IPC state machine (exhaustive) + decision functions, process lifecycle + transfer plan + teardown plan, buddy allocator, page tables, ExceptionContext ABI, ESR decode, HandleKind + handle ops, VirtIO types + layout, block protocol, FDT parser, device probe protocol, notifications, wait readiness, ticket lock (multi-threaded), feature negotiation |
-| Integration tests (QEMU) | 43 | Full boot through 13 phases, scheduler/MMU integration, IPC bootstrap, caller token delivery (positive + negative assertions), thread exit cleanup, thread creation |
-| Stack analysis | 4 entry points | No recursion, depth within 8KB budget, per-function 1536B cap, all indirect calls annotated, both debug and release profiles |
+| Unit tests (host) | 463 | Scheduler model, IPC state machine (exhaustive) + decision functions, process lifecycle + transfer plan + teardown plan, buddy allocator, page tables (PageTableWalk + MapWalk + unmap_validated), ExceptionContext ABI, ESR decode, HandleKind + handle ops, VirtIO types + layout, block protocol, FDT parser, device probe protocol, notifications, wait readiness, ticket lock (multi-threaded), feature negotiation, L3 region tracker, ScratchCursor pagination, build_process_page permission policy |
+| Integration tests (QEMU) | 44 | Full boot through 16 phases, scheduler/MMU integration, IPC bootstrap, caller token delivery (positive + negative assertions), thread exit cleanup, thread creation |
+| Stack analysis | 4 entry points | No recursion, depth within 8KB budget, per-function 1600B cap, all indirect calls annotated, both debug and release profiles |
 | Pointer cast lint | 70+ | Every `as *const` / `as *mut` in kernel code has a SAFETY comment |
 
 The IPC state machine test exhaustively explores all reachable system states (endpoint state x per-client reply state x thread states) via BFS with a 3-thread model and verifies: no kernel-caused deadlocks, all 8 invariants hold, all effect orderings correct (BlockCurrent always last, UnblockThread before ClearReply).
@@ -109,7 +118,7 @@ The IPC state machine test exhaustively explores all reachable system states (en
 
 - **Four entry points** -- _start, _secondary_start, __vec_sync_lower, __vec_irq (not just the boot path)
 - **Combined budget** -- max(normal, secondary) + max(sync exception, IRQ) <= 8192 bytes
-- **Per-function cap** -- any single function exceeding 1536 bytes fails immediately
+- **Per-function cap** -- any single function exceeding 1600 bytes fails immediately
 - **No recursion** -- detects cycles in the call graph (DFS on disassembly, allowed_cycles for guarded paths)
 - **All indirect calls annotated** -- every `BLR` instruction must be listed in `xtask/stack-annotations.toml` with its known targets, or the build fails
 - **Tail call modeling** -- `b <symbol>` parsed as inter-function branches (conservative)
@@ -134,15 +143,17 @@ brew install qemu  # or apt install qemu-system-aarch64
 ### Build, run, and test
 
 ```sh
-make build            # Build (runs stack + pointer checks first)
+make build            # Build (runs stack + pointer + vtable checks first)
 make run              # Build and run in QEMU
 make run-display      # Build and run with ramfb display window
 make run-blk          # Build and run with virtio-blk disk (creates test.img)
+make pi4              # Build a kernel8.img for Raspberry Pi 4B SD card boot
 make test             # Run all tests (unit + integration + stack)
 make test-unit        # Host-side unit tests only
 make test-qemu        # QEMU integration tests only
 make check-stack      # Stack depth and call graph analysis
 make check-pointers   # Pointer cast SAFETY annotation check
+make check-vtables    # Scan .rodata/.data for unauthorized code pointers
 make objdump          # Disassemble the kernel
 ```
 
@@ -229,7 +240,14 @@ user/                        # Userspace binaries (separate Cargo projects)
   ramfb-driver/              # Display driver -- fw_cfg DMA, contiguous framebuffer
   virtio-blk-driver/         # VirtIO block driver -- MMIO transport, virtqueue, BlockEngine
   display-test/              # Display DDI test client -- queries modes, draws gradient
+  posix-server/              # POSIX personality server -- ELF loader + Linux syscall dispatch via shared-buffer IPC
+  posix-hello/               # POSIX test client -- hello.c (musl-built) + standalone.c (no-libc fallback)
   lockjaw-userlib/           # Shared library (syscalls, display DDI, block DDI, virtqueue, PageSetGuard)
+
+musl-lockjaw/                # Patched musl 1.2.5 (downloaded by build.sh)
+  build.sh                   # Incremental cross-compile: patches + libc.a + hello.c
+  patches/                   # crt_arch.h (SP adjust), syscall_arch.h (SVC redirect)
+  src/shim.c                 # lockjaw_syscall: bootstrap handshake + IPC dispatch + local brk
 
 docs/                        # Book of Lockjaw -- design documentation
   book-of-lockjaw/           # Architecture chapters (philosophy + taxonomy)
@@ -246,7 +264,7 @@ docs/                        # Book of Lockjaw -- design documentation
   tech-debt.md               # Known limitations and planned fixes
   extraction-roadmap.md      # Push-shaped code remaining to extract, ranked
   yagni-parking-lot.md       # Removed code tracked for future phases
-  development-journal.md     # Journal entries from the AI collaborator (1-6)
+  development-journal.md     # Journal entries from the AI collaborator (1-7)
 
 xtask/                       # Build tools
   src/main.rs                # check-stack and check-pointers commands
@@ -274,9 +292,11 @@ tests/
 | 12. PageSet Lifecycle | Done | Mapping tracking, ownership transfer, refcounting, free-on-zero, process exit cleanup |
 | 13. Caller Tokens | Done | Kernel-assigned opaque per-endpoint caller tokens for multi-client IPC isolation |
 | 14. VirtIO Block Driver | Done | VirtIO MMIO transport, split virtqueue with barriers, block engine + server framework, per-device GIC trigger mode, selftest reads sector 0 |
-| 15. Architecture Hardening | In progress | Extracting pure logic to lockjaw-types (push→pull), making illegal states unrepresentable |
-| 16. Real Hardware | Planned | Bring-up on a simple AArch64 board (Raspberry Pi 4 or similar) |
-| 17. POSIX Compatibility | Planned | POSIX personality server in userspace, musl libc port |
+| 15. Real Hardware Portability | Done (rudimentary Pi 4B) | DTB-driven platform discovery, GICv2/v3 split, PIE boot with higher-half pivot, PSCI + spin-table SMP, custom print (no core::fmt), 1 GB RAM, `make pi4` produces kernel8.img |
+| 16. POSIX Phase 0 | Done | Personality server + patched musl + shared-buffer IPC; statically-linked musl `puts("hello, lockjaw")` runs end-to-end |
+| 17. Architecture Hardening | Ongoing | Extracting pure logic to lockjaw-types (push→pull), making illegal states unrepresentable |
+| 18. Pi 4B Bring-Up Validation | Planned | Confirm `kernel8.img` boots on a real Pi 4B; fix whatever real-hardware quirks surface |
+| 19. POSIX Phase 1+ | Planned | Filesystem (ramfs), mmap, threads (futex), processes (posix_spawn/wait), pipes, signals |
 
 ## License
 
