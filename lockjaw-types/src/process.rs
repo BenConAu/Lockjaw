@@ -28,6 +28,14 @@ pub struct ProcessMapping {
 /// ProcessMapping flag: page contains executable code.
 pub const PROCESS_MAP_FLAG_EXECUTABLE: u64 = 1 << 0;
 
+/// Number of `ProcessMapping` entries that fit in a single 4 KB page.
+/// Userspace process loaders allocate the mapping array in N×4 KB pages
+/// and use this constant as the per-page capacity. Pairing the loader's
+/// plan-buffer cap with the same constant keeps the two in lock-step:
+/// a plan can never produce more entries than the array can hold.
+pub const PROCESS_MAPPINGS_PER_PAGE: usize =
+    crate::addr::PAGE_SIZE as usize / core::mem::size_of::<ProcessMapping>();
+
 // SAFETY: ProcessMapping is repr(C) with only u64 fields — every bit pattern valid.
 unsafe impl crate::user_pod::UserPod for ProcessMapping {}
 

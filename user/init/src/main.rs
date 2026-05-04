@@ -9,6 +9,29 @@ static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
 use lockjaw_userlib::*;
 use lockjaw_userlib::elf::parse_elf;
+use lockjaw_userlib::elf_loader::{plan_elf_load, ElfLoadEntry};
+
+/// Number of 4 KB pages allocated for each spawn's `ProcessMapping`
+/// array. 16 pages = 2048 mapping slots — matches the kernel's own
+/// init-load mapping buffer (`e16b9cb`) and gives ample headroom for
+/// any user binary init might spawn. Bump this and the load-plan and
+/// temp-VA reservations below grow with it (they're derived).
+const INIT_MAP_ARRAY_PAGES: u64 = 16;
+
+/// Plan-buffer capacity for `plan_elf_load`. Equal to the
+/// `ProcessMapping` array capacity so a successfully built plan always
+/// has somewhere to land its writes.
+const INIT_LOAD_PLAN_CAP: usize =
+    INIT_MAP_ARRAY_PAGES as usize * PROCESS_MAPPINGS_PER_PAGE;
+
+/// Pages required to hold an `INIT_LOAD_PLAN_CAP`-entry plan buffer.
+/// Computed at compile time from the entry size; the buffer is mapped
+/// once at init startup (out of stack — at 2048 entries × ~40 B each
+/// it would not fit in init's 8-page stack) and reused across spawns.
+const INIT_PLAN_BUFFER_PAGES: u64 = {
+    let bytes = (INIT_LOAD_PLAN_CAP * core::mem::size_of::<ElfLoadEntry>()) as u64;
+    (bytes + PAGE_SIZE - 1) / PAGE_SIZE
+};
 
 /// The child process ELF binary, embedded at compile time.
 /// Built by: cd user/hello && cargo build --release
@@ -46,8 +69,21 @@ static POSIX_SERVER_ELF: &[u8] = include_bytes!("../../posix-server/target/aarch
 /// `elf_data` is the raw ELF binary. `name` is used for log messages.
 /// `map_array_va` is a user VA where the mapping array will be mapped (must be free).
 /// `temp_base_va` is a base VA for temporary segment page mappings (must be free).
+/// `plan_buf_va` is a user VA where `INIT_PLAN_BUFFER_PAGES` pages of
+/// `ElfLoadEntry` storage are already mapped (allocated once at init
+/// startup and reused — a 2048-entry plan does not fit on init's 8-page
+/// stack, so the buffer lives in mapped memory).
 /// Returns true on success.
-fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, scratch_ps: PageSetHandle, handle_to_copy: EndpointHandle, stack_pages: u64) -> bool {
+fn spawn_elf(
+    elf_data: &[u8],
+    name: &str,
+    map_array_va: u64,
+    temp_base_va: u64,
+    plan_buf_va: u64,
+    scratch_ps: PageSetHandle,
+    handle_to_copy: EndpointHandle,
+    stack_pages: u64,
+) -> bool {
     puts("init: parsing ");
     puts(name);
     puts(" ELF...\n");
@@ -72,8 +108,10 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
         None => {}
     }
 
-    // Allocate a page for the mapping array
-    let map_array_ps = match sys_alloc_pages(1) {
+    // Allocate `INIT_MAP_ARRAY_PAGES` pages for the mapping array. The
+    // plan-buffer cap below is derived from the same constant, so the
+    // array always has room for every entry the plan produces.
+    let map_array_ps = match sys_alloc_pages(INIT_MAP_ARRAY_PAGES) {
         Ok(id) => id,
         Err(_) => { puts("init: alloc map array FAILED\n"); return false; }
     };
@@ -82,58 +120,67 @@ fn spawn_elf(elf_data: &[u8], name: &str, map_array_va: u64, temp_base_va: u64, 
         return false;
     }
     let map_array = map_array_va as *mut ProcessMapping;
-    let mut mapping_count: usize = 0;
 
-    // For each ELF segment: allocate pages, map into our space, copy data
-    for i in 0..elf_info.segment_count {
-        let seg = &elf_info.segments[i];
-        let num_pages = ((seg.mem_size + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
+    // Plan capacity == array capacity (see constants at the top of
+    // this file). plan_elf_load returns TooManyEntries cleanly if a
+    // binary needs more — bumping the cap means raising both
+    // constants together. The plan buffer is in mapped memory
+    // (allocated once at init startup) rather than on the stack
+    // because at INIT_LOAD_PLAN_CAP entries it's far too large for
+    // init's 8-page stack.
+    //
+    // SAFETY: caller of spawn_elf passes a `plan_buf_va` mapped to
+    // exactly INIT_PLAN_BUFFER_PAGES of memory, which is sized to hold
+    // INIT_LOAD_PLAN_CAP `ElfLoadEntry` structs. The slice lifetime is
+    // bounded by this function's stack frame.
+    let plan_buf = unsafe {
+        core::slice::from_raw_parts_mut(
+            plan_buf_va as *mut ElfLoadEntry,
+            INIT_LOAD_PLAN_CAP,
+        )
+    };
+    let plan = match plan_elf_load(&elf_info, elf_data.len(), plan_buf) {
+        Ok(p) => p,
+        Err(_) => { puts("init: elf load plan FAILED\n"); return false; }
+    };
 
-        for p in 0..num_pages {
-            let ps_id = match sys_alloc_pages(1) {
-                Ok(id) => id,
-                Err(_) => { puts("init: alloc for segment FAILED\n"); return false; }
-            };
+    // Apply each entry: allocate, temp-map, zero, copy file slice at the
+    // correct in-page offset, register a ProcessMapping at page_va.
+    for (i, entry) in plan.entries().iter().enumerate() {
+        let ps_id = match sys_alloc_pages(1) {
+            Ok(id) => id,
+            Err(_) => { puts("init: alloc for segment FAILED\n"); return false; }
+        };
 
-            let temp_va: u64 = temp_base_va + (mapping_count as u64) * PAGE_SIZE;
-            if !sys_map_pages(ps_id, temp_va, 0).is_ok() {
-                puts("init: map for segment FAILED\n");
-                return false;
-            }
+        let temp_va: u64 = temp_base_va + (i as u64) * PAGE_SIZE;
+        if !sys_map_pages(ps_id, temp_va, 0).is_ok() {
+            puts("init: map for segment FAILED\n");
+            return false;
+        }
 
-            unsafe { zero_page_at_va(temp_va); }
+        unsafe { zero_page_at_va(temp_va); }
 
-            let seg_page_offset = (p as u64) * PAGE_SIZE;
-            let file_remaining = if seg.file_size > seg_page_offset {
-                let r = seg.file_size - seg_page_offset;
-                if r > PAGE_SIZE { PAGE_SIZE } else { r }
-            } else {
-                0
-            };
-
-            if file_remaining > 0 {
-                let src_start = (seg.file_offset + seg_page_offset) as usize;
-                let src_end = src_start + file_remaining as usize;
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        elf_data[src_start..src_end].as_ptr(),
-                        temp_va as *mut u8,
-                        file_remaining as usize,
-                    );
-                }
-            }
-
+        let (src_start, src_end) = entry.src_file_range;
+        if src_end > src_start {
             unsafe {
-                core::ptr::write(map_array.add(mapping_count), ProcessMapping {
-                    virt_addr: seg.vaddr + seg_page_offset,
-                    pageset_id: ps_id.0,
-                    page_index: 0,
-                    flags: if seg.executable { FLAG_EXECUTABLE } else { 0 },
-                });
+                core::ptr::copy_nonoverlapping(
+                    elf_data[src_start..src_end].as_ptr(),
+                    (temp_va + entry.in_page_offset as u64) as *mut u8,
+                    src_end - src_start,
+                );
             }
-            mapping_count += 1;
+        }
+
+        unsafe {
+            core::ptr::write(map_array.add(i), ProcessMapping {
+                virt_addr: entry.page_va,
+                pageset_id: ps_id.0,
+                page_index: 0,
+                flags: if entry.executable { FLAG_EXECUTABLE } else { 0 },
+            });
         }
     }
+    let mapping_count = plan.page_count();
 
     let stack_ps = match sys_alloc_pages(stack_pages) {
         Ok(id) => id,
@@ -289,20 +336,39 @@ pub extern "C" fn _start() -> ! {
     let posix_boot_ep = alloc_endpoint("posix boot");
 
     // Spawn child processes.
-    // Allocate temp VAs for ELF loading. Each spawn needs:
-    // - 1 page for the mapping array
-    // - N pages for temporary segment mappings (generous: 128 pages = 512KB)
-    // These are reused across spawns since spawn_elf completes before returning.
-    let map_array_va = VMEM.alloc(1).expect("VA exhausted for map array");
-    let temp_base_va = VMEM.alloc(128).expect("VA exhausted for temp pages");
+    // Allocate VAs for ELF loading. These are reused across spawns
+    // since spawn_elf completes before returning.
+    //   - INIT_MAP_ARRAY_PAGES for the ProcessMapping array
+    //   - INIT_LOAD_PLAN_CAP pages for temporary per-page segment mappings
+    //     (one temp VA per plan entry)
+    //   - INIT_PLAN_BUFFER_PAGES for the plan buffer itself, which is
+    //     too large for the stack at INIT_LOAD_PLAN_CAP entries.
+    let map_array_va = VMEM.alloc(INIT_MAP_ARRAY_PAGES as usize)
+        .expect("VA exhausted for map array");
+    let temp_base_va = VMEM.alloc(INIT_LOAD_PLAN_CAP)
+        .expect("VA exhausted for temp pages");
+    let plan_buf_va = VMEM.alloc(INIT_PLAN_BUFFER_PAGES as usize)
+        .expect("VA exhausted for plan buffer");
 
-    spawn_elf(HELLO_ELF, "hello", map_array_va, temp_base_va, scratch_ps, hello_boot_ep, 1);
-    spawn_elf(DEVMGR_ELF, "device-manager", map_array_va, temp_base_va, scratch_ps, devmgr_boot_ep, 8);
-    spawn_elf(UART_ELF, "uart-driver", map_array_va, temp_base_va, scratch_ps, uart_boot_ep, 4);
-    spawn_elf(RAMFB_ELF, "ramfb-driver", map_array_va, temp_base_va, scratch_ps, ramfb_boot_ep, 4);
-    spawn_elf(BLK_ELF, "blk-driver", map_array_va, temp_base_va, scratch_ps, blk_boot_ep, 4);
-    spawn_elf(POSIX_SERVER_ELF, "posix-server", map_array_va, temp_base_va, scratch_ps, posix_boot_ep, 8);
-    spawn_elf(DISPLAY_TEST_ELF, "display-test", map_array_va, temp_base_va, scratch_ps, display_test_boot_ep, 1);
+    // Allocate + map the plan buffer once. Pages from sys_alloc_pages
+    // are zeroed; plan_elf_load only writes (never reads before write)
+    // into the prefix it populates, so no per-spawn re-init is needed.
+    let plan_buf_ps = match sys_alloc_pages(INIT_PLAN_BUFFER_PAGES) {
+        Ok(id) => id,
+        Err(_) => { puts("init: alloc plan buffer FAILED\n"); loop { sys_yield(); } }
+    };
+    if !sys_map_pages(plan_buf_ps, plan_buf_va, 0).is_ok() {
+        puts("init: map plan buffer FAILED\n");
+        loop { sys_yield(); }
+    }
+
+    spawn_elf(HELLO_ELF, "hello", map_array_va, temp_base_va, plan_buf_va, scratch_ps, hello_boot_ep, 1);
+    spawn_elf(DEVMGR_ELF, "device-manager", map_array_va, temp_base_va, plan_buf_va, scratch_ps, devmgr_boot_ep, 8);
+    spawn_elf(UART_ELF, "uart-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, uart_boot_ep, 4);
+    spawn_elf(RAMFB_ELF, "ramfb-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, ramfb_boot_ep, 4);
+    spawn_elf(BLK_ELF, "blk-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, blk_boot_ep, 4);
+    spawn_elf(POSIX_SERVER_ELF, "posix-server", map_array_va, temp_base_va, plan_buf_va, scratch_ps, posix_boot_ep, 8);
+    spawn_elf(DISPLAY_TEST_ELF, "display-test", map_array_va, temp_base_va, plan_buf_va, scratch_ps, display_test_boot_ep, 1);
 
     // Bootstrap hello: export a test notification into its handle table.
     puts("init: waiting for hello bootstrap...\n");

@@ -12,7 +12,7 @@ use lockjaw_userlib::*;
 use lockjaw_userlib::elf::parse_elf;
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_types::constants::USER_STACK_BASE;
-use lockjaw_types::elf_loader::{plan_elf_load, ElfLoadEntry};
+use lockjaw_userlib::elf_loader::{plan_elf_load, ElfLoadEntry};
 
 /// Pre-built statically-linked musl hello binary.
 /// Built with patched musl (see musl-lockjaw/).
