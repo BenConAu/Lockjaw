@@ -28,3 +28,4 @@ pub mod display;
 pub mod virtio;
 pub mod block;
 pub mod fat32;
+pub mod fs;
