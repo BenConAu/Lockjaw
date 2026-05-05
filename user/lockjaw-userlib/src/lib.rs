@@ -6,6 +6,7 @@ pub mod process;
 pub mod virtual_memory;
 pub mod block;
 pub mod display;
+pub mod fs;
 pub mod handle;
 pub mod virtqueue;
 

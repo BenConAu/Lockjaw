@@ -65,6 +65,10 @@ static POSIX_SERVER_ELF: &[u8] = include_bytes!("../../posix-server/target/aarch
 /// Built by: cd user/fat32-server && cargo build --release
 static FAT32_ELF: &[u8] = include_bytes!("../../fat32-server/target/aarch64-unknown-none/release/lockjaw-fat32-server");
 
+/// The FAT32 verification client ELF binary, embedded at compile time.
+/// Built by: cd user/fat32-test && cargo build --release
+static FAT32_TEST_ELF: &[u8] = include_bytes!("../../fat32-test/target/aarch64-unknown-none/release/lockjaw-fat32-test");
+
 // ---------------------------------------------------------------------------
 // ELF spawn helper
 // ---------------------------------------------------------------------------
@@ -338,6 +342,7 @@ pub extern "C" fn _start() -> ! {
     let blk_boot_ep = alloc_endpoint("blk boot");
     let fat32_srv_ep = alloc_endpoint("fat32 srv");
     let fat32_boot_ep = alloc_endpoint("fat32 boot");
+    let fat32_test_boot_ep = alloc_endpoint("fat32-test boot");
     let posix_boot_ep = alloc_endpoint("posix boot");
 
     // Spawn child processes.
@@ -373,6 +378,7 @@ pub extern "C" fn _start() -> ! {
     spawn_elf(RAMFB_ELF, "ramfb-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, ramfb_boot_ep, 4);
     spawn_elf(BLK_ELF, "blk-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, blk_boot_ep, 4);
     spawn_elf(FAT32_ELF, "fat32-server", map_array_va, temp_base_va, plan_buf_va, scratch_ps, fat32_boot_ep, 4);
+    spawn_elf(FAT32_TEST_ELF, "fat32-test", map_array_va, temp_base_va, plan_buf_va, scratch_ps, fat32_test_boot_ep, 4);
     spawn_elf(POSIX_SERVER_ELF, "posix-server", map_array_va, temp_base_va, plan_buf_va, scratch_ps, posix_boot_ep, 8);
     spawn_elf(DISPLAY_TEST_ELF, "display-test", map_array_va, temp_base_va, plan_buf_va, scratch_ps, display_test_boot_ep, 1);
 
@@ -487,6 +493,17 @@ pub extern "C" fn _start() -> ! {
     };
     sys_reply(fat32_srv_idx, fat32_blk_idx, 0, 0);
     puts("[BOOTSTRAP] fat32\n");
+
+    // Bootstrap fat32-test: export fat32_srv_ep so the verification
+    // client can speak the FS protocol against the server.
+    puts("init: waiting for fat32-test bootstrap...\n");
+    let _ = sys_receive(fat32_test_boot_ep);
+    let fat32_test_idx = match sys_export_handle(fat32_srv_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export fat32_srv_ep to fat32-test FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(fat32_test_idx, 0, 0, 0);
+    puts("[BOOTSTRAP] fat32-test\n");
 
     // Bootstrap posix-server: no handles to export, just acknowledge.
     puts("init: waiting for posix-server bootstrap...\n");

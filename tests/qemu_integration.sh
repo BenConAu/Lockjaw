@@ -111,6 +111,7 @@ assert_contains "\[BOOTSTRAP\] ramfb" "Init-ramfb bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] blk" "Init-blk bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] display-test" "Init-display-test bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] fat32" "Init-fat32 bootstrap IPC completed"
+assert_contains "\[BOOTSTRAP\] fat32-test" "Init-fat32-test bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] posix-server" "Init-posix-server bootstrap IPC completed"
 
 echo "Phase 9 — Thread Exit:"
@@ -165,6 +166,18 @@ assert_contains "fat32: bootstrapped" "fat32-server completed bootstrap"
 #     of 2 (the first usable data cluster) for every volume it produces
 assert_contains "fat32: mounted" "fat32-server mounted disk and parsed BPB"
 assert_contains "root_cluster=2" "fat32-server identified root cluster as 2"
+
+echo "Phase 15 — FAT32 Verification Client (open + read end-to-end):"
+assert_contains "\[FAT32-TEST\] starting" "fat32-test client started"
+assert_contains "\[FAT32-TEST\] bootstrapped" "fat32-test client bootstrapped"
+assert_contains "\[FAT32-TEST\] opened /HELLO.TXT" "fat32-test opened /HELLO.TXT"
+# HELLO.TXT contains "hello from fat32\n" (17 bytes; mcopy added it
+# during test.img generation). The read goes through:
+#   fat32-test -> FsClient (FS_OPEN) -> fat32-server -> BlockClient
+#   -> virtio-blk-driver -> QEMU -> test.img
+# This single line proves the entire stack works end to end.
+assert_contains "\[FAT32-TEST\] read 17 bytes: hello from fat32" "fat32-test read HELLO.TXT contents via FS IPC"
+assert_contains "\[FAT32-TEST\] done" "fat32-test completed cleanly"
 
 echo "Phase 16 — POSIX Personality (Phase 0):"
 assert_contains "posix-server: starting" "posix-server started"
