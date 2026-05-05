@@ -4,10 +4,13 @@ Binary compatibility with `aarch64-unknown-linux-musl`. Any
 statically-linked Linux binary built against musl libc runs on
 Lockjaw without recompilation.
 
-**Status (2026-05-03):** Phase 0 done — a real musl-built
-`puts("hello, lockjaw")` runs end-to-end through the personality
-server (`23f18f1` + `b454770`). Phases 1+ still aspirational. See
-[Phase 0 status and notes](#phase-0-hello-world) below.
+**Status (2026-05-05):** Phase 1 done — a real musl-built program
+opens a file on a 64 MiB FAT32 virtio-blk disk, reads its contents
+through three IPC layers (posix-server -> fat32-server -> virtio-blk-driver),
+and prints them. Phase 0 (`23f18f1` + `b454770`) and Phase 1
+(`2fb0e49` ... `f929766`) gates met. Phases 2+ still aspirational.
+See [Phase 0](#phase-0-hello-world) and [Phase 1](#phase-1-filesystem)
+sections below.
 
 ## Architecture
 
@@ -261,16 +264,105 @@ POSIX_INIT reply.
 - **Build script portability.** `sysctl -n hw.ncpu` is macOS-only;
   the script now falls through `nproc` → `sysctl` → `4`.
 
-### Phase 1: Filesystem
+### Phase 1: Filesystem — DONE
 
-**Gate:** read a file from ramfs.
+**Gate met:** A real musl-built program opens `/HELLO.TXT` on a
+FAT32 virtio-blk disk via `openat`, reads the contents via `read`,
+closes the fd, and prints the bytes. The full path is:
 
-New userspace:
-- `user/ramfs-server/` — cpio parser, inode table, IPC interface
-- Personality server: VFS dispatch, FD open/close/seek
+```
+musl libc -> patched shim -> posix-server (FdTable + handlers)
+  -> FsClient (FS-IPC) -> fat32-server (path resolve + FAT walk)
+  -> BlockClient (block-IPC) -> virtio-blk-driver (MMIO + IRQ)
+  -> QEMU virtio-blk -> test.img (mformat-built FAT32).
+```
 
-Syscalls: `openat`, `read`, `close`, `lseek`, `fstat`,
-`newfstatat`, `getcwd`, `readlinkat` (stub ENOENT)
+Plan reframe: the original draft proposed `user/ramfs-server/` (a
+cpio archive parsed in memory). We threw that out and built FAT32
+on the existing virtio-blk driver instead — the block driver was
+sitting in CI with no real workload, the FAT32 server is portable
+to a future Pi 4B SDIO driver because both speak `BlockEngine`,
+and we don't write throwaway code that ramfs would mostly become.
+
+What was built:
+
+- `lockjaw-types/src/fat32.rs` — pure BPB parser, FAT-chain
+  decode, dirent parser, 8.3 path matching. ~70 host tests
+  including adversarial geometries (FAT region exceeds volume,
+  cluster count below FAT32 minimum, FAT too small for cluster
+  count, forged fs_type strings).
+- `lockjaw-types/src/fs.rs` — FS-IPC protocol (FS_OPEN /
+  FS_READ / FS_CLOSE) with a pure dispatch decision function.
+  Inline path bytes (16-byte cap) instead of capability-passing
+  PageSet handles, because `sys_export_handle` only goes
+  server→client and client→server import would need a new
+  kernel syscall. Documented in the module header.
+- `lockjaw-types/src/posix_fd.rs` — pure `FdTable<MAX_FDS=32>`
+  with `with_stdio()` constructor, lowest-free-fd allocation,
+  and stdio protection. No cursor field — cursor lives in
+  fat32-server (Linux "open file description" semantics).
+- `user/fat32-server/` — bootstraps from init, mounts the disk,
+  serves FS_OPEN / FS_READ / FS_CLOSE. Open-file table scoped
+  by `sys_query_caller_token` for cross-client isolation.
+  Cluster scratch + FAT scratch buffers from the block driver.
+- `user/fat32-test/` — ~100-line verification client that opens
+  `/HELLO.TXT`, reads via FsClient, prints via UART. Independent
+  of musl (proves the FS server works without the personality
+  server in the loop).
+- `user/lockjaw-userlib/src/fs.rs` — `FsClient` typed wrapper.
+- `user/posix-server/src/main.rs` — `FsClient` integration,
+  per-client FD table, FileOpen/Read/Close handlers. Open
+  rejects write-touching flags (`O_WRONLY`/`O_RDWR`/`O_CREAT`/
+  `O_EXCL`/`O_TRUNC`/`O_APPEND`) with `-EROFS` since Phase 1
+  is read-only. Close talks remote-first; failed remote closes
+  go on a small deferred-retry queue.
+- `musl-lockjaw/src/shim.c` — `openat` and `read` syscall
+  handlers; `close` uses the existing scalar catch-all.
+- `user/posix-hello/hello.c` — extended to also openat + read
+  + close. Uses *direct syscalls* (not fopen/fread) because
+  musl's stdio mallocs the FILE struct and musl's malloc uses
+  mmap, which Phase 2 handles.
+
+Syscalls implemented this phase: `openat`, `read`, `close`.
+Deferred to follow-on phases: `lseek`, `fstat`, `newfstatat`,
+`getcwd`, `readlinkat`.
+
+#### Implementation notes (lessons learned)
+
+- **The FAT32 spec's discriminator is cluster count, not the
+  fs_type string.** The string at offset 82 is informational; a
+  forged "FAT32   " on a FAT16-sized volume should be rejected.
+  `parse_bpb` enforces `cluster_count >= FAT32_MIN_CLUSTERS = 65525`.
+- **Per-page PageSet allocation breaks at 32 pages.**
+  `ProcessTransferPlan::MAX_CONSUMED_HEADERS = 32`. Init's
+  `spawn_elf` originally allocated one PageSet per page of the
+  child binary, which broke `sys_create_process` for posix-server
+  (now ~42 pages because of the embedded musl hello binary).
+  Fixed by allocating one PageSet of N pages with each
+  `ProcessMapping` referencing it at a different `page_index`.
+- **Trailing slash on a path carries semantic meaning.**
+  `/file.txt/` should require the target to be a directory
+  (`-ENOTDIR`), not silently open a file. Slash-normalization
+  must capture the trailing-slash bit *before* dropping empty
+  components in the filter.
+- **Caller-token isolation is mandatory for shared servers.** The
+  block server's `BufferTracker` already had this pattern; the
+  fat32-server's open-file table needed the same scoping so a
+  malicious client can't operate on another client's handles by
+  guessing the integer.
+- **musl stdio drags in malloc which drags in mmap.** A test
+  program using `fopen`/`fread` won't work in Phase 1 — direct
+  `openat`/`read` is required until Phase 2 lands.
+
+### Phase 1 syscalls deferred to later
+
+- `lseek` — needs cursor manipulation in fat32-server (cursor lives
+  there per the Phase 1 design). Pure decision function in
+  lockjaw-types::fs::dispatch (FS_LSEEK arm).
+- `fstat` / `newfstatat` — file metadata fetch. Needs new FS-IPC
+  arms (FS_FSTAT and FS_STAT) plus a Linux `struct stat` layout
+  in shared bytes.
+- `getcwd` / `readlinkat` — stub ENOENT initially.
 
 ### Phase 2: Memory Management
 
