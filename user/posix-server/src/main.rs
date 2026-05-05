@@ -299,6 +299,7 @@ pub extern "C" fn _start() -> ! {
             nr: msg[0],
             arg1: msg[1],
             arg2: msg[2],
+            arg3: msg[3],
         });
 
         match action {
@@ -343,6 +344,13 @@ pub extern "C" fn _start() -> ! {
                 puts("posix: unknown nr=");
                 put_hex(nr);
                 puts(" -> ENOSYS\n");
+                sys_reply(neg_errno(ENOSYS), 0, 0, 0);
+            }
+
+            // F.1: dispatch decisions added; runtime handlers wired
+            // up in F.2. For now, reply -ENOSYS so a misconfigured
+            // musl program calling these doesn't hang.
+            Action::FileOpen { .. } | Action::FileRead { .. } | Action::FileClose { .. } => {
                 sys_reply(neg_errno(ENOSYS), 0, 0, 0);
             }
         }

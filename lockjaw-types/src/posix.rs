@@ -10,7 +10,7 @@
 //! The personality server's loop becomes:
 //!
 //! ```ignore
-//! match dispatch(&DispatchInputs { nr, arg1, arg2 }) {
+//! match dispatch(&DispatchInputs { nr, arg1, arg2, arg3 }) {
 //!     Action::Reply { words } => sys_reply(words[0], ..),
 //!     Action::EmitFromShared { fd, len, then_reply } => {
 //!         // copy len bytes from server's mapping of the shared buffer
@@ -36,6 +36,9 @@ pub const POSIX_INIT: u64 = 0xFFFF_FFFF_FFFF_FF00;
 // ---------------------------------------------------------------------------
 
 pub const NR_IOCTL: u64 = 29;
+pub const NR_OPENAT: u64 = 56;
+pub const NR_CLOSE: u64 = 57;
+pub const NR_READ: u64 = 63;
 pub const NR_WRITE: u64 = 64;
 pub const NR_WRITEV: u64 = 66;
 pub const NR_EXIT_GROUP: u64 = 94;
@@ -46,9 +49,15 @@ pub const NR_SET_TID_ADDRESS: u64 = 96;
 // ---------------------------------------------------------------------------
 
 pub const EBADF: u64 = 9;
+pub const ENOMEM: u64 = 12;
 pub const EINVAL: u64 = 22;
+pub const EMFILE: u64 = 24;
 pub const ENOTTY: u64 = 25;
 pub const ENOSYS: u64 = 38;
+pub const EIO: u64 = 5;
+pub const ENOENT: u64 = 2;
+pub const ENOTDIR: u64 = 20;
+pub const EISDIR: u64 = 21;
 
 /// Encode a positive errno as the negative-errno return value Linux's
 /// syscall ABI uses (musl reads `r0 < 0` as `-errno`).
@@ -60,15 +69,16 @@ pub const fn neg_errno(e: u64) -> u64 {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-/// Inputs to one dispatch decision. `arg1` and `arg2` are the next two
-/// message words after the syscall number; their meaning depends on `nr`
-/// (e.g. for `write`, `arg1` is fd and `arg2` is byte count in the
-/// shared buffer).
+/// Inputs to one dispatch decision. `arg1`, `arg2`, `arg3` are the
+/// next three message words after the syscall number; their meaning
+/// depends on `nr` (e.g. for `write`, `arg1` is fd and `arg2` is byte
+/// count in the shared buffer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DispatchInputs {
     pub nr: u64,
     pub arg1: u64,
     pub arg2: u64,
+    pub arg3: u64,
 }
 
 /// What the personality server should do in response to one syscall.
@@ -92,6 +102,20 @@ pub enum Action {
     /// variant (rather than a plain `Reply`) so the diagnostic survives
     /// the pure-dispatch boundary.
     Unknown { nr: u64 },
+    /// Linux `openat`. Path bytes live in the client's shared buffer
+    /// for `path_len` bytes (musl's shim writes them there before
+    /// calling). `dirfd` is currently ignored — Phase F treats every
+    /// path as resolved against the FS server's root regardless of
+    /// dirfd. `flags` is the Linux open(2) flags word.
+    FileOpen { dirfd: u64, path_len: u64, flags: u64 },
+    /// Linux `read(fd, _, len)`. The server reads up to `len` bytes
+    /// from the FS handle backing `fd` into the *client's* shared
+    /// buffer (one copy via the FS-server's per-handle buffer), then
+    /// replies with the byte count.
+    FileRead { fd: u64, len: u64 },
+    /// Linux `close(fd)`. Server forwards to the FS server, drops
+    /// the FD entry, replies 0 on success or -EBADF on bad fd.
+    FileClose { fd: u64 },
 }
 
 /// Pure decision: classify one received syscall message into an
@@ -122,6 +146,28 @@ pub fn dispatch(inp: &DispatchInputs) -> Action {
         NR_SET_TID_ADDRESS => Action::Reply { words: [1, 0, 0, 0] },
 
         NR_IOCTL => Action::Reply { words: [neg_errno(ENOTTY), 0, 0, 0] },
+
+        NR_OPENAT => {
+            // arg1 = dirfd, arg2 = path_len (in shared buffer), arg3 = flags.
+            // Path-length cap matches the shared buffer size (PAGE_SIZE).
+            // Empty path is a protocol violation from the shim — reject
+            // here rather than letting the FS server return NotFound.
+            if inp.arg2 == 0 || inp.arg2 > PAGE_SIZE {
+                return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+            Action::FileOpen { dirfd: inp.arg1, path_len: inp.arg2, flags: inp.arg3 }
+        }
+
+        NR_READ => {
+            // arg1 = fd, arg2 = byte count to read into the shared buffer.
+            // len cap matches the shared buffer size.
+            if inp.arg2 > PAGE_SIZE {
+                return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+            Action::FileRead { fd: inp.arg1, len: inp.arg2 }
+        }
+
+        NR_CLOSE => Action::FileClose { fd: inp.arg1 },
 
         nr => Action::Unknown { nr },
     }
@@ -324,7 +370,11 @@ mod tests {
     use crate::elf::{LoadSegment, MAX_SEGMENTS};
 
     fn inp(nr: u64, arg1: u64, arg2: u64) -> DispatchInputs {
-        DispatchInputs { nr, arg1, arg2 }
+        DispatchInputs { nr, arg1, arg2, arg3: 0 }
+    }
+
+    fn inp4(nr: u64, arg1: u64, arg2: u64, arg3: u64) -> DispatchInputs {
+        DispatchInputs { nr, arg1, arg2, arg3 }
     }
 
     fn read_u64(buf: &[u8], offset: usize) -> u64 {
@@ -494,6 +544,98 @@ mod tests {
         assert_eq!(neg_errno(EBADF), (-9i64) as u64);
         assert_eq!(neg_errno(ENOSYS), (-38i64) as u64);
         assert_eq!(neg_errno(EINVAL), (-22i64) as u64);
+    }
+
+    // ---- Phase 1 file syscalls (openat / read / close) ----
+
+    #[test]
+    fn openat_decoded_with_dirfd_pathlen_flags() {
+        let action = dispatch(&inp4(NR_OPENAT, /*dirfd=*/0xFFFFFFFFFFFFFF9C, /*path_len=*/10, /*flags=*/0));
+        assert_eq!(
+            action,
+            Action::FileOpen { dirfd: 0xFFFFFFFFFFFFFF9C, path_len: 10, flags: 0 },
+        );
+    }
+
+    #[test]
+    fn openat_zero_path_len_is_einval() {
+        // Empty path is a protocol violation from the shim — caught here
+        // rather than passed to the FS server.
+        assert_eq!(
+            dispatch(&inp4(NR_OPENAT, 0, 0, 0)),
+            Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn openat_path_too_long_is_einval() {
+        // path_len > PAGE_SIZE can't fit in the shim's shared buffer.
+        assert_eq!(
+            dispatch(&inp4(NR_OPENAT, 0, PAGE_SIZE + 1, 0)),
+            Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn openat_flags_plumbed_through() {
+        let action = dispatch(&inp4(NR_OPENAT, 0, 5, 0xCAFE));
+        assert_eq!(
+            action,
+            Action::FileOpen { dirfd: 0, path_len: 5, flags: 0xCAFE },
+        );
+    }
+
+    #[test]
+    fn read_decoded_with_fd_and_len() {
+        assert_eq!(
+            dispatch(&inp(NR_READ, 3, 1024)),
+            Action::FileRead { fd: 3, len: 1024 },
+        );
+    }
+
+    #[test]
+    fn read_zero_length_decoded() {
+        // read(_, 0) is legal; returns 0 bytes.
+        assert_eq!(
+            dispatch(&inp(NR_READ, 3, 0)),
+            Action::FileRead { fd: 3, len: 0 },
+        );
+    }
+
+    #[test]
+    fn read_at_page_size_boundary_ok() {
+        assert_eq!(
+            dispatch(&inp(NR_READ, 3, PAGE_SIZE)),
+            Action::FileRead { fd: 3, len: PAGE_SIZE },
+        );
+    }
+
+    #[test]
+    fn read_past_page_size_is_einval() {
+        // Same shared-buffer cap as write.
+        assert_eq!(
+            dispatch(&inp(NR_READ, 3, PAGE_SIZE + 1)),
+            Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn close_decoded_with_fd() {
+        assert_eq!(
+            dispatch(&inp(NR_CLOSE, 5, 0)),
+            Action::FileClose { fd: 5 },
+        );
+    }
+
+    #[test]
+    fn close_doesnt_validate_fd_at_dispatch() {
+        // The dispatch layer doesn't know which fds are open — it just
+        // emits the action and the runtime decides. fd 0 (stdin) is a
+        // valid close request shape; the runtime side rejects it.
+        assert_eq!(
+            dispatch(&inp(NR_CLOSE, 0, 0)),
+            Action::FileClose { fd: 0 },
+        );
     }
 
     // ---- write_linux_stack ----
