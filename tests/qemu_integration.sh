@@ -179,11 +179,15 @@ assert_contains "\[FAT32-TEST\] opened /HELLO.TXT" "fat32-test opened /HELLO.TXT
 assert_contains "\[FAT32-TEST\] read 17 bytes: hello from fat32" "fat32-test read HELLO.TXT contents via FS IPC"
 assert_contains "\[FAT32-TEST\] done" "fat32-test completed cleanly"
 
-echo "Phase 16 — POSIX Personality (Phase 0):"
+echo "Phase 16 — POSIX Personality (Phase 0 + Phase 1):"
 assert_contains "posix-server: starting" "posix-server started"
 assert_contains "posix-server: posix-hello spawned OK" "posix-server spawned musl child"
 assert_contains "posix-server: POSIX_INIT OK" "POSIX_INIT bootstrap handshake completed"
 assert_contains "hello, lockjaw" "musl puts() reached kernel UART (Phase 0 gate)"
+# Phase 1 gate via the musl path: hello.c does fopen("/HELLO.TXT") +
+# fread + printf. Exercises the full stack: musl libc -> shim -> posix-server
+# -> FsClient -> fat32-server -> BlockClient -> virtio-blk -> QEMU disk.
+assert_contains "posix-hello: hello from fat32" "musl read FAT32 file via posix-server (Phase 1 gate)"
 assert_contains "posix-server: child exit" "posix-server saw child exit_group"
 assert_contains "posix-server: done" "posix-server dispatch loop terminated cleanly"
 

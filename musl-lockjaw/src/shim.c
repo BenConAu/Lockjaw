@@ -28,6 +28,8 @@
 #define PAGE_SIZE   4096UL
 
 /* Linux syscall numbers (aarch64) */
+#define __NR_openat      56
+#define __NR_read        63
 #define __NR_write       64
 #define __NR_writev      66
 #define __NR_brk        214
@@ -278,6 +280,12 @@ static void shim_memcpy(volatile char *dst, const char *src, long n) {
         dst[i] = src[i];
 }
 
+/* Read direction: shared buffer (volatile) -> user buffer (plain). */
+static void shim_memcpy_from_shared(char *dst, const volatile char *src, long n) {
+    for (long i = 0; i < n; i++)
+        dst[i] = src[i];
+}
+
 /* ---------- Main entry point ---------- */
 
 /*
@@ -298,6 +306,31 @@ long lockjaw_syscall(long n, long a, long b, long c,
         long len = c > (long)PAGE_SIZE ? (long)PAGE_SIZE : c;
         shim_memcpy(shared_buf, (const char *)b, len);
         return lj_call(0, reply_handle, n, a, len, 0);
+    }
+
+    /* openat(dirfd, path, flags, mode): copy path into shared buffer,
+     * forward (dirfd, path_len, flags) to the personality server.
+     * mode is ignored (Phase 1 is read-only; the dispatch layer
+     * rejects O_CREAT etc. with -EROFS up front). */
+    if (n == __NR_openat) {
+        const char *path = (const char *)b;
+        long path_len = 0;
+        while (path[path_len] && path_len < (long)PAGE_SIZE)
+            path_len++;
+        shim_memcpy(shared_buf, path, path_len);
+        return lj_call(0, reply_handle, n, a, path_len, c);
+    }
+
+    /* read(fd, buf, len): server reads file into shared buffer; on
+     * success, copy from shared buffer into user buf. Cap len at
+     * PAGE_SIZE (the personality server caps it the same way). */
+    if (n == __NR_read) {
+        long len = c > (long)PAGE_SIZE ? (long)PAGE_SIZE : c;
+        long ret = lj_call(0, reply_handle, n, a, len, 0);
+        if (ret > 0) {
+            shim_memcpy_from_shared((char *)b, shared_buf, ret);
+        }
+        return ret;
     }
 
     /* writev(fd, iov, iovcnt): gather into shared buffer, cap at PAGE_SIZE */

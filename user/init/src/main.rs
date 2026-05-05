@@ -152,22 +152,37 @@ fn spawn_elf(
         Err(_) => { puts("init: elf load plan FAILED\n"); return false; }
     };
 
-    // Apply each entry: allocate, temp-map, zero, copy file slice at the
-    // correct in-page offset, register a ProcessMapping at page_va.
+    // Allocate ONE PageSet for ALL of the child's segment pages. Each
+    // ProcessMapping then references this PageSet at a different
+    // page_index. This consumes a single header slot in
+    // ProcessTransferPlan rather than one per page, which matters
+    // because the plan's MAX_CONSUMED_HEADERS cap is 32 — well below
+    // the page count of larger binaries (e.g. posix-server with the
+    // embedded musl hello binary spans ~42 pages and would exhaust
+    // the cap if each page was its own PageSet).
+    let page_count = plan.page_count();
+    let segs_ps = match sys_alloc_pages(page_count as u64) {
+        Ok(id) => id,
+        Err(_) => { puts("init: alloc segments PageSet FAILED\n"); return false; }
+    };
+    if !sys_map_pages(segs_ps, temp_base_va, 0).is_ok() {
+        puts("init: map segments PageSet FAILED\n");
+        return false;
+    }
+
+    // Zero the entire mapped range up front. sys_alloc_pages doesn't
+    // guarantee zeroed pages, and we may leave gaps inside pages
+    // (in_page_offset != 0, file_size < PAGE_SIZE) that would
+    // otherwise leak whatever stale data was there.
+    for i in 0..page_count {
+        unsafe { zero_page_at_va(temp_base_va + (i as u64) * PAGE_SIZE); }
+    }
+
+    // Apply each entry: copy its file slice at the correct in-page
+    // offset and register a ProcessMapping at the entry's page_va,
+    // using the same segs_ps PageSet with the entry index as page_index.
     for (i, entry) in plan.entries().iter().enumerate() {
-        let ps_id = match sys_alloc_pages(1) {
-            Ok(id) => id,
-            Err(_) => { puts("init: alloc for segment FAILED\n"); return false; }
-        };
-
         let temp_va: u64 = temp_base_va + (i as u64) * PAGE_SIZE;
-        if !sys_map_pages(ps_id, temp_va, 0).is_ok() {
-            puts("init: map for segment FAILED\n");
-            return false;
-        }
-
-        unsafe { zero_page_at_va(temp_va); }
-
         let (src_start, src_end) = entry.src_file_range;
         if src_end > src_start {
             unsafe {
@@ -182,13 +197,13 @@ fn spawn_elf(
         unsafe {
             core::ptr::write(map_array.add(i), ProcessMapping {
                 virt_addr: entry.page_va,
-                pageset_id: ps_id.0,
-                page_index: 0,
+                pageset_id: segs_ps.0,
+                page_index: i as u64,
                 flags: if entry.executable { FLAG_EXECUTABLE } else { 0 },
             });
         }
     }
-    let mapping_count = plan.page_count();
+    let mapping_count = page_count;
 
     let stack_ps = match sys_alloc_pages(stack_pages) {
         Ok(id) => id,
