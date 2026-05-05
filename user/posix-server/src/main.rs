@@ -10,12 +10,16 @@ static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
 use lockjaw_userlib::*;
 use lockjaw_userlib::elf::parse_elf;
+use lockjaw_userlib::fs::{FsClient, FsError};
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_types::constants::USER_STACK_BASE;
+use lockjaw_types::fs::FS_MAX_INLINE_PATH;
+use lockjaw_types::posix_fd::{FdEntry, FdKind, FdTable, FD_STDIN, MAX_FDS};
 use lockjaw_userlib::elf_loader::{plan_elf_load, ElfLoadEntry};
 use lockjaw_types::posix::{
     compute_va_layout, dispatch, neg_errno, write_linux_stack, Action, DispatchInputs,
-    StackInputs, ENOSYS, STACK_LAYOUT_FIXED_BYTES,
+    StackInputs, EBADF, EINVAL, EIO, EISDIR, EMFILE, ENOENT, ENOMEM, ENOSYS, ENOTDIR,
+    STACK_LAYOUT_FIXED_BYTES,
 };
 
 /// Pre-built statically-linked musl hello binary.
@@ -157,6 +161,276 @@ fn write_stack_layout(stack_va: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-FD file-resource tracking (kernel side of the FS handle)
+// ---------------------------------------------------------------------------
+
+/// Resources held server-side for one open POSIX fd. Mirrors the
+/// FdTable slot but holds `lockjaw-userlib`-typed PageSetHandle that
+/// can't live in the pure `lockjaw-types::posix_fd::FdEntry`. The
+/// pair (FdTable, file_resources) is updated together — see
+/// `open_fd` / `close_fd` helpers.
+#[derive(Clone, Copy)]
+struct FileResource {
+    /// fat32-server's per-handle PageSet (in this process's table).
+    buffer_pageset: PageSetHandle,
+    /// Where this server has the buffer mapped.
+    buffer_va: u64,
+    /// Buffer size in bytes (≤ PAGE_SIZE for now).
+    buffer_size: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Deferred remote-close queue
+// ---------------------------------------------------------------------------
+
+/// Max in-flight remote handles waiting on retry from a failed
+/// rollback `fs.close()`. Bounded so a runaway transport failure
+/// halts the personality server (loudly) rather than leaking
+/// indefinitely.
+const MAX_DEFERRED_CLOSES: usize = 4;
+
+/// Push a server handle onto the retry queue. Returns Err if the
+/// queue is already full (signalling the dispatch loop to halt —
+/// continuing would silently leak fat32-server slots).
+fn defer_close(
+    deferred: &mut [Option<u32>; MAX_DEFERRED_CLOSES],
+    handle: u32,
+) -> Result<(), ()> {
+    for slot in deferred.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(handle);
+            return Ok(());
+        }
+    }
+    Err(())
+}
+
+/// Try once to close every queued handle. Successful closes leave
+/// the slot empty for reuse; failures are left in place for the
+/// next iteration. Called at the top of the dispatch loop.
+fn drain_deferred_closes(
+    fs: &FsClient,
+    deferred: &mut [Option<u32>; MAX_DEFERRED_CLOSES],
+) {
+    for slot in deferred.iter_mut() {
+        if let Some(h) = *slot {
+            if fs.close(h).is_ok() {
+                *slot = None;
+            }
+        }
+    }
+}
+
+/// Wrap `fs.close()` so a transport failure schedules a retry
+/// instead of leaking the remote slot. Local resources (pageset
+/// handle, VA) are independent of the remote close — the caller
+/// frees those itself before invoking this helper.
+fn close_remote_or_defer(
+    fs: &FsClient,
+    deferred: &mut [Option<u32>; MAX_DEFERRED_CLOSES],
+    server_handle: u32,
+) {
+    if fs.close(server_handle).is_ok() {
+        return;
+    }
+    if defer_close(deferred, server_handle).is_err() {
+        puts("posix: deferred-close queue full; halting\n");
+        halt();
+    }
+}
+
+/// Map FsError → POSIX errno.
+fn fs_error_to_errno(e: FsError) -> u64 {
+    match e {
+        FsError::NotFound => neg_errno(ENOENT),
+        FsError::IsDirectory => neg_errno(EISDIR),
+        FsError::NotDirectory => neg_errno(ENOTDIR),
+        FsError::TooManyOpen => neg_errno(EMFILE),
+        FsError::AllocFailed => neg_errno(ENOMEM),
+        FsError::Io => neg_errno(EIO),
+        FsError::PathTooLong
+            | FsError::Invalid
+            | FsError::InvalidBufferPages
+            | FsError::Unknown
+            | FsError::IpcFailed => neg_errno(EINVAL),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 file-syscall handlers
+// ---------------------------------------------------------------------------
+
+fn handle_file_open(
+    fs: &FsClient,
+    fd_table: &mut FdTable,
+    file_resources: &mut [Option<FileResource>; MAX_FDS],
+    deferred: &mut [Option<u32>; MAX_DEFERRED_CLOSES],
+    server_shared_va: u64,
+    path_len: u64,
+    flags: u64,
+) {
+    if server_shared_va == 0 {
+        // openat before POSIX_INIT — protocol violation.
+        sys_reply(neg_errno(EINVAL), 0, 0, 0);
+        return;
+    }
+    if path_len == 0 || path_len > FS_MAX_INLINE_PATH as u64 {
+        // Phase F caps paths at FS_MAX_INLINE_PATH (16 bytes); longer
+        // paths need the future capability-passing extension.
+        sys_reply(neg_errno(EINVAL), 0, 0, 0);
+        return;
+    }
+    // SAFETY: server_shared_va is the personality server's mapping
+    // of the per-client shared buffer; the shim wrote `path_len`
+    // bytes there before calling. path_len ≤ FS_MAX_INLINE_PATH ≤
+    // PAGE_SIZE, so the slice is in-bounds.
+    let path: &[u8] = unsafe {
+        core::slice::from_raw_parts(server_shared_va as *const u8, path_len as usize)
+    };
+
+    let opened = match fs.open(path, 1) {
+        Ok(o) => o,
+        Err(e) => { sys_reply(fs_error_to_errno(e), 0, 0, 0); return; }
+    };
+
+    // Past this point, every failure path must release the remote
+    // FS handle via close_remote_or_defer (which schedules a retry
+    // if fs.close fails) so we don't leak fat32-server open-file
+    // slots when local setup fails.
+
+    // Map the per-handle buffer locally so we can read from it on
+    // FileRead (then copy into the client's shared buffer).
+    let buffer_va = match VMEM.alloc(1) {
+        Some(va) => va,
+        None => {
+            let _ = sys_close_handle(opened.pageset);
+            close_remote_or_defer(fs, deferred, opened.handle);
+            sys_reply(neg_errno(ENOMEM), 0, 0, 0);
+            return;
+        }
+    };
+    if !sys_map_pages(opened.pageset, buffer_va, 0).is_ok() {
+        let _ = sys_close_handle(opened.pageset);
+        VMEM.free(buffer_va, 1);
+        close_remote_or_defer(fs, deferred, opened.handle);
+        sys_reply(neg_errno(ENOMEM), 0, 0, 0);
+        return;
+    }
+
+    let fd = match fd_table.alloc(FdEntry::file(opened.handle, flags as u32)) {
+        Ok(fd) => fd,
+        Err(_) => {
+            let _ = sys_unmap_pages(opened.pageset, buffer_va);
+            let _ = sys_close_handle(opened.pageset);
+            VMEM.free(buffer_va, 1);
+            close_remote_or_defer(fs, deferred, opened.handle);
+            sys_reply(neg_errno(EMFILE), 0, 0, 0);
+            return;
+        }
+    };
+    file_resources[fd as usize] = Some(FileResource {
+        buffer_pageset: opened.pageset,
+        buffer_va,
+        buffer_size: opened.buffer_size,
+    });
+    sys_reply(fd as u64, 0, 0, 0);
+}
+
+fn handle_file_read(
+    fs: &FsClient,
+    fd_table: &FdTable,
+    file_resources: &[Option<FileResource>; MAX_FDS],
+    server_shared_va: u64,
+    fd: u64,
+    len: u64,
+) {
+    if server_shared_va == 0 {
+        // read before POSIX_INIT — there's no shared buffer to copy
+        // bytes back to. Reject with EINVAL rather than dereferencing
+        // VA 0 in the copy_nonoverlapping below.
+        sys_reply(neg_errno(EINVAL), 0, 0, 0);
+        return;
+    }
+    let entry = match fd_table.lookup(fd as u32) {
+        Some(e) => *e,
+        None => { sys_reply(neg_errno(EBADF), 0, 0, 0); return; }
+    };
+    match entry.kind {
+        FdKind::Stdio => {
+            // Phase F: stdin returns EOF; reading from stdout/stderr
+            // is EBADF. (Linux returns EBADF for read on a write-only
+            // fd, which stdout/stderr effectively are here.)
+            let r = if fd == FD_STDIN as u64 { 0 } else { neg_errno(EBADF) };
+            sys_reply(r, 0, 0, 0);
+        }
+        FdKind::File => {
+            let resource = match &file_resources[fd as usize] {
+                Some(r) => *r,
+                None => { sys_reply(neg_errno(EBADF), 0, 0, 0); return; }
+            };
+            let cap = (len as u32).min(resource.buffer_size).min(PAGE_SIZE as u32);
+            let bytes_returned = match fs.read(entry.server_handle, cap) {
+                Ok(n) => n,
+                Err(e) => { sys_reply(fs_error_to_errno(e), 0, 0, 0); return; }
+            };
+            // Copy from per-handle buffer to client's shared buffer
+            // so the shim can deliver the data to the user buf.
+            // SAFETY: both source and dest are mapped pages this
+            // process owns; bytes_returned ≤ buffer_size ≤ PAGE_SIZE.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    resource.buffer_va as *const u8,
+                    server_shared_va as *mut u8,
+                    bytes_returned as usize,
+                );
+            }
+            sys_reply(bytes_returned as u64, 0, 0, 0);
+        }
+    }
+}
+
+fn handle_file_close(
+    fs: &FsClient,
+    fd_table: &mut FdTable,
+    file_resources: &mut [Option<FileResource>; MAX_FDS],
+    fd: u64,
+) {
+    let entry = match fd_table.lookup(fd as u32) {
+        Some(e) => *e,
+        None => { sys_reply(neg_errno(EBADF), 0, 0, 0); return; }
+    };
+    match entry.kind {
+        FdKind::Stdio => {
+            // Phase F protects stdio from being closed; musl wouldn't
+            // normally close fd 1/2 itself, but a buggy program might.
+            sys_reply(neg_errno(EBADF), 0, 0, 0);
+        }
+        FdKind::File => {
+            // Close the remote handle FIRST so a transport failure
+            // doesn't leak the fat32-server open-file slot. If the
+            // remote close fails, the local fd stays live and the
+            // caller sees the error — a retry can drive the close
+            // through later. Otherwise our small server-side
+            // open-file table would silently fill up.
+            if let Err(e) = fs.close(entry.server_handle) {
+                sys_reply(fs_error_to_errno(e), 0, 0, 0);
+                return;
+            }
+            // Remote handle is gone; only now drop our side.
+            // close() can only fail with StdioClosed (handled above)
+            // or BadFd (we just looked it up). Either is unreachable.
+            let _ = fd_table.close(fd as u32);
+            if let Some(r) = file_resources[fd as usize].take() {
+                let _ = sys_unmap_pages(r.buffer_pageset, r.buffer_va);
+                let _ = sys_close_handle(r.buffer_pageset);
+                VMEM.free(r.buffer_va, 1);
+            }
+            sys_reply(0, 0, 0, 0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Side effects for dispatch actions
 // ---------------------------------------------------------------------------
 
@@ -165,7 +439,17 @@ fn write_stack_layout(stack_va: u64) {
 /// Splitting the read pointer / length / reply value out of the action lets
 /// `dispatch` decide policy (which fds are valid, length cap) without
 /// pulling syscalls into lockjaw-types.
+///
+/// Rejects writes that arrive before POSIX_INIT (server_shared_va == 0)
+/// — without the guard, the unsafe slice below would read from VA 0
+/// and the kernel would fault. Per the comment on dispatch's write
+/// arm, this is a protocol violation; reporting EINVAL is friendlier
+/// than crashing the personality server.
 fn apply_emit_from_shared(server_shared_va: u64, len: u64, then_reply: u64) {
+    if server_shared_va == 0 {
+        sys_reply(neg_errno(EINVAL), 0, 0, 0);
+        return;
+    }
     // SAFETY: server_shared_va is the personality server's mapping of
     // the shared buffer; the child wrote `len` bytes there before the
     // IPC and is blocked waiting on our reply, so the buffer is stable
@@ -190,10 +474,12 @@ pub extern "C" fn _start() -> ! {
         Ok(h) => h,
         Err(_) => { puts("posix: reply alloc FAILED\n"); halt(); }
     };
-    if sys_call_ret4(bootstrap_endpoint(), reply, 0, 0, 0, 0).is_err() {
-        puts("posix: bootstrap call FAILED\n");
-        halt();
-    }
+    let bootstrap = match sys_call_ret4(bootstrap_endpoint(), reply, 0, 0, 0, 0) {
+        Ok(r) => r,
+        Err(_) => { puts("posix: bootstrap call FAILED\n"); halt(); }
+    };
+    let fs_ep = EndpointHandle(bootstrap[0]);
+    let fs = FsClient::new(fs_ep, reply);
     puts("[BOOTSTRAP] posix-server\n");
 
     // --- Parse embedded POSIX binary ---
@@ -286,8 +572,16 @@ pub extern "C" fn _start() -> ! {
 
     // --- Syscall dispatch loop ---
     let mut server_shared_va: u64 = 0;
+    let mut fd_table = FdTable::with_stdio();
+    let mut file_resources: [Option<FileResource>; MAX_FDS] = [None; MAX_FDS];
+    let mut deferred_closes: [Option<u32>; MAX_DEFERRED_CLOSES] = [None; MAX_DEFERRED_CLOSES];
 
     loop {
+        // Retry any FS handles whose close failed in a previous open
+        // rollback. Local resources for these were already freed; only
+        // the remote slot is still alive.
+        drain_deferred_closes(&fs, &mut deferred_closes);
+
         let msg = match sys_receive_ret4(syscall_ep) {
             Ok(m) => m,
             Err(_) => { puts("posix: receive FAILED\n"); halt(); }
@@ -347,11 +641,20 @@ pub extern "C" fn _start() -> ! {
                 sys_reply(neg_errno(ENOSYS), 0, 0, 0);
             }
 
-            // F.1: dispatch decisions added; runtime handlers wired
-            // up in F.2. For now, reply -ENOSYS so a misconfigured
-            // musl program calling these doesn't hang.
-            Action::FileOpen { .. } | Action::FileRead { .. } | Action::FileClose { .. } => {
-                sys_reply(neg_errno(ENOSYS), 0, 0, 0);
+            Action::FileOpen { dirfd: _, path_len, flags } => {
+                handle_file_open(
+                    &fs, &mut fd_table, &mut file_resources, &mut deferred_closes,
+                    server_shared_va, path_len, flags,
+                );
+            }
+            Action::FileRead { fd, len } => {
+                handle_file_read(
+                    &fs, &fd_table, &file_resources,
+                    server_shared_va, fd, len,
+                );
+            }
+            Action::FileClose { fd } => {
+                handle_file_close(&fs, &mut fd_table, &mut file_resources, fd);
             }
         }
     }

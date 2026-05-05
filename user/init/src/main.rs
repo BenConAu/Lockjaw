@@ -505,10 +505,15 @@ pub extern "C" fn _start() -> ! {
     sys_reply(fat32_test_idx, 0, 0, 0);
     puts("[BOOTSTRAP] fat32-test\n");
 
-    // Bootstrap posix-server: no handles to export, just acknowledge.
+    // Bootstrap posix-server: export fs_srv_ep so it can forward
+    // Phase 1 syscalls (openat / read / close) to fat32-server.
     puts("init: waiting for posix-server bootstrap...\n");
     let _ = sys_receive(posix_boot_ep);
-    sys_reply(0, 0, 0, 0);
+    let posix_fs_idx = match sys_export_handle(fat32_srv_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export fs to posix-server FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(posix_fs_idx, 0, 0, 0);
     puts("[BOOTSTRAP] posix-server\n");
 
     // Allocate a Reply object for init's own outbound calls (ipc_puts to

@@ -58,6 +58,26 @@ pub const EIO: u64 = 5;
 pub const ENOENT: u64 = 2;
 pub const ENOTDIR: u64 = 20;
 pub const EISDIR: u64 = 21;
+pub const EROFS: u64 = 30;
+
+// ---------------------------------------------------------------------------
+// Linux open(2) flags (subset relevant to Phase 1 read-only validation).
+// ---------------------------------------------------------------------------
+
+/// Access-mode mask covering O_RDONLY / O_WRONLY / O_RDWR.
+pub const O_ACCMODE: u64 = 0o3;
+pub const O_RDONLY: u64 = 0o0;
+pub const O_WRONLY: u64 = 0o1;
+pub const O_RDWR: u64 = 0o2;
+
+pub const O_CREAT: u64 = 0o100;
+pub const O_EXCL: u64 = 0o200;
+pub const O_TRUNC: u64 = 0o1000;
+pub const O_APPEND: u64 = 0o2000;
+
+/// Bitmask of open flags that require write capability. Phase 1's
+/// read-only filesystem rejects any open() with these set.
+pub const WRITE_OPEN_FLAGS: u64 = O_CREAT | O_EXCL | O_TRUNC | O_APPEND;
 
 /// Encode a positive errno as the negative-errno return value Linux's
 /// syscall ABI uses (musl reads `r0 < 0` as `-errno`).
@@ -154,6 +174,16 @@ pub fn dispatch(inp: &DispatchInputs) -> Action {
             // here rather than letting the FS server return NotFound.
             if inp.arg2 == 0 || inp.arg2 > PAGE_SIZE {
                 return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+            // Phase 1 is read-only. Reject access modes other than
+            // O_RDONLY and any write-touching flag. Writing programs
+            // should see EROFS up-front rather than getting an fd
+            // they can't actually write to.
+            if inp.arg3 & O_ACCMODE != O_RDONLY {
+                return Action::Reply { words: [neg_errno(EROFS), 0, 0, 0] };
+            }
+            if inp.arg3 & WRITE_OPEN_FLAGS != 0 {
+                return Action::Reply { words: [neg_errno(EROFS), 0, 0, 0] };
             }
             Action::FileOpen { dirfd: inp.arg1, path_len: inp.arg2, flags: inp.arg3 }
         }
@@ -578,10 +608,80 @@ mod tests {
 
     #[test]
     fn openat_flags_plumbed_through() {
-        let action = dispatch(&inp4(NR_OPENAT, 0, 5, 0xCAFE));
+        // High bits (above O_ACCMODE / WRITE_OPEN_FLAGS) are harmless
+        // and pass through. We use a bit value that doesn't collide
+        // with any of the rejected flags.
+        let harmless = 1u64 << 20; // O_CLOEXEC = 0o2000000 — same kind of bit
+        let action = dispatch(&inp4(NR_OPENAT, 0, 5, harmless));
         assert_eq!(
             action,
-            Action::FileOpen { dirfd: 0, path_len: 5, flags: 0xCAFE },
+            Action::FileOpen { dirfd: 0, path_len: 5, flags: harmless },
+        );
+    }
+
+    #[test]
+    fn openat_o_wronly_is_erofs() {
+        assert_eq!(
+            dispatch(&inp4(NR_OPENAT, 0, 5, O_WRONLY)),
+            Action::Reply { words: [neg_errno(EROFS), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn openat_o_rdwr_is_erofs() {
+        assert_eq!(
+            dispatch(&inp4(NR_OPENAT, 0, 5, O_RDWR)),
+            Action::Reply { words: [neg_errno(EROFS), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn openat_o_creat_is_erofs() {
+        assert_eq!(
+            dispatch(&inp4(NR_OPENAT, 0, 5, O_CREAT)),
+            Action::Reply { words: [neg_errno(EROFS), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn openat_o_trunc_is_erofs() {
+        assert_eq!(
+            dispatch(&inp4(NR_OPENAT, 0, 5, O_TRUNC)),
+            Action::Reply { words: [neg_errno(EROFS), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn openat_o_append_is_erofs() {
+        assert_eq!(
+            dispatch(&inp4(NR_OPENAT, 0, 5, O_APPEND)),
+            Action::Reply { words: [neg_errno(EROFS), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn openat_o_excl_is_erofs() {
+        assert_eq!(
+            dispatch(&inp4(NR_OPENAT, 0, 5, O_EXCL)),
+            Action::Reply { words: [neg_errno(EROFS), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn openat_rdonly_with_creat_still_erofs() {
+        // O_RDONLY by itself is fine; combined with O_CREAT it isn't.
+        assert_eq!(
+            dispatch(&inp4(NR_OPENAT, 0, 5, O_RDONLY | O_CREAT)),
+            Action::Reply { words: [neg_errno(EROFS), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn openat_pure_rdonly_zero_flags_accepted() {
+        // O_RDONLY == 0 is the most common shape from fopen("r").
+        assert_eq!(
+            dispatch(&inp4(NR_OPENAT, 0, 10, O_RDONLY)),
+            Action::FileOpen { dirfd: 0, path_len: 10, flags: O_RDONLY },
         );
     }
 
