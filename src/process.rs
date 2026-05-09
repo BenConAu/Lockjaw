@@ -58,9 +58,12 @@ impl Drop for Ttbr0Guard {
 /// a time, constant stack usage), resolves PageSet IDs to physical addresses,
 /// creates the address space, TCB, and schedules the new thread.
 ///
-/// PageSet consumption (the destructive transfer of ownership from parent
-/// to child) happens LAST, after all fallible steps have succeeded. This
-/// ensures the parent retains its handles if any step fails.
+/// Two-phase: validate (all fallible work, no destructive mutation) then
+/// apply (all infallible commits). If any validate step fails the parent
+/// is unchanged; if validate succeeds apply runs to completion. The
+/// child's handle table is allocated empty in validate and the
+/// parent_handle_to_copy slot is inserted in apply, AFTER all consumes,
+/// so the not-yet-scheduled child does not participate in revoke walks.
 pub fn create_process(
     addr_space: &UserAddressSpace,
     mappings_va: u64,
@@ -71,6 +74,7 @@ pub fn create_process(
     parent_handle_to_copy: u64,
     name: [u8; 16],
 ) -> Result<(), &'static str> {
+    // ============ Validate phase: all fallible work ============
     // Look up stack and scratch PageSets from handle table.
     // These are handle indices, not raw pageset IDs.
     let ht = CurrentThread::handle_table();
@@ -80,6 +84,29 @@ pub fn create_process(
         .map_err(|_| "invalid stack handle")?;
     // SAFETY: object_paddr from a PageSet handle — valid header page.
     let stack_ps = unsafe { PageSetRef::from_header_paddr(stack_entry.object_paddr) };
+
+    // Resolve parent_handle_to_copy in validate phase. The actual
+    // child-table insertion runs in apply (step 6) so the
+    // not-yet-scheduled child stays out of revoke accounting.
+    //
+    // PageSet kind is rejected here: process.rs:246-277's existing
+    // copy logic inserts without inc_refcount, which would underflow
+    // refcount the first time anyone closes the parent handle and
+    // would let the data pages outlive their accounting. Clean fix
+    // is sys_export_handle (which DOES inc_refcount); the parent
+    // can call it from userspace if PageSet transfer is needed.
+    let parent_copy_entry = if parent_handle_to_copy != u64::MAX {
+        let entry = CurrentThread::handle_table().lookup_any(
+            parent_handle_to_copy as u32,
+            crate::cap::rights::Rights::none(),
+        ).map_err(|_| "parent handle lookup failed")?;
+        if matches!(entry.kind, lockjaw_types::object::HandleKind::PageSet { .. }) {
+            return Err("parent_handle_to_copy: PageSet kind not supported (use sys_export_handle)");
+        }
+        Some(entry)
+    } else {
+        None
+    };
 
     // Use the caller-provided scratch pages as the Mapping buffer.
     let scratch_entry = ht.lookup(scratch_pageset_id as u32,
@@ -241,41 +268,6 @@ pub fn create_process(
     // First thread — increment via narrow op (count 0 → 1)
     crate::cap::process_obj::process_inc_thread_count(proc_guard.addr());
 
-    // Copy a handle from the parent's table into the child's table.
-    // This is the simplest form of capability transfer at process creation.
-    if parent_handle_to_copy != u64::MAX {
-        let parent_ht = CurrentThread::handle_table();
-        let entry = parent_ht.lookup_any(
-            parent_handle_to_copy as u32,
-            crate::cap::rights::Rights::none(),
-        ).map_err(|_| "parent handle lookup failed")?;
-
-        // For Endpoint handles: assign a caller token so the child can
-        // send/call on this handle. Same logic as sys_export_handle:
-        // token==0 → fresh from endpoint counter, nonzero → copy (lineage).
-        let child_kind = match entry.kind {
-            lockjaw_types::object::HandleKind::Endpoint { caller_token } if caller_token == 0 => {
-                let mut ep = unsafe {
-                    crate::mm::kernel_ptr::KernelMut::<crate::ipc::endpoint::EndpointObject>::from_paddr(
-                        PhysAddr::new(entry.object_paddr),
-                    )
-                };
-                let token = ep.get().next_token;
-                ep.get_mut().next_token = token + 1;
-                lockjaw_types::object::HandleKind::Endpoint { caller_token: token }
-            }
-            other => other,
-        };
-
-        // SAFETY: ht_guard was just initialized as a valid handle table above.
-        let child_ht = unsafe { HandleTableRef::from_paddr(ht_guard.addr()) };
-        child_ht.insert(
-            PhysAddr::new(entry.object_paddr),
-            entry.rights,
-            child_kind,
-        ).map_err(|_| "child handle insert failed")?;
-    }
-
     // Create TCB — first thread in this process
     let mut tcb_stack_guard = PageGuard::new(
         page_alloc::alloc_page().ok_or("out of pages for TCB stack")?
@@ -301,57 +293,86 @@ pub fn create_process(
         ).map_err(|_| "TCB create failed")?;
     }
 
-    // --- Phase 1: Tear down parent's VA mappings (fallible) ---
-    // Must happen BEFORE the point of no return. If any unmap fails,
-    // the entire create_process fails and guards clean up everything.
-    let parent_ttbr0 = addr_space.ttbr0();
-    for i in 0..plan.headers().len() {
-        let (idx, hdr) = plan.header_at(i).unwrap();
-        let header = unsafe { crate::cap::pageset_table::read_header(hdr) };
-        let page_count = header.data_page_count();
-        let pages = &header.pages[..page_count];
-
-        let (total_mapped, unmapped) = ht.unmap_for_object(hdr, |va| {
-            unsafe {
-                crate::arch::aarch64::vmem::unmap_validated(parent_ttbr0, va, pages).is_ok()
-            }
-        });
-
-        plan.record_unmap(idx, total_mapped, unmapped);
-
-        // Decrement map_count for successfully unmapped handles
-        let dec = plan.successful_unmaps(idx);
-        if dec > 0 {
-            unsafe {
-                let hdr_mut = crate::cap::pageset_table::read_header_mut(hdr);
-                for _ in 0..dec {
-                    hdr_mut.dec_map_count();
-                }
-            }
-        }
+    // Validate that revoking every consumed PageSet header would
+    // succeed. consume_pageset_validate is read-only — Err here
+    // leaves every parent's handle table and page table untouched.
+    // Iterating plan.headers() (deduplicated by add_header) so an
+    // N-page PageSet mapped at N VAs validates exactly once.
+    for &hdr in plan.headers() {
+        crate::cap::pageset_table::consume_pageset_validate(hdr)
+            .map_err(|_| "consume validate failed during ownership transfer")?;
     }
 
-    // Validate: all unmaps must have fully succeeded.
-    plan.validate().map_err(|_| "parent unmap failed during ownership transfer")?;
-
-    // Enqueue the thread — last fallible step.
-    if !scheduler::add_thread(tcb_guard.addr()) {
+    // Last fallible check: the run queue must have a free slot.
+    // GKL is held continuously through to add_thread below, so the
+    // answer is stable.
+    if !scheduler::has_room() {
         return Err("scheduler run queue full");
     }
 
-    // === Point of no return ===
-    // All fallible steps succeeded (including parent unmaps).
-    // Defuse guards and consume PageSets.
+    // ============ Apply phase: all infallible commits ============
+
+    // Apply consume for each unique header. revoke_apply walks every
+    // process's handle table (including the parent's), clears PTEs
+    // for active mappings, decrements refcount/map_count per cleared
+    // slot, then unlinks and frees the header. Cannot fail under the
+    // validate→apply contract (GKL held throughout).
+    for &hdr in plan.headers() {
+        crate::cap::pageset_table::consume_pageset_apply(hdr);
+    }
+
+    // Insert parent_handle_to_copy into the child's now-empty table.
+    // Runs after consume_apply so the not-yet-scheduled child does
+    // not appear in the revoke walks above. Cannot fail: the table
+    // was freshly allocated empty in step 2 and has zero entries.
+    if let Some(entry) = parent_copy_entry {
+        // For Endpoint handles: assign a caller token so the child can
+        // send/call on this handle. Same logic as sys_export_handle:
+        // token==0 → fresh from endpoint counter, nonzero → copy (lineage).
+        let child_kind = match entry.kind {
+            lockjaw_types::object::HandleKind::Endpoint { caller_token } if caller_token == 0 => {
+                let mut ep = unsafe {
+                    crate::mm::kernel_ptr::KernelMut::<crate::ipc::endpoint::EndpointObject>::from_paddr(
+                        PhysAddr::new(entry.object_paddr),
+                    )
+                };
+                let token = ep.get().next_token;
+                ep.get_mut().next_token = token + 1;
+                lockjaw_types::object::HandleKind::Endpoint { caller_token: token }
+            }
+            other => other,
+        };
+
+        // SAFETY: ht_guard was initialized as a valid handle table above.
+        let child_ht = unsafe { HandleTableRef::from_paddr(ht_guard.addr()) };
+        // Cannot fail: the child table was freshly allocated empty in
+        // step 2, with HANDLE_SLOTS_PER_PAGE empty slots. Avoid
+        // Result::expect so the panic path doesn't pull in Debug
+        // formatting for SyscallError (would inflate exception stack).
+        if child_ht.insert(
+            PhysAddr::new(entry.object_paddr),
+            entry.rights,
+            child_kind,
+        ).is_err() {
+            panic!("child handle insert into fresh empty table failed (kernel-invariant violation)");
+        }
+    }
+
+    // Capture the TCB paddr before defusing — defuse() drops the
+    // guard's ownership, after which addr() would panic.
+    let tcb_paddr = tcb_guard.addr();
+
+    // Defuse drop guards — child now owns all its resources.
     proc_guard.defuse();
     ht_guard.defuse();
     ttbr0_guard.defuse();
     tcb_stack_guard.defuse();
     tcb_guard.defuse();
 
-    // --- Phase 2: Consume transferred PageSets (infallible) ---
-    // Plan already validated — all unmaps succeeded.
-    for &hdr in plan.headers() {
-        crate::cap::pageset_table::consume_pageset(hdr, &ht);
+    // Enqueue the thread. Cannot fail because has_room() above
+    // returned true and GKL has been held throughout.
+    if !scheduler::add_thread(tcb_paddr) {
+        panic!("scheduler::add_thread failed after has_room() returned true (kernel-invariant violation)");
     }
 
     Ok(())

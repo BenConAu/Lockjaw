@@ -2,7 +2,7 @@ use crate::cap::object::ObjectType;
 use crate::cap::rights::Rights;
 use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
 use lockjaw_types::object::{HandleTableHeader, HandleEntry, HandleKind};
-use lockjaw_types::handle_ops::{self, HandleError};
+use lockjaw_types::handle_ops::{self, HandleError, SlotRevokeAction};
 use lockjaw_types::syscall::SyscallError;
 
 // ---------------------------------------------------------------------------
@@ -75,43 +75,49 @@ impl HandleTableRef {
         }
     }
 
-    /// For each handle pointing at the given object with a non-zero
-    /// mapped_va_page, call the callback with the mapping VA. The callback
-    /// returns true if the unmap succeeded — only then is mapped_va_page
-    /// cleared. Returns (total_mapped, successfully_unmapped). If these
-    /// differ, some mappings could not be torn down.
-    pub fn unmap_for_object(&self, object_paddr: u64, mut cb: impl FnMut(u64) -> bool) -> (usize, usize) {
-        let mut total = 0;
-        let mut unmapped = 0;
+    /// Phase-1 revoke walk: read-only. For each handle in this table
+    /// referencing `object_paddr`, invoke `on_action(&action)` exactly
+    /// once with the slot's pre-clear snapshot. Returns the number of
+    /// matching slots seen.
+    ///
+    /// **No state mutated.** The caller's callback may read but must
+    /// not write the slot. Used by `revoke::validate` to walk every
+    /// process's table without disturbing them; the caller pairs each
+    /// action with `validate_pte_match` against the right TTBR0 to
+    /// confirm the apply phase will succeed.
+    pub fn revoke_validate(
+        &self,
+        object_paddr: u64,
+        on_action: impl FnMut(&SlotRevokeAction),
+    ) -> usize {
         // SAFETY: self.0 was validated at construction.
         unsafe {
             let (_header, slots) = table_slots(self.0);
-            for slot in slots.iter_mut() {
-                if let HandleKind::PageSet { mapped_va_page } = &mut slot.kind {
-                    if slot.object_paddr == object_paddr && *mapped_va_page != 0 {
-                        total += 1;
-                        let va = (*mapped_va_page as u64) << 12;
-                        if cb(va) {
-                            *mapped_va_page = 0;
-                            unmapped += 1;
-                        }
-                    }
-                }
-            }
+            handle_ops::slot_revoke_validate(slots, object_paddr, on_action)
         }
-        (total, unmapped)
     }
 
-    /// Remove ALL handles pointing at a given object physical address.
-    /// Used when consuming a PageSet for object creation — invalidates
-    /// any duplicate handles in the same table to prevent stale access.
-    /// Cross-process exported handles are not affected (requires
-    /// revocation infrastructure, tracked in tech-debt).
-    pub fn remove_all_by_object(&self, object_paddr: u64) {
+    /// Phase-2 revoke walk: write. For each handle in this table
+    /// referencing `object_paddr`, invoke `on_action(&action)` with
+    /// the slot's pre-clear snapshot, then zero the slot.
+    ///
+    /// `on_action` runs BEFORE the slot is cleared so the caller's
+    /// PTE clear (`clear_validated_pte` against the right TTBR0),
+    /// `dec_map_count`, and `dec_refcount` all read the action's
+    /// `mapped_va_page` and `kind`.
+    ///
+    /// MUST be called only after a successful matching
+    /// `revoke_validate` against the same `object_paddr` within the
+    /// same critical section (GKL held).
+    pub fn revoke_apply(
+        &self,
+        object_paddr: u64,
+        on_action: impl FnMut(&SlotRevokeAction),
+    ) -> usize {
         // SAFETY: self.0 was validated at construction.
         unsafe {
             let (_header, slots) = table_slots(self.0);
-            handle_ops::slot_remove_all_by_object(slots, object_paddr);
+            handle_ops::slot_revoke_apply(slots, object_paddr, on_action)
         }
     }
 

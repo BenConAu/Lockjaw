@@ -248,34 +248,59 @@ pub fn dec_both_and_maybe_free(header_paddr: u64) {
     dec_refcount_and_maybe_free(header_paddr);
 }
 
-/// Consume a PageSet for ownership transfer. Data pages are NOT freed —
-/// the caller takes ownership of them.
+/// Phase 1 of two-phase consume: validate that revoking every
+/// cross-process handle to `header_paddr` would succeed. Pure
+/// read-only walk over `scheduler::for_each_tcb` — no state
+/// mutated on either success or failure.
 ///
-/// Steps:
-/// 1. Zero the header page — makes any stale handles (local duplicates
-///    or cross-process exports) read count=0 from the zeroed header,
-///    so they become inert without needing revocation.
-/// 2. Remove from global pageset table (unlinks the slot).
-/// 3. Remove ALL handles in the given table that point at this header.
+/// On success, the caller MUST call `consume_pageset_apply` for
+/// the same header within the same critical section (GKL held
+/// continuously). On failure, the caller propagates the error to
+/// userspace and the PageSet is unchanged — the user can retry
+/// or close it.
 ///
-/// The header page is intentionally NOT freed. It stays allocated as a
-/// zeroed tombstone so that stale exported handles in other processes
-/// safely read count=0. Freeing would allow the page to be reused,
-/// making stale handles point at a live object — a use-after-repurpose
-/// bug. The proper fix is handle revocation (future work).
-///
-/// Used by both create_kernel_object (single-page donation for endpoints,
-/// notifications, etc.) and create_process (multi-page image transfer).
-pub fn consume_pageset(
+/// Used by `create_kernel_object` (one PageSet → one new endpoint
+/// / notification / reply / TCB) and by `sys_create_process`
+/// (per consumed PageSet header). See
+/// `docs/handle-revocation-plan.md`.
+pub fn consume_pageset_validate(
     header_paddr: u64,
-    handle_table: &super::handle_table::HandleTableRef,
-) {
-    // Zero header BEFORE removing handles — stale handles read count=0
-    page_alloc::zero_page(PhysAddr::new(header_paddr));
-    // Unlink from global table
+) -> Result<(), super::revoke::RevokeError> {
+    super::revoke::revoke_validate(header_paddr)
+}
+
+/// Phase 2 of two-phase consume: clear every cross-process handle
+/// to `header_paddr`, unlink from the global PageSet table, and
+/// free the header page. Cannot fail under the precondition that
+/// a matching `consume_pageset_validate` returned Ok within the
+/// same critical section.
+///
+/// After return:
+/// - Every PageSet handle to `header_paddr` in any process's table
+///   is cleared (revoke_apply walks all live processes).
+/// - Every active mapping's PTEs are cleared and TLB-invalidated.
+/// - The header is unlinked from the PageSet table.
+/// - The header page is freed back to the allocator (no tombstone).
+///
+/// Data pages are NOT freed — the caller takes ownership of them
+/// (consume is the ownership-transfer path).
+pub fn consume_pageset_apply(header_paddr: u64) {
+    // Phase 2: clear cross-process handles, dec refcount/map_count,
+    // clear PTEs. After this returns, header.refcount == 0 and
+    // header.map_count == 0; no handle or PTE anywhere references
+    // the header.
+    super::revoke::revoke_apply(header_paddr);
+
+    // Unlink from the global PageSet table.
     consume_by_header_paddr(header_paddr);
-    // Remove all handles pointing at the consumed PageSet
-    handle_table.remove_all_by_object(header_paddr);
+
+    // Free the header page — safe because revoke cleared every
+    // reference. Replaces the previous tombstone-leak pattern:
+    // exported handles in other processes are no longer a hazard
+    // because revoke walked their tables too.
+    page_alloc::dealloc_page(
+        crate::mm::addr::PhysPage::containing(PhysAddr::new(header_paddr))
+    );
 }
 
 /// Remove a PageSet from the table by its header physical address.

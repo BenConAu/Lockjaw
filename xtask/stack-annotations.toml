@@ -16,7 +16,20 @@
 "<core::fmt::Formatter>::pad" = "fmt-internal"
 "<core::fmt::Formatter>::pad_integral" = "fmt-internal"
 "<core::fmt::Formatter>::pad_integral::write_prefix" = "fmt-internal"
+"<core::fmt::Formatter>::debug_tuple_field1_finish" = "fmt-internal"
+"<core::fmt::builders::PadAdapter as core::fmt::Write>::write_char" = "fmt-internal"
+"<core::fmt::builders::PadAdapter as core::fmt::Write>::write_str" = "fmt-internal"
 "<usize as core::fmt::Display>::fmt" = "fmt-internal"
+
+# create_kernel_object dispatches through init_fn: fn(ObjectInitPage)
+# — a function pointer parameter. All real callers pass one of these
+# init functions, each of which writes one fixed-size header into the
+# donated page.
+"lockjaw::syscall::handler::create_kernel_object" = [
+    "lockjaw::ipc::endpoint::create_endpoint",
+    "lockjaw::ipc::notification::create_notification",
+    "lockjaw::ipc::reply::create_reply",
+]
 
 # Thread entry trampoline calls the thread's entry function via blr x19.
 # All possible targets listed here:
@@ -79,6 +92,7 @@
 "core::panicking::panic_const::panic_const_shl_overflow" = 64
 "core::panicking::panic_const::panic_const_sub_overflow" = 64
 "core::option::unwrap_failed" = 128
+"core::result::unwrap_failed" = 128
 "core::slice::index::slice_index_fail" = 128
 # core::panicking::assert_failed is generic — the checker resolves
 # the monomorphized instances via .llvm. suffix stripping.

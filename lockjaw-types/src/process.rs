@@ -95,52 +95,29 @@ pub fn on_thread_create(thread_count: u32) -> u32 {
 /// typically has 3–5 PageSets (code, rodata, data, bss, stack).
 pub const MAX_CONSUMED_HEADERS: usize = 32;
 
-/// Opaque index into the consumed-headers array, returned by
-/// `ProcessTransferPlan::add_header` and consumed by `record_unmap`.
-/// Prevents callers from guessing indices.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HeaderIndex(usize);
-
-impl HeaderIndex {
-    /// Placeholder value for array initialization.
-    pub const ZERO: Self = Self(0);
-}
-
-/// Errors from building or validating a process transfer plan.
+/// Errors from building a process transfer plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferError {
     /// consumed_headers array is full (MAX_CONSUMED_HEADERS reached).
     TooManyHeaders,
-    /// Some parent handle unmaps failed — cannot safely transfer.
-    UnmapFailed {
-        header_idx: usize,
-        total: usize,
-        failed: usize,
-    },
 }
 
-/// Pure planning/validation for process ownership transfer.
+/// Pure deduplication for the PageSet headers a `sys_create_process`
+/// must consume. The kernel walks the user-supplied mapping list and
+/// pushes every referenced header through `add_header`; the plan
+/// collapses duplicates so the consume loop runs exactly once per
+/// unique header.
 ///
-/// The kernel builds this incrementally as it resolves mappings,
-/// then queries it for all the tricky decisions:
-/// - Did we dedup owned pages correctly?
-/// - Did we dedup consumed headers correctly?
-/// - If some parent unmaps failed, must we abort?
-/// - Are we trying to transfer too many pages/headers?
-/// - What exactly should be consumed on success?
+/// Without dedup, an N-page PageSet mapped at N VAs would yield N
+/// validate/apply pairs against the same header — the second pair
+/// would see refcount == 0 (revoke_apply already drained it) and
+/// double-consume the global PageSet table slot.
 ///
-/// Side effects (page alloc, PTE ops, handle table mutation) stay
-/// in the kernel. This struct only holds the decision state.
-/// Tracks PageSet headers for consumption and validates that parent
-/// unmaps fully succeeded before committing. Owned pages are written
-/// directly to the ProcessObject page by the kernel (not tracked here)
-/// to avoid a 1 KB stack array.
+/// Side effects (revoke walk, PTE ops, handle table mutation) live
+/// in the kernel. This struct only owns the deduplicated header set.
 pub struct ProcessTransferPlan {
     headers: [u64; MAX_CONSUMED_HEADERS],
     header_count: usize,
-    /// Per-header: (total_mapped_handles, successfully_unmapped).
-    /// Populated by the kernel after calling unmap_for_object.
-    unmap_results: [(usize, usize); MAX_CONSUMED_HEADERS],
 }
 
 impl ProcessTransferPlan {
@@ -148,69 +125,29 @@ impl ProcessTransferPlan {
         Self {
             headers: [0; MAX_CONSUMED_HEADERS],
             header_count: 0,
-            unmap_results: [(0, 0); MAX_CONSUMED_HEADERS],
         }
     }
 
     /// Record a PageSet header for consumption. Deduplicates —
     /// multiple mappings from the same PageSet produce one entry.
-    /// Returns the HeaderIndex for use with `record_unmap`.
-    pub fn add_header(&mut self, header_paddr: u64) -> Result<HeaderIndex, TransferError> {
-        // Dedup: return existing index if already tracked
+    pub fn add_header(&mut self, header_paddr: u64) -> Result<(), TransferError> {
+        // Dedup: skip if already tracked.
         for i in 0..self.header_count {
             if self.headers[i] == header_paddr {
-                return Ok(HeaderIndex(i));
+                return Ok(());
             }
         }
         if self.header_count >= MAX_CONSUMED_HEADERS {
             return Err(TransferError::TooManyHeaders);
         }
-        let idx = self.header_count;
-        self.headers[idx] = header_paddr;
+        self.headers[self.header_count] = header_paddr;
         self.header_count += 1;
-        Ok(HeaderIndex(idx))
-    }
-
-    /// Record the result of unmapping parent handles for a header.
-    /// `header_idx` must be a value returned by `add_header`.
-    pub fn record_unmap(&mut self, header_idx: HeaderIndex, total: usize, unmapped: usize) {
-        self.unmap_results[header_idx.0] = (total, unmapped);
-    }
-
-    /// Can we commit? All unmaps must have fully succeeded.
-    pub fn validate(&self) -> Result<(), TransferError> {
-        for i in 0..self.header_count {
-            let (total, unmapped) = self.unmap_results[i];
-            if unmapped != total {
-                return Err(TransferError::UnmapFailed {
-                    header_idx: i,
-                    total,
-                    failed: total - unmapped,
-                });
-            }
-        }
         Ok(())
-    }
-
-    /// Number of successful unmaps for a header (derived from
-    /// record_unmap inputs — not a second source of truth).
-    pub fn successful_unmaps(&self, header_idx: HeaderIndex) -> usize {
-        self.unmap_results[header_idx.0].1
     }
 
     /// The deduplicated list of PageSet headers to consume.
     pub fn headers(&self) -> &[u64] {
         &self.headers[..self.header_count]
-    }
-
-    /// Get header and its opaque index by position. For use in loops
-    /// where record_unmap needs to be called on the same plan.
-    pub fn header_at(&self, i: usize) -> Option<(HeaderIndex, u64)> {
-        if i < self.header_count {
-            Some((HeaderIndex(i), self.headers[i]))
-        } else {
-            None
-        }
     }
 }
 
@@ -368,12 +305,10 @@ mod tests {
     #[test]
     fn duplicate_headers_deduped() {
         let mut plan = ProcessTransferPlan::new();
-        let idx1 = plan.add_header(0xA000).unwrap();
-        let idx2 = plan.add_header(0xB000).unwrap();
-        let idx3 = plan.add_header(0xA000).unwrap(); // duplicate
+        plan.add_header(0xA000).unwrap();
+        plan.add_header(0xB000).unwrap();
+        plan.add_header(0xA000).unwrap(); // duplicate — collapsed
         assert_eq!(plan.headers(), &[0xA000, 0xB000]);
-        assert_eq!(idx1, idx3); // same index returned for duplicate
-        assert_ne!(idx1, idx2);
     }
 
     #[test]
@@ -384,49 +319,8 @@ mod tests {
         }
         assert_eq!(
             plan.add_header(0xFFFF_0000),
-            Err(TransferError::TooManyHeaders)
+            Err(TransferError::TooManyHeaders),
         );
-    }
-
-    #[test]
-    fn partial_unmap_blocks_commit() {
-        let mut plan = ProcessTransferPlan::new();
-        let idx = plan.add_header(0xA000).unwrap();
-        plan.record_unmap(idx, 3, 2); // 1 failed
-        assert_eq!(
-            plan.validate(),
-            Err(TransferError::UnmapFailed {
-                header_idx: 0,
-                total: 3,
-                failed: 1,
-            })
-        );
-    }
-
-    #[test]
-    fn all_unmaps_succeed_allows_commit() {
-        let mut plan = ProcessTransferPlan::new();
-        let idx1 = plan.add_header(0xA000).unwrap();
-        let idx2 = plan.add_header(0xB000).unwrap();
-        plan.record_unmap(idx1, 2, 2);
-        plan.record_unmap(idx2, 1, 1);
-        assert_eq!(plan.validate(), Ok(()));
-    }
-
-    #[test]
-    fn zero_mapped_handles_allows_commit() {
-        let mut plan = ProcessTransferPlan::new();
-        let idx = plan.add_header(0xA000).unwrap();
-        plan.record_unmap(idx, 0, 0); // no handles were mapped
-        assert_eq!(plan.validate(), Ok(()));
-    }
-
-    #[test]
-    fn successful_unmaps_derived_from_record() {
-        let mut plan = ProcessTransferPlan::new();
-        let idx = plan.add_header(0xA000).unwrap();
-        plan.record_unmap(idx, 5, 3);
-        assert_eq!(plan.successful_unmaps(idx), 3);
     }
 
     #[test]
@@ -439,56 +333,32 @@ mod tests {
 
     #[test]
     fn same_header_from_multiple_mappings_deduped() {
+        // Models: an N-page PageSet mapped at N contiguous VAs
+        // produces N add_header calls but exactly one consume_pageset
+        // pair downstream.
         let mut plan = ProcessTransferPlan::new();
-        // Multiple mappings from the same PageSet
         plan.add_header(0xA000).unwrap();
-        let idx2 = plan.add_header(0xA000).unwrap();
-        assert_eq!(plan.headers().len(), 1); // deduped
-        // Returned index matches the original
-        assert_eq!(plan.successful_unmaps(idx2), 0);
+        plan.add_header(0xA000).unwrap();
+        plan.add_header(0xA000).unwrap();
+        assert_eq!(plan.headers(), &[0xA000]);
     }
 
     #[test]
-    fn empty_plan_validates() {
+    fn empty_plan_has_empty_headers() {
         let plan = ProcessTransferPlan::new();
-        assert_eq!(plan.validate(), Ok(()));
-        assert_eq!(plan.headers().len(), 0);
+        assert!(plan.headers().is_empty());
     }
 
     #[test]
-    fn header_at_and_record_unmap_roundtrip() {
+    fn dedup_after_full_does_not_overflow() {
+        // Already-tracked header is accepted even when the array is
+        // at capacity, since dedup short-circuits.
         let mut plan = ProcessTransferPlan::new();
-        plan.add_header(0xA000).unwrap();
-        plan.add_header(0xB000).unwrap();
-        plan.add_header(0xC000).unwrap();
-        assert_eq!(plan.headers().len(), 3);
-
-        // Iterate by index, record unmaps
-        for i in 0..plan.headers().len() {
-            let (idx, _hdr) = plan.header_at(i).unwrap();
-            plan.record_unmap(idx, 1, 1);
+        for i in 0..MAX_CONSUMED_HEADERS {
+            plan.add_header(i as u64 * 0x1000).unwrap();
         }
-        assert_eq!(plan.validate(), Ok(()));
-
-        // Out of bounds returns None
-        assert!(plan.header_at(3).is_none());
-    }
-
-    #[test]
-    fn second_header_unmap_failure_detected() {
-        let mut plan = ProcessTransferPlan::new();
-        let idx1 = plan.add_header(0xA000).unwrap();
-        let idx2 = plan.add_header(0xB000).unwrap();
-        plan.record_unmap(idx1, 1, 1); // OK
-        plan.record_unmap(idx2, 2, 1); // 1 failed
-        assert_eq!(
-            plan.validate(),
-            Err(TransferError::UnmapFailed {
-                header_idx: 1,
-                total: 2,
-                failed: 1,
-            })
-        );
+        assert!(plan.add_header(0).is_ok()); // duplicate of headers[0]
+        assert_eq!(plan.headers().len(), MAX_CONSUMED_HEADERS);
     }
 
     // -----------------------------------------------------------------------

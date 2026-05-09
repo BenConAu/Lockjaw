@@ -174,6 +174,15 @@ impl SchedState {
         None
     }
 
+    /// Read-only precheck: true iff `add_thread` would currently
+    /// succeed. Used by `sys_create_process` to verify the run queue
+    /// has room before any destructive transfer work runs in the
+    /// apply phase. Stable until the next `add_thread` (caller must
+    /// hold the GKL across the precheck and the eventual add).
+    pub fn has_free_slot(&self) -> bool {
+        self.states.iter().any(|s| s.is_none())
+    }
+
     /// Mark the current thread on `cpu_id` as Running. Used once at boot
     /// when the first thread is already executing, and for secondary CPUs
     /// when their idle thread is assigned.
@@ -525,6 +534,28 @@ mod tests {
         let idx = s.add_thread().unwrap();
         assert_eq!(s.get(idx), Some(SchedThreadState::Ready));
         assert!(s.check_invariants());
+    }
+
+    #[test]
+    fn has_free_slot_initially_true() {
+        let s = SchedState::new();
+        assert!(s.has_free_slot());
+    }
+
+    #[test]
+    fn has_free_slot_false_when_full() {
+        let mut s = SchedState::new();
+        // SchedState::new fills slot 0 (boot thread). Add until full.
+        while s.add_thread().is_some() {}
+        assert!(!s.has_free_slot());
+        assert!(s.add_thread().is_none(), "add must agree with has_free_slot");
+    }
+
+    #[test]
+    fn has_free_slot_true_after_partial_fill() {
+        let mut s = SchedState::new();
+        s.add_thread().unwrap();
+        assert!(s.has_free_slot());
     }
 
     #[test]

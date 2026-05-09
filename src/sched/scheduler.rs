@@ -164,6 +164,43 @@ pub fn add_thread_for_cpu(tcb_paddr: PhysAddr, cpu_id: usize) -> bool {
     }
 }
 
+/// Read-only check: would the next `add_thread` succeed?
+///
+/// Used by `sys_create_process` as a precondition during the validate
+/// phase of the new transactional restructure: if the run queue is
+/// full, the caller returns an error before any destructive consume
+/// work runs in the apply phase. The answer is stable across the
+/// remainder of the syscall because GKL is held throughout — no other
+/// thread can mutate the run queue between has_room() and add_thread().
+pub fn has_room() -> bool {
+    // SAFETY: GKL held — exclusive access to state.
+    unsafe {
+        let state = &*SCHEDULER.state_ptr();
+        state.has_free_slot()
+    }
+}
+
+/// Read-only walk over every registered TCB. Used by handle revocation
+/// to enumerate live processes whose handle tables may hold a handle
+/// to the object being revoked.
+///
+/// `f` is called once per Some(tcb_paddr) slot in the run queue.
+/// Slots may share a process (multiple threads of one process); the
+/// caller is responsible for any deduplication needed. GKL must be
+/// held — the run queue must not change between the walk and any
+/// follow-up action keyed on the visited TCBs.
+pub fn for_each_tcb(mut f: impl FnMut(PhysAddr)) {
+    // SAFETY: GKL held — read-only access to threads array.
+    unsafe {
+        let threads = &*SCHEDULER.threads_ptr();
+        for i in 0..MAX_THREADS {
+            if let Some(paddr) = threads[i] {
+                f(paddr);
+            }
+        }
+    }
+}
+
 /// Activate the scheduler. After this call, timer ticks trigger scheduling.
 /// Must be called after all initial threads are registered via add_thread().
 pub fn start() {

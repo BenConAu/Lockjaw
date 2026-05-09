@@ -102,12 +102,17 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
 }
 
 /// Common logic for sys_create_notification, sys_create_endpoint, etc.
-/// Takes a PageSet handle, validates it's 1 page, calls the init function,
-/// consumes the PageSet, and inserts a new handle for the created object.
+/// Takes a PageSet handle, validates it's 1 page, runs init_fn on the
+/// data page, then transactionally revokes every cross-process handle
+/// to the donated PageSet, frees the header, and inserts a new handle
+/// for the created object.
 ///
-/// After consumption, the header page is zeroed so that any stale handles
-/// (local duplicates or cross-process exports) become inert: they read
-/// count=0 from the zeroed header and cannot map, query, or re-donate.
+/// Order is validate → init → apply: validate is the only fallible
+/// kernel-side step, init is fallible but mutates a soon-to-be-claimed
+/// page and never observable state, apply cannot fail. If validate
+/// returns Err the user's PageSet handle still works; if init returns
+/// Err the donated page contents are partially written but the
+/// PageSet is still owned by the caller (no consume happened).
 fn create_kernel_object(
     ps_handle: u32,
     kind: lockjaw_types::object::HandleKind,
@@ -119,7 +124,7 @@ fn create_kernel_object(
     let entry = ht.lookup(ps_handle, Rights::from_bits(RIGHT_WRITE), ObjectType::PageSet)?;
     let header_paddr = entry.object_paddr;
 
-    // Read header, validate exactly 1 data page. Must read BEFORE zeroing.
+    // Read header, validate exactly 1 data page.
     let header = unsafe { crate::cap::pageset_table::read_header(header_paddr) };
     if header.data_page_count() != 1 {
         return Err(SyscallError::INVALID_PARAMETER);
@@ -128,13 +133,24 @@ fn create_kernel_object(
     // SAFETY: page came from a registered PageSet — valid kernel page.
     let page = unsafe { crate::mm::addr::ObjectInitPage::new(PhysAddr::new(page_paddr)) };
 
+    // Phase 1: validate that revoke would succeed. No state mutated
+    // on failure — caller's PageSet handle is still valid.
+    if crate::cap::pageset_table::consume_pageset_validate(header_paddr).is_err() {
+        return Err(SyscallError::INVALID_HANDLE);
+    }
+
+    // Initialize the data page as the new kernel object. Runs after
+    // validate but before apply: if init fails, no consume has
+    // happened yet, so the caller's PageSet handle is still usable
+    // (the page contents are partially overwritten but ignored).
     if init_fn(page).is_err() {
         return Err(SyscallError::UNKNOWN);
     }
 
-    // Consume the PageSet: zero header (inerts stale handles), remove from
-    // global table, remove all handles, free header page.
-    crate::cap::pageset_table::consume_pageset(header_paddr, &ht);
+    // Phase 2: revoke every cross-process handle, clear PTEs, dec
+    // refcount/map_count, unlink from PageSet table, free the
+    // header page. Cannot fail under the validate→apply contract.
+    crate::cap::pageset_table::consume_pageset_apply(header_paddr);
 
     // Insert a new handle for the created object.
     ht.insert(PhysAddr::new(page_paddr), Rights::from_bits(RIGHT_READ | RIGHT_WRITE), kind)
