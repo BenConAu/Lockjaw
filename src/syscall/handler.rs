@@ -125,11 +125,14 @@ fn create_kernel_object(
     let header_paddr = entry.object_paddr;
 
     // Read header, validate exactly 1 data page.
-    let header = unsafe { crate::cap::pageset_table::read_header(header_paddr) };
-    if header.data_page_count() != 1 {
+    // SAFETY: entry.object_paddr came from a PageSet handle, which
+    // points to a registered header — read_header_backed enforces that
+    // contract and the wrapper makes get_page safe.
+    let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_paddr) };
+    if backed.data_page_count() != 1 {
         return Err(SyscallError::INVALID_PARAMETER);
     }
-    let page_paddr = header.get_page(0).ok_or(SyscallError::INVALID_HANDLE)?;
+    let page_paddr = backed.get_page(0).ok_or(SyscallError::INVALID_HANDLE)?;
     // SAFETY: page came from a registered PageSet — valid kernel page.
     let page = unsafe { crate::mm::addr::ObjectInitPage::new(PhysAddr::new(page_paddr)) };
 
@@ -365,11 +368,11 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
         _ => {}
     }
 
-    // SAFETY: object_paddr came from a PageSet handle — valid header page.
+    // SAFETY: object_paddr came from a PageSet handle — registered header.
     let header_paddr = entry.object_paddr;
-    let header = unsafe { crate::cap::pageset_table::read_header(header_paddr) };
+    let header = unsafe { crate::cap::pageset_table::read_header_backed(header_paddr) };
     unsafe {
-        match crate::arch::aarch64::vmem::map_pages_in_existing(addr_space.ttbr0(), virt_addr, header, flags) {
+        match crate::arch::aarch64::vmem::map_pages_in_existing(addr_space.ttbr0(), virt_addr, &header, flags) {
             Ok(()) => {
                 // Record the mapping on this handle and increment the
                 // PageSet's global map count.
@@ -755,9 +758,9 @@ fn sys_query_pageset_phys(ctx: &mut ExceptionContext) -> Result<u64, SyscallErro
 
     let ht = CurrentThread::handle_table();
     let entry = ht.lookup(handle, Rights::from_bits(RIGHT_READ), ObjectType::PageSet)?;
-    // SAFETY: object_paddr came from a PageSet handle — valid header page.
-    let header = unsafe { crate::cap::pageset_table::read_header(entry.object_paddr) };
-    header.get_page(page_index)
+    // SAFETY: object_paddr came from a PageSet handle — registered header.
+    let backed = unsafe { crate::cap::pageset_table::read_header_backed(entry.object_paddr) };
+    backed.get_page(page_index)
         .ok_or(SyscallError::INVALID_PARAMETER)
 }
 
@@ -900,9 +903,9 @@ fn sys_unmap_pages(ctx: &mut ExceptionContext) -> SyscallError {
     // Read the PageSet header to get expected physical pages.
     // Pass the header's page array directly — no stack copy.
     let header_paddr = entry.object_paddr;
-    let header = unsafe { crate::cap::pageset_table::read_header(header_paddr) };
-    let count = header.data_page_count();
-    let expected = &header.pages[..count];
+    // SAFETY: object_paddr came from a PageSet handle — registered header.
+    let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_paddr) };
+    let expected = backed.pages_slice();
 
     // Validate PTEs and clear them. TLB flushed inside.
     if unsafe {
@@ -958,10 +961,12 @@ fn sys_close_handle(ctx: &mut ExceptionContext) -> SyscallError {
 
         CloseHandleResult::UnmapThenRemove { header_paddr, mapped_va_page } => {
             // Unmap PTEs first — fallible. If unmap fails, reject close.
-            let header = unsafe {
-                crate::cap::pageset_table::read_header(header_paddr)
+            // SAFETY: header_paddr came from a PageSet handle slot —
+            // registered header.
+            let backed = unsafe {
+                crate::cap::pageset_table::read_header_backed(header_paddr)
             };
-            let pages = &header.pages[..header.data_page_count()];
+            let pages = backed.pages_slice();
             let va = (mapped_va_page as u64) << 12;
             if let Some(addr_space) = CurrentThread::address_space() {
                 if unsafe {

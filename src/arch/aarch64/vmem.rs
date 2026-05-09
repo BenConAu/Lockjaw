@@ -284,11 +284,12 @@ pub unsafe fn translate_user_va(ttbr0_paddr: PhysAddr, user_va: u64) -> Option<u
 ///
 /// # Safety
 /// `ttbr0_paddr` must be a valid L0 page table.
-/// `header` must be a valid PageSetHeader with page_count data pages.
+/// `header` must be a valid BackedHeader with page_count data pages —
+/// the wrapper carries the backing-pages witness so get_page is safe.
 pub unsafe fn map_pages_in_existing(
     ttbr0_paddr: PhysAddr,
     virt_addr: u64,
-    header: &lockjaw_types::pageset_table::PageSetHeader,
+    header: &lockjaw_types::pageset_table::BackedHeader<'_>,
     flags: u64,
 ) -> Result<(), VmemError> {
     use lockjaw_types::page_table::{MapWalk, MapWalkResult};

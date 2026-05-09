@@ -20,6 +20,7 @@
 "<core::fmt::builders::PadAdapter as core::fmt::Write>::write_char" = "fmt-internal"
 "<core::fmt::builders::PadAdapter as core::fmt::Write>::write_str" = "fmt-internal"
 "<usize as core::fmt::Display>::fmt" = "fmt-internal"
+"<&str as core::fmt::Display>::fmt" = "fmt-internal"
 
 # create_kernel_object dispatches through init_fn: fn(ObjectInitPage)
 # — a function pointer parameter. All real callers pass one of these

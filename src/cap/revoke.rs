@@ -99,11 +99,13 @@ pub fn revoke_validate(object_paddr: u64) -> Result<(), RevokeError> {
                 // short-lived and clear_validated_pte (apply phase) may
                 // dec_map_count between iterations, so caching across
                 // iterations would be misleading.
-                let header = unsafe {
-                    crate::cap::pageset_table::read_header(object_paddr)
+                // SAFETY: object_paddr is a registered PageSet that
+                // reached revoke from an active handle slot; the
+                // wrapper makes pages_slice safe.
+                let backed = unsafe {
+                    crate::cap::pageset_table::read_header_backed(object_paddr)
                 };
-                let count = header.data_page_count();
-                let expected = &header.pages[..count];
+                let expected = backed.pages_slice();
                 let ok = unsafe {
                     crate::arch::aarch64::vmem::validate_pte_match(
                         PhysAddr::new(ttbr0),
@@ -174,8 +176,12 @@ pub fn revoke_apply(object_paddr: u64) -> RevokeStats {
             if action.had_mapping {
                 stats.mappings += 1;
                 let va = (action.mapped_va_page as u64) << 12;
+                // Use the trusted count for the PTE clear range — a
+                // corrupted on-disk header.count could otherwise
+                // truncate the unmap and leave stale PTEs behind.
                 let count = unsafe {
-                    crate::cap::pageset_table::read_header(object_paddr).data_page_count()
+                    crate::cap::pageset_table::read_header_backed(object_paddr)
+                        .data_page_count()
                 };
                 // SAFETY: validate_pte_match succeeded for this exact
                 // (ttbr0, va, count) in the validate phase; the GKL
