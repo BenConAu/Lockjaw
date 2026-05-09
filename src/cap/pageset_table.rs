@@ -289,7 +289,18 @@ pub fn consume_pageset_apply(header_paddr: u64) {
     // clear PTEs. After this returns, header.refcount == 0 and
     // header.map_count == 0; no handle or PTE anywhere references
     // the header.
-    super::revoke::revoke_apply(header_paddr);
+    let stats = super::revoke::revoke_apply(header_paddr);
+
+    // "revoke OK" diagnostic: proves the walker ran (and how much
+    // it cleared) on every consume. The plan calls for this so a
+    // make run boot can verify the happy path is exercised; the
+    // integration suite asserts the line appears at least once.
+    crate::kprintln!(
+        "revoke OK: header=", header_paddr,
+        " procs=", stats.processes,
+        " slots=", stats.slots,
+        " maps=", stats.mappings,
+    );
 
     // Unlink from the global PageSet table.
     consume_by_header_paddr(header_paddr);

@@ -191,6 +191,31 @@ assert_contains "posix-hello: hello from fat32" "musl read FAT32 file via posix-
 assert_contains "posix-server: child exit" "posix-server saw child exit_group"
 assert_contains "posix-server: done" "posix-server dispatch loop terminated cleanly"
 
+echo "Phase 17 — Handle revocation (commit 2 lockdown):"
+# Diagnostic format: "revoke OK: header=N procs=N slots=N maps=N"
+# Emitted from consume_pageset_apply on every kernel-object create
+# (sys_create_endpoint/notification/reply) and every sys_create_process
+# segment consume. Asserting the prefix proves the revoke walker actually
+# runs on every consume — a baseline silent kprintln-removal would let a
+# regression pass make test otherwise.
+assert_contains "revoke OK:" "Revocation walker fires on consume_pageset_apply"
+
+# Multi-process walk: assert that at least one consume sees procs >= 2.
+# The exact count is intentionally not pinned — it depends on which
+# threads are registered in scheduler::threads at the moment of
+# consume_pageset_apply, which is sensitive to boot order and (for
+# sys_create_process) does NOT include the child being spawned (the
+# child is added to the scheduler after the apply phase completes).
+# A regex over [2-9] or two-digit counts catches any nontrivial walk
+# without locking in today's specific number.
+if echo "$OUTPUT" | grep -qE "revoke OK:.*procs=([2-9]|[1-9][0-9]+)"; then
+    echo "  PASS: Revoke walker visits multiple processes (procs >= 2)"
+    PASSED=$((PASSED + 1))
+else
+    echo "  FAIL: Revoke walker never reached procs >= 2"
+    FAILED=$((FAILED + 1))
+fi
+
 # Fail explicitly if the thread test reported failure
 if echo "$OUTPUT" | grep -q "\[THREAD-TEST\] FAILED"; then
     echo "  FAIL: Thread test reported failure"

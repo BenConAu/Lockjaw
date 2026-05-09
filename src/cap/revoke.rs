@@ -145,6 +145,11 @@ pub fn revoke_validate(object_paddr: u64) -> Result<(), RevokeError> {
 /// clear PTEs for active PageSet mappings, decrement the header's
 /// map_count and refcount per cleared slot, then zero the slot.
 ///
+/// Returns `(slots_cleared, mappings_cleared, processes_visited)`
+/// for the caller to surface as a diagnostic. `slots_cleared` matches
+/// the snapshot refcount validate observed; `mappings_cleared` matches
+/// the snapshot map_count.
+///
 /// MUST be called only after a matching successful `revoke_validate`
 /// for the same `object_paddr` within the same critical section
 /// (no GKL release between). Cannot fail under that precondition.
@@ -154,8 +159,10 @@ pub fn revoke_validate(object_paddr: u64) -> Result<(), RevokeError> {
 /// - No PTE in any process's address space references the data pages
 ///
 /// The caller may now free the header pages.
-pub fn revoke_apply(object_paddr: u64) {
+pub fn revoke_apply(object_paddr: u64) -> RevokeStats {
+    let mut stats = RevokeStats::default();
     for_each_unique_process(|process_paddr| {
+        stats.processes += 1;
         let ttbr0 = process_obj::process_ttbr0(PhysAddr::new(process_paddr));
         let ht = unsafe {
             HandleTableRef::from_paddr(process_obj::process_handle_table(
@@ -163,7 +170,9 @@ pub fn revoke_apply(object_paddr: u64) {
             ))
         };
         ht.revoke_apply(object_paddr, |action| {
+            stats.slots += 1;
             if action.had_mapping {
+                stats.mappings += 1;
                 let va = (action.mapped_va_page as u64) << 12;
                 let count = unsafe {
                     crate::cap::pageset_table::read_header(object_paddr).data_page_count()
@@ -193,6 +202,22 @@ pub fn revoke_apply(object_paddr: u64) {
             }
         });
     });
+    stats
+}
+
+/// Per-revoke counts surfaced for diagnostic logging. The plan calls
+/// for a "revoke OK" message at the end of each consume so a single
+/// `make run` boot proves the walker actually ran (and how often).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RevokeStats {
+    /// Unique processes walked during the apply pass.
+    pub processes: usize,
+    /// Total handle-table slots cleared across all processes.
+    /// Equals the header's snapshot refcount (validated in phase 1).
+    pub slots: usize,
+    /// Subset of cleared slots that had an active mapping.
+    /// Equals the header's snapshot map_count.
+    pub mappings: usize,
 }
 
 /// Walk the run queue, deduplicate by process_paddr, and invoke
