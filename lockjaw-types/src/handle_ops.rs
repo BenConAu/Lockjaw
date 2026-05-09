@@ -170,6 +170,106 @@ pub fn slot_set_mapped_va(
 }
 
 // ---------------------------------------------------------------------------
+// Slot revocation walks (two-phase: validate read-only, apply write)
+// ---------------------------------------------------------------------------
+
+/// Per-slot info yielded during a revoke walk.
+///
+/// The kernel-side caller uses this to drive per-kind cleanup
+/// (cross-process PTE clear, dec_map_count, dec_refcount) on the
+/// matching slot before / as the slot itself is cleared.
+///
+/// `kind` is the slot's pre-clear HandleKind so callers can distinguish
+/// PageSet (refcounted) from non-PageSet kinds without a second lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotRevokeAction {
+    /// True iff this is a PageSet handle with `mapped_va_page != 0`.
+    /// Caller's PTE-clear callback runs only when this is true.
+    pub had_mapping: bool,
+    /// VA page of the active mapping (valid only when `had_mapping`).
+    pub mapped_va_page: u32,
+    /// Original handle kind. PageSet kinds need dec_refcount; other
+    /// kinds (Endpoint / Notification / Reply) do not under today's
+    /// accounting model.
+    pub kind: HandleKind,
+}
+
+/// Phase 1: read-only walk. For each slot whose `object_paddr ==
+/// target`, build a `SlotRevokeAction` and pass it to `on_action`.
+/// Returns the number of matching slots seen.
+///
+/// **No mutation.** The caller's callback may inspect the action but
+/// must not mutate the slots. Designed for revoke's validate phase
+/// (count slots, validate corresponding PTEs read-only).
+pub fn slot_revoke_validate<F>(
+    slots: &[HandleEntry],
+    target: u64,
+    mut on_action: F,
+) -> usize
+where
+    F: FnMut(&SlotRevokeAction),
+{
+    let mut count = 0;
+    for slot in slots.iter() {
+        if slot.object_paddr != target {
+            continue;
+        }
+        let action = action_for(slot);
+        on_action(&action);
+        count += 1;
+    }
+    count
+}
+
+/// Phase 2: write walk. For each slot whose `object_paddr == target`,
+/// build a `SlotRevokeAction`, hand it to `on_action`, then clear
+/// the slot. Returns the number of cleared slots.
+///
+/// `on_action` runs BEFORE the slot is zeroed so the caller's PTE
+/// clear and refcount/map_count decrements can read the action's
+/// `mapped_va_page` and `kind`.
+///
+/// MUST be called only after a successful matching `slot_revoke_validate`
+/// against the same `(slots, target)` pair within the same critical
+/// section (GKL held). The action stream is identical across both
+/// passes under that precondition.
+pub fn slot_revoke_apply<F>(
+    slots: &mut [HandleEntry],
+    target: u64,
+    mut on_action: F,
+) -> usize
+where
+    F: FnMut(&SlotRevokeAction),
+{
+    let mut count = 0;
+    for slot in slots.iter_mut() {
+        if slot.object_paddr != target {
+            continue;
+        }
+        let action = action_for(slot);
+        on_action(&action);
+        *slot = HandleEntry::EMPTY;
+        count += 1;
+    }
+    count
+}
+
+fn action_for(slot: &HandleEntry) -> SlotRevokeAction {
+    match slot.kind {
+        HandleKind::PageSet { mapped_va_page } => SlotRevokeAction {
+            had_mapping: mapped_va_page != 0,
+            mapped_va_page,
+            kind: slot.kind,
+        },
+        other => SlotRevokeAction {
+            had_mapping: false,
+            mapped_va_page: 0,
+            kind: other,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -383,5 +483,133 @@ mod tests {
     fn empty_entry_has_zero_paddr() {
         assert_eq!(HandleEntry::EMPTY.object_paddr, 0);
         assert_eq!(HandleEntry::EMPTY.kind, HandleKind::Empty);
+    }
+
+    // --- slot_revoke_validate / slot_revoke_apply ---
+
+    #[test]
+    fn revoke_validate_does_not_mutate() {
+        let mut slots = empty_table(4);
+        // PageSet inserts zero mapped_va_page (per-address-space rule).
+        // Set the mapping VA explicitly to model an active mapping.
+        let h0 = slot_insert(&mut slots, 0x1000, Rights::none(),
+                             HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        slot_set_mapped_va(&mut slots, h0, 0x400).unwrap();
+        slot_insert(&mut slots, 0x2000, Rights::none(),
+                    HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(),
+                    HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+
+        let snapshot = slots.clone();
+        let mut actions = vec![];
+        let n = slot_revoke_validate(&slots, 0x1000, |a| actions.push(*a));
+        assert_eq!(n, 2);
+        assert_eq!(slots, snapshot);
+
+        // Action stream reflects pre-clear state.
+        assert!(actions[0].had_mapping);
+        assert_eq!(actions[0].mapped_va_page, 0x400);
+        assert!(matches!(actions[0].kind, HandleKind::PageSet { mapped_va_page: 0x400 }));
+        assert!(!actions[1].had_mapping);
+        assert!(matches!(actions[1].kind, HandleKind::PageSet { mapped_va_page: 0 }));
+    }
+
+    #[test]
+    fn revoke_apply_clears_matching_slots() {
+        let mut slots = empty_table(4);
+        slot_insert(&mut slots, 0x1000, Rights::none(),
+                    HandleKind::PageSet { mapped_va_page: 0x400 }).unwrap();
+        slot_insert(&mut slots, 0x2000, Rights::none(),
+                    HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(),
+                    HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+
+        let n = slot_revoke_apply(&mut slots, 0x1000, |_| {});
+        assert_eq!(n, 2);
+
+        // Both 0x1000 slots cleared; the 0x2000 slot survives.
+        assert_eq!(slots[0], HandleEntry::EMPTY);
+        assert_eq!(slots[1].object_paddr, 0x2000);
+        assert_eq!(slots[2], HandleEntry::EMPTY);
+    }
+
+    #[test]
+    fn revoke_apply_yields_action_before_clearing() {
+        // Verifies the on_action callback observes pre-clear state.
+        let mut slots = empty_table(2);
+        let h = slot_insert(&mut slots, 0x1000, Rights::none(),
+                            HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        slot_set_mapped_va(&mut slots, h, 0x400).unwrap();
+
+        let mut seen = None;
+        slot_revoke_apply(&mut slots, 0x1000, |a| seen = Some(*a));
+
+        let action = seen.unwrap();
+        assert!(action.had_mapping);
+        assert_eq!(action.mapped_va_page, 0x400);
+        assert_eq!(slots[0], HandleEntry::EMPTY);
+    }
+
+    #[test]
+    fn revoke_validate_and_apply_yield_same_action_stream() {
+        // The two-phase precondition: under stable handle table, the
+        // action stream from validate and apply must match exactly so
+        // accounting reconciliation in validate predicts apply.
+        let mut slots = empty_table(8);
+        let h0 = slot_insert(&mut slots, 0x1000, Rights::none(),
+                             HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        slot_set_mapped_va(&mut slots, h0, 0x100).unwrap();
+        slot_insert(&mut slots, 0x2000, Rights::none(),
+                    HandleKind::Notification).unwrap();
+        slot_insert(&mut slots, 0x1000, Rights::none(),
+                    HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        let h2 = slot_insert(&mut slots, 0x1000, Rights::none(),
+                             HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        slot_set_mapped_va(&mut slots, h2, 0x200).unwrap();
+
+        let mut validate_actions = vec![];
+        slot_revoke_validate(&slots, 0x1000, |a| validate_actions.push(*a));
+
+        let mut apply_actions = vec![];
+        slot_revoke_apply(&mut slots, 0x1000, |a| apply_actions.push(*a));
+
+        assert_eq!(validate_actions, apply_actions);
+        assert_eq!(validate_actions.len(), 3);
+    }
+
+    #[test]
+    fn revoke_no_match_yields_zero() {
+        let mut slots = empty_table(4);
+        slot_insert(&mut slots, 0x1000, Rights::none(),
+                    HandleKind::Endpoint { caller_token: 0 }).unwrap();
+
+        let mut count = 0;
+        let v = slot_revoke_validate(&slots, 0x9999, |_| count += 1);
+        assert_eq!(v, 0);
+        assert_eq!(count, 0);
+
+        let snapshot = slots.clone();
+        let a = slot_revoke_apply(&mut slots, 0x9999, |_| count += 1);
+        assert_eq!(a, 0);
+        assert_eq!(count, 0);
+        assert_eq!(slots, snapshot);
+    }
+
+    #[test]
+    fn revoke_apply_non_pageset_kind_not_marked_mapped() {
+        // Endpoint / Notification / Reply slots set had_mapping = false
+        // regardless of slot fields — the action's mapped_va_page is
+        // only meaningful for PageSet.
+        let mut slots = empty_table(4);
+        slot_insert(&mut slots, 0x1000, Rights::none(),
+                    HandleKind::Endpoint { caller_token: 7 }).unwrap();
+
+        let mut seen = None;
+        slot_revoke_apply(&mut slots, 0x1000, |a| seen = Some(*a));
+
+        let action = seen.unwrap();
+        assert!(!action.had_mapping);
+        assert_eq!(action.mapped_va_page, 0);
+        assert!(matches!(action.kind, HandleKind::Endpoint { caller_token: 7 }));
     }
 }

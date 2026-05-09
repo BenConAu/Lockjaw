@@ -395,6 +395,85 @@ pub unsafe fn unmap_validated(
     Ok(())
 }
 
+/// Validate that L3 PTEs at [va, va + count*PAGE_SIZE) map to the
+/// expected physical pages. Read-only walk; never writes and never
+/// invalidates the TLB.
+///
+/// Returns Ok(()) on full match, Err(InvalidParameter) on the first
+/// mismatch (the index is folded into a single error here; callers
+/// that need the index can use `lockjaw_types::page_table::validate_pte_match`
+/// directly).
+///
+/// Pairs with `clear_validated_pte`: after a successful return,
+/// `clear_validated_pte` against the same `(ttbr0, va, count)` is
+/// guaranteed to clear every PTE this function inspected, provided the
+/// kernel holds the GKL across the pair.
+///
+/// # Safety
+/// `ttbr0_paddr` must be a valid L0 page table base.
+/// `expected_pages` must contain valid physical addresses.
+pub unsafe fn validate_pte_match(
+    ttbr0_paddr: PhysAddr,
+    va: u64,
+    expected_pages: &[u64],
+) -> Result<(), VmemError> {
+    lockjaw_types::page_table::validate_pte_match(
+        ttbr0_paddr.as_u64(),
+        va,
+        expected_pages,
+        |pte_paddr| {
+            // SAFETY: kernel VA via KERNEL_VA_OFFSET
+            core::ptr::read_volatile((pte_paddr + KERNEL_VA_OFFSET) as *const u64)
+        },
+    ).map_err(|_| VmemError::InvalidParameter)
+}
+
+/// Clear L3 PTEs at [va, va + count*PAGE_SIZE) and flush the TLB.
+/// Write-only — does NOT validate the PTEs match anything.
+///
+/// MUST be called only after a successful matching `validate_pte_match`
+/// against the same `(ttbr0, va, count)` within the same critical
+/// section (GKL held). Under that precondition every L3 walk completes
+/// successfully; any other walk outcome means the page table changed
+/// between phases (kernel bug).
+///
+/// TLB invalidation lives here, not in the validate wrapper, because
+/// only the write phase changes mappings.
+///
+/// # Safety
+/// `ttbr0_paddr` must be a valid L0 page table base.
+pub unsafe fn clear_validated_pte(
+    ttbr0_paddr: PhysAddr,
+    va: u64,
+    count: usize,
+) {
+    lockjaw_types::page_table::clear_validated_pte(
+        ttbr0_paddr.as_u64(),
+        va,
+        count,
+        |pte_paddr| {
+            // SAFETY: kernel VA via KERNEL_VA_OFFSET
+            core::ptr::read_volatile((pte_paddr + KERNEL_VA_OFFSET) as *const u64)
+        },
+        |pte_paddr, val| {
+            // SAFETY: kernel VA via KERNEL_VA_OFFSET
+            core::ptr::write_volatile((pte_paddr + KERNEL_VA_OFFSET) as *mut u64, val);
+        },
+    );
+
+    // dsb ish: drain prior PTE writes before TLBI;
+    // tlbi vmalle1is: invalidate TLB across inner-shareable cores;
+    // dsb ish: wait for TLBI completion;
+    // isb: refetch instructions in case any depend on freshly-flushed
+    //      stage-1 mappings.
+    core::arch::asm!(
+        "dsb ish",
+        "tlbi vmalle1is",
+        "dsb ish",
+        "isb",
+    );
+}
+
 /// with the same state. Uses the pure MappingQuery state machine from
 /// lockjaw-types (host-testable); the kernel only does memory reads.
 ///

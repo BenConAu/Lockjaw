@@ -239,6 +239,17 @@ impl PageTableWalk {
         (walk, WalkResult::Continue(pte_paddr))
     }
 
+    /// Page table level the walker is currently at: 0..=3.
+    ///
+    /// After `step()` returns `WalkResult::Done(_)`, the level identifies
+    /// where resolution happened: 1 means an L1 1GB block, 2 means an L2
+    /// 2MB block, 3 means an L3 4KiB page. Callers that require a
+    /// specific granule (e.g. validate_pte_match's "L3 only" contract)
+    /// must check this after Done.
+    pub fn level(&self) -> u8 {
+        self.level
+    }
+
     /// Feed a raw PTE value read from the address returned by the previous step.
     pub fn step(&mut self, pte_raw: u64) -> WalkResult {
         let pte = PageTableEntry::from_raw(pte_raw);
@@ -484,31 +495,27 @@ pub fn query_mapping_run<F: Fn(u64) -> u64>(
 }
 
 /// Validate that L3 PTEs at [va, va + count*4096) map to the expected
-/// physical pages, then clear them. Returns Ok(()) if all matched and
-/// were cleared. Returns Err(index) with the first mismatched page index.
+/// physical pages. Pure read-only walk; never writes.
 ///
-/// L3 page entries only — returns Err if the walk resolves at L1/L2
-/// (block mapping) or faults.
+/// Returns Ok(()) on full match, Err(index) with the first mismatched
+/// page index. L3 page entries only — returns Err if the walk resolves
+/// at L1/L2 (block mapping) or faults at any level.
 ///
-/// The caller provides closures for reading and writing PTEs, keeping
-/// this function pure and host-testable.
-pub fn unmap_validated<R, W>(
+/// Designed for the validate phase of two-phase revocation: a
+/// successful return guarantees that a paired `clear_validated_pte`
+/// call against the same `(ttbr0, va, count)` will find every PTE
+/// where this function looked. Caller must hold whatever lock keeps
+/// the page table stable between the two calls (GKL today).
+pub fn validate_pte_match<R>(
     ttbr0_paddr: u64,
     va: u64,
     expected_pages: &[u64],
     read_pte: R,
-    write_pte: W,
 ) -> Result<(), usize>
 where
     R: Fn(u64) -> u64,
-    W: Fn(u64, u64),
 {
-    let count = expected_pages.len();
-
-    // Pass 1 (read-only): validate every PTE matches the expected
-    // physical page. No writes — if any page mismatches, the address
-    // space is untouched.
-    for i in 0..count {
+    for i in 0..expected_pages.len() {
         let page_va = va + (i as u64) * 4096;
         let (mut walk, mut result) = PageTableWalk::start(ttbr0_paddr, page_va);
 
@@ -519,6 +526,16 @@ where
                     let next = walk.step(pte_raw);
                     match next {
                         WalkResult::Done(phys_addr) => {
+                            // L3-only contract: PageTableWalk::step also
+                            // returns Done for L1 1GB blocks (level==1)
+                            // and L2 2MB blocks (level==2). Reject those
+                            // here — the kernel never installs PageSet
+                            // mappings as blocks, so a block resolution
+                            // means the walked PTE chain is not the L3
+                            // page entry the caller expects to clear.
+                            if walk.level() != 3 {
+                                return Err(i);
+                            }
                             let actual_page = phys_addr & !0xFFF;
                             if actual_page != expected_pages[i] {
                                 return Err(i);
@@ -534,9 +551,37 @@ where
         }
     }
 
-    // Pass 2 (write): all PTEs validated — now clear them. Walk each
-    // page again to find the L3 PTE address. This is a second page
-    // table walk but avoids a large stack array and is transactional.
+    Ok(())
+}
+
+/// Clear L3 PTEs at [va, va + count*4096). Pure write-only operation —
+/// does NOT validate that the PTEs match anything.
+///
+/// MUST be called only after a successful `validate_pte_match` against
+/// the same `(ttbr0, va, count)` within the same critical section
+/// (GKL held). Under that precondition, every L3 walk completes with
+/// a `WalkResult::Done` and the writes succeed.
+///
+/// **Any other walk outcome panics**: a Done at L1/L2 (block mapping
+/// appeared), a Fault at top level (entry cleared), or a Fault mid-path
+/// (descriptor invalidated) all indicate the page table changed
+/// between validate and clear. That is a kernel-invariant violation,
+/// not a recoverable error — silently breaking on it would leak a
+/// partial unmap behind a successful return and let the apply phase
+/// of revocation fail open.
+///
+/// TLB invalidation is the kernel wrapper's responsibility — this
+/// pure helper only writes PTE storage.
+pub fn clear_validated_pte<R, W>(
+    ttbr0_paddr: u64,
+    va: u64,
+    count: usize,
+    read_pte: R,
+    write_pte: W,
+) where
+    R: Fn(u64) -> u64,
+    W: Fn(u64, u64),
+{
     for i in 0..count {
         let page_va = va + (i as u64) * 4096;
         let (mut walk, mut result) = PageTableWalk::start(ttbr0_paddr, page_va);
@@ -545,21 +590,75 @@ where
             match result {
                 WalkResult::Continue(pte_paddr) => {
                     let pte_raw = read_pte(pte_paddr);
-                    let next = walk.step(pte_raw);
-                    match next {
+                    match walk.step(pte_raw) {
                         WalkResult::Done(_) => {
+                            // L3-only contract: validate_pte_match
+                            // already verified walk.level() == 3 for
+                            // every page, so reaching Done at L1/L2
+                            // here means a block mapping appeared
+                            // between phases (kernel bug).
+                            if walk.level() != 3 {
+                                panic!(
+                                    "clear_validated_pte: Done at level {} for page \
+                                     index {} after validate_pte_match succeeded — \
+                                     block mapping appeared at L1/L2 \
+                                     (kernel-invariant violation)",
+                                    walk.level(), i
+                                );
+                            }
                             write_pte(pte_paddr, 0);
                             break;
                         }
-                        _ => result = next,
+                        next @ WalkResult::Continue(_) => {
+                            result = next;
+                        }
+                        WalkResult::Fault => panic!(
+                            "clear_validated_pte: walk faulted mid-path at page index {} \
+                             after validate_pte_match succeeded — page table diverged \
+                             (kernel-invariant violation)",
+                            i
+                        ),
                     }
                 }
-                // Pass 1 already validated — these can't happen
-                _ => break,
+                // The first WalkResult::Continue is produced by
+                // PageTableWalk::start; reaching Done/Fault here means
+                // the page table changed since validate.
+                WalkResult::Done(_) => panic!(
+                    "clear_validated_pte: walk resolved at L1/L2 for page index {} \
+                     after validate_pte_match succeeded — block mapping appeared \
+                     (kernel-invariant violation)",
+                    i
+                ),
+                WalkResult::Fault => panic!(
+                    "clear_validated_pte: walk faulted at top level for page index {} \
+                     after validate_pte_match succeeded — descriptor cleared \
+                     (kernel-invariant violation)",
+                    i
+                ),
             }
         }
     }
+}
 
+/// Validate then clear in one call. Thin wrapper over
+/// `validate_pte_match` + `clear_validated_pte` for callers that don't
+/// need to interleave other work between phases.
+///
+/// Returns Ok(()) if all matched and were cleared. Returns Err(index)
+/// from validate_pte_match without writing anything.
+pub fn unmap_validated<R, W>(
+    ttbr0_paddr: u64,
+    va: u64,
+    expected_pages: &[u64],
+    read_pte: R,
+    write_pte: W,
+) -> Result<(), usize>
+where
+    R: Fn(u64) -> u64,
+    W: Fn(u64, u64),
+{
+    validate_pte_match(ttbr0_paddr, va, expected_pages, &read_pte)?;
+    clear_validated_pte(ttbr0_paddr, va, expected_pages.len(), &read_pte, write_pte);
     Ok(())
 }
 
@@ -1107,5 +1206,187 @@ mod tests {
             |_, _| panic!("should not write"),
         );
         assert_eq!(result, Err(1)); // second page is unmapped
+    }
+
+    // --- validate_pte_match (read-only) tests ---
+
+    #[test]
+    fn validate_pte_match_does_not_write() {
+        // Pure read: never invokes the write closure even on success.
+        let (pt, l0) = build_basic_pt(3);
+        let expected = [0x8000_0000, 0x8000_1000, 0x8000_2000];
+
+        let result = validate_pte_match(l0, 0x40_0000, &expected, |a| pt.read(a));
+        assert!(result.is_ok());
+
+        // Verify mappings are unchanged: query still finds them.
+        let (mapped, run) = query_mapping_run(l0, 0x40_0000, |a| pt.read(a));
+        assert!(mapped);
+        assert!(run >= 3);
+    }
+
+    #[test]
+    fn validate_pte_match_returns_first_mismatch_index() {
+        let (pt, l0) = build_basic_pt(3);
+        // First two pages match, third is wrong.
+        let expected = [0x8000_0000, 0x8000_1000, 0xDEAD_2000];
+
+        let result = validate_pte_match(l0, 0x40_0000, &expected, |a| pt.read(a));
+        assert_eq!(result, Err(2));
+    }
+
+    #[test]
+    fn validate_pte_match_empty_slice_is_ok() {
+        let (pt, l0) = build_basic_pt(0);
+        let expected: [u64; 0] = [];
+        assert!(validate_pte_match(l0, 0x40_0000, &expected, |a| pt.read(a)).is_ok());
+    }
+
+    // --- clear_validated_pte (write-only) tests ---
+
+    #[test]
+    fn clear_validated_pte_clears_all_count_ptes() {
+        use std::cell::RefCell;
+        let (pt, l0) = build_basic_pt(3);
+        let pt = RefCell::new(pt);
+
+        clear_validated_pte(
+            l0, 0x40_0000, 3,
+            |a| pt.borrow().read(a),
+            |a, v| pt.borrow_mut().set(a, v),
+        );
+
+        let (mapped, _) = query_mapping_run(l0, 0x40_0000, |a| pt.borrow().read(a));
+        assert!(!mapped);
+    }
+
+    #[test]
+    #[should_panic(expected = "kernel-invariant violation")]
+    fn clear_validated_pte_panics_on_unmapped_page() {
+        // Without a prior validate_pte_match, the second iteration walks
+        // an unmapped VA and gets WalkResult::Fault. The implementation
+        // must panic loudly, not silently leave the cleared first PTE
+        // in a half-applied state.
+        let (pt, l0) = build_basic_pt(1);
+        clear_validated_pte(
+            l0, 0x40_0000, 2,
+            |a| pt.read(a),
+            |_, _| {},
+        );
+    }
+
+    /// Build a page table where VA 0x40_0000 resolves through an L2
+    /// 2MB block instead of an L3 page entry. validate_pte_match's
+    /// "L3 only" contract must reject this.
+    fn build_l2_block_pt() -> (FakePT, u64) {
+        let mut pt = FakePT::new();
+        let l0: u64 = 0x1_0000;
+        let l1: u64 = 0x2_0000;
+        let l2: u64 = 0x3_0000;
+
+        pt.set_table_entry(l0, 0, l1);
+        pt.set_table_entry(l1, 0, l2);
+        // L2[2] is a 2MB block descriptor pointing at 0x8000_0000,
+        // not a table descriptor pointing at an L3 page.
+        let block = PageTableEntry::new_block(
+            PhysAddr::new(0x8000_0000), MAIR_NORMAL, AP_RW_ALL, SH_INNER,
+        );
+        pt.set(l2 + 2 * 8, block.raw());
+
+        (pt, l0)
+    }
+
+    #[test]
+    fn validate_pte_match_rejects_l2_block_mapping() {
+        // VA 0x40_0000 resolves at L2 as a 2MB block. Even if the
+        // resolved phys matches expected, the L3-only contract
+        // requires rejection because clear_validated_pte cannot
+        // safely zero an L2 block descriptor (would unmap 2MB).
+        let (pt, l0) = build_l2_block_pt();
+        let expected = [0x8000_0000];
+
+        let result = validate_pte_match(l0, 0x40_0000, &expected, |a| pt.read(a));
+        assert_eq!(result, Err(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "block mapping appeared at L1/L2")]
+    fn clear_validated_pte_panics_on_l2_block_mapping() {
+        // The validate stage would have rejected this, but if the page
+        // table changed between phases to install a block (kernel bug),
+        // clear must panic instead of zeroing the block descriptor.
+        let (pt, l0) = build_l2_block_pt();
+        clear_validated_pte(
+            l0, 0x40_0000, 1,
+            |a| pt.read(a),
+            |_, _| {},
+        );
+    }
+
+    #[test]
+    fn page_table_walk_level_tracks_resolution() {
+        // Locks down the level() invariant validate_pte_match relies on:
+        // step() leaves walk.level at the level Done resolved at.
+        let (mut w, _) = PageTableWalk::start(0x1_0000, 0x4000_1234);
+        // L0 → L1
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        // L1 block resolves at level 1
+        let r = w.step(PageTableEntry::new_block(
+            PhysAddr::new(0x8000_0000), MAIR_NORMAL, AP_RW_ALL, SH_INNER,
+        ).raw());
+        assert!(matches!(r, WalkResult::Done(_)));
+        assert_eq!(w.level(), 1);
+
+        let (mut w, _) = PageTableWalk::start(0x1_0000, 0x40_1234);
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
+        // L2 block resolves at level 2
+        let r = w.step(PageTableEntry::new_block(
+            PhysAddr::new(0x8000_0000), MAIR_NORMAL, AP_RW_ALL, SH_INNER,
+        ).raw());
+        assert!(matches!(r, WalkResult::Done(_)));
+        assert_eq!(w.level(), 2);
+
+        let (mut w, _) = PageTableWalk::start(0x1_0000, 0x40_1234);
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x2_0000)).raw());
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x3_0000)).raw());
+        w.step(PageTableEntry::new_table(PhysAddr::new(0x4_0000)).raw());
+        // L3 page resolves at level 3
+        let r = w.step(PageTableEntry::new_page(
+            PhysAddr::new(0x5_0000), MAIR_NORMAL, AP_RW_ALL, SH_INNER,
+        ).raw());
+        assert!(matches!(r, WalkResult::Done(_)));
+        assert_eq!(w.level(), 3);
+    }
+
+    #[test]
+    fn validate_then_clear_matches_unmap_validated() {
+        // Two-phase split is functionally identical to the wrapper.
+        use std::cell::RefCell;
+
+        let (pt_a, l0_a) = build_basic_pt(3);
+        let pt_a = RefCell::new(pt_a);
+        let expected = [0x8000_0000, 0x8000_1000, 0x8000_2000];
+
+        validate_pte_match(l0_a, 0x40_0000, &expected, |a| pt_a.borrow().read(a)).unwrap();
+        clear_validated_pte(
+            l0_a, 0x40_0000, expected.len(),
+            |a| pt_a.borrow().read(a),
+            |a, v| pt_a.borrow_mut().set(a, v),
+        );
+
+        let (pt_b, l0_b) = build_basic_pt(3);
+        let pt_b = RefCell::new(pt_b);
+        unmap_validated(
+            l0_b, 0x40_0000, &expected,
+            |a| pt_b.borrow().read(a),
+            |a, v| pt_b.borrow_mut().set(a, v),
+        ).unwrap();
+
+        // Both produce the same end-state: no mapping at 0x40_0000.
+        let (a_mapped, _) = query_mapping_run(l0_a, 0x40_0000, |a| pt_a.borrow().read(a));
+        let (b_mapped, _) = query_mapping_run(l0_b, 0x40_0000, |a| pt_b.borrow().read(a));
+        assert!(!a_mapped);
+        assert!(!b_mapped);
     }
 }
