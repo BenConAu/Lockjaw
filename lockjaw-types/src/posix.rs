@@ -208,8 +208,9 @@ pub fn dispatch(inp: &DispatchInputs) -> Action {
 // ---------------------------------------------------------------------------
 
 /// Resolved VA layout for a POSIX child: where the ELF image ends, where
-/// the personality server's shared buffer goes, and where the heap (brk)
-/// starts. All addresses are page-aligned.
+/// the personality server's shared buffer goes, where the heap (brk)
+/// starts, and where mmap regions get carved from. All addresses are
+/// page-aligned.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PosixVaLayout {
     /// First page-aligned VA strictly after every loaded segment. Doubles
@@ -220,6 +221,11 @@ pub struct PosixVaLayout {
     pub child_shared_va: u64,
     /// First VA musl can grow brk into (one page above the shared buffer).
     pub brk_base: u64,
+    /// Base VA of the mmap region. Anonymous private mmap allocations
+    /// from the posix-server's bump allocator carve upward from here.
+    /// Must satisfy `mmap_base > user_stack_base + stack_pages*PAGE_SIZE
+    /// + PAGE_SIZE` (above stack + one guard page).
+    pub mmap_base: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -233,21 +239,38 @@ pub enum LayoutError {
     /// `brk_base` would overlap (or sit above) the user stack. The
     /// personality server has no place to put the heap if this fires.
     OverflowsStack { brk_base: u64, user_stack_base: u64 },
+    /// `mmap_base` does not sit strictly above the user stack + one
+    /// guard page. Phase 2.0 invariant: a fixed POSIX_MMAP_BASE is
+    /// safe only because brk is confined below USER_STACK_BASE
+    /// (existing OverflowsStack check) AND mmap is above the stack
+    /// top (this check). If a future ABI change moves the stack up,
+    /// POSIX_MMAP_BASE must move with it; this error catches the
+    /// regression at boot rather than at use.
+    MmapBelowStack {
+        mmap_base: u64,
+        user_stack_base: u64,
+        stack_pages: u32,
+    },
 }
 
-/// Compute where to place the shared buffer and brk for a POSIX child.
+/// Compute where to place the shared buffer, brk, and mmap base for a
+/// POSIX child.
 ///
 /// Layout (in ascending VA):
 ///
 /// ```text
-/// [ELF segments] elf_end_aligned [guard page] child_shared_va [shared] brk_base [...] user_stack_base
+/// [ELF segments] elf_end_aligned [guard] child_shared_va [shared] brk_base
+///   [...] user_stack_base [stack: stack_pages] [guard] mmap_base [...]
 /// ```
 ///
 /// Pure: no I/O, no syscalls. The personality server uses the result to
-/// allocate and map the shared page and to seed musl's brk pointer.
+/// allocate and map the shared page, seed musl's brk pointer, and pass
+/// `mmap_base` to the shim via POSIX_INIT.
 pub fn compute_va_layout(
     info: &ElfInfo,
     user_stack_base: u64,
+    stack_pages: u32,
+    mmap_base: u64,
 ) -> Result<PosixVaLayout, LayoutError> {
     let mut elf_end: u64 = 0;
     for i in 0..info.segment_count {
@@ -275,7 +298,31 @@ pub fn compute_va_layout(
     if brk_base >= user_stack_base {
         return Err(LayoutError::OverflowsStack { brk_base, user_stack_base });
     }
-    Ok(PosixVaLayout { elf_end_aligned, child_shared_va, brk_base })
+
+    // mmap_base must sit strictly above the stack top + one guard page.
+    // The kernel maps stack_pages at user_stack_base, occupying VAs
+    // [user_stack_base, user_stack_base + stack_pages*PAGE_SIZE). One
+    // page above that for a guard, then mmap_base.
+    let stack_top = user_stack_base
+        .checked_add((stack_pages as u64) * PAGE_SIZE)
+        .ok_or(LayoutError::AlignOverflow)?;
+    let stack_top_plus_guard = stack_top
+        .checked_add(PAGE_SIZE)
+        .ok_or(LayoutError::AlignOverflow)?;
+    if mmap_base < stack_top_plus_guard {
+        return Err(LayoutError::MmapBelowStack {
+            mmap_base,
+            user_stack_base,
+            stack_pages,
+        });
+    }
+
+    Ok(PosixVaLayout {
+        elf_end_aligned,
+        child_shared_va,
+        brk_base,
+        mmap_base,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +500,9 @@ mod tests {
 
     // Use a stack base well above any test ELF.
     const TEST_STACK_BASE: u64 = 0x0000_0040_0000_0000;
+    // Tests use a 4-page stack and an mmap base safely above stack + guard.
+    const TEST_STACK_PAGES: u32 = 4;
+    const TEST_MMAP_BASE: u64 = 0x0000_0050_0000_0000;
 
     #[test]
     fn write_fd1_emits_from_shared() {
@@ -875,7 +925,7 @@ mod tests {
             (0x40_0000, 0x1000),
             (0x41_0000, 0x2000),
         ]);
-        let l = compute_va_layout(&info, TEST_STACK_BASE).unwrap();
+        let l = compute_va_layout(&info, TEST_STACK_BASE, TEST_STACK_PAGES, TEST_MMAP_BASE).unwrap();
         // Largest seg_end is 0x41_0000 + 0x2000 = 0x412000 (already page aligned).
         assert_eq!(l.elf_end_aligned, 0x41_2000);
         assert_eq!(l.child_shared_va, 0x41_3000);
@@ -886,7 +936,7 @@ mod tests {
     fn layout_unaligned_segment_end_rounds_up() {
         // Segment ends at 0x40_1234 → aligned to 0x40_2000.
         let info = make_info(&[(0x40_0000, 0x1234)]);
-        let l = compute_va_layout(&info, TEST_STACK_BASE).unwrap();
+        let l = compute_va_layout(&info, TEST_STACK_BASE, TEST_STACK_PAGES, TEST_MMAP_BASE).unwrap();
         assert_eq!(l.elf_end_aligned, 0x40_2000);
         assert_eq!(l.child_shared_va, 0x40_3000);
         assert_eq!(l.brk_base, 0x40_4000);
@@ -895,7 +945,7 @@ mod tests {
     #[test]
     fn layout_results_are_page_aligned() {
         let info = make_info(&[(0x40_0001, 0x789)]);
-        let l = compute_va_layout(&info, TEST_STACK_BASE).unwrap();
+        let l = compute_va_layout(&info, TEST_STACK_BASE, TEST_STACK_PAGES, TEST_MMAP_BASE).unwrap();
         let mask = PAGE_SIZE - 1;
         assert_eq!(l.elf_end_aligned & mask, 0);
         assert_eq!(l.child_shared_va & mask, 0);
@@ -907,7 +957,7 @@ mod tests {
         // No segments — elf_end_aligned is 0; layout still places the
         // shared buffer and brk in the lowest two non-null pages.
         let info = make_info(&[]);
-        let l = compute_va_layout(&info, TEST_STACK_BASE).unwrap();
+        let l = compute_va_layout(&info, TEST_STACK_BASE, TEST_STACK_PAGES, TEST_MMAP_BASE).unwrap();
         assert_eq!(l.elf_end_aligned, 0);
         assert_eq!(l.child_shared_va, PAGE_SIZE);
         assert_eq!(l.brk_base, 2 * PAGE_SIZE);
@@ -921,7 +971,7 @@ mod tests {
             (0x40_0000, 0x1000),  // ends at 0x40_1000
             (0x41_0000, 0x1000),  // ends at 0x41_1000
         ]);
-        let l = compute_va_layout(&info, TEST_STACK_BASE).unwrap();
+        let l = compute_va_layout(&info, TEST_STACK_BASE, TEST_STACK_PAGES, TEST_MMAP_BASE).unwrap();
         assert_eq!(l.elf_end_aligned, 0x42_1000);
     }
 
@@ -933,7 +983,7 @@ mod tests {
         // elf_end_aligned = 0x40_2000, child = 0x40_3000, brk = 0x40_4000.
         // brk (0x40_4000) >= stack (0x40_3000) → error.
         assert_eq!(
-            compute_va_layout(&info, stack_base),
+            compute_va_layout(&info, stack_base, TEST_STACK_PAGES, TEST_MMAP_BASE),
             Err(LayoutError::OverflowsStack {
                 brk_base: 0x40_4000,
                 user_stack_base: stack_base,
@@ -948,7 +998,7 @@ mod tests {
         let stack_base = 0x40_4000;
         let info = make_info(&[(0x40_0000, 0x2000)]); // brk_base = 0x40_4000
         assert!(matches!(
-            compute_va_layout(&info, stack_base),
+            compute_va_layout(&info, stack_base, TEST_STACK_PAGES, TEST_MMAP_BASE),
             Err(LayoutError::OverflowsStack { .. }),
         ));
     }
@@ -958,7 +1008,7 @@ mod tests {
         // vaddr + mem_size overflows u64.
         let info = make_info(&[(u64::MAX - 100, 200)]);
         assert_eq!(
-            compute_va_layout(&info, TEST_STACK_BASE),
+            compute_va_layout(&info, TEST_STACK_BASE, TEST_STACK_PAGES, TEST_MMAP_BASE),
             Err(LayoutError::SegmentEndOverflow { seg_idx: 0 }),
         );
     }
@@ -971,8 +1021,73 @@ mod tests {
         let info = make_info(&[(u64::MAX & !(PAGE_SIZE - 1), PAGE_SIZE - 1)]);
         // seg_end = u64::MAX, +PAGE_SIZE-1 overflows.
         assert_eq!(
-            compute_va_layout(&info, TEST_STACK_BASE),
+            compute_va_layout(&info, TEST_STACK_BASE, TEST_STACK_PAGES, TEST_MMAP_BASE),
             Err(LayoutError::AlignOverflow),
         );
+    }
+
+    // ---- mmap_base layout invariant (Phase 2.0) ----
+
+    #[test]
+    fn layout_returns_mmap_base() {
+        let info = make_info(&[(0x40_0000, 0x1000)]);
+        let l = compute_va_layout(
+            &info, TEST_STACK_BASE, TEST_STACK_PAGES, TEST_MMAP_BASE,
+        ).unwrap();
+        assert_eq!(l.mmap_base, TEST_MMAP_BASE);
+    }
+
+    #[test]
+    fn layout_real_posix_constants() {
+        // The actual POSIX_MMAP_BASE = 16 MiB sits well above
+        // USER_STACK_BASE = 8 MiB + 4-page stack + guard. Sanity check.
+        use crate::constants::{POSIX_MMAP_BASE, USER_STACK_BASE};
+        let info = make_info(&[(0x40_0000, 0x1000)]);
+        let l = compute_va_layout(
+            &info, USER_STACK_BASE, 4, POSIX_MMAP_BASE,
+        ).unwrap();
+        assert_eq!(l.mmap_base, POSIX_MMAP_BASE);
+    }
+
+    #[test]
+    fn layout_mmap_base_below_stack_top_is_error() {
+        // mmap_base lands inside the stack region — must reject.
+        let info = make_info(&[(0x40_0000, 0x1000)]);
+        let stack_pages = 4u32;
+        // Stack occupies [TEST_STACK_BASE, TEST_STACK_BASE + 4*PAGE_SIZE).
+        // mmap_base equal to the first stack page would be an overlap.
+        let bad_mmap = TEST_STACK_BASE + 2 * PAGE_SIZE;
+        assert_eq!(
+            compute_va_layout(&info, TEST_STACK_BASE, stack_pages, bad_mmap),
+            Err(LayoutError::MmapBelowStack {
+                mmap_base: bad_mmap,
+                user_stack_base: TEST_STACK_BASE,
+                stack_pages,
+            }),
+        );
+    }
+
+    #[test]
+    fn layout_mmap_base_at_stack_top_no_guard_is_error() {
+        // mmap_base = stack_top exactly (no guard page) — must reject.
+        let info = make_info(&[(0x40_0000, 0x1000)]);
+        let stack_pages = 4u32;
+        let bad_mmap = TEST_STACK_BASE + (stack_pages as u64) * PAGE_SIZE;
+        assert!(matches!(
+            compute_va_layout(&info, TEST_STACK_BASE, stack_pages, bad_mmap),
+            Err(LayoutError::MmapBelowStack { .. }),
+        ));
+    }
+
+    #[test]
+    fn layout_mmap_base_one_guard_page_above_stack_ok() {
+        // mmap_base = stack_top + PAGE_SIZE — minimum legal placement.
+        let info = make_info(&[(0x40_0000, 0x1000)]);
+        let stack_pages = 4u32;
+        let ok_mmap = TEST_STACK_BASE + (stack_pages as u64) * PAGE_SIZE + PAGE_SIZE;
+        let l = compute_va_layout(
+            &info, TEST_STACK_BASE, stack_pages, ok_mmap,
+        ).unwrap();
+        assert_eq!(l.mmap_base, ok_mmap);
     }
 }

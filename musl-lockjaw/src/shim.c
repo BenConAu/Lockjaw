@@ -192,6 +192,12 @@ static long reply_handle;
 static volatile char *shared_buf;
 static long brk_current;
 static long brk_mapped_end;
+/*
+ * Phase 2.0: base VA of the mmap region, sent by the personality
+ * server in POSIX_INIT word 3. Stashed here for use by the future
+ * mmap()/munmap() shim (Phase 2.3); not read by anything yet.
+ */
+static long mmap_base;
 static int initialized;
 
 /* ---------- Local brk handler ---------- */
@@ -254,7 +260,7 @@ static void ensure_init(void) {
      *      r[0] = child's PageSet handle index (for shared buffer)
      *      r[1] = child_shared_va (where to map the shared buffer)
      *      r[2] = brk_base (heap start VA)
-     *      r[3] = 0
+     *      r[3] = mmap_base (base VA of mmap region, Phase 2.0)
      */
     long r[4];
     err = lj_call_ret4(0, reply_handle, POSIX_INIT, 0, 0, 0, r);
@@ -263,6 +269,7 @@ static void ensure_init(void) {
     long buf_va        = r[1];
     brk_current        = r[2];
     brk_mapped_end     = brk_current;
+    mmap_base          = r[3];
 
     /* 3. Map the shared buffer page locally */
     err = lj_svc3(LJ_SYS_MAP_PAGES, shared_ps_idx, buf_va, 0);

@@ -12,7 +12,7 @@ use lockjaw_userlib::*;
 use lockjaw_userlib::elf::parse_elf;
 use lockjaw_userlib::fs::{FsClient, FsError};
 use lockjaw_types::addr::PAGE_SIZE;
-use lockjaw_types::constants::USER_STACK_BASE;
+use lockjaw_types::constants::{POSIX_MMAP_BASE, USER_STACK_BASE};
 use lockjaw_types::fs::FS_MAX_INLINE_PATH;
 use lockjaw_types::posix_fd::{FdEntry, FdKind, FdTable, FD_STDIN, MAX_FDS};
 use lockjaw_userlib::elf_loader::{plan_elf_load, ElfLoadEntry};
@@ -489,17 +489,20 @@ pub extern "C" fn _start() -> ! {
     };
 
     // --- Compute dynamic VAs from ELF layout ---
-    // Pure decision (and overflow / stack-overlap checks) live in
-    // lockjaw_types::posix::compute_va_layout (host-tested).
-    let layout = match compute_va_layout(&elf_info, USER_STACK_BASE) {
+    // Pure decision (and overflow / stack-overlap / mmap-below-stack
+    // checks) live in lockjaw_types::posix::compute_va_layout
+    // (host-tested). The 4 below matches the stack_pages allocation a
+    // few lines down.
+    let layout = match compute_va_layout(&elf_info, USER_STACK_BASE, 4, POSIX_MMAP_BASE) {
         Ok(l) => l,
         Err(_) => {
-            puts("posix: ELF layout overlaps stack or overflows\n");
+            puts("posix: ELF layout overlaps stack/mmap or overflows\n");
             halt();
         }
     };
     let child_shared_va = layout.child_shared_va;
     let brk_base = layout.brk_base;
+    let mmap_base = layout.mmap_base;
 
     // --- Allocate working pages for ELF loading ---
     let map_array_va = VMEM.alloc(1).expect("VA exhausted");
@@ -616,8 +619,12 @@ pub extern "C" fn _start() -> ! {
                     Ok(idx) => idx,
                     Err(_) => { puts("posix: export shared FAILED\n"); halt(); }
                 };
-                // Reply: [child's PageSet handle, child VA, brk base, 0]
-                sys_reply(child_idx, child_shared_va, brk_base, 0);
+                // Reply: [child's PageSet handle, child VA, brk base, mmap base]
+                // mmap_base in word 3 is new in Phase 2.0 — the shim
+                // stashes it for use by mmap() once Phase 2.3 wires it
+                // up. Until then it's a free pass-through with no
+                // user-visible effect.
+                sys_reply(child_idx, child_shared_va, brk_base, mmap_base);
                 puts("posix-server: POSIX_INIT OK\n");
             }
 
