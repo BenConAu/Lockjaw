@@ -14,6 +14,7 @@
 
 #include <stdint.h>
 #include <sys/uio.h>
+#include <errno.h>  /* EINVAL / ENOMEM for direct -errno returns */
 
 /* ---------- Lockjaw syscall numbers ---------- */
 #define LJ_SYS_DEBUG_PUTS    0
@@ -35,12 +36,14 @@
 #define __NR_openat      56
 #define __NR_read        63
 #define __NR_write       64
+#define __NR_readv       65
 #define __NR_writev      66
 #define __NR_brk        214
 #define __NR_munmap     215
 #define __NR_mmap       222
 #define __NR_mprotect   226
 #define __NR_madvise    233
+
 
 /* ---------- Diagnostic helpers (no IPC required) ---------- */
 
@@ -336,7 +339,7 @@ static long handle_mmap(long len, long prot, long flags) {
         }
         /* Server's side cleaned up; close the orphan local handle. */
         (void)lj_svc3(LJ_SYS_CLOSE_HANDLE, handle, 0, 0);
-        return -12; /* -ENOMEM */
+        return -ENOMEM;
     }
 
     /* Find a tracker slot. On full, treat like map failure: the
@@ -352,7 +355,7 @@ static long handle_mmap(long len, long prot, long flags) {
         if (rb_err != 0)
             lj_die("mmap rollback failed (tracker full)", rb_err);
         (void)lj_svc3(LJ_SYS_CLOSE_HANDLE, handle, 0, 0);
-        return -12; /* -ENOMEM */
+        return -ENOMEM;
     }
     mmap_tracker[slot].base_va = base_va;
     mmap_tracker[slot].handle  = handle;
@@ -362,7 +365,9 @@ static long handle_mmap(long len, long prot, long flags) {
 
 /*
  * Linux munmap(addr, len). Remote-first teardown:
- *   1. Look up base_va in the tracker. ENOENT (-2) if missing.
+ *   1. Look up base_va in the tracker. EINVAL if missing (mirrors
+ *      the server's policy and Linux convention for "not a known
+ *      mapping").
  *   2. lj_call(NR_MUNMAP, base_va, len). On errno reply: return it
  *      with the tracker untouched so the caller can retry.
  *   3. sys_unmap_pages(handle, base_va). Failure here means local
@@ -379,7 +384,7 @@ static long handle_munmap(long base_va, long len) {
      * would split the contract — the visible errno would depend on
      * whether the miss happened in the local tracker or the server
      * table. Linux uses EINVAL for "not a known mapping" too. */
-    if (slot < 0) return -22; /* -EINVAL */
+    if (slot < 0) return -EINVAL;
 
     long handle = mmap_tracker[slot].handle;
     long ret = lj_call(0, reply_handle, __NR_munmap, base_va, len, 0);
@@ -530,10 +535,49 @@ long lockjaw_syscall(long n, long a, long b, long c,
         return ret;
     }
 
+    /* readv(fd, iov, iovcnt): musl's __stdio_read uses readv to fill
+     * the user's buffer + the FILE struct's internal buffer in one
+     * syscall. Translate to a single read at the IPC level (server
+     * doesn't know about iovs; it just fills the shared buffer up
+     * to `total` bytes), then scatter the returned bytes back into
+     * the iov entries. Cap total at PAGE_SIZE — same shared-buffer
+     * limit as __NR_read. */
+    if (n == __NR_readv) {
+        const struct iovec *iov = (const struct iovec *)b;
+        int iovcnt = (int)c;
+        /* Linux returns -EINVAL for iovcnt < 0; the loop-bound
+         * fallthrough would otherwise report this as EOF (return 0)
+         * which musl would interpret as success. */
+        if (iovcnt < 0) return -EINVAL;
+        long total = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            long chunk = (long)iov[i].iov_len;
+            if (total + chunk > (long)PAGE_SIZE) {
+                total = (long)PAGE_SIZE;
+                break;
+            }
+            total += chunk;
+        }
+        if (total == 0) return 0;
+        long ret = lj_call(0, reply_handle, __NR_read, a, total, 0);
+        if (ret <= 0) return ret;
+        long copied = 0;
+        for (int i = 0; i < iovcnt && copied < ret; i++) {
+            long chunk = (long)iov[i].iov_len;
+            if (copied + chunk > ret) chunk = ret - copied;
+            shim_memcpy_from_shared((char *)iov[i].iov_base,
+                                     shared_buf + copied, chunk);
+            copied += chunk;
+        }
+        return ret;
+    }
+
     /* writev(fd, iov, iovcnt): gather into shared buffer, cap at PAGE_SIZE */
     if (n == __NR_writev) {
         const struct iovec *iov = (const struct iovec *)b;
         int iovcnt = (int)c;
+        /* Same guard as readv — Linux returns -EINVAL for iovcnt < 0. */
+        if (iovcnt < 0) return -EINVAL;
         long total = 0;
         for (int i = 0; i < iovcnt && total < (long)PAGE_SIZE; i++) {
             long chunk = (long)iov[i].iov_len;
