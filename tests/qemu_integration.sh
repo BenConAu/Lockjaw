@@ -189,6 +189,7 @@ assert_contains "hello, lockjaw" "musl puts() reached kernel UART (Phase 0 gate)
 # -> FsClient -> fat32-server -> BlockClient -> virtio-blk -> QEMU disk.
 assert_contains "posix-hello: hello from fat32" "musl read FAT32 file via posix-server (Phase 1 gate)"
 assert_contains "posix-hello: malloc 1MB ok" "musl malloc(1MB) via mmap (Phase 2.3 gate)"
+assert_contains "posix-hello: malloc 8MB ok" "musl malloc(8MB) via single-PageSet mmap (Phase 2.4 gate)"
 assert_contains "posix-server: child exit" "posix-server saw child exit_group"
 assert_contains "posix-server: done" "posix-server dispatch loop terminated cleanly"
 

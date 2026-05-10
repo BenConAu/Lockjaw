@@ -47,21 +47,43 @@ int main(void) {
      * page into the working set (PTE write needs a real backing
      * page). The free() may or may not call munmap depending on
      * musl's malloc state — we don't assert it. */
-    const size_t SIZE = 1 * 1024 * 1024;
-    char *p = (char *)malloc(SIZE);
-    if (!p) {
+    const size_t SIZE_1M = 1 * 1024 * 1024;
+    char *p1 = (char *)malloc(SIZE_1M);
+    if (!p1) {
         puts("posix-hello: malloc 1MB FAILED");
         return 1;
     }
-    p[0] = 0xA5;
-    p[SIZE / 2] = 0x5A;
-    p[SIZE - 1] = 0x33;
-    if (p[0] == (char)0xA5 && p[SIZE / 2] == (char)0x5A && p[SIZE - 1] == (char)0x33) {
+    p1[0] = 0xA5;
+    p1[SIZE_1M / 2] = 0x5A;
+    p1[SIZE_1M - 1] = 0x33;
+    if (p1[0] == (char)0xA5 && p1[SIZE_1M / 2] == (char)0x5A && p1[SIZE_1M - 1] == (char)0x33) {
         puts("posix-hello: malloc 1MB ok");
     } else {
         puts("posix-hello: malloc 1MB readback FAILED");
         return 1;
     }
-    free(p);
+    free(p1);
+
+    /* Phase 2.4 gate: 8 MiB malloc. Single PageSet (2048 data
+     * pages + 5-page contiguous header) thanks to the variable-
+     * size header from Phase 2.K — without it MAX_PAGES_PER_SET
+     * was 510 and 8 MiB would need 5 PageSets. Same write-through
+     * pattern as the 1 MiB test. */
+    const size_t SIZE_8M = 8 * 1024 * 1024;
+    char *p8 = (char *)malloc(SIZE_8M);
+    if (!p8) {
+        puts("posix-hello: malloc 8MB FAILED");
+        return 1;
+    }
+    p8[0] = 0x77;
+    p8[SIZE_8M / 2] = 0x88;
+    p8[SIZE_8M - 1] = 0x99;
+    if (p8[0] == (char)0x77 && p8[SIZE_8M / 2] == (char)0x88 && p8[SIZE_8M - 1] == (char)0x99) {
+        puts("posix-hello: malloc 8MB ok");
+    } else {
+        puts("posix-hello: malloc 8MB readback FAILED");
+        return 1;
+    }
+    free(p8);
     return 0;
 }
