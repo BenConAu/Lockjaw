@@ -31,6 +31,14 @@ use crate::elf::ElfInfo;
 /// can hand back the shared buffer's PageSet and brk base.
 pub const POSIX_INIT: u64 = 0xFFFF_FFFF_FFFF_FF00;
 
+/// Shim-only sentinel for the mmap-rollback path (Phase 2.3). Not a
+/// real Linux syscall — musl can never originate it. The shim sends
+/// it after a successful FS_MMAP whose local sys_map_pages then
+/// failed; the server tears down its mmap_table entry and frees the
+/// PageSet so the half-completed allocation doesn't leak. Sits one
+/// above POSIX_INIT.
+pub const NR_MMAP_ROLLBACK: u64 = 0xFFFF_FFFF_FFFF_FF01;
+
 // ---------------------------------------------------------------------------
 // Linux syscall numbers (aarch64, asm-generic/unistd.h).
 // ---------------------------------------------------------------------------
@@ -201,6 +209,13 @@ pub enum Action {
     /// exists so the dispatch loop can log unhandled advice values
     /// for diagnostic purposes.
     FileMadvise { base_va: u64, len_bytes: u64, advice: u64 },
+    /// Shim-only rollback for the failure path of mmap. The shim
+    /// sends `NR_MMAP_ROLLBACK` when it received a successful
+    /// FS_MMAP reply but its local `sys_map_pages` then failed.
+    /// The server takes the `(caller_token, base_va)` entry from
+    /// its mmap_table and frees the server-side PageSet. Reply 0
+    /// on success, EINVAL if the entry is unknown.
+    FileMmapRollback { base_va: u64 },
 }
 
 /// Pure decision: classify one received syscall message into an
@@ -210,6 +225,8 @@ pub enum Action {
 pub fn dispatch(inp: &DispatchInputs) -> Action {
     match inp.nr {
         POSIX_INIT => Action::PosixInit,
+
+        NR_MMAP_ROLLBACK => Action::FileMmapRollback { base_va: inp.arg1 },
 
         NR_WRITE | NR_WRITEV => {
             // arg1 = fd, arg2 = byte count in the shared buffer.
@@ -1153,6 +1170,25 @@ mod tests {
                 advice: 4,
             },
         );
+    }
+
+    #[test]
+    fn mmap_rollback_sentinel_decodes() {
+        // The shim sends NR_MMAP_ROLLBACK after a failed local
+        // sys_map_pages. arg1 is the base_va the server returned;
+        // other args are unused.
+        assert_eq!(
+            dispatch(&inp(NR_MMAP_ROLLBACK, 0x0100_0000, 0)),
+            Action::FileMmapRollback { base_va: 0x0100_0000 },
+        );
+    }
+
+    #[test]
+    fn mmap_rollback_distinct_from_posix_init() {
+        // Both are u64::MAX-aligned sentinels; verify they don't
+        // alias (NR_MMAP_ROLLBACK = POSIX_INIT + 1).
+        assert_ne!(NR_MMAP_ROLLBACK, POSIX_INIT);
+        assert_eq!(NR_MMAP_ROLLBACK, POSIX_INIT + 1);
     }
 
     // ---- write_linux_stack ----

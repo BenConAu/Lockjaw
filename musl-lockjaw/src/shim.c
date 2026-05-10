@@ -21,9 +21,13 @@
 #define LJ_SYS_ALLOC_PAGES   6
 #define LJ_SYS_MAP_PAGES     7
 #define LJ_SYS_CREATE_REPLY  20
+#define LJ_SYS_CLOSE_HANDLE  24
+#define LJ_SYS_UNMAP_PAGES   25
 
-/* Sentinel: not a real Linux syscall number */
-#define POSIX_INIT  0xFFFFFFFFFFFFFF00UL
+/* Sentinels: not real Linux syscall numbers. Sit at the top of the
+ * u64 range so they cannot collide with any musl-issued syscall. */
+#define POSIX_INIT          0xFFFFFFFFFFFFFF00UL
+#define NR_MMAP_ROLLBACK    0xFFFFFFFFFFFFFF01UL
 
 #define PAGE_SIZE   4096UL
 
@@ -33,6 +37,10 @@
 #define __NR_write       64
 #define __NR_writev      66
 #define __NR_brk        214
+#define __NR_munmap     215
+#define __NR_mmap       222
+#define __NR_mprotect   226
+#define __NR_madvise    233
 
 /* ---------- Diagnostic helpers (no IPC required) ---------- */
 
@@ -193,12 +201,57 @@ static volatile char *shared_buf;
 static long brk_current;
 static long brk_mapped_end;
 /*
- * Phase 2.0: base VA of the mmap region, sent by the personality
- * server in POSIX_INIT word 3. Stashed here for use by the future
- * mmap()/munmap() shim (Phase 2.3); not read by anything yet.
+ * Base VA of the mmap region, sent by the personality server in
+ * POSIX_INIT word 3. The shim doesn't read this directly during
+ * mmap() — the server picks each base_va — but stashes it for
+ * diagnostics and future use (e.g. validating that munmap targets
+ * fall in the mmap region rather than brk).
  */
-static long mmap_base;
+static long mmap_base __attribute__((unused));
 static int initialized;
+
+/* ---------- mmap region tracker (Phase 2.3) ---------- */
+
+/*
+ * Per-process tracker for live mmap regions. Phase 2.3 cap; bump
+ * when programs need more. Each slot records the (base_va, handle,
+ * len) tuple needed to undo the mapping.
+ *
+ * Updated only on full mmap success; munmap removes after the
+ * remote side has acknowledged the teardown. mmap-fail-mid-flow
+ * cleanup uses NR_MMAP_ROLLBACK + sys_close_handle without
+ * touching the tracker (the entry was never recorded).
+ */
+#define MMAP_TRACKER_SLOTS 16
+struct mmap_slot {
+    long base_va;     /* 0 means slot is empty */
+    long handle;
+    long len;
+};
+static struct mmap_slot mmap_tracker[MMAP_TRACKER_SLOTS];
+
+/*
+ * Find an empty tracker slot. Returns its index, or -1 if full.
+ */
+static int mmap_tracker_find_free(void) {
+    for (int i = 0; i < MMAP_TRACKER_SLOTS; i++) {
+        if (mmap_tracker[i].base_va == 0)
+            return i;
+    }
+    return -1;
+}
+
+/*
+ * Locate the slot holding `base_va`. Returns its index, or -1 if
+ * not found.
+ */
+static int mmap_tracker_find(long base_va) {
+    for (int i = 0; i < MMAP_TRACKER_SLOTS; i++) {
+        if (mmap_tracker[i].base_va == base_va)
+            return i;
+    }
+    return -1;
+}
 
 /* ---------- Local brk handler ---------- */
 
@@ -229,6 +282,122 @@ static long handle_brk(long addr) {
 
     brk_current = addr;
     return brk_current;
+}
+
+/* ---------- mmap / munmap (Phase 2.3) ---------- */
+
+/*
+ * Linux mmap(addr, len, prot, flags, fd, offset). Phase 2 supports
+ * the anonymous-private subset: addr=0 (or ignored), fd=-1,
+ * offset=0; flags must be MAP_PRIVATE|MAP_ANONYMOUS; prot must be
+ * PROT_READ|PROT_WRITE. The dispatch layer in posix-server enforces
+ * the contract and returns -errno for anything else, so the shim
+ * passes the request through verbatim and trusts the reply.
+ *
+ * Failure-ordered handshake (the FS_MMAP_ROLLBACK protocol):
+ *   1. lj_call(NR_MMAP, len, prot, flags) -> reply (status, base_va,
+ *      exported_handle, total_pages).
+ *   2. sys_map_pages(handle, base_va, 0). On failure: NR_MMAP_ROLLBACK,
+ *      sys_close_handle, return -ENOMEM. If rollback fails: lj_die.
+ *   3. mmap_tracker[i] = (base_va, handle, len). On tracker-full:
+ *      treat like step 2 failure (rollback + return -ENOMEM).
+ *   4. Return base_va.
+ *
+ * The tracker is updated only after every step succeeds; failure
+ * in any post-FS_MMAP step rolls back so the server doesn't keep
+ * an mmap_table entry the client can't see.
+ */
+static long handle_mmap(long len, long prot, long flags) {
+    long r[4];
+    long err = lj_call_ret4(0, reply_handle, __NR_mmap, len, prot, flags, r);
+    if (err != 0) lj_die("mmap: IPC transport failure", err);
+    /* r[0] = status (0 on success or -errno from dispatch).
+     * r[1] = base_va (only valid when r[0] == 0).
+     * r[2] = exported handle.
+     * r[3] = page count. */
+    if (r[0] != 0) return r[0];
+    long base_va = r[1];
+    long handle  = r[2];
+
+    /* Map the exported PageSet at base_va. flags=0 (RW UXN). */
+    if (lj_svc3(LJ_SYS_MAP_PAGES, handle, base_va, 0) != 0) {
+        /* Local map failed AFTER successful FS_MMAP. Tell the
+         * server to tear down its mmap_table entry; without this
+         * the server would think the region is live. */
+        long rb_err = lj_call(0, reply_handle, NR_MMAP_ROLLBACK, base_va, 0, 0);
+        if (rb_err != 0) {
+            /* Rollback IPC succeeded but server returned error
+             * (entry missing, already rolled back). Or transport
+             * failed mid-rollback. Either way the server's view
+             * of this region is no longer recoverable from the
+             * client side — halt rather than leak. */
+            lj_die("mmap rollback failed; refusing to leak server PageSet",
+                   rb_err);
+        }
+        /* Server's side cleaned up; close the orphan local handle. */
+        (void)lj_svc3(LJ_SYS_CLOSE_HANDLE, handle, 0, 0);
+        return -12; /* -ENOMEM */
+    }
+
+    /* Find a tracker slot. On full, treat like map failure: the
+     * region is live but we have no way to remember it for munmap,
+     * so we'd leak indefinitely. Roll back to keep the leak bounded. */
+    int slot = mmap_tracker_find_free();
+    if (slot < 0) {
+        /* sys_unmap_pages first, then NR_MMAP_ROLLBACK + close. We
+         * need to undo the map even though the server's entry will
+         * also be torn down — the local PTE is independent. */
+        (void)lj_svc3(LJ_SYS_UNMAP_PAGES, handle, base_va, 0);
+        long rb_err = lj_call(0, reply_handle, NR_MMAP_ROLLBACK, base_va, 0, 0);
+        if (rb_err != 0)
+            lj_die("mmap rollback failed (tracker full)", rb_err);
+        (void)lj_svc3(LJ_SYS_CLOSE_HANDLE, handle, 0, 0);
+        return -12; /* -ENOMEM */
+    }
+    mmap_tracker[slot].base_va = base_va;
+    mmap_tracker[slot].handle  = handle;
+    mmap_tracker[slot].len     = len;
+    return base_va;
+}
+
+/*
+ * Linux munmap(addr, len). Remote-first teardown:
+ *   1. Look up base_va in the tracker. ENOENT (-2) if missing.
+ *   2. lj_call(NR_MUNMAP, base_va, len). On errno reply: return it
+ *      with the tracker untouched so the caller can retry.
+ *   3. sys_unmap_pages(handle, base_va). Failure here means local
+ *      and remote state diverged — lj_die loud rather than leak.
+ *   4. sys_close_handle(handle). Failure here is a bounded one-slot
+ *      local leak; log and continue.
+ *   5. Drop the tracker entry, return 0.
+ */
+static long handle_munmap(long base_va, long len) {
+    int slot = mmap_tracker_find(base_va);
+    /* Mirror the server's EINVAL-for-unknown-region policy
+     * (posix-server's handle_file_munmap returns -EINVAL when the
+     * (caller, base_va) lookup misses). Returning -ENOENT here
+     * would split the contract — the visible errno would depend on
+     * whether the miss happened in the local tracker or the server
+     * table. Linux uses EINVAL for "not a known mapping" too. */
+    if (slot < 0) return -22; /* -EINVAL */
+
+    long handle = mmap_tracker[slot].handle;
+    long ret = lj_call(0, reply_handle, __NR_munmap, base_va, len, 0);
+    if (ret != 0) {
+        /* Server rejected (likely len mismatch or stale entry).
+         * Leave the tracker so a corrected retry can succeed. */
+        return ret;
+    }
+    if (lj_svc3(LJ_SYS_UNMAP_PAGES, handle, base_va, 0) != 0)
+        lj_die("munmap: local sys_unmap_pages diverged from remote", 0);
+    /* close failure leaks one local handle slot. Log + continue. */
+    if (lj_svc3(LJ_SYS_CLOSE_HANDLE, handle, 0, 0) != 0)
+        lj_dbg_print("posix-shim: munmap close_handle failed (leak)\n");
+
+    mmap_tracker[slot].base_va = 0;
+    mmap_tracker[slot].handle  = 0;
+    mmap_tracker[slot].len     = 0;
+    return 0;
 }
 
 /* ---------- Bootstrap ---------- */
@@ -307,6 +476,27 @@ long lockjaw_syscall(long n, long a, long b, long c,
     /* brk: handled locally, no IPC */
     if (n == __NR_brk)
         return handle_brk(a);
+
+    /* mmap(addr, len, prot, flags, fd, offset): Phase 2 supports the
+     * anonymous-private subset. addr/fd/offset are ignored — server
+     * picks base_va, fd=-1 + offset=0 implied by MAP_ANONYMOUS. */
+    if (n == __NR_mmap)
+        return handle_mmap(b, c, d);
+
+    /* munmap(addr, len) */
+    if (n == __NR_munmap)
+        return handle_munmap(a, b);
+
+    /* mprotect(addr, len, prot): forwards to posix-server which
+     * verifies the region matches a known mmap entry. */
+    if (n == __NR_mprotect)
+        return lj_call(0, reply_handle, n, a, b, c);
+
+    /* madvise(addr, len, advice): hints aren't load-bearing; the
+     * server replies 0 unconditionally. Still forward so any
+     * future per-region check can run server-side. */
+    if (n == __NR_madvise)
+        return lj_call(0, reply_handle, n, a, b, c);
 
     /* write(fd, buf, len): clamp to PAGE_SIZE, copy into shared buffer */
     if (n == __NR_write) {

@@ -660,6 +660,31 @@ fn handle_file_munmap(
     sys_reply(0, 0, 0, 0);
 }
 
+/// Shim-side rollback for the failure path of mmap. The shim sends
+/// `NR_MMAP_ROLLBACK` if its local `sys_map_pages` failed AFTER a
+/// successful FS_MMAP reply. Looks up `(caller_token, base_va)` and
+/// tears down the entry — close the server-side PageSet handle and
+/// remove from the table. Reply 0 on success, EINVAL if the entry
+/// is unknown (caller bug or duplicate rollback).
+///
+/// This is the missing half of the Phase 2.2 export-then-insert
+/// handshake: the export bumped refcount on the caller's table,
+/// but a failed local map means the caller never actually used
+/// the region. Without rollback, the server's PageSet handle and
+/// the caller's exported handle would both leak.
+fn handle_file_mmap_rollback(
+    mmap_table: &mut MmapTable,
+    base_va: u64,
+) {
+    let caller_token = sys_query_caller_token();
+    if let Some(entry) = mmap_table.take_by_base_va(caller_token, base_va) {
+        let _ = sys_close_handle(entry.server_pageset);
+        sys_reply(0, 0, 0, 0);
+    } else {
+        sys_reply(neg_errno(EINVAL), 0, 0, 0);
+    }
+}
+
 /// mprotect on an mmap region: must match (caller_token, base_va,
 /// len_bytes) exactly. Phase 2 has no kernel API to actually change
 /// protection, so we only accept calls that "set" the existing RW
@@ -945,6 +970,9 @@ pub extern "C" fn _start() -> ! {
                 // Hints aren't load-bearing — reply 0 unconditionally
                 // regardless of region state.
                 sys_reply(0, 0, 0, 0);
+            }
+            Action::FileMmapRollback { base_va } => {
+                handle_file_mmap_rollback(&mut mmap_table, base_va);
             }
         }
     }
