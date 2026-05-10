@@ -317,7 +317,11 @@ pub enum MapWalkResult {
     },
     /// Walk faulted: invalid entry at L0 or L1.
     Fault,
-    /// Validation failed (bad VA, too many pages, spans L2 boundary, etc).
+    /// Validation failed: VA outside user range, page_count zero or
+    /// above MAX_PRACTICAL_PAGES_PER_SET, or the mapping would
+    /// extend past USER_VA_END. Phase 2.M lifted the "spans L2
+    /// boundary" rejection — multi-L2 mappings are now valid and
+    /// the kernel iterates regions via L2RegionIter.
     InvalidMapping,
 }
 

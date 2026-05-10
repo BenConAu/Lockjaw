@@ -64,42 +64,135 @@ pub fn map_action_for_l2(state: L2SlotState) -> MapAction {
     }
 }
 
-/// Validate a mapping request. Returns the L2 and L3 indices, or an error.
+/// Validate a mapping request. Returns the starting L2 / L3 indices,
+/// or an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapValidation {
-    /// Valid: map at this L2 index, starting at this L3 index.
+    /// Valid: start at this L2 index and L3 offset within that L2's
+    /// L3 table. The kernel iterates L2 indices itself if the
+    /// mapping spans multiple L2 regions (Phase 2.M).
     Ok { l2_idx: usize, l3_start: usize },
-    /// Error: VA is not in the first 1GB (L1[0] range).
+    /// Error: VA is not in the first 1GB (L1[0] range), or the
+    /// mapping would extend past USER_VA_END.
     ErrorOutOfRange,
-    /// Error: pages would span two different L2 regions.
-    ErrorSpansL2Boundary,
-    /// Error: too many pages.
+    /// Error: too many pages (zero, or above the practical cap).
     ErrorTooManyPages,
 }
 
-/// Validate a contiguous mapping of `page_count` pages starting at `virt_addr`.
+/// Validate a contiguous mapping of `page_count` pages starting at
+/// `virt_addr`. Phase 2.M lifted the previous one-L2-region cap (512
+/// pages); the mapping may now span multiple L2 regions, bounded by
+/// `MAX_PRACTICAL_PAGES_PER_SET` and the end of user VA range.
 pub fn validate_mapping(virt_addr: u64, page_count: usize) -> MapValidation {
-    if page_count == 0 || page_count > 512 {
+    if page_count == 0
+        || page_count > crate::pageset_table::MAX_PRACTICAL_PAGES_PER_SET
+    {
         return MapValidation::ErrorTooManyPages;
     }
 
     let (l0, l1, l2_start, l3_start) = page_table_indices(virt_addr);
 
-    // Must be in L0[0], L1[0] (first 1GB, user range)
+    // Must be in L0[0], L1[0] (first 1GB, user range).
     if l0 != 0 || l1 != 0 {
         return MapValidation::ErrorOutOfRange;
     }
 
-    // Check all pages fall in the same L2 region
-    let end_va = virt_addr + ((page_count - 1) as u64) * PAGE_SIZE;
-    let (_, _, l2_end, _) = page_table_indices(end_va);
-    if l2_start != l2_end {
-        return MapValidation::ErrorSpansL2Boundary;
+    // End VA must also fit within the user range. checked_add catches
+    // both overflow and overrun past USER_VA_END.
+    let bytes = (page_count as u64) * PAGE_SIZE;
+    let end_va_excl = match virt_addr.checked_add(bytes) {
+        Some(v) => v,
+        None => return MapValidation::ErrorOutOfRange,
+    };
+    if end_va_excl > crate::constants::USER_VA_END {
+        return MapValidation::ErrorOutOfRange;
     }
 
     MapValidation::Ok {
         l2_idx: l2_start,
         l3_start,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-L2 region iterator (Phase 2.M)
+// ---------------------------------------------------------------------------
+
+/// Number of entries per page table at any level (4 KiB / 8 bytes).
+pub const PAGES_PER_L2_REGION: usize = 512;
+
+/// One contiguous slice of a mapping that fits in a single L2 region's
+/// L3 table. The kernel iterates over `L2RegionIter` and writes
+/// `pages_in_region` entries starting at `L3[l3_start]` for the L3
+/// table indexed by `L2[l2_idx]`. `data_offset` points into the source
+/// PageSet's pages array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct L2Region {
+    /// Index into the L2 table (0..512).
+    pub l2_idx: usize,
+    /// Starting offset within this L2's L3 table (0..512). Only the
+    /// first region returned by an iterator can be non-zero;
+    /// subsequent regions always start at 0.
+    pub l3_start: usize,
+    /// How many page entries to write at L3[l3_start..l3_start+pages_in_region].
+    /// At most `PAGES_PER_L2_REGION - l3_start`.
+    pub pages_in_region: usize,
+    /// Index into the source PageSet's pages array. The kernel writes
+    /// `pages[data_offset..data_offset + pages_in_region]` into the L3
+    /// table. Accumulates across regions.
+    pub data_offset: usize,
+}
+
+/// Iterator that slices a mapping request `(l2_start, l3_start,
+/// page_count)` into one `L2Region` per L2 table the mapping touches.
+/// Pure: no I/O, no syscalls. The kernel applies the side effects
+/// (allocate L3, write PTEs) per region.
+///
+/// Precondition: callers should pre-validate via [`validate_mapping`]
+/// to ensure `l2_start + region_count <= PAGES_PER_L2_REGION` (i.e.
+/// the mapping stays within one L1 region). The iterator does not
+/// re-check this — it just produces regions until `page_count` is
+/// exhausted.
+pub struct L2RegionIter {
+    next_l2_idx: usize,
+    next_l3_offset: usize,
+    pages_remaining: usize,
+    data_offset: usize,
+}
+
+impl L2RegionIter {
+    /// Begin slicing. `l2_start` and `l3_start` come from
+    /// `validate_mapping`; `page_count` is the total page count
+    /// across all regions.
+    pub fn new(l2_start: usize, l3_start: usize, page_count: usize) -> Self {
+        Self {
+            next_l2_idx: l2_start,
+            next_l3_offset: l3_start,
+            pages_remaining: page_count,
+            data_offset: 0,
+        }
+    }
+}
+
+impl Iterator for L2RegionIter {
+    type Item = L2Region;
+    fn next(&mut self) -> Option<L2Region> {
+        if self.pages_remaining == 0 {
+            return None;
+        }
+        let pages_in_region =
+            (PAGES_PER_L2_REGION - self.next_l3_offset).min(self.pages_remaining);
+        let region = L2Region {
+            l2_idx: self.next_l2_idx,
+            l3_start: self.next_l3_offset,
+            pages_in_region,
+            data_offset: self.data_offset,
+        };
+        self.next_l2_idx += 1;
+        self.next_l3_offset = 0;
+        self.pages_remaining -= pages_in_region;
+        self.data_offset += pages_in_region;
+        Some(region)
     }
 }
 
@@ -333,6 +426,7 @@ impl ScratchCursor {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use crate::addr::PhysAddr;
     use crate::page_table::*;
@@ -396,18 +490,38 @@ mod tests {
     }
 
     #[test]
-    fn validate_pages_spanning_l2_boundary() {
-        // Start near end of L2[2] region, span into L2[3]
-        // L2[2] covers 0x0040_0000 to 0x005F_FFFF (512 pages)
-        // Start at page 511 of L2[2]: VA = 0x005F_F000
+    fn validate_pages_spanning_l2_boundary_now_ok() {
+        // Phase 2.M: a mapping crossing an L2 region boundary is
+        // valid. validate_mapping returns the starting (l2_idx,
+        // l3_start); the kernel iterates L2 indices itself.
+        // Start at page 511 of L2[2]: VA = 0x005F_F000, two pages —
+        // one in L2[2], one in L2[3].
         let result = validate_mapping(0x005F_F000, 2);
-        assert_eq!(result, MapValidation::ErrorSpansL2Boundary);
+        assert_eq!(result, MapValidation::Ok { l2_idx: 2, l3_start: 511 });
     }
 
     #[test]
-    fn validate_out_of_range() {
+    fn validate_pages_spanning_many_l2_regions() {
+        // 8 MiB = 2048 pages spans L2[0..4]. Returns the starting
+        // (l2_idx=0, l3_start=0); kernel iterates the rest.
+        let result = validate_mapping(0x0000_0000, 2048);
+        assert_eq!(result, MapValidation::Ok { l2_idx: 0, l3_start: 0 });
+    }
+
+    #[test]
+    fn validate_out_of_range_l1_above_user() {
         // VA in second 1GB (L1[1]) — kernel territory
         let result = validate_mapping(0x4000_0000, 1);
+        assert_eq!(result, MapValidation::ErrorOutOfRange);
+    }
+
+    #[test]
+    fn validate_extends_past_user_va_end() {
+        // Start in user range but length pushes past USER_VA_END.
+        // USER_VA_END = 0x4000_0000; start at 0x3FFE_0000 with 64
+        // pages = 256 KiB → ends at 0x3FFE_0000 + 0x4_0000 =
+        // 0x4002_0000 (past end).
+        let result = validate_mapping(0x3FFE_0000, 64);
         assert_eq!(result, MapValidation::ErrorOutOfRange);
     }
 
@@ -418,7 +532,141 @@ mod tests {
 
     #[test]
     fn validate_too_many_pages() {
-        assert_eq!(validate_mapping(0x0040_0000, 513), MapValidation::ErrorTooManyPages);
+        // Above the variable-header cap (16384 pages = 64 MiB).
+        let too_many = crate::pageset_table::MAX_PRACTICAL_PAGES_PER_SET + 1;
+        assert_eq!(
+            validate_mapping(0x0040_0000, too_many),
+            MapValidation::ErrorTooManyPages,
+        );
+    }
+
+    // --- L2RegionIter tests (Phase 2.M) ---
+
+    fn collect_regions(l2_start: usize, l3_start: usize, page_count: usize)
+        -> std::vec::Vec<L2Region>
+    {
+        L2RegionIter::new(l2_start, l3_start, page_count).collect()
+    }
+
+    #[test]
+    fn iter_single_page_one_region() {
+        let r = collect_regions(2, 0, 1);
+        assert_eq!(r, std::vec![
+            L2Region { l2_idx: 2, l3_start: 0, pages_in_region: 1, data_offset: 0 },
+        ]);
+    }
+
+    #[test]
+    fn iter_full_l2_region_fits_in_one() {
+        // Exactly 512 pages starting at l3_offset 0 should fit in
+        // L2[2]'s L3 table without spilling.
+        let r = collect_regions(2, 0, 512);
+        assert_eq!(r, std::vec![
+            L2Region { l2_idx: 2, l3_start: 0, pages_in_region: 512, data_offset: 0 },
+        ]);
+    }
+
+    #[test]
+    fn iter_513_pages_spills_to_second_l2() {
+        // One more than fits in L2[2] forces a second region of 1 page.
+        let r = collect_regions(2, 0, 513);
+        assert_eq!(r, std::vec![
+            L2Region { l2_idx: 2, l3_start: 0, pages_in_region: 512, data_offset: 0 },
+            L2Region { l2_idx: 3, l3_start: 0, pages_in_region: 1, data_offset: 512 },
+        ]);
+    }
+
+    #[test]
+    fn iter_starts_mid_region() {
+        // Two pages starting at L2[2] / L3[511] crosses the boundary
+        // into L2[3] for the second page.
+        let r = collect_regions(2, 511, 2);
+        assert_eq!(r, std::vec![
+            L2Region { l2_idx: 2, l3_start: 511, pages_in_region: 1, data_offset: 0 },
+            L2Region { l2_idx: 3, l3_start: 0, pages_in_region: 1, data_offset: 1 },
+        ]);
+    }
+
+    #[test]
+    fn iter_8_mib_aligned_four_full_regions() {
+        // 8 MiB / 4 KiB = 2048 pages starting at l3_offset 0 fills
+        // exactly 4 L2 regions.
+        let r = collect_regions(0, 0, 2048);
+        assert_eq!(r.len(), 4);
+        for (i, region) in r.iter().enumerate() {
+            assert_eq!(region.l2_idx, i);
+            assert_eq!(region.l3_start, 0);
+            assert_eq!(region.pages_in_region, 512);
+            assert_eq!(region.data_offset, i * 512);
+        }
+    }
+
+    #[test]
+    fn iter_8_mib_offset_five_regions() {
+        // 2048 pages starting at L2[0] / L3[256] spills across 5 L2
+        // regions: 256, 512, 512, 512, 256.
+        let r = collect_regions(0, 256, 2048);
+        let expected = std::vec![
+            L2Region { l2_idx: 0, l3_start: 256, pages_in_region: 256, data_offset: 0 },
+            L2Region { l2_idx: 1, l3_start: 0, pages_in_region: 512, data_offset: 256 },
+            L2Region { l2_idx: 2, l3_start: 0, pages_in_region: 512, data_offset: 768 },
+            L2Region { l2_idx: 3, l3_start: 0, pages_in_region: 512, data_offset: 1280 },
+            L2Region { l2_idx: 4, l3_start: 0, pages_in_region: 256, data_offset: 1792 },
+        ];
+        assert_eq!(r, expected);
+    }
+
+    #[test]
+    fn iter_zero_pages_yields_nothing() {
+        // Defensive: validate_mapping rejects page_count == 0, but
+        // the iterator should also handle it gracefully.
+        let r = collect_regions(2, 0, 0);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn iter_data_offsets_sum_to_total_pages() {
+        // Sanity: across any region count, the sum of pages_in_region
+        // equals the requested page_count.
+        for &count in &[1usize, 100, 511, 512, 513, 1024, 2048, 16384] {
+            let r = collect_regions(0, 0, count);
+            let total: usize = r.iter().map(|x| x.pages_in_region).sum();
+            assert_eq!(total, count, "count {} mismatched", count);
+            // data_offset of region i should equal sum of earlier regions.
+            let mut acc = 0;
+            for region in r.iter() {
+                assert_eq!(region.data_offset, acc);
+                acc += region.pages_in_region;
+            }
+        }
+    }
+
+    #[test]
+    fn iter_first_region_only_can_have_nonzero_l3_start() {
+        // Subsequent regions always start at l3_start = 0.
+        let r = collect_regions(2, 100, 1024);
+        assert_eq!(r[0].l3_start, 100);
+        for region in r.iter().skip(1) {
+            assert_eq!(region.l3_start, 0);
+        }
+    }
+
+    #[test]
+    fn iter_l2_idx_strictly_increases() {
+        let r = collect_regions(0, 0, 2048);
+        for window in r.windows(2) {
+            assert!(window[1].l2_idx > window[0].l2_idx);
+        }
+    }
+
+    #[test]
+    fn iter_count_matches_validate_mapping_for_max_practical() {
+        // Maximum practical mapping (16384 pages = 64 MiB) yields 32
+        // L2 regions starting at l3_start=0.
+        let count = crate::pageset_table::MAX_PRACTICAL_PAGES_PER_SET;
+        let r = collect_regions(0, 0, count);
+        assert_eq!(r.len(), 32);
+        assert_eq!(r.iter().map(|x| x.pages_in_region).sum::<usize>(), count);
     }
 
     #[test]

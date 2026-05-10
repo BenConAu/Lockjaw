@@ -93,6 +93,7 @@
 "core::panicking::panic_const::panic_const_shl_overflow" = 64
 "core::panicking::panic_const::panic_const_sub_overflow" = 64
 "core::option::unwrap_failed" = 128
+"core::option::expect_failed" = 128
 "core::result::unwrap_failed" = 128
 "core::slice::index::slice_index_fail" = 128
 # core::panicking::assert_failed is generic — the checker resolves

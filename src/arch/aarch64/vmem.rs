@@ -1,4 +1,4 @@
-use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
+use crate::mm::addr::{PhysAddr, PhysPage, KERNEL_VA_OFFSET};
 use crate::mm::page_alloc;
 use crate::mm::page_table::*;
 use core::ptr;
@@ -293,14 +293,19 @@ pub unsafe fn map_pages_in_existing(
     flags: u64,
 ) -> Result<(), VmemError> {
     use lockjaw_types::page_table::{MapWalk, MapWalkResult};
-    use lockjaw_types::vmem::{map_action_for_l2, MapAction, select_attrs, build_user_page};
+    use lockjaw_types::vmem::{
+        classify_l2_entry, map_action_for_l2, L2RegionIter, MapAction,
+        select_attrs, build_user_page,
+    };
 
     let page_count = header.data_page_count();
 
-    // Walk L0 → L1 → L2 using the pure state machine (tested on host).
-    // The kernel only does memory reads; all PTE interpretation is in lockjaw-types.
+    // Walk L0 → L1 → L2 once via the pure state machine to find the
+    // first L2 region. After this we have the L2 table paddr and the
+    // starting (l2_idx, l3_start); L2RegionIter slices the rest into
+    // per-L2-region chunks (multi-L2 mappings introduced in Phase 2.M).
     let (mut walk, mut result) = MapWalk::start(ttbr0_paddr.as_u64(), virt_addr, page_count);
-    loop {
+    let (l2_table_paddr, l2_start, l3_start) = loop {
         match result {
             MapWalkResult::ReadPte(pte_paddr) => {
                 // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
@@ -308,53 +313,141 @@ pub unsafe fn map_pages_in_existing(
                 let pte_raw = core::ptr::read_volatile(pte_va as *const u64);
                 result = walk.step(pte_raw);
             }
-            MapWalkResult::ReachedL2 { l2_table_paddr, l2_idx, l3_start, state } => {
-                // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-                let l2_va = (l2_table_paddr + KERNEL_VA_OFFSET) as *mut PageTable;
-
-                // Ask the model what to do with this L2 slot
-                let l3_va = match map_action_for_l2(state) {
-                    MapAction::UseExistingL3 => {
-                        let l3_paddr = (*l2_va).entries[l2_idx].output_addr();
-                        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-                        (l3_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut PageTable
-                    }
-                    MapAction::AllocateL3 => {
-                        let l3_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
-                        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-                        let va = (l3_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
-                        ptr::write_bytes(va, 0, 1);
-                        (*l2_va).entries[l2_idx] = PageTableEntry::new_table(l3_page.start_addr());
-                        va
-                    }
-                    MapAction::ErrorBlockConflict => {
-                        return Err(VmemError::TooManyL3Regions);
-                    }
-                };
-
-                // Select memory attributes and write page entries.
-                // Read each page address from the header (no stack array needed).
-                let (attr, sh) = select_attrs(flags);
-                for i in 0..page_count {
-                    let phys = PhysAddr::new(header.get_page(i).unwrap());
-                    (*l3_va).entries[l3_start + i] = build_user_page(phys, attr, sh);
-                }
-
-                // TLB invalidate so the new mappings take effect
-                core::arch::asm!(
-                    "dsb ish",
-                    "tlbi vmalle1is",
-                    "dsb ish",
-                    "isb",
-                );
-
-                return Ok(());
+            MapWalkResult::ReachedL2 { l2_table_paddr, l2_idx, l3_start, .. } => {
+                // We re-classify each L2 entry inside the loop below
+                // rather than caching `state`, since the iterator
+                // iterates across L2 entries and only the first one
+                // is reflected in MapWalk's returned `state`.
+                break (l2_table_paddr, l2_idx, l3_start);
             }
             MapWalkResult::Fault => return Err(VmemError::OutOfPages),
             MapWalkResult::InvalidMapping => return Err(VmemError::TooManyMappings),
         }
+    };
+
+    let (attr, sh) = select_attrs(flags);
+    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
+    let l2_va = (l2_table_paddr + KERNEL_VA_OFFSET) as *mut PageTable;
+
+    // Three-pass transactional layout:
+    //   Pass 1 (classify): walk every L2 region read-only. If any
+    //     slot is a block conflict, return Err immediately — no
+    //     L2/L3 state has been touched.
+    //   Pass 2 (pre-allocate): grab the needed number of L3 pages
+    //     up front. On partial failure, free what we got and
+    //     return Err — still no L2/L3 state touched.
+    //   Pass 3 (apply): write L2 + L3 entries. Cannot fail because
+    //     all decisions and allocations from the first two passes
+    //     are now committed in local state.
+    // Without this, a multi-L2 mapping that hits a block conflict
+    // or OOM in a later region would leave an earlier region's L3
+    // table partially populated and never rolled back — Phase 2.M
+    // regression flagged by review.
+
+    // PASS 1: classify each L2 entry, reject on conflict, count
+    // L3 allocations needed.
+    let mut needed_l3_allocs: usize = 0;
+    for region in L2RegionIter::new(l2_start, l3_start, page_count) {
+        let l2_state = classify_l2_entry((*l2_va).entries[region.l2_idx]);
+        match map_action_for_l2(l2_state) {
+            MapAction::UseExistingL3 => {}
+            MapAction::AllocateL3 => needed_l3_allocs += 1,
+            MapAction::ErrorBlockConflict => {
+                return Err(VmemError::TooManyL3Regions);
+            }
+        }
     }
+
+    // PASS 2: pre-allocate L3 pages into a stack array. Bounded by
+    // MAX_L2_REGIONS_PER_MAP (33) — the worst case for a maximum-
+    // size practical mapping starting at a non-aligned l3_start.
+    // On partial allocation failure, free what we got and return.
+    let mut prealloc_l3: [Option<PhysPage>; MAX_L2_REGIONS_PER_MAP] =
+        [None; MAX_L2_REGIONS_PER_MAP];
+    for i in 0..needed_l3_allocs {
+        match page_alloc::alloc_page() {
+            Some(p) => prealloc_l3[i] = Some(p),
+            None => {
+                // Roll back partial allocations. No L2/L3 state
+                // touched yet, so this fully restores entry state.
+                for slot in &mut prealloc_l3[..i] {
+                    if let Some(p) = slot.take() {
+                        page_alloc::dealloc_page(p);
+                    }
+                }
+                return Err(VmemError::OutOfPages);
+            }
+        }
+    }
+
+    // PASS 3: apply. Re-classify each L2 entry (state hasn't changed
+    // since pass 1 — GKL held throughout), use the pre-allocated L3
+    // page when needed. Cannot fail.
+    let mut alloc_cursor = 0;
+    for region in L2RegionIter::new(l2_start, l3_start, page_count) {
+        let l2_entry = (*l2_va).entries[region.l2_idx];
+        let l2_state = classify_l2_entry(l2_entry);
+        let l3_va = match map_action_for_l2(l2_state) {
+            MapAction::UseExistingL3 => {
+                let l3_paddr = l2_entry.output_addr();
+                // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
+                (l3_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut PageTable
+            }
+            MapAction::AllocateL3 => {
+                // SAFETY: pass 2 reserved exactly needed_l3_allocs
+                // pages; the iterator visits the same regions in
+                // the same order, so alloc_cursor is in bounds and
+                // the slot is Some.
+                let l3_page = prealloc_l3[alloc_cursor]
+                    .take()
+                    .expect("L3 page reserved in pass 2");
+                alloc_cursor += 1;
+                // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
+                let va = (l3_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+                ptr::write_bytes(va, 0, 1);
+                (*l2_va).entries[region.l2_idx] =
+                    PageTableEntry::new_table(l3_page.start_addr());
+                va
+            }
+            MapAction::ErrorBlockConflict => {
+                // Pass 1 verified no block conflict. Reaching this
+                // arm means the L2 table mutated under us, which
+                // can only happen with a kernel bug since GKL is
+                // held throughout map_pages_in_existing.
+                panic!(
+                    "map_pages_in_existing: L2 entry mutated between pass 1 and pass 3 \
+                     (l2_idx={})",
+                    region.l2_idx
+                );
+            }
+        };
+
+        // Write entries for this L2 region. data_offset / l3_start /
+        // pages_in_region all come from the iterator.
+        for i in 0..region.pages_in_region {
+            let phys = PhysAddr::new(header.get_page(region.data_offset + i).unwrap());
+            (*l3_va).entries[region.l3_start + i] = build_user_page(phys, attr, sh);
+        }
+    }
+
+    // Single TLB invalidate at the end — covers all L2 regions written
+    // above. tlbi vmalle1is broadcasts to inner-shareable cores.
+    core::arch::asm!(
+        "dsb ish",
+        "tlbi vmalle1is",
+        "dsb ish",
+        "isb",
+    );
+
+    Ok(())
 }
+
+/// Maximum number of L2 regions a single mapping can touch.
+/// `MAX_PRACTICAL_PAGES_PER_SET (16384) / PAGES_PER_L2_REGION (512) = 32`,
+/// plus one extra to cover a non-aligned starting offset that splits
+/// the first region. Used to size the stack array of pre-allocated
+/// L3 pages in `map_pages_in_existing`.
+const MAX_L2_REGIONS_PER_MAP: usize = 33;
 
 /// Query the mapping state at a user VA and count consecutive pages
 /// Validate that L3 PTEs at [va, va + count*PAGE_SIZE) map to the expected
