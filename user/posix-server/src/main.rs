@@ -12,7 +12,7 @@ use lockjaw_userlib::*;
 use lockjaw_userlib::elf::parse_elf;
 use lockjaw_userlib::fs::{FsClient, FsError};
 use lockjaw_types::addr::PAGE_SIZE;
-use lockjaw_types::constants::{POSIX_MMAP_BASE, USER_STACK_BASE};
+use lockjaw_types::constants::{POSIX_MMAP_BASE, USER_STACK_BASE, USER_VA_END};
 use lockjaw_types::fs::FS_MAX_INLINE_PATH;
 use lockjaw_types::posix_fd::{FdEntry, FdKind, FdTable, FD_STDIN, MAX_FDS};
 use lockjaw_userlib::elf_loader::{plan_elf_load, ElfLoadEntry};
@@ -177,6 +177,121 @@ struct FileResource {
     buffer_va: u64,
     /// Buffer size in bytes (≤ PAGE_SIZE for now).
     buffer_size: u32,
+}
+
+// ---------------------------------------------------------------------------
+// mmap region tracking (Phase 2.2)
+// ---------------------------------------------------------------------------
+
+/// Maximum simultaneous mmap regions per process. Phase 2 cap; bump
+/// when programs need more.
+const MAX_MMAP_REGIONS: usize = 16;
+
+/// One outstanding mmap region. Lookups are scoped by
+/// `caller_token` — two clients can hold regions at the same VA
+/// (each in its own address space), but a client can only operate
+/// on entries it created. Mirrors the OpenTable shape in
+/// fat32-server.
+#[derive(Clone, Copy)]
+struct MmapEntry {
+    /// Identifies which posix client owns this entry. munmap and
+    /// mprotect refuse cross-caller lookups.
+    caller_token: u64,
+    base_va: u64,
+    len_bytes: u64,
+    /// Server-side handle for the PageSet. Closed on munmap (the
+    /// export bumped refcount so the client's handle survives until
+    /// it's closed).
+    server_pageset: PageSetHandle,
+}
+
+/// Per-process mmap region table. Insertion is O(N) — fine for
+/// MAX_MMAP_REGIONS = 16.
+struct MmapTable {
+    slots: [Option<MmapEntry>; MAX_MMAP_REGIONS],
+}
+
+impl MmapTable {
+    const fn new() -> Self {
+        Self { slots: [None; MAX_MMAP_REGIONS] }
+    }
+
+    /// True if at least one slot is free. Used to pre-check insert
+    /// capacity BEFORE doing any state-mutating IPC (PageSet alloc,
+    /// handle export). Single-threaded dispatch means
+    /// `has_room()` at decision time is equivalent to
+    /// "next insert will succeed".
+    fn has_room(&self) -> bool {
+        self.slots.iter().any(|s| s.is_none())
+    }
+
+    /// Insert an entry. Returns Err(()) if the table is full.
+    /// Callers that have already acquired external resources
+    /// (PageSet alloc, exported handle) should pre-check via
+    /// `has_room()` so this branch is unreachable on the success
+    /// path.
+    fn insert(&mut self, e: MmapEntry) -> Result<(), ()> {
+        for slot in self.slots.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(e);
+                return Ok(());
+            }
+        }
+        Err(())
+    }
+
+    /// Find the entry matching `(caller_token, base_va)` and remove
+    /// it. Returns the entry; None if no caller-scoped match.
+    fn take_by_base_va(&mut self, caller_token: u64, base_va: u64) -> Option<MmapEntry> {
+        for slot in self.slots.iter_mut() {
+            if let Some(e) = slot.as_ref() {
+                if e.caller_token == caller_token && e.base_va == base_va {
+                    return slot.take();
+                }
+            }
+        }
+        None
+    }
+
+    /// Find an entry by `(caller_token, base_va)` without removing.
+    fn find_by_base_va(&self, caller_token: u64, base_va: u64) -> Option<&MmapEntry> {
+        for slot in self.slots.iter() {
+            if let Some(e) = slot.as_ref() {
+                if e.caller_token == caller_token && e.base_va == base_va {
+                    return Some(e);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Bump-only VA allocator for the mmap region. Phase 2 doesn't
+/// reuse freed VA — every mmap claims the next contiguous chunk.
+/// 1 GiB of user VA between POSIX_MMAP_BASE and USER_VA_END leaves
+/// plenty of room before the bump runs into the limit.
+struct MmapVaAllocator {
+    next: u64,
+    limit: u64,
+}
+
+impl MmapVaAllocator {
+    const fn new(base: u64, limit: u64) -> Self {
+        Self { next: base, limit }
+    }
+
+    /// Reserve `pages` PAGE_SIZE pages. Returns the base VA, or
+    /// None if the region would exceed `limit`.
+    fn alloc(&mut self, pages: u64) -> Option<u64> {
+        let bytes = pages.checked_mul(PAGE_SIZE)?;
+        let new_next = self.next.checked_add(bytes)?;
+        if new_next > self.limit {
+            return None;
+        }
+        let base = self.next;
+        self.next = new_next;
+        Some(base)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +546,148 @@ fn handle_file_close(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2.2 mmap handlers
+// ---------------------------------------------------------------------------
+
+/// Allocate a PageSet of N pages, claim a base_va from the bump
+/// allocator, export the handle to the caller, and record the
+/// `(caller_token, base_va, len_bytes, server_pageset)` entry.
+///
+/// Reply: `(0, base_va, exported_handle, pages)` on success;
+/// `(-errno, 0, 0, 0)` on any failure. The mmap_table.has_room()
+/// pre-check ensures that nothing after sys_export_handle can fail —
+/// the export is the point of no return because there's no way to
+/// rescind a handle already in the caller's handle table without
+/// the FS_MMAP_ROLLBACK protocol (Phase 2.3). Pre-checking keeps
+/// today's runtime correct without that protocol.
+fn handle_file_mmap(
+    mmap_table: &mut MmapTable,
+    va_alloc: &mut MmapVaAllocator,
+    len_bytes: u64,
+) {
+    // dispatch already validated len > 0 and len <= MAX_MMAP_BYTES.
+    let pages = (len_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    let caller_token = sys_query_caller_token();
+
+    // 1. Pre-check that mmap_table has room. If not, fail fast with
+    //    no IPC side effects. Single-threaded dispatch means a
+    //    has_room() == true here implies the insert at step 5 will
+    //    succeed.
+    if !mmap_table.has_room() {
+        sys_reply(neg_errno(ENOMEM), 0, 0, 0);
+        return;
+    }
+
+    // 2. Allocate the data PageSet.
+    let server_ps = match sys_alloc_pages(pages) {
+        Ok(ps) => ps,
+        Err(_) => { sys_reply(neg_errno(ENOMEM), 0, 0, 0); return; }
+    };
+
+    // 3. Reserve a base VA. On failure, rewind by freeing the PageSet
+    //    we just allocated.
+    let base_va = match va_alloc.alloc(pages) {
+        Some(va) => va,
+        None => {
+            let _ = sys_close_handle(server_ps);
+            sys_reply(neg_errno(ENOMEM), 0, 0, 0);
+            return;
+        }
+    };
+
+    // 4. Export the handle to the caller. sys_export_handle bumps
+    //    the PageSet refcount and inserts a handle in the caller's
+    //    table. After this point we cannot rescind the export
+    //    without an explicit rollback protocol — so step 5 must
+    //    not fail (guaranteed by the has_room precheck above).
+    let exported_handle = match sys_export_handle(server_ps) {
+        Ok(h) => h,
+        Err(_) => {
+            // Pre-export failure path: close server PageSet, no
+            // caller-side cleanup needed because the export never
+            // happened. VA bump is intentionally NOT rewound — Phase
+            // 2 is bump-only by design.
+            let _ = sys_close_handle(server_ps);
+            sys_reply(neg_errno(ENOMEM), 0, 0, 0);
+            return;
+        }
+    };
+
+    // 5. Record the entry. Cannot fail: pre-checked has_room above,
+    //    and dispatch is single-threaded so no other action can
+    //    consume the slot between steps 1 and 5.
+    let entry = MmapEntry {
+        caller_token,
+        base_va,
+        len_bytes,
+        server_pageset: server_ps,
+    };
+    mmap_table.insert(entry).expect("pre-checked has_room at step 1");
+
+    sys_reply(0, base_va, exported_handle, pages);
+}
+
+/// Look up `(caller_token, base_va)` in the mmap_table. Phase 2
+/// supports only exact whole-region unmap: the caller's `len_bytes`
+/// MUST match the original allocation. Mismatch returns EINVAL;
+/// missing entry returns EINVAL too (no separate ENOENT — Linux
+/// uses EINVAL for "not a known mapping"). Cross-caller lookups
+/// return EINVAL because the table scopes by caller_token.
+///
+/// On match: take the entry, close the server-side PageSet handle,
+/// reply 0.
+fn handle_file_munmap(
+    mmap_table: &mut MmapTable,
+    base_va: u64,
+    len_bytes: u64,
+) {
+    let caller_token = sys_query_caller_token();
+    // First peek to verify len matches. Take only on full match so a
+    // wrong-len call doesn't accidentally drop the entry.
+    let matches = match mmap_table.find_by_base_va(caller_token, base_va) {
+        Some(e) => e.len_bytes == len_bytes,
+        None => false,
+    };
+    if !matches {
+        sys_reply(neg_errno(EINVAL), 0, 0, 0);
+        return;
+    }
+    // Confirmed match — take and close.
+    let entry = mmap_table
+        .take_by_base_va(caller_token, base_va)
+        .expect("just-confirmed entry");
+    let _ = sys_close_handle(entry.server_pageset);
+    sys_reply(0, 0, 0, 0);
+}
+
+/// mprotect on an mmap region: must match (caller_token, base_va,
+/// len_bytes) exactly. Phase 2 has no kernel API to actually change
+/// protection, so we only accept calls that "set" the existing RW
+/// protection (already validated by dispatch). Reply 0 on match,
+/// EINVAL on mismatch.
+///
+/// The narrow rule keeps the no-op stub truthful: mprotect succeeds
+/// only for known mmap regions owned by this caller. brk, ELF,
+/// stack, arbitrary VAs, and other clients' mmap regions all
+/// return EINVAL even with the right prot.
+fn handle_file_mprotect(
+    mmap_table: &MmapTable,
+    base_va: u64,
+    len_bytes: u64,
+) {
+    let caller_token = sys_query_caller_token();
+    let matches = matches!(
+        mmap_table.find_by_base_va(caller_token, base_va),
+        Some(e) if e.len_bytes == len_bytes,
+    );
+    if matches {
+        sys_reply(0, 0, 0, 0);
+    } else {
+        sys_reply(neg_errno(EINVAL), 0, 0, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Side effects for dispatch actions
 // ---------------------------------------------------------------------------
 
@@ -578,6 +835,12 @@ pub extern "C" fn _start() -> ! {
     let mut fd_table = FdTable::with_stdio();
     let mut file_resources: [Option<FileResource>; MAX_FDS] = [None; MAX_FDS];
     let mut deferred_closes: [Option<u32>; MAX_DEFERRED_CLOSES] = [None; MAX_DEFERRED_CLOSES];
+    let mut mmap_table = MmapTable::new();
+    // Bump-only VA allocator from POSIX_MMAP_BASE to USER_VA_END.
+    // Phase 2 doesn't reuse freed VA — every mmap claims the next
+    // contiguous chunk. Out of ~1 GiB of available range that's
+    // plenty for the malloc workloads Phase 2 targets.
+    let mut mmap_va_alloc = MmapVaAllocator::new(POSIX_MMAP_BASE, USER_VA_END);
 
     loop {
         // Retry any FS handles whose close failed in a previous open
@@ -665,23 +928,22 @@ pub extern "C" fn _start() -> ! {
             }
 
             // Phase 2.1 stubs. The dispatch arms above (in lockjaw_types)
-            // reject malformed shapes with the right errno; what reaches
-            // these match arms has already passed validation. Phase 2.2
-            // replaces these stubs with real handlers; phase 2.3 adds
-            // the shim-side caller. Until then, mmap/munmap return
-            // ENOSYS so any caller fails closed, while mprotect/madvise
-            // are genuine no-ops (sys_map_pages already produces RW;
-            // hints aren't load-bearing).
-            Action::FileMmap { len_bytes: _, prot: _, flags: _ } => {
-                sys_reply(neg_errno(ENOSYS), 0, 0, 0);
+            // reject malformed shapes with the right errno; what
+            // reaches these match arms has already passed validation.
+            // Phase 2.3 adds the shim-side caller; until then, no
+            // existing client exercises these arms.
+            Action::FileMmap { len_bytes, prot: _, flags: _ } => {
+                handle_file_mmap(&mut mmap_table, &mut mmap_va_alloc, len_bytes);
             }
-            Action::FileMunmap { base_va: _, len_bytes: _ } => {
-                sys_reply(neg_errno(ENOSYS), 0, 0, 0);
+            Action::FileMunmap { base_va, len_bytes } => {
+                handle_file_munmap(&mut mmap_table, base_va, len_bytes);
             }
-            Action::FileMprotect { base_va: _, len_bytes: _, prot: _ } => {
-                sys_reply(0, 0, 0, 0);
+            Action::FileMprotect { base_va, len_bytes, prot: _ } => {
+                handle_file_mprotect(&mmap_table, base_va, len_bytes);
             }
             Action::FileMadvise { base_va: _, len_bytes: _, advice: _ } => {
+                // Hints aren't load-bearing — reply 0 unconditionally
+                // regardless of region state.
                 sys_reply(0, 0, 0, 0);
             }
         }
