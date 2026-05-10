@@ -12,7 +12,7 @@ The design follows a few core principles:
 - **Handle-based access control.** Every kernel object is accessed through an integer handle with an associated rights bitmask. No handle, no access.
 - **Vulkan-inspired create-info pattern.** Each object type has its own create-info struct used for both size queries and creation. Same struct, no mismatch.
 - **Proven stack safety.** A custom build tool analyzes the call graph and per-function stack sizes from four entry points (_start, _secondary_start, __vec_sync_lower, __vec_irq) on every build. Indirect calls must be annotated or the build fails.
-- **Map or donate, never both.** A PageSet is consumed when donated for a kernel object. Consumed headers are left as zeroed tombstones so stale exported handles safely read count=0.
+- **Map or donate, never both.** A PageSet is consumed when donated for a kernel object. Consume is a transactional two-phase operation (validate + apply) that walks every live process's handle table, clears stale cross-process exported handles, and frees the header — no tombstones, no leaks.
 - **Verified IPC state machine.** The IPC endpoint logic is driven by a pure state machine model that is exhaustively explored at test time -- all reachable states, all transitions, all effect orderings verified. Kernel IPC handlers match on typed decision enums (SendDecision, ReceiveDecision, CallDecision, ReplyDecision) returned by lockjaw-types. No inline state branching in kernel code.
 - **Pull over push.** Kernel code is organized by integration shape: pull (types drives sequencing), plan/apply (types returns a decision, kernel executes), or push (kernel calls helpers). Push is treated as highest review-risk; the extraction rubric converts push to pull wherever possible.
 - **All MMIO through the device manager.** Drivers cannot map arbitrary physical addresses. The device manager discovers hardware from the DTB and issues tracked PageSets for MMIO pages. Only processes that receive an MMIO PageSet can map device memory.
@@ -20,7 +20,7 @@ The design follows a few core principles:
 
 ## What works today
 
-Lockjaw boots on QEMU with up to 4 cores (`-smp 4`), manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads across multiple CPUs with a Giant Kernel Lock, serves 28 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects and kernel-assigned caller tokens for multi-client isolation, runs eight isolated userspace processes loaded from ELF binaries (init, hello, device-manager, uart-driver, ramfb-driver, virtio-blk-driver, posix-server, plus a musl-built `hello, lockjaw` test client spawned by the personality server), has a device manager that discovers hardware from the DTB with probe and claim-by-address protocols, a UART driver, a ramfb display driver, a VirtIO block driver that reads from a virtual disk via virtqueues, and a POSIX personality server that runs statically-linked patched-musl binaries via shared-buffer IPC (Phase 0 done).
+Lockjaw boots on QEMU with up to 4 cores (`-smp 4`), manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads across multiple CPUs with a Giant Kernel Lock, serves 28 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects and kernel-assigned caller tokens for multi-client isolation, runs ten isolated userspace processes loaded from ELF binaries (init, hello, device-manager, uart-driver, ramfb-driver, virtio-blk-driver, fat32-server, fat32-test, posix-server, plus a musl-built `hello, lockjaw` test client spawned by the personality server), has a device manager that discovers hardware from the DTB with probe and claim-by-address protocols, a UART driver, a ramfb display driver, a VirtIO block driver that reads from a virtual disk via virtqueues, a FAT32 filesystem server that mounts the disk and serves open/read/close over IPC, and a POSIX personality server that runs statically-linked patched-musl binaries — including reading `/HELLO.TXT` via `fopen + fread + fclose` and allocating an 8 MiB buffer through `malloc` (musl stdio + mmap + cross-process file I/O all working end-to-end).
 
 ```
 === Lockjaw Microkernel v0.1.0 ===
@@ -46,10 +46,14 @@ ramfb: display configured
 blk: found virtio-blk device            # with -drive flag
 blk: selftest read OK, sector 0 = [4c 4f 43 4b ...]
 blk: serving
+fat32: mounted, cluster_size=512 bytes, root_cluster=2
 posix-server: spawning posix-hello...
 posix-server: posix-hello spawned OK
 posix-server: POSIX_INIT OK
 hello, lockjaw                          # ← from a real musl-built static binary
+posix-hello: hello from fat32           # ← fopen + fread on /HELLO.TXT via FAT32 IPC
+posix-hello: malloc 1MB ok              # ← musl malloc -> mmap -> server mmap_table
+posix-hello: malloc 8MB ok              # ← single-PageSet 64 MiB-capable mmap
 posix-server: child exit
 [IPC BENCHMARK] 10000 call/reply round-trips in 74 ticks
 [IPC BENCHMARK] 135 round-trips per tick
@@ -79,7 +83,7 @@ posix-server: child exit
 
 **Phase 11 -- SMP.** Secondary CPUs booted via PSCI CPU_ON. Per-CPU stacks in the linker script (2MB-aligned, 4 guard+stack pairs). Per-CPU data via TPIDR_EL1 with narrow accessors. Giant Kernel Lock (ticket lock from lockjaw-types, host-testable with multi-threaded tests) serializes all kernel execution. Scheduler model adapted for per-CPU current threads. Exception handlers acquire/release GKL. Kernel threads run cooperatively under the GKL with IRQs masked. Idle threads release GKL and halt in wfi. Process entry releases GKL before eret to EL0. INTID 0 reserved for future cross-core reschedule SGI (parked until fine-grained locking).
 
-**Phase 12 -- PageSet Lifecycle.** Mapping tracking, ownership transfer with ProcessTransferPlan, refcounting with free-on-zero, process exit cleanup via ProcessTeardownPlan with construction-safe narrowing (separate step variants for with/without address space, making illegal unmap-during-teardown unrepresentable).
+**Phase 12 -- PageSet Lifecycle.** Mapping tracking, ownership transfer with ProcessTransferPlan (deduplication), refcounting with free-on-zero, process exit cleanup via ProcessTeardownPlan with construction-safe narrowing (separate step variants for with/without address space, making illegal unmap-during-teardown unrepresentable). Cross-process handle revocation: consume_pageset is now a transactional two-phase (validate + apply) operation that walks every live process's handle table, clears stale exported handles, decrements per-handle refcount/map_count, and frees the header — replacing the previous tombstone-leak pattern. sys_create_process restructured to push every fallible step into the validate phase (scheduler::has_room precheck, parent_handle_to_copy validation, consume_validate per header) so the apply phase cannot fail mid-stream. Variable-size PageSetHeader: 16-byte fixed metadata followed by an inline u64 array spanning multiple physically-contiguous header pages. Page-addr access is gated by a `BackedHeader<'a>` wrapper that carries trusted (count, backing_pages) witnesses from the global PageSetTable rather than from the on-disk header itself, so a corrupted header cannot silently truncate or extend operations. Lifts the previous 510-pages-per-set cap to a practical 64 MiB.
 
 **Phase 13 -- Caller Tokens.** HandleEntry redesigned with typed HandleKind enum (repr(C, u8) with per-type metadata: caller_token on Endpoint, mapped_va_page on PageSet). Kernel assigns monotonic u64 tokens per endpoint on sys_export_handle and create_process handle copy. Token 0 = receive-only; send/call with token 0 is rejected. Servers query tokens via SYS_QUERY_CALLER_TOKEN (syscall 26). Tokens identify handle lineage for capability delegation. Integration test verifies nonzero token delivery.
 
@@ -87,7 +91,12 @@ posix-server: child exit
 
 **Phase 15 -- Real Hardware Portability (Raspberry Pi 4B).** Boot path made portable to real AArch64 hardware. Firmware DTB pointer preserved from `x0` at entry. Lightweight FDT platform scanner runs early in boot to discover RAM base/size, UART/GIC/timer MMIO addresses, GIC version (v2 vs v3), and SMP boot method (PSCI vs spin-table) from the device tree. All hardcoded MMIO addresses removed — platform consumers wired to DTB-discovered values. GIC split into v2 and v3 drivers with runtime enum dispatch (Pi 4B uses GICv2; QEMU virt uses GICv3). Position-independent boot with a higher-half pivot — kernel can load at any physical address; `__kernel_start` linker symbol replaces hardcoded `KERNEL_LOAD_ADDR`. DTB-driven SMP boot: PSCI/HVC for QEMU, spin-table (write entry to `cpu-release-addr`, dsb, sev) for Pi 4B. BuddyAllocator capacity bumped from 32 K pages (128 MB) to 262 K pages (1 GB) for real-hardware memory sizes. `core::fmt` replaced with a custom print module — 12% .text savings, removes a class of vtable function pointers in `.rodata` that real-hardware secure boot pipelines would have to allow-list. New `xtask check-vtables` build check scans `.rodata`/`.data` for absolute code pointers and fails the build on unauthorized ones (with an allow-list for legitimate cases like compiler jump tables). FDT parser hardened against real-hardware DTB layouts. `make pi4` produces `kernel8.img` ready to copy to a Pi 4B SD card boot partition.
 
-**Phase 16 -- POSIX Personality (Phase 0).** A real `puts("hello, lockjaw")` from a statically-linked patched-musl binary runs end-to-end. Personality server (`user/posix-server/`) bootstraps with init, parses an embedded ELF, builds the Linux initial stack (argc/argv/auxv with AT_PAGESZ + AT_RANDOM), spawns the child via sys_create_process with a syscall endpoint as handle 0, and dispatches Linux syscalls received over IPC. Three musl patches in `musl-lockjaw/`: `crt_arch.h` (SP adjustment), `syscall_arch.h` (SVC redirect), and `shim.c` (per-syscall dispatch + bootstrap handshake + local brk handling, with fail-fast `lj_die()` for any transport or bootstrap error). Shared-buffer IPC (one page per client) with the asymmetric Lockjaw reply ABI (messages in x2-x5, reply in x1-x4) used correctly. Real ELF loader handles unaligned LOAD segments (musl's tightly-packed second LOAD at vaddr 0x41ffa8 spans two pages with file data placed at the right in-page offset). Implemented: write, writev, exit_group, set_tid_address (stub), ioctl (stub), brk (local). Phases 1+ (filesystem, mmap, threads, processes, signals) still aspirational.
+**Phase 16 -- POSIX Personality (Phases 0-2).** Real musl programs allocate memory and read files end-to-end on Lockjaw. Personality server (`user/posix-server/`) bootstraps with init, parses an embedded ELF, builds the Linux initial stack (argc/argv/auxv with AT_PAGESZ + AT_RANDOM), spawns the child via sys_create_process with a syscall endpoint as handle 0, and dispatches Linux syscalls received over IPC. Three musl patches in `musl-lockjaw/`: `crt_arch.h` (SP adjustment), `syscall_arch.h` (SVC redirect), and `shim.c` (per-syscall dispatch + bootstrap handshake + local brk handling + per-process mmap tracker, with fail-fast `lj_die()` for any transport or bootstrap error). Shared-buffer IPC (one page per client) with the asymmetric Lockjaw reply ABI (messages in x2-x5, reply in x1-x4) used correctly. Real ELF loader handles unaligned LOAD segments. Implemented:
+
+- **Phase 0** (puts via shared buffer): `puts("hello, lockjaw")` from a statically-linked patched-musl binary. write, writev, exit_group, set_tid_address (stub), ioctl (stub), brk (local).
+- **Phase 1** (filesystem): `openat / read / close` route through posix-server to a FAT32 filesystem server (`user/fat32-server/`) over a shared-buffer FS-IPC protocol (open/read/close request/reply messages). Per-client OpenTable in fat32-server scoped by caller_token; per-handle DMA buffer PageSet exported to posix-server. fat32-server uses a `BlockEngine`-shaped `BlockClient` to talk to the virtio-blk driver. The FsClient + FdTable infrastructure on the posix-server side mirrors the FdTable shape (caller_token isolation, per-fd resource tracking, deferred-close queue for transport-failure rollback).
+- **Phase 2** (mmap + stdio): musl's `malloc` above the brk threshold goes through `mmap(NULL, len, RW, MAP_PRIVATE|MAP_ANONYMOUS)`. Personality server's per-client mmap_table allocates a PageSet, picks a base_va from a bump VA allocator, exports the handle to the client. Shim's failure-ordered handshake (`NR_MMAP` IPC -> `sys_map_pages` -> tracker insert) with explicit `NR_MMAP_ROLLBACK` if any post-export step fails. Variable-size PageSet header (Phase 2.K, see Phase 12) lets one PageSet back up to 64 MiB. Multi-L2 page-table mapping (Phase 2.M) lets a single mapping span multiple L2 regions transactionally (classify, pre-allocate, apply — same shape as consume_pageset_validate/apply). 8 MiB malloc gate verified end-to-end. `fopen + fread + fclose` exercises Phase 1 through musl stdio (which mallocs the FILE struct via mmap), proving Phase 2's mmap-backed malloc supports stdio.
+- Phase 3+ (filesystem write, threads via futex, processes via posix_spawn, pipes, signals) still aspirational.
 
 ### Unsafe reduction
 
@@ -105,10 +114,10 @@ Three layers of automated testing run on every build:
 
 | Layer | Count | What it tests |
 |-------|-------|---------------|
-| Unit tests (host) | 463 | Scheduler model, IPC state machine (exhaustive) + decision functions, process lifecycle + transfer plan + teardown plan, buddy allocator, page tables (PageTableWalk + MapWalk + unmap_validated), ExceptionContext ABI, ESR decode, HandleKind + handle ops, VirtIO types + layout, block protocol, FDT parser, device probe protocol, notifications, wait readiness, ticket lock (multi-threaded), feature negotiation, L3 region tracker, ScratchCursor pagination, build_process_page permission policy |
-| Integration tests (QEMU) | 44 | Full boot through 16 phases, scheduler/MMU integration, IPC bootstrap, caller token delivery (positive + negative assertions), thread exit cleanup, thread creation |
+| Unit tests (host) | 708 | Scheduler model, IPC state machine (exhaustive) + decision functions, process lifecycle + transfer plan + teardown plan, buddy allocator, page tables (PageTableWalk + MapWalk + validate_pte_match + clear_validated_pte + L2RegionIter), ExceptionContext ABI, ESR decode, HandleKind + handle ops + slot_revoke_validate/apply, BackedHeader/BackedHeaderMut wrapper bounds, VirtIO types + layout, block protocol, FDT parser, FAT32 BPB + cluster chains + dirent parser + 8.3 path matching, FS-IPC protocol, POSIX dispatch arms (mmap/munmap/mprotect/madvise + 21 rejection paths) + VA layout + Linux stack writer, device probe protocol, notifications, wait readiness, ticket lock (multi-threaded), feature negotiation, L3 region tracker, ScratchCursor pagination, build_process_page permission policy |
+| Integration tests (QEMU) | 87 (per GIC variant) | Full boot through 17 phases, scheduler/MMU integration, IPC bootstrap, caller token delivery (positive + negative assertions), thread exit cleanup, thread creation, virtio-blk disk read, FAT32 mount + open + read end-to-end, POSIX Phase 0 puts, Phase 1 file read via fopen, Phase 2.3 malloc(1 MiB) gate, Phase 2.4 malloc(8 MiB) gate, handle revocation diagnostic with multi-process walk assertion |
 | Stack analysis | 4 entry points | No recursion, depth within 8KB budget, per-function 1600B cap, all indirect calls annotated, both debug and release profiles |
-| Pointer cast lint | 70+ | Every `as *const` / `as *mut` in kernel code has a SAFETY comment |
+| Pointer cast lint | 80+ | Every `as *const` / `as *mut` in kernel code has a SAFETY comment |
 
 The IPC state machine test exhaustively explores all reachable system states (endpoint state x per-client reply state x thread states) via BFS with a 3-thread model and verifies: no kernel-caused deadlocks, all 8 invariants hold, all effect orderings correct (BlockCurrent always last, UnblockThread before ClearReply).
 
@@ -190,10 +199,11 @@ src/
   cap/
     object.rs                # ObjectType, create-info pattern, query/create
     object_ops.rs            # Safe IPC/notification facade (narrow operation methods)
-    handle_table.rs          # HandleTableRef, handle insert/lookup/remove with rights
+    handle_table.rs          # HandleTableRef, handle insert/lookup/remove + revoke_validate/apply
     rights.rs                # Rights bitmask
     pageset.rs               # PageSet state machine
     pageset_table.rs         # PageSetRef, PageSet tracking table, contiguous allocation
+    revoke.rs                # Cross-process handle revocation (revoke_validate + revoke_apply)
   sched/
     tcb.rs                   # TCB creation (imports Tcb/SavedContext from lockjaw-types)
     context.rs               # context_switch assembly (imports SavedContext from lockjaw-types)
@@ -213,14 +223,18 @@ lockjaw-types/               # Pure-logic library crate, testable on host
     page_table.rs            # PageTableEntry, PageTable, PageTableWalk, MapWalk
     rights.rs                # Rights bitmask
     object.rs                # ObjectType, HandleKind enum, HandleEntry, CloseHandleResult, TeardownHandleAction
-    handle_ops.rs            # Pure handle-table slot operations (insert/lookup/remove/rights)
+    handle_ops.rs            # Pure handle-table slot operations (insert/lookup/remove/rights/revoke_validate/revoke_apply)
     virtio.rs                # VirtIO MMIO registers, virtqueue types, block request types, feature negotiation
     block.rs                 # Block device IPC protocol (CMD_GET_INFO/ALLOC_BUFFER/READ/WRITE/FREE_BUFFER)
     ipc_state.rs             # IPC state machine model + kernel-facing decision functions (decide_send/receive/call/reply)
     exception.rs             # ExceptionContext ABI, ESR decode, sync exception classification
     thread.rs                # SavedContext, Tcb, TcbCreateInfo, ThreadBootstrap ABI
     notification_state.rs    # Notification timeline semaphore model
-    pageset_table.rs         # PageSet table model, refcount/map_count lifecycle
+    pageset_table.rs         # PageSet table model + variable-size header (BackedHeader/BackedHeaderMut wrappers), refcount/map_count lifecycle
+    fs.rs                    # FS-IPC protocol (open/read/close request/reply messages)
+    fat32.rs                 # FAT32 BPB parser, cluster chains, dirent + 8.3 path matching
+    posix.rs                 # POSIX dispatch arms (write/openat/read/close/mmap/munmap/mprotect/madvise) + VA layout + Linux initial stack writer
+    posix_fd.rs              # Pure FdTable for POSIX fd allocation/lookup/close
     process.rs               # ProcessLifecycle, ProcessTransferPlan, ProcessTeardownPlan
     vmem.rs                  # Page table walk/map validation, index computation
     wait.rs                  # sys_wait_any readiness model, ReadinessWaiter
@@ -240,9 +254,11 @@ user/                        # Userspace binaries (separate Cargo projects)
   ramfb-driver/              # Display driver -- fw_cfg DMA, contiguous framebuffer
   virtio-blk-driver/         # VirtIO block driver -- MMIO transport, virtqueue, BlockEngine
   display-test/              # Display DDI test client -- queries modes, draws gradient
-  posix-server/              # POSIX personality server -- ELF loader + Linux syscall dispatch via shared-buffer IPC
-  posix-hello/               # POSIX test client -- hello.c (musl-built) + standalone.c (no-libc fallback)
-  lockjaw-userlib/           # Shared library (syscalls, display DDI, block DDI, virtqueue, PageSetGuard)
+  fat32-server/              # FAT32 filesystem server -- mounts virtio-blk disk, serves open/read/close over FS-IPC
+  fat32-test/                # FAT32 verification client -- end-to-end open + read of /HELLO.TXT
+  posix-server/              # POSIX personality server -- ELF loader + Linux syscall dispatch + FsClient + FdTable + mmap_table + per-client VA allocator
+  posix-hello/               # POSIX test client -- hello.c (musl-built, fopen + malloc + stdio) + standalone.c (no-libc fallback)
+  lockjaw-userlib/           # Shared library (syscalls, display DDI, block DDI, FsClient, virtqueue, PageSetGuard)
 
 musl-lockjaw/                # Patched musl 1.2.5 (downloaded by build.sh)
   build.sh                   # Incremental cross-compile: patches + libc.a + hello.c
@@ -264,7 +280,10 @@ docs/                        # Book of Lockjaw -- design documentation
   tech-debt.md               # Known limitations and planned fixes
   extraction-roadmap.md      # Push-shaped code remaining to extract, ranked
   yagni-parking-lot.md       # Removed code tracked for future phases
-  development-journal.md     # Journal entries from the AI collaborator (1-7)
+  development-journal.md     # Journal entries from the AI collaborator (1-9)
+  handle-revocation-plan.md  # Plan for two-phase consume_pageset + sys_create_process restructure
+  posix-musl-plan.md         # Multi-phase plan for the musl personality (Phase 0/1/2 done)
+  posix-phase2-mmap-plan.md  # Phase 2 mmap design + sub-phase breakdown
 
 xtask/                       # Build tools
   src/main.rs                # check-stack and check-pointers commands
@@ -294,9 +313,12 @@ tests/
 | 14. VirtIO Block Driver | Done | VirtIO MMIO transport, split virtqueue with barriers, block engine + server framework, per-device GIC trigger mode, selftest reads sector 0 |
 | 15. Real Hardware Portability | Done (rudimentary Pi 4B) | DTB-driven platform discovery, GICv2/v3 split, PIE boot with higher-half pivot, PSCI + spin-table SMP, custom print (no core::fmt), 1 GB RAM, `make pi4` produces kernel8.img |
 | 16. POSIX Phase 0 | Done | Personality server + patched musl + shared-buffer IPC; statically-linked musl `puts("hello, lockjaw")` runs end-to-end |
-| 17. Architecture Hardening | Ongoing | Extracting pure logic to lockjaw-types (push→pull), making illegal states unrepresentable |
-| 18. Pi 4B Bring-Up Validation | Planned | Confirm `kernel8.img` boots on a real Pi 4B; fix whatever real-hardware quirks surface |
-| 19. POSIX Phase 1+ | Planned | Filesystem (ramfs), mmap, threads (futex), processes (posix_spawn/wait), pipes, signals |
+| 16a. POSIX Phase 1 | Done | FAT32 server (mounts virtio-blk disk), FsClient + FdTable in posix-server, openat/read/close end-to-end; musl direct syscalls read `/HELLO.TXT` |
+| 16b. POSIX Phase 2 | Done | Variable-size PageSet header, multi-L2 page-table mapping, posix-server mmap_table + VA allocator, shim mmap/munmap/mprotect/madvise + readv translation; `malloc(8 MiB)` and `fopen + fread + fclose` work end-to-end |
+| 17. Handle Revocation | Done | Two-phase consume_pageset (validate + apply) walks every live process's handle table, clears stale exported handles, replaces tombstone-leak pattern. sys_create_process restructured to push every fallible step into the validate phase. |
+| 18. Architecture Hardening | Ongoing | Extracting pure logic to lockjaw-types (push→pull), making illegal states unrepresentable |
+| 19. Pi 4B Bring-Up Validation | Planned | Confirm `kernel8.img` boots on a real Pi 4B; fix whatever real-hardware quirks surface |
+| 20. POSIX Phase 3+ | Planned | Filesystem write, threads (futex), processes (posix_spawn/wait), pipes, signals |
 
 ## License
 
