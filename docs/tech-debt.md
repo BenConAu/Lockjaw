@@ -4,27 +4,15 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ---
 
-## Static PageSet table (32-slot cap)
-
-**Where:** `src/cap/pageset_table.rs`
-
-**What:** PageSets are tracked in a fixed-size static array of 32 slots. No per-process tracking, no cleanup on process death.
-
-**Why bootstrap:** The eventual design (PageSets as kernel objects in per-process handle tables) has a circularity — you need pages to create the object that tracks pages. Bootstrapping requires pre-created PageSets for init.
-
-**Fix:** Device manager process owns the table in its own allocated pages. Kernel pre-creates bootstrap PageSets for init at boot. Per-process accounting via handle tables.
-
----
-
-## Static IRQ binding table (32-slot cap)
+## Static IRQ binding table (96-slot cap)
 
 **Where:** `src/arch/aarch64/irq_bind.rs`
 
-**What:** IRQ-to-Notification bindings stored in a static array of 32 entries. Cannot grow dynamically. No unbind, no conflict detection, no ownership tracking.
+**What:** IRQ-to-Notification bindings stored in a static array of 96 entries (raised from 32 once UART + virtio-blk + virtio-mmio device probing started filling it). No unbind, no conflict detection, no ownership tracking. The kernel still owns the table directly even though the device-manager process is now the policy authority for who gets which device.
 
-**Why bootstrap:** Same pattern as PageSet table. A single UART IRQ binding doesn't need more.
+**Why bootstrap:** A single UART IRQ binding doesn't need more, and the device manager + drivers we have today fit under 96. Moving the table into the device manager would require an IPC round-trip on every bind.
 
-**Fix:** Superseded by the device manager (see below). The device manager owns the binding table, the kernel syscall stays simple: one binding at a time.
+**Fix:** Move the binding table into the device manager process; the kernel syscall stays simple (one binding at a time), and the device manager arbitrates ownership and detects conflicts.
 
 ---
 
@@ -32,11 +20,11 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 **Where:** `src/arch/aarch64/vmem.rs` (create_address_space, L1[1] and L2[4])
 
-**What:** Every user address space includes the kernel's physical address range (RAM at L1[1], device MMIO at L2[4]) with AP_RW_EL1. This is because the kernel binary is linked at physical addresses and VBAR_EL1 points to a physical address.
+**What:** Every user address space includes the kernel's physical address range (RAM at L1[1], device MMIO at L2[4]) with AP_RW_EL1. Despite the higher-half kernel pivot via TTBR1, the kernel binary is still linked at physical addresses (`linker.ld` ORIGIN = `0x40200000`); the higher-half mapping is an additional view of the same physical memory, not a relocation. Some kernel exception-handling paths still reference TTBR0-range addresses.
 
 **Why bootstrap:** Relinking the kernel at higher-half VAs requires changing the linker script origin, adding a boot trampoline that runs at physical addresses before jumping to higher-half, and updating every function/static address. Significant change.
 
-**Fix:** Relink the kernel at higher-half VAs (linker.ld ORIGIN = 0xFFFF_0000_4008_0000). Add a boot trampoline in boot.rs that identity-maps initially, then jumps to higher-half after TTBR1 is installed. After that, TTBR0 can be pure user pages with no kernel entries.
+**Fix:** Relink the kernel at higher-half VAs (`linker.ld` ORIGIN = `0xFFFF_0000_4008_0000`). Add a boot trampoline in `boot.rs` that identity-maps initially, then jumps to higher-half after TTBR1 is installed. After that, TTBR0 can be pure user pages with no kernel entries. This unblocks the "kernel threads leave stale user TTBR0" item below.
 
 ---
 
@@ -52,27 +40,27 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ---
 
-## MAX_THREADS = 8 static scheduler array
+## MAX_THREADS = 16 static scheduler array
 
-**Where:** `src/sched/scheduler.rs`
+**Where:** `src/sched/scheduler.rs:15`
 
-**What:** The run queue is a fixed-size array of 8 slots. Cannot grow. add_thread returns false when full.
+**What:** The run queue is a fixed-size array of 16 slots (raised from 8). Cannot grow. `add_thread` returns false when full. Sufficient for today's ~11 active processes plus kernel threads, but a hard ceiling.
 
-**Why bootstrap:** A dynamic run queue requires either kernel allocation (violates our principle) or a user-donated page for the queue. For 3 processes (init, hello, UART driver) plus 2 IPC threads + idle, 8 is enough.
+**Why bootstrap:** A dynamic run queue requires either kernel allocation (violates our principle) or a user-donated page for the queue.
 
 **Fix:** User-donated page for the run queue, similar to how handle tables work. The scheduler would be initialized with a donated page that holds the thread array.
 
 ---
 
-## UnsafeCell globals assume single-core
+## UnsafeCell globals serialized only by GKL
 
 **Where:** `src/cap/pageset_table.rs`, `src/arch/aarch64/irq_bind.rs`
 
-**What:** Kernel globals use `UnsafeCell` with a manual `unsafe impl Sync` to avoid `static mut` UB warnings. The safety argument is "single-core kernel, no concurrent access during a syscall." This is true today but breaks under SMP where multiple cores can execute syscalls concurrently.
+**What:** Kernel globals use `UnsafeCell` with a manual `unsafe impl Sync` and a comment claiming "single-core kernel, no concurrent access." The comments are stale: SMP support landed (Phase 11), and the safety actually comes from the Giant Kernel Lock (`src/sched/gkl.rs`) which serializes all kernel-mode execution. The bare `UnsafeCell` is correct under GKL but the SAFETY comments lie about why.
 
-**Why bootstrap:** Proper locking (spinlocks, per-CPU data) requires an SMP-aware synchronization primitive that doesn't exist yet. Single-core QEMU virt doesn't need it.
+**Why bootstrap:** Proper per-object locking would let cores execute non-conflicting kernel work in parallel; GKL is the placeholder until then.
 
-**Fix:** When adding SMP support, replace bare `UnsafeCell` wrappers with a kernel spinlock type (e.g. `SpinMutex<T>` that disables IRQs on lock). Audit every `unsafe impl Sync` for the same pattern. The IRQ binding table (`irq_bind.rs`) still uses `static mut` and needs the same treatment.
+**Fix:** Update the SAFETY comments to cite GKL (small fix, keeps current semantics correct on paper). Then, when the kernel grows beyond GKL — replace bare `UnsafeCell` wrappers with a kernel spinlock type (e.g. `SpinMutex<T>` that disables IRQs on lock) and audit every `unsafe impl Sync` for the same pattern.
 
 ---
 
@@ -88,43 +76,21 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ---
 
-## No device manager process
-
-**Where:** Affects `src/arch/aarch64/irq_bind.rs`, `src/syscall/handler.rs` (sys_map_pages with MAP_FLAG_DEVICE, sys_bind_irq)
-
-**What:** Drivers currently call sys_bind_irq and sys_map_pages(MAP_FLAG_DEVICE) directly with hardcoded physical addresses and INTIDs. There is no authority controlling which driver gets which hardware resources. Any process that can call these syscalls can map any MMIO region or claim any IRQ.
-
-The eventual design is a **device manager** process that:
-
-1. **Parses the DTB (device tree blob)** at boot to discover hardware: MMIO base addresses, sizes, IRQ numbers, compatible strings. QEMU `-machine virt` provides a DTB at a known address that the kernel can pass to the device manager.
-
-2. **Owns the IRQ binding table** in its own allocated pages (replacing the static 32-slot kernel table). Drivers request IRQ bindings via IPC to the device manager, which calls sys_bind_irq on their behalf.
-
-3. **Grants MMIO access** by allocating PageSets covering device memory regions and donating them to the requesting driver. The device manager is the only process that calls sys_map_pages with MAP_FLAG_DEVICE — drivers receive pre-mapped pages or capabilities to map them.
-
-4. **Enforces policy:** which driver gets which device (by compatible string or explicit config), conflict detection (two drivers claiming the same MMIO range or IRQ), and revocation.
-
-**Why bootstrap:** Phase 9 only needs one UART driver with one known MMIO address and one IRQ. Hardcoding works. The DTB parser and resource arbitration are substantial — worth their own phase.
-
-**Fix:** Dedicated phase. The kernel's sys_bind_irq and sys_map_pages syscalls stay as-is (simple, low-level primitives). The device manager sits on top as the userspace authority that decides who gets to call them and with what arguments.
-
----
-
 ## Single-handle copy at process creation
 
-**Where:** `src/process.rs`, `src/syscall/handler.rs` (sys_create_process x5 parameter)
+**Where:** `src/process.rs:98-109`, `src/syscall/handler.rs` (sys_create_process x5 parameter)
 
-**What:** sys_create_process copies at most one handle from the parent's handle table into the child's. x5 = handle index to copy, or u64::MAX for none. This is the only mechanism for capability transfer between processes.
+**What:** sys_create_process copies at most one handle from the parent's handle table into the child's. x5 = handle index to copy, or u64::MAX for none. PageSet kinds are now explicitly rejected here (see the validate-phase check in `process.rs:98-109`) — callers that need to transfer a PageSet must use `sys_export_handle` instead.
 
-**Why bootstrap:** The UART driver needs exactly one handle (the IPC endpoint from init). One handle is enough for Phase 9.
+**Why bootstrap:** The UART driver needs exactly one handle (the IPC endpoint from init). One handle is enough for current bootstrap shapes; everything else flows through `sys_export_handle` post-spawn.
 
-**Fix:** Either extend to an array of handles (x5 = pointer to handle index array, x6 = count), or implement IPC-based capability transfer where handles can be sent in IPC messages (like seL4's CNode mint/copy operations). The latter is the proper microkernel approach — capabilities flow through IPC, not just at creation time.
+**Fix:** Either extend to an array of handles (x5 = pointer to handle index array, x6 = count), or treat the current single-handle path as deprecated and route everything through IPC-based transfer. The latter is the proper microkernel approach — capabilities flow through IPC, not just at creation time.
 
 ---
 
 ## Kernel threads leave stale user TTBR0 in hardware
 
-**Where:** `src/sched/scheduler.rs:147`, `src/main.rs:280-310`
+**Where:** `src/sched/scheduler.rs:435-442`
 
 **What:** Kernel threads are created with `ttbr0_paddr = 0`. The scheduler only writes TTBR0_EL1 when `new_ttbr0 != 0`. When switching from a user process to a kernel thread, the previous user process's page table stays in TTBR0_EL1. An accidental lower-half access from a kernel thread would hit the previous process's memory instead of faulting cleanly.
 
@@ -142,39 +108,15 @@ The eventual design is a **device manager** process that:
 
 **What:** The BlockToken + scoped_mut pattern enforces at compile time that no `&mut T` reference to a shared kernel object survives across `block_current()`. However, the protection is opt-in: code that uses bare `unsafe { &mut *ptr }` instead of `scoped_mut(ptr, &mut tok)` bypasses the guardrail entirely. The token only protects functions that participate in the protocol.
 
-**Current state:** All four blocking IPC paths (ipc_send, ipc_receive, ipc_call, notification_wait) use the token protocol. No bare `&mut *ptr` appears in blocking paths today.
+**Current state:** All four blocking IPC paths (ipc_send, ipc_receive, ipc_call, notification_wait) use the token protocol. Bare `&mut *ptr` casts in `endpoint.rs` (lines 103, 188, 207) and `notification.rs` (line 87) sit on fast paths that return without ever calling `block_current()` — the comments explain why. No machine enforcement yet.
 
-**Fix:** Enforce via review and grep: `grep -n '&mut \*' src/ipc/` should return only `scoped_mut` calls in blocking functions. If a new blocking IPC function is added, it must use BlockToken. Consider a xtask lint that checks for bare `&mut *raw_ptr` in IPC files.
-
----
-
-## Consumed PageSet headers leak as tombstones
-
-**Where:** `src/cap/pageset_table.rs` (consume_pageset)
-
-**What:** When a PageSet is consumed (for object creation or process ownership transfer), its header page is zeroed but never freed. It stays allocated as a tombstone so that stale exported handles in other processes safely read count=0. Each consumption leaks one 4 KB page permanently.
-
-**Why:** Without handle revocation, freeing the header page would let it be reused. A stale exported handle could then read whatever new object lives at that address, creating a use-after-repurpose bug.
-
-**Fix:** Handle revocation — when a PageSet is consumed, walk all handle tables across all processes and remove entries pointing at that header. Then the header page can be safely freed. This requires a process registry and cross-process handle table iteration.
-
----
-
-## No handle-table cleanup for non-PageSet objects on process exit
-
-**Where:** `src/sched/scheduler.rs` (finish_exit, LastThread arm)
-
-**What:** Process exit walks the handle table and calls handle_cleanup + apply_handle_cleanup for each entry. But handle_cleanup only acts on PageSet handles (dec_refcount, dec_map_count). Handles to endpoints, notifications, and reply objects are silently dropped without any cleanup. Their ObjectHeader.refcount is never decremented.
-
-**Why:** Only PageSets currently have free-on-zero semantics. Endpoints and notifications are kernel objects donated from parent PageSets — their lifetime is managed by the consuming process, not by refcounting. The refcount field in ObjectHeader exists but is not wired into any lifecycle logic for non-PageSet types.
-
-**Fix:** Extend handle_cleanup to act on all object types when their refcounting is wired up. For now, endpoint/notification/reply objects are effectively immortal once created — they are never freed.
+**Fix:** Enforce via review and grep: `grep -n '&mut \*' src/ipc/` should return only `scoped_mut` calls in blocking functions. If a new blocking IPC function is added, it must use BlockToken. Consider an xtask lint that checks for bare `&mut *raw_ptr` in IPC files.
 
 ---
 
 ## SYS_RECV_NB naming inconsistency
 
-**Where:** `lockjaw-types/src/syscall.rs`, `src/syscall/handler.rs`, `user/lockjaw-userlib/src/syscall.rs`
+**Where:** `lockjaw-types/src/syscall.rs:91`, `src/syscall/handler.rs:61`, `user/lockjaw-userlib/src/syscall.rs:271`
 
 **What:** The syscall is named `SYS_RECV_NB` / `sys_recv_nb` but every other IPC syscall spells out "receive" (`SYS_RECEIVE`, `sys_receive`). Inconsistent abbreviation.
 
@@ -186,15 +128,16 @@ The eventual design is a **device manager** process that:
 
 **Where:** `user/lockjaw-userlib/`
 
-**What:** Several minor issues from the initial extraction:
-- `ProcessMapping` is defined in both userlib and the kernel (`src/process.rs`). Should live in lockjaw-types so both sides share one definition.
-- No module-level doc comment on `lib.rs`.
-- Inconsistent re-export strategy: syscall/print are glob-exported, elf is namespaced. Should be a documented choice.
-- Empty `[lib]` section in Cargo.toml (no effect, just noise).
+**What:** Initial extraction left several minor issues. Status updated:
+
+- ~~`ProcessMapping` is defined in both userlib and the kernel~~ — **resolved**: `user/lockjaw-userlib/src/process.rs:2` re-exports from `lockjaw-types::process::ProcessMapping`.
+- No module-level doc comment on `lib.rs` — still missing.
+- Inconsistent re-export strategy: `syscall::*` and `print::*` are glob-exported, `lockjaw_types::elf` is namespaced. Should be a documented choice.
+- Empty `[lib]` section in `Cargo.toml` (line 11) — still present, no effect, just noise.
 
 **Why:** Low-priority cleanup. None of these cause bugs.
 
-**Fix:** Move `ProcessMapping` to lockjaw-types. Add doc comment. Clean up Cargo.toml. Standardize re-exports.
+**Fix:** Add doc comment. Standardize re-exports. Drop the empty `[lib]` section.
 
 ---
 
@@ -210,29 +153,15 @@ The eventual design is a **device manager** process that:
 
 ---
 
-## No cross-process handle revocation
-
-**Where:** `src/syscall/handler.rs` (create_kernel_object), `src/cap/handle_table.rs` (remove_all_by_object)
-
-**What:** When a PageSet is consumed to create a kernel object (endpoint, notification, reply), all handles to it in the *caller's* table are invalidated. But if the PageSet handle was exported to another process via `sys_export_handle`, those cross-process handles remain live and stale — they still point at the old header page, which has been repurposed as a different object type.
-
-**Why:** No revocation infrastructure exists. seL4 uses a Capability Derivation Tree (CDT) to track all copies of a capability and revoke them atomically. Lockjaw's handle model is flat copies with no provenance tracking.
-
-**Current mitigation:** The header page is zeroed on consumption, making stale handles inert (they read count=0 and cannot map, query, or re-donate). This prevents use-after-repurpose of the data page. However, the stale handle entry itself persists in the remote process's handle table, occupying a slot and passing type checks as ObjectType::PageSet — it's just operationally dead. In practice, donation-target pagesets (1-page allocations for endpoints/notifications/replies) are never exported cross-process, so stale exported handles don't arise on the current boot path.
-
-**Fix:** Capability revocation — either a CDT (seL4-style) or a simpler generation-counter scheme where each handle carries a generation number that must match the object's current generation.
-
----
-
-## sys_close_handle is slot-only — no backing memory freed
+## sys_close_handle ownership semantics
 
 **Where:** `src/syscall/handler.rs` (sys_close_handle), all userspace programs
 
-**What:** `sys_close_handle(handle)` reclaims the handle table slot but does NOT free the backing kernel object or its physical pages. Without refcounting, mapping tracking, or capability revocation, freeing pages on close would be use-after-free: other processes may hold exported handles or active VA mappings to the same physical memory.
+**What:** `sys_close_handle(handle)` reclaims the handle table slot and, for PageSet handles, decrements refcount via the revocation path (`free-on-zero` semantics). For non-PageSet handles (endpoint, notification, reply), the slot is freed but the underlying object is not — by design, since these are donated pages owned by the consuming process and never refcounted. The original "no backing memory freed" framing conflated these two cases.
 
-**Current state:** Handle slots are the scarce resource (255 per process). Closing reclaims the slot. The backing object and pages leak for the process lifetime. This is bounded and rare in practice (only on error paths like device manager export failure).
+**Current state:** PageSet handles correctly free pages on last-close (handle revocation walks all processes' handle tables before freeing). Non-PageSet objects remain effectively immortal — their `refcount` field on `ObjectHeader` exists but is not wired into any lifecycle for endpoint/notification/reply types.
 
-**Fix:** Add refcounting or generation-based revocation, then a `sys_free_pageset(handle)` that validates no mappings or exports exist before freeing. Alternatively, track all mappings per-PageSet so the kernel can unmap before freeing.
+**Fix:** Decide whether endpoints/notifications/replies should be refcounted (matches the "everything is a handle" microkernel ideal) or remain donation-owned (matches the current "you donated the page, you decide when to reclaim" model). If refcounted, extend the close path to drop them on last-close; if donation-owned, document that explicitly somewhere user-visible.
 
 ---
 
@@ -240,9 +169,9 @@ The eventual design is a **device manager** process that:
 
 **Where:** `src/process.rs` (create_process), `src/syscall/handler.rs` (sys_create_thread), and any kernel path that allocates multiple resources and rolls back manually on failure.
 
-**What:** Many kernel functions allocate pages, TCBs, or other resources and use explicit multi-step rollback on error. This is fragile — new error paths can miss cleanup. The `HeaderPageGuard` pattern in `src/cap/pageset_table.rs` shows the fix: RAII guards that free resources on drop unless explicitly taken.
+**What:** The `HeaderPageGuard` pattern in `src/cap/pageset_table.rs` is the model: RAII guards that free resources on drop unless explicitly taken. `create_process` (`src/process.rs:18-46`) now uses `PageGuard` and `Ttbr0Guard` throughout. But other allocation paths still use manual rollback — most visibly `sys_create_thread` in `src/syscall/handler.rs` (around line 757) where TCB and stack pages are deallocated by hand on error.
 
-**Fix:** Audit all kernel allocation paths for manual rollback chains. Replace with drop guards where the pattern applies.
+**Fix:** Continue applying the guard pattern to remaining manual-rollback paths. Each new fallible allocation chain should reach for guards by default.
 
 ---
 
@@ -262,6 +191,14 @@ The eventual design is a **device manager** process that:
 
 **Where:** Kernel-side modules in `src/` that contain pure state machines, data structures, or decision logic with no hardware or `unsafe` dependencies.
 
-**What:** Code that is pure logic but lives in the kernel crate cannot be tested on the host. Moving it to lockjaw-types enables host-side unit tests (like scheduler, page table walk, buddy allocator). The kernel crate should contain only hardware interaction, unsafe glue, and the syscall dispatch layer.
+**What:** Substantial progress: lockjaw-types has grown to ~16 K LOC across 25+ modules covering IPC state machine, scheduler model, process lifecycle/transfer/teardown, PageSet table + variable-size header, POSIX dispatch + VA layout, FAT32, FDT, and ELF loader. Kernel-side `src/cap` + `src/ipc` + `src/sched` together still hold ~3300 LOC. `docs/extraction-roadmap.md` lists the remaining priority targets.
 
-**Fix:** Audit `src/cap/`, `src/ipc/`, `src/sched/`, and `src/process.rs` for types and functions that could move to lockjaw-types. Candidates include handle table entry layout (done), process mapping validation, and any state machine that doesn't touch hardware.
+**Outstanding push-shaped kernel code:**
+- `create_process` outer orchestration (Priority 1 in extraction-roadmap)
+- `sys_map_pages` VA decision (Priority 1)
+- PageSet alloc rollback (Priority 1)
+- Endpoint and notification runtime handlers (~560 LOC combined)
+- Scheduler context-switch integration (~730 LOC)
+- Revocation walks (~260 LOC) — recently added; could likely have parts extracted
+
+**Fix:** Continue the push→pull conversion per `docs/extraction-roadmap.md`. Each new feature should land its decision logic in lockjaw-types first; the kernel mechanically executes.
