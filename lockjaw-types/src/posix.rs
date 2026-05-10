@@ -44,6 +44,13 @@ pub const NR_WRITEV: u64 = 66;
 pub const NR_EXIT_GROUP: u64 = 94;
 pub const NR_SET_TID_ADDRESS: u64 = 96;
 
+// Memory mapping syscalls (Phase 2). Linux numbers from
+// asm-generic/unistd.h (aarch64).
+pub const NR_MUNMAP: u64 = 215;
+pub const NR_MMAP: u64 = 222;
+pub const NR_MPROTECT: u64 = 226;
+pub const NR_MADVISE: u64 = 233;
+
 // ---------------------------------------------------------------------------
 // Linux errno values referenced by current dispatch arms.
 // ---------------------------------------------------------------------------
@@ -59,6 +66,8 @@ pub const ENOENT: u64 = 2;
 pub const ENOTDIR: u64 = 20;
 pub const EISDIR: u64 = 21;
 pub const EROFS: u64 = 30;
+pub const EACCES: u64 = 13;
+pub const EFAULT: u64 = 14;
 
 // ---------------------------------------------------------------------------
 // Linux open(2) flags (subset relevant to Phase 1 read-only validation).
@@ -78,6 +87,37 @@ pub const O_APPEND: u64 = 0o2000;
 /// Bitmask of open flags that require write capability. Phase 1's
 /// read-only filesystem rejects any open() with these set.
 pub const WRITE_OPEN_FLAGS: u64 = O_CREAT | O_EXCL | O_TRUNC | O_APPEND;
+
+// ---------------------------------------------------------------------------
+// Linux mmap(2) prot bits and flags (subset relevant to Phase 2).
+// ---------------------------------------------------------------------------
+
+pub const PROT_NONE: u64 = 0;
+pub const PROT_READ: u64 = 0x1;
+pub const PROT_WRITE: u64 = 0x2;
+pub const PROT_EXEC: u64 = 0x4;
+
+pub const MAP_SHARED: u64 = 0x01;
+pub const MAP_PRIVATE: u64 = 0x02;
+pub const MAP_FIXED: u64 = 0x10;
+pub const MAP_ANONYMOUS: u64 = 0x20;
+
+/// Phase 2 mmap accepts only `MAP_PRIVATE | MAP_ANONYMOUS`. Any other
+/// flag combination (MAP_SHARED, MAP_FIXED, file-backed) returns
+/// ENOSYS at dispatch.
+pub const REQUIRED_MMAP_FLAGS: u64 = MAP_PRIVATE | MAP_ANONYMOUS;
+
+/// Phase 2 mmap accepts only `PROT_READ | PROT_WRITE` since
+/// `sys_map_pages` produces RW + UXN unconditionally. Read-only
+/// (PROT_READ alone) is rejected as ENOSYS until the kernel's
+/// page-mapping API gains PROT bits.
+pub const REQUIRED_MMAP_PROT: u64 = PROT_READ | PROT_WRITE;
+
+/// Maximum bytes mmap can return in one call. Sized to fit in a
+/// single PageSet under MAX_PRACTICAL_PAGES_PER_SET (16 384 pages =
+/// 64 MiB) — the variable-size header from Phase 2.K. Larger
+/// requests return ENOMEM at dispatch.
+pub const MAX_MMAP_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Encode a positive errno as the negative-errno return value Linux's
 /// syscall ABI uses (musl reads `r0 < 0` as `-errno`).
@@ -136,6 +176,31 @@ pub enum Action {
     /// Linux `close(fd)`. Server forwards to the FS server, drops
     /// the FD entry, replies 0 on success or -EBADF on bad fd.
     FileClose { fd: u64 },
+
+    /// Linux `mmap` for the anonymous-private subset Phase 2 supports
+    /// (`addr=0`, `fd=-1`, `offset=0` are implicit and not carried).
+    /// Server allocates a PageSet of `ceil(len_bytes / PAGE_SIZE)`
+    /// pages, picks `base_va` from its bump allocator, and exports
+    /// the PageSet to the client. Reply is `[base_va, exported_handle,
+    /// page_count, 0]`. Phase 2.1 ships only the dispatch arm; Phase
+    /// 2.2 wires the runtime.
+    FileMmap { len_bytes: u64, prot: u64, flags: u64 },
+    /// Linux `munmap(addr, len)`. Server validates the (caller_token,
+    /// base_va) entry in its mmap_table and that `len` matches the
+    /// original allocation, frees its server-side PageSet handle, and
+    /// replies 0 on success.
+    FileMunmap { base_va: u64, len_bytes: u64 },
+    /// Linux `mprotect(addr, len, prot)`. Phase 2 scope: must match an
+    /// existing mmap region exactly with `prot == PROT_READ|PROT_WRITE`.
+    /// Reply 0 (no-op — region is already RW). Validation here only
+    /// catches dispatch-time prot violations; address/length checks
+    /// happen in the server runtime.
+    FileMprotect { base_va: u64, len_bytes: u64, prot: u64 },
+    /// Linux `madvise(addr, len, advice)`. Hints are not load-bearing
+    /// for correctness; server replies 0 unconditionally. The variant
+    /// exists so the dispatch loop can log unhandled advice values
+    /// for diagnostic purposes.
+    FileMadvise { base_va: u64, len_bytes: u64, advice: u64 },
 }
 
 /// Pure decision: classify one received syscall message into an
@@ -198,6 +263,111 @@ pub fn dispatch(inp: &DispatchInputs) -> Action {
         }
 
         NR_CLOSE => Action::FileClose { fd: inp.arg1 },
+
+        NR_MMAP => {
+            // arg1 = len, arg2 = prot, arg3 = flags. addr (always 0
+            // since MAP_FIXED is rejected), fd (-1 with MAP_ANONYMOUS),
+            // and offset (0 with MAP_ANONYMOUS) are implicit and not
+            // carried over IPC.
+            let (len_bytes, prot, flags) = (inp.arg1, inp.arg2, inp.arg3);
+
+            // Length validation:
+            //   - 0 length is a Linux EINVAL.
+            //   - cap at MAX_MMAP_BYTES so the server's PageSet alloc
+            //     stays within the variable-header limit (Phase 2.K).
+            if len_bytes == 0 {
+                return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+            if len_bytes > MAX_MMAP_BYTES {
+                return Action::Reply { words: [neg_errno(ENOMEM), 0, 0, 0] };
+            }
+
+            // PROT validation. Phase 2 supports exactly RW (no PROT bits
+            // on sys_map_pages yet); other shapes are rejected up-front.
+            //   PROT_EXEC               → EACCES (no JIT)
+            //   PROT_NONE (prot == 0)   → EINVAL (Linux: needs >=1 bit)
+            //   PROT_WRITE alone        → EINVAL (write-without-read)
+            //   PROT_READ alone         → ENOSYS (RO mappings deferred)
+            //   PROT_READ | PROT_WRITE  → accepted
+            if prot & PROT_EXEC != 0 {
+                return Action::Reply { words: [neg_errno(EACCES), 0, 0, 0] };
+            }
+            if prot == PROT_NONE {
+                return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+            if prot == PROT_WRITE {
+                return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+            if prot == PROT_READ {
+                return Action::Reply { words: [neg_errno(ENOSYS), 0, 0, 0] };
+            }
+            if prot != REQUIRED_MMAP_PROT {
+                return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+
+            // Flags validation. Phase 2 accepts only MAP_PRIVATE |
+            // MAP_ANONYMOUS exactly; other combinations (MAP_SHARED,
+            // MAP_FIXED, file-backed) are out of scope.
+            if flags & MAP_FIXED != 0 {
+                return Action::Reply { words: [neg_errno(ENOSYS), 0, 0, 0] };
+            }
+            if flags != REQUIRED_MMAP_FLAGS {
+                return Action::Reply { words: [neg_errno(ENOSYS), 0, 0, 0] };
+            }
+
+            Action::FileMmap { len_bytes, prot, flags }
+        }
+
+        NR_MUNMAP => {
+            // arg1 = addr (base_va), arg2 = len.
+            let (base_va, len_bytes) = (inp.arg1, inp.arg2);
+            // Linux EINVAL for len == 0 or unaligned addr/len. Phase 2
+            // is exact-whole-region only, so PAGE_SIZE alignment is the
+            // narrower contract.
+            if len_bytes == 0 {
+                return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+            if base_va & (PAGE_SIZE - 1) != 0 {
+                return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+            if len_bytes & (PAGE_SIZE - 1) != 0 {
+                return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+            Action::FileMunmap { base_va, len_bytes }
+        }
+
+        NR_MPROTECT => {
+            // arg1 = addr, arg2 = len, arg3 = prot.
+            let (base_va, len_bytes, prot) = (inp.arg1, inp.arg2, inp.arg3);
+            if len_bytes == 0 {
+                return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+            if base_va & (PAGE_SIZE - 1) != 0 {
+                return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+            if len_bytes & (PAGE_SIZE - 1) != 0 {
+                return Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] };
+            }
+            // Reject anything other than PROT_READ | PROT_WRITE — the
+            // mapping is already installed RW; we have no kernel API
+            // to change it. (See sys_map_pages.)
+            if prot != REQUIRED_MMAP_PROT {
+                return Action::Reply { words: [neg_errno(ENOSYS), 0, 0, 0] };
+            }
+            Action::FileMprotect { base_va, len_bytes, prot }
+        }
+
+        NR_MADVISE => {
+            // arg1 = addr, arg2 = len, arg3 = advice.
+            // Hints aren't load-bearing; server replies 0 regardless.
+            // Surface to the server so it can log unknown advice
+            // values without disturbing the dispatch decision.
+            Action::FileMadvise {
+                base_va: inp.arg1,
+                len_bytes: inp.arg2,
+                advice: inp.arg3,
+            }
+        }
 
         nr => Action::Unknown { nr },
     }
@@ -785,6 +955,203 @@ mod tests {
         assert_eq!(
             dispatch(&inp(NR_CLOSE, 0, 0)),
             Action::FileClose { fd: 0 },
+        );
+    }
+
+    // ---- Phase 2.1 mmap-family dispatch ----
+
+    /// Construct a happy mmap input: 1-page allocation, RW, private+anon.
+    fn mmap_inp(len: u64, prot: u64, flags: u64) -> DispatchInputs {
+        inp4(NR_MMAP, len, prot, flags)
+    }
+
+    #[test]
+    fn mmap_happy_path_decodes_to_filemmap() {
+        assert_eq!(
+            dispatch(&mmap_inp(PAGE_SIZE, REQUIRED_MMAP_PROT, REQUIRED_MMAP_FLAGS)),
+            Action::FileMmap {
+                len_bytes: PAGE_SIZE,
+                prot: REQUIRED_MMAP_PROT,
+                flags: REQUIRED_MMAP_FLAGS,
+            },
+        );
+    }
+
+    #[test]
+    fn mmap_zero_length_is_einval() {
+        assert_eq!(
+            dispatch(&mmap_inp(0, REQUIRED_MMAP_PROT, REQUIRED_MMAP_FLAGS)),
+            Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn mmap_oversize_is_enomem() {
+        assert_eq!(
+            dispatch(&mmap_inp(MAX_MMAP_BYTES + 1, REQUIRED_MMAP_PROT, REQUIRED_MMAP_FLAGS)),
+            Action::Reply { words: [neg_errno(ENOMEM), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn mmap_at_max_size_accepted() {
+        // Exactly MAX_MMAP_BYTES is the boundary — must accept.
+        assert!(matches!(
+            dispatch(&mmap_inp(MAX_MMAP_BYTES, REQUIRED_MMAP_PROT, REQUIRED_MMAP_FLAGS)),
+            Action::FileMmap { .. },
+        ));
+    }
+
+    #[test]
+    fn mmap_prot_exec_is_eacces() {
+        assert_eq!(
+            dispatch(&mmap_inp(PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, REQUIRED_MMAP_FLAGS)),
+            Action::Reply { words: [neg_errno(EACCES), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn mmap_prot_none_is_einval() {
+        assert_eq!(
+            dispatch(&mmap_inp(PAGE_SIZE, PROT_NONE, REQUIRED_MMAP_FLAGS)),
+            Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn mmap_prot_write_only_is_einval() {
+        assert_eq!(
+            dispatch(&mmap_inp(PAGE_SIZE, PROT_WRITE, REQUIRED_MMAP_FLAGS)),
+            Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn mmap_prot_read_only_is_enosys() {
+        // RO mappings need a sys_map_pages PROT extension; deferred.
+        assert_eq!(
+            dispatch(&mmap_inp(PAGE_SIZE, PROT_READ, REQUIRED_MMAP_FLAGS)),
+            Action::Reply { words: [neg_errno(ENOSYS), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn mmap_map_fixed_is_enosys() {
+        assert_eq!(
+            dispatch(&mmap_inp(PAGE_SIZE, REQUIRED_MMAP_PROT, REQUIRED_MMAP_FLAGS | MAP_FIXED)),
+            Action::Reply { words: [neg_errno(ENOSYS), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn mmap_map_shared_is_enosys() {
+        // MAP_SHARED set instead of MAP_PRIVATE — no longer matches required.
+        assert_eq!(
+            dispatch(&mmap_inp(PAGE_SIZE, REQUIRED_MMAP_PROT, MAP_SHARED | MAP_ANONYMOUS)),
+            Action::Reply { words: [neg_errno(ENOSYS), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn mmap_missing_anonymous_is_enosys() {
+        // Plain MAP_PRIVATE without MAP_ANONYMOUS implies file-backed.
+        assert_eq!(
+            dispatch(&mmap_inp(PAGE_SIZE, REQUIRED_MMAP_PROT, MAP_PRIVATE)),
+            Action::Reply { words: [neg_errno(ENOSYS), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn munmap_happy_path_decodes() {
+        let base = 0x0100_0000;
+        assert_eq!(
+            dispatch(&inp(NR_MUNMAP, base, PAGE_SIZE)),
+            Action::FileMunmap { base_va: base, len_bytes: PAGE_SIZE },
+        );
+    }
+
+    #[test]
+    fn munmap_zero_length_is_einval() {
+        assert_eq!(
+            dispatch(&inp(NR_MUNMAP, 0x0100_0000, 0)),
+            Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn munmap_unaligned_addr_is_einval() {
+        assert_eq!(
+            dispatch(&inp(NR_MUNMAP, 0x0100_0001, PAGE_SIZE)),
+            Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn munmap_unaligned_len_is_einval() {
+        // PAGE_SIZE - 1 is the canonical "off by one" len that breaks
+        // exact-whole-region semantics; reject up front.
+        assert_eq!(
+            dispatch(&inp(NR_MUNMAP, 0x0100_0000, PAGE_SIZE - 1)),
+            Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn mprotect_happy_path_decodes() {
+        let base = 0x0100_0000;
+        assert_eq!(
+            dispatch(&inp4(NR_MPROTECT, base, PAGE_SIZE, REQUIRED_MMAP_PROT)),
+            Action::FileMprotect {
+                base_va: base,
+                len_bytes: PAGE_SIZE,
+                prot: REQUIRED_MMAP_PROT,
+            },
+        );
+    }
+
+    #[test]
+    fn mprotect_non_rw_prot_is_enosys() {
+        assert_eq!(
+            dispatch(&inp4(NR_MPROTECT, 0x0100_0000, PAGE_SIZE, PROT_READ)),
+            Action::Reply { words: [neg_errno(ENOSYS), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn mprotect_zero_length_is_einval() {
+        assert_eq!(
+            dispatch(&inp4(NR_MPROTECT, 0x0100_0000, 0, REQUIRED_MMAP_PROT)),
+            Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn mprotect_unaligned_addr_is_einval() {
+        assert_eq!(
+            dispatch(&inp4(NR_MPROTECT, 0x0100_0001, PAGE_SIZE, REQUIRED_MMAP_PROT)),
+            Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn mprotect_unaligned_len_is_einval() {
+        assert_eq!(
+            dispatch(&inp4(NR_MPROTECT, 0x0100_0000, PAGE_SIZE - 1, REQUIRED_MMAP_PROT)),
+            Action::Reply { words: [neg_errno(EINVAL), 0, 0, 0] },
+        );
+    }
+
+    #[test]
+    fn madvise_passes_through_with_advice() {
+        // madvise dispatch never rejects — runtime always replies 0.
+        // Surface advice value to the action so the server can log.
+        assert_eq!(
+            dispatch(&inp4(NR_MADVISE, 0x0100_0000, PAGE_SIZE, 4 /* MADV_DONTNEED */)),
+            Action::FileMadvise {
+                base_va: 0x0100_0000,
+                len_bytes: PAGE_SIZE,
+                advice: 4,
+            },
         );
     }
 

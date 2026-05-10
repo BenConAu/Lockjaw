@@ -663,6 +663,27 @@ pub extern "C" fn _start() -> ! {
             Action::FileClose { fd } => {
                 handle_file_close(&fs, &mut fd_table, &mut file_resources, fd);
             }
+
+            // Phase 2.1 stubs. The dispatch arms above (in lockjaw_types)
+            // reject malformed shapes with the right errno; what reaches
+            // these match arms has already passed validation. Phase 2.2
+            // replaces these stubs with real handlers; phase 2.3 adds
+            // the shim-side caller. Until then, mmap/munmap return
+            // ENOSYS so any caller fails closed, while mprotect/madvise
+            // are genuine no-ops (sys_map_pages already produces RW;
+            // hints aren't load-bearing).
+            Action::FileMmap { len_bytes: _, prot: _, flags: _ } => {
+                sys_reply(neg_errno(ENOSYS), 0, 0, 0);
+            }
+            Action::FileMunmap { base_va: _, len_bytes: _ } => {
+                sys_reply(neg_errno(ENOSYS), 0, 0, 0);
+            }
+            Action::FileMprotect { base_va: _, len_bytes: _, prot: _ } => {
+                sys_reply(0, 0, 0, 0);
+            }
+            Action::FileMadvise { base_va: _, len_bytes: _, advice: _ } => {
+                sys_reply(0, 0, 0, 0);
+            }
         }
     }
 
