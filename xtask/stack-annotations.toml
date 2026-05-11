@@ -23,19 +23,12 @@
 "<usize as core::fmt::Display>::fmt" = "fmt-internal"
 "<&str as core::fmt::Display>::fmt" = "fmt-internal"
 
-# create_kernel_object dispatches through init_fn: fn(ObjectInitPage)
-# — a function pointer parameter. All real callers pass one of these
-# init functions, each of which writes one fixed-size header into the
-# donated page.
-"lockjaw::syscall::handler::create_kernel_object" = [
-    "lockjaw::ipc::endpoint::create_endpoint",
-    "lockjaw::ipc::notification::create_notification",
-    "lockjaw::ipc::reply::create_reply",
-]
-
-# Same pattern for the KVA-mapping orchestrator used by kernel objects
-# that live in the KVM pool (Reply, Notification today; Endpoint as the
-# next per-kind migration commit lands).
+# create_kernel_object_kvm dispatches through init_fn: fn(ObjectInitPage)
+# — a function pointer parameter. All three real callers (create_endpoint,
+# create_notification, create_reply) write one fixed-size header into the
+# donated page, then map_existing exposes the same frame at a KVA so the
+# new handle slot can carry `HandleKind::{Endpoint, Notification, Reply}
+# { kva }`.
 "lockjaw::syscall::handler::create_kernel_object_kvm" = [
     "lockjaw::ipc::endpoint::create_endpoint",
     "lockjaw::ipc::notification::create_notification",

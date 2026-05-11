@@ -25,15 +25,15 @@ pub fn send(handle: u32, msg: [u64; 4]) -> Result<Result<(), endpoint::IpcError>
         Rights::from_bits(crate::cap::rights::RIGHT_WRITE),
         ObjectType::Endpoint,
     )?;
-    let (paddr, caller_token) = match entry.kind {
-        HandleKind::Endpoint { paddr, caller_token } if caller_token != 0 => (paddr, caller_token),
+    let (kva, caller_token) = match entry.kind {
+        HandleKind::Endpoint { kva, caller_token } if caller_token != 0 => (kva, caller_token),
         HandleKind::Endpoint { .. } => return Err(SyscallError::INVALID_PARAMETER),
         _ => return Err(SyscallError::INVALID_PARAMETER),
     };
-    // SAFETY: handle_lookup verified type == Endpoint; object lives in a
-    // kernel-owned page; KernelMut is created and dropped within this call.
+    // SAFETY: handle_lookup verified type == Endpoint; object lives in
+    // the KVM pool; KernelMut is created and dropped within this call.
     // Blocking — pass raw pointer so no &mut T survives across block_current().
-    let km = unsafe { KernelMut::<endpoint::EndpointObject>::from_paddr(paddr) };
+    let km = unsafe { KernelMut::<endpoint::EndpointObject>::from_kva(kva) };
     Ok(endpoint::ipc_send(km.raw_ptr(), msg, caller_token))
 }
 
@@ -44,11 +44,11 @@ pub fn receive(handle: u32) -> Result<Result<[u64; 4], endpoint::IpcError>, Sysc
         Rights::from_bits(crate::cap::rights::RIGHT_READ),
         ObjectType::Endpoint,
     )?;
-    let HandleKind::Endpoint { paddr, .. } = entry.kind else {
+    let HandleKind::Endpoint { kva, .. } = entry.kind else {
         return Err(SyscallError::INVALID_PARAMETER);
     };
     // Blocking — pass raw pointer so no &mut T survives across block_current().
-    let km = unsafe { KernelMut::<endpoint::EndpointObject>::from_paddr(paddr) };
+    let km = unsafe { KernelMut::<endpoint::EndpointObject>::from_kva(kva) };
     Ok(endpoint::ipc_receive(km.raw_ptr()))
 }
 
@@ -63,8 +63,8 @@ pub fn call(
     let rw = Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE);
     let ep_entry = ht.lookup(ep_handle, rw, ObjectType::Endpoint)?;
     let reply_entry = ht.lookup(reply_handle, rw, ObjectType::Reply)?;
-    let (ep_paddr, caller_token) = match ep_entry.kind {
-        HandleKind::Endpoint { paddr, caller_token } if caller_token != 0 => (paddr, caller_token),
+    let (ep_kva, caller_token) = match ep_entry.kind {
+        HandleKind::Endpoint { kva, caller_token } if caller_token != 0 => (kva, caller_token),
         HandleKind::Endpoint { .. } => return Err(SyscallError::INVALID_PARAMETER),
         _ => return Err(SyscallError::INVALID_PARAMETER),
     };
@@ -72,9 +72,9 @@ pub fn call(
         return Err(SyscallError::INVALID_PARAMETER);
     };
     // SAFETY: both types verified; endpoint and reply are distinct objects
-    // on distinct pages; both KernelMuts scoped to this call.
+    // in the KVM pool; both KernelMuts scoped to this call.
     // Blocking — pass raw pointers so no &mut T survives across block_current().
-    let ep_km = unsafe { KernelMut::<endpoint::EndpointObject>::from_paddr(ep_paddr) };
+    let ep_km = unsafe { KernelMut::<endpoint::EndpointObject>::from_kva(ep_kva) };
     let reply_km = unsafe { KernelMut::<reply::ReplyObject>::from_kva(reply_kva) };
     Ok(endpoint::ipc_call(ep_km.raw_ptr(), reply_km.raw_ptr(), msg, caller_token))
 }
@@ -86,11 +86,11 @@ pub fn recv_nb(handle: u32) -> Result<Result<[u64; 4], endpoint::IpcError>, Sysc
         Rights::from_bits(crate::cap::rights::RIGHT_READ),
         ObjectType::Endpoint,
     )?;
-    let HandleKind::Endpoint { paddr, .. } = entry.kind else {
+    let HandleKind::Endpoint { kva, .. } = entry.kind else {
         return Err(SyscallError::INVALID_PARAMETER);
     };
     // SAFETY: same as send — type verified, KernelMut scoped to this call.
-    let mut km = unsafe { KernelMut::<endpoint::EndpointObject>::from_paddr(paddr) };
+    let mut km = unsafe { KernelMut::<endpoint::EndpointObject>::from_kva(kva) };
     Ok(endpoint::ipc_receive_nb(km.get_mut()))
 }
 

@@ -68,7 +68,7 @@ pub enum HandleKind {
     Empty = 0,
     HandleTable { paddr: crate::addr::PhysAddr } = 1,
     ThreadControlBlock { paddr: crate::addr::PhysAddr } = 2,
-    Endpoint { paddr: crate::addr::PhysAddr, caller_token: u64 } = 3,
+    Endpoint { kva: crate::addr::KernelVa, caller_token: u64 } = 3,
     Notification { kva: crate::addr::KernelVa } = 4,
     Reply { kva: crate::addr::KernelVa } = 5,
     Process { paddr: crate::addr::PhysAddr } = 6,
@@ -397,7 +397,7 @@ mod tests {
         // Ensure HandleKind discriminant values match ObjectType for diagnostics.
         assert_eq!(HandleKind::Empty.obj_type(), ObjectType::HandleTable); // inert
         assert_eq!(HandleKind::HandleTable { paddr: dummy_paddr }.obj_type(), ObjectType::HandleTable);
-        assert_eq!(HandleKind::Endpoint { paddr: dummy_paddr, caller_token: 0 }.obj_type(), ObjectType::Endpoint);
+        assert_eq!(HandleKind::Endpoint { kva: dummy_kva, caller_token: 0 }.obj_type(), ObjectType::Endpoint);
         assert_eq!(HandleKind::PageSet { kva: dummy_kva, mapped_va_page: 0 }.obj_type(), ObjectType::PageSet);
         assert_eq!(HandleKind::Notification { kva: dummy_kva }.obj_type(), ObjectType::Notification);
     }
@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn close_non_pageset_remove_only() {
-        let entry = make_entry(HandleKind::Endpoint { paddr: dummy_paddr(), caller_token: 0 });
+        let entry = make_entry(HandleKind::Endpoint { kva: dummy_kva(), caller_token: 0 });
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::RemoveOnly);
     }
 
@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn teardown_handle_non_pageset_skip() {
-        let entry = make_entry(HandleKind::Endpoint { paddr: dummy_paddr(), caller_token: 0 });
+        let entry = make_entry(HandleKind::Endpoint { kva: dummy_kva(), caller_token: 0 });
         assert_eq!(decide_teardown_handle(&entry), TeardownHandleAction::Skip);
     }
 

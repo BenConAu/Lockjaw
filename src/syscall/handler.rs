@@ -101,76 +101,11 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
     CurrentThread::clear_breadcrumb();
 }
 
-/// Common logic for sys_create_notification, sys_create_endpoint, etc.
-/// Takes a PageSet handle, validates it's 1 page, runs init_fn on the
-/// data page, then transactionally revokes every cross-process handle
-/// to the donated PageSet, frees the header, and inserts a new handle
-/// for the created object.
-///
-/// Order is validate → init → apply: validate is the only fallible
-/// kernel-side step, init is fallible but mutates a soon-to-be-claimed
-/// page and never observable state, apply cannot fail. If validate
-/// returns Err the user's PageSet handle still works; if init returns
-/// Err the donated page contents are partially written but the
-/// PageSet is still owned by the caller (no consume happened).
-fn create_kernel_object(
-    ps_handle: u32,
-    make_kind: fn(PhysAddr) -> lockjaw_types::object::HandleKind,
-    init_fn: fn(crate::mm::addr::ObjectInitPage) -> Result<(), crate::cap::object::CreateError>,
-) -> Result<u64, SyscallError> {
-    let ht = CurrentThread::handle_table();
-    // Require WRITE rights — this is a destructive operation that consumes
-    // the PageSet and repurposes its page.
-    let entry = ht.lookup(ps_handle, Rights::from_bits(RIGHT_WRITE), ObjectType::PageSet)?;
-    let header_kva = match entry.kind {
-        lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
-        _ => return Err(SyscallError::INVALID_HANDLE),
-    };
-
-    // Read header, validate exactly 1 data page.
-    // SAFETY: entry came from a PageSet handle, which points to a
-    // registered header — read_header_backed enforces that contract
-    // and the wrapper makes get_page safe.
-    let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
-    if backed.data_page_count() != 1 {
-        return Err(SyscallError::INVALID_PARAMETER);
-    }
-    let page_paddr = backed.get_page(0).ok_or(SyscallError::INVALID_HANDLE)?;
-    // SAFETY: page came from a registered PageSet — valid kernel page.
-    let page = unsafe { crate::mm::addr::ObjectInitPage::new(PhysAddr::new(page_paddr)) };
-
-    // Phase 1: validate that revoke would succeed. No state mutated
-    // on failure — caller's PageSet handle is still valid.
-    if crate::cap::pageset_table::consume_pageset_validate(header_kva).is_err() {
-        return Err(SyscallError::INVALID_HANDLE);
-    }
-
-    // Initialize the data page as the new kernel object. Runs after
-    // validate but before apply: if init fails, no consume has
-    // happened yet, so the caller's PageSet handle is still usable
-    // (the page contents are partially overwritten but ignored).
-    if init_fn(page).is_err() {
-        return Err(SyscallError::UNKNOWN);
-    }
-
-    // Phase 2: revoke every cross-process handle, clear PTEs, dec
-    // refcount/map_count, unlink from PageSet table, free the
-    // header page. Cannot fail under the validate→apply contract.
-    crate::cap::pageset_table::consume_pageset_apply(header_kva);
-
-    // Insert a new handle for the created object. The factory is
-    // infallible — it just packages the donated paddr into the
-    // matching HandleKind variant. Used by not-yet-KVA-migrated
-    // kinds (Endpoint, Notification today).
-    ht.insert(Rights::from_bits(RIGHT_READ | RIGHT_WRITE), make_kind(PhysAddr::new(page_paddr)))
-        .map(|h| h as u64)
-}
-
-/// Same shape as `create_kernel_object`, but the new object is
-/// addressed through the KVM pool: every fallible step (including
-/// `kvm::map_existing` for the donated frame) runs **before**
-/// `consume_pageset_apply`, so a KVM-OOM cannot strand the caller
-/// with their PageSet revoked.
+/// Common logic for sys_create_endpoint, sys_create_notification,
+/// sys_create_reply. The new object is addressed through the KVM
+/// pool: every fallible step (including `kvm::map_existing` for the
+/// donated frame) runs **before** `consume_pageset_apply`, so a
+/// KVM-OOM cannot strand the caller with their PageSet revoked.
 ///
 /// The factory takes the donated page's KVA — already mapped — and
 /// packages it into the appropriate `HandleKind` variant. The KVA
@@ -590,9 +525,11 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
 /// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_endpoint(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(
+    // Endpoint lives in the KVM pool — use the _kvm orchestrator so
+    // map_existing runs in the validate phase before consume_apply.
+    create_kernel_object_kvm(
         ctx.gpr[0] as u32,
-        |paddr| lockjaw_types::object::HandleKind::Endpoint { paddr, caller_token: 0 },
+        |kva| lockjaw_types::object::HandleKind::Endpoint { kva, caller_token: 0 },
         endpoint::create_endpoint,
     )
 }
@@ -678,8 +615,8 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
                 Rights::from_bits(crate::cap::rights::RIGHT_READ),
             )?;
             let (obj_type, addr) = match he.kind {
-                lockjaw_types::object::HandleKind::Endpoint { paddr, .. } =>
-                    (ObjectType::Endpoint, paddr.as_u64()),
+                lockjaw_types::object::HandleKind::Endpoint { kva, .. } =>
+                    (ObjectType::Endpoint, kva.as_u64()),
                 lockjaw_types::object::HandleKind::Notification { kva } =>
                     (ObjectType::Notification, kva.as_u64()),
                 _ => return Err(SyscallError::INVALID_PARAMETER),
@@ -696,16 +633,15 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         }
 
         // Slow path: register as readiness waiter on each object, then block.
-        // Each kind decodes its own address regime from the polymorphic u64.
+        // Both Endpoint and Notification live in the KVM pool now —
+        // decode the polymorphic u64 as KernelVa for both.
         for i in 0..count {
+            let kva = lockjaw_types::addr::KernelVa::new(addrs[i]);
             match types[i] {
                 ObjectType::Endpoint =>
-                    endpoint::set_readiness_waiter(PhysAddr::new(addrs[i]), tcb_paddr),
-                ObjectType::Notification => notification::set_readiness_waiter(
-                    lockjaw_types::addr::KernelVa::new(addrs[i]),
-                    tcb_paddr,
-                    thresholds[i],
-                ),
+                    endpoint::set_readiness_waiter(kva, tcb_paddr),
+                ObjectType::Notification =>
+                    notification::set_readiness_waiter(kva, tcb_paddr, thresholds[i]),
                 _ => {}
             }
         }
@@ -724,12 +660,12 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         let wc = CurrentThread::wait_count();
         for i in 0..wc {
             let (a, type_tag) = CurrentThread::wait_entry(i);
+            let kva = lockjaw_types::addr::KernelVa::new(a);
             match obj_type_from_u8(type_tag) {
                 ObjectType::Endpoint =>
-                    endpoint::clear_readiness_waiter(PhysAddr::new(a), tcb_paddr),
-                ObjectType::Notification => notification::clear_readiness_waiter(
-                    lockjaw_types::addr::KernelVa::new(a), tcb_paddr,
-                ),
+                    endpoint::clear_readiness_waiter(kva, tcb_paddr),
+                ObjectType::Notification =>
+                    notification::clear_readiness_waiter(kva, tcb_paddr),
                 _ => {}
             }
         }
@@ -743,10 +679,8 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 /// Build ObjectReadiness snapshots from live objects and compute the ready bitmask.
 /// The readiness logic is in lockjaw_types::wait::compute_ready_mask (tested on host).
 ///
-/// `addrs` is polymorphic u64 storage: each entry's regime is determined
-/// by the matching `types[i]`. Endpoint entries decode as `PhysAddr`;
-/// Notification entries decode as `KernelVa` (Notification objects live
-/// in the KVM pool).
+/// `addrs` is polymorphic u64 storage: both Endpoint and Notification
+/// entries decode as `KernelVa` (both kinds live in the KVM pool).
 fn check_readiness(
     addrs: &[u64],
     types: &[ObjectType],
@@ -758,15 +692,14 @@ fn check_readiness(
 
     let mut objects = [ObjectReadiness::Endpoint(EpState::Idle); MAX_WAIT_OBJECTS];
     for i in 0..count {
+        let kva = lockjaw_types::addr::KernelVa::new(addrs[i]);
         objects[i] = match types[i] {
             ObjectType::Endpoint => {
-                let state = endpoint::read_state(PhysAddr::new(addrs[i]));
+                let state = endpoint::read_state(kva);
                 ObjectReadiness::Endpoint(state)
             }
             ObjectType::Notification => {
-                let value = crate::ipc::notification::read_value(
-                    lockjaw_types::addr::KernelVa::new(addrs[i]),
-                );
+                let value = crate::ipc::notification::read_value(kva);
                 ObjectReadiness::Notification { value, threshold: thresholds[i] }
             }
             _ => ObjectReadiness::Endpoint(EpState::Idle), // not waitable, never ready
@@ -810,12 +743,12 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         // - caller_token == 0 (server's own handle): allocate fresh from endpoint.next_token
         // - caller_token != 0 (re-export): copy unchanged (lineage preservation)
         let export_kind = match export_entry.kind {
-            lockjaw_types::object::HandleKind::Endpoint { paddr, caller_token } if caller_token == 0 => {
+            lockjaw_types::object::HandleKind::Endpoint { kva, caller_token } if caller_token == 0 => {
                 // First export: assign fresh token from the endpoint's counter.
-                let mut ep = KernelMut::<crate::ipc::endpoint::EndpointObject>::from_paddr(paddr);
+                let mut ep = KernelMut::<crate::ipc::endpoint::EndpointObject>::from_kva(kva);
                 let token = ep.get().next_token;
                 ep.get_mut().next_token = token + 1;
-                lockjaw_types::object::HandleKind::Endpoint { paddr, caller_token: token }
+                lockjaw_types::object::HandleKind::Endpoint { kva, caller_token: token }
             }
             other => other, // non-Endpoint or re-export: pass through
         };

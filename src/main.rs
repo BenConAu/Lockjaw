@@ -489,10 +489,17 @@ pub extern "C" fn kmain() -> ! {
         use sched::tcb::{TcbCreateInfo, create_tcb};
         use cap::handle_table;
 
-        // Create endpoint object
-        let ep_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("endpoint alloc")).start_addr();
-        ipc::endpoint::create_endpoint(mm::addr::ObjectInitPage::new(ep_page)).unwrap_or_else(|_| panic!("create endpoint"));
-        kprintln!("  Endpoint created at phys ", Hex(ep_page.as_u64()));
+        // Create endpoint object. Init through the linear map (paddr),
+        // then expose at a KVA via kvm::map_existing so the bench
+        // handle slot can carry `HandleKind::Endpoint { kva }`. The
+        // bench Endpoint lives for the kernel's lifetime — no destroy
+        // path needed.
+        let ep_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("endpoint alloc"));
+        let ep_paddr = ep_page.start_addr();
+        ipc::endpoint::create_endpoint(mm::addr::ObjectInitPage::new(ep_paddr)).unwrap_or_else(|_| panic!("create endpoint"));
+        let ep_kva = mm::kvm::map_existing(ep_page)
+            .unwrap_or_else(|_| panic!("endpoint kvm map")).kva;
+        kprintln!("  Endpoint created at phys ", Hex(ep_paddr.as_u64()), ", kva ", Hex(ep_kva.as_u64()));
 
         // Reply object for the ipc_sender benchmark thread. One page,
         // pre-allocated and exposed via KVA so the handle slot can carry
@@ -525,7 +532,7 @@ pub extern "C" fn kmain() -> ! {
         // Assign a caller token from the endpoint's counter so the kernel
         // sender thread can use it (token 0 = receive-only).
         let ep_token = {
-            let mut ep_km = mm::kernel_ptr::KernelMut::<ipc::endpoint::EndpointObject>::from_paddr(ep_page);
+            let mut ep_km = mm::kernel_ptr::KernelMut::<ipc::endpoint::EndpointObject>::from_kva(ep_kva);
             let t = ep_km.get().next_token;
             ep_km.get_mut().next_token = t + 1;
             t
@@ -533,7 +540,7 @@ pub extern "C" fn kmain() -> ! {
         handle_table::handle_insert(
             kernel_ht_page,
             cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
-            lockjaw_types::object::HandleKind::Endpoint { paddr: ep_page, caller_token: ep_token },
+            lockjaw_types::object::HandleKind::Endpoint { kva: ep_kva, caller_token: ep_token },
         ).unwrap_or_else(|_| panic!("insert ep handle"));
         handle_table::handle_insert(
             kernel_ht_page,

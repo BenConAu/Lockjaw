@@ -660,11 +660,11 @@ mod tests {
     // ProcessCreationPlanBuilder tests
     // -----------------------------------------------------------------------
 
-    fn endpoint_entry(paddr: u64) -> HandleEntry {
+    fn endpoint_entry(kva_lo: u64) -> HandleEntry {
         HandleEntry {
             rights: Rights::from_bits(0),
             kind: HandleKind::Endpoint {
-                paddr: crate::addr::PhysAddr::new(paddr),
+                kva: crate::addr::KernelVa::new(0xFFFF_8000_0000_0000 | kva_lo),
                 caller_token: 0,
             },
         }
@@ -709,7 +709,7 @@ mod tests {
         let dummy = crate::addr::PhysAddr::new(0x4000_2000);
         let dummy_kva = crate::addr::KernelVa::new(0xFFFF_8000_0000_2000);
         for kind in [
-            HandleKind::Endpoint { paddr: dummy, caller_token: 0 },
+            HandleKind::Endpoint { kva: dummy_kva, caller_token: 0 },
             HandleKind::Notification { kva: dummy_kva },
             HandleKind::Reply { kva: dummy_kva },
         ] {
@@ -796,7 +796,7 @@ mod tests {
         let parent = plan.parent_copy().unwrap();
         assert!(matches!(
             parent.kind,
-            HandleKind::Endpoint { paddr, .. } if paddr.as_u64() == 0xDEAD_0000
+            HandleKind::Endpoint { kva, .. } if kva.as_u64() == 0xFFFF_8000_DEAD_0000
         ));
     }
 
@@ -867,7 +867,7 @@ mod tests {
         let parent = b.parent_copy.unwrap();
         assert!(matches!(
             parent.kind,
-            HandleKind::Endpoint { paddr, .. } if paddr.as_u64() == 0xAAAA_0000
+            HandleKind::Endpoint { kva, .. } if kva.as_u64() == 0xFFFF_8000_AAAA_0000
         ));
     }
 
@@ -895,7 +895,7 @@ mod tests {
         let entry = HandleEntry {
             rights: Rights::from_bits(0),
             kind: HandleKind::Endpoint {
-                paddr: crate::addr::PhysAddr::new(0x1234_5000),
+                kva: crate::addr::KernelVa::new(0xFFFF_8000_1234_5000),
                 caller_token: 0xDEAD_BEEF_CAFE_BABE,
             },
         };
@@ -926,7 +926,7 @@ mod tests {
         let entry = HandleEntry {
             rights: Rights::from_bits(0b1010_1010),
             kind: HandleKind::Endpoint {
-                paddr: crate::addr::PhysAddr::new(0x1234_5000),
+                kva: crate::addr::KernelVa::new(0xFFFF_8000_1234_5000),
                 caller_token: 0,
             },
         };

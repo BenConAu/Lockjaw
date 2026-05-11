@@ -255,8 +255,8 @@ mod tests {
         vec![HandleEntry::EMPTY; n]
     }
 
-    fn ep(paddr: u64, token: u64) -> HandleKind {
-        HandleKind::Endpoint { paddr: PhysAddr::new(paddr), caller_token: token }
+    fn ep(kva: u64, token: u64) -> HandleKind {
+        HandleKind::Endpoint { kva: KernelVa::new(kva), caller_token: token }
     }
     fn notif(kva: u64) -> HandleKind {
         HandleKind::Notification { kva: KernelVa::new(kva) }
@@ -269,21 +269,23 @@ mod tests {
     }
     const KVA_A: u64 = 0xFFFF_8000_0000_1000;
     const KVA_B: u64 = 0xFFFF_8000_0000_2000;
+    const KVA_C: u64 = 0xFFFF_8000_0000_3000;
+    const KVA_D: u64 = 0xFFFF_8000_0000_4000;
 
     // --- insert ---
 
     #[test]
     fn insert_into_empty_table_returns_index_0() {
         let mut slots = empty_table(4);
-        let idx = slot_insert(&mut slots, Rights::from_bits(RIGHT_READ), ep(0x1000, 0));
+        let idx = slot_insert(&mut slots, Rights::from_bits(RIGHT_READ), ep(KVA_A, 0));
         assert_eq!(idx, Ok(0));
-        assert_eq!(slots[0].kind, ep(0x1000, 0));
+        assert_eq!(slots[0].kind, ep(KVA_A, 0));
     }
 
     #[test]
     fn insert_fills_sequentially() {
         let mut slots = empty_table(4);
-        assert_eq!(slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)), Ok(0));
+        assert_eq!(slot_insert(&mut slots, Rights::none(), ep(KVA_A, 0)), Ok(0));
         assert_eq!(slot_insert(&mut slots, Rights::none(), notif(KVA_B)), Ok(1));
         assert_eq!(slot_insert(&mut slots, Rights::none(), reply(KVA_A)), Ok(2));
         assert_eq!(slot_insert(&mut slots, Rights::none(), ps(KVA_A)), Ok(3));
@@ -292,21 +294,21 @@ mod tests {
     #[test]
     fn insert_reuses_removed_slot() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)).unwrap();
-        slot_insert(&mut slots, Rights::none(), ep(0x2000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(KVA_A, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(KVA_B, 0)).unwrap();
         slot_remove(&mut slots, 0).unwrap();
-        let idx = slot_insert(&mut slots, Rights::none(), ep(0x3000, 0)).unwrap();
+        let idx = slot_insert(&mut slots, Rights::none(), ep(KVA_C, 0)).unwrap();
         assert_eq!(idx, 0);
-        assert_eq!(slots[0].kind, ep(0x3000, 0));
+        assert_eq!(slots[0].kind, ep(KVA_C, 0));
     }
 
     #[test]
     fn insert_full_table_returns_table_full() {
         let mut slots = empty_table(2);
-        slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)).unwrap();
-        slot_insert(&mut slots, Rights::none(), ep(0x2000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(KVA_A, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(KVA_B, 0)).unwrap();
         assert_eq!(
-            slot_insert(&mut slots, Rights::none(), ep(0x3000, 0)),
+            slot_insert(&mut slots, Rights::none(), ep(KVA_C, 0)),
             Err(HandleError::TableFull)
         );
     }
@@ -316,9 +318,9 @@ mod tests {
     #[test]
     fn lookup_valid_entry() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), ep(0x1000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), ep(KVA_A, 0)).unwrap();
         let entry = slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ)).unwrap();
-        assert_eq!(entry.kind, ep(0x1000, 0));
+        assert_eq!(entry.kind, ep(KVA_A, 0));
     }
 
     #[test]
@@ -336,7 +338,7 @@ mod tests {
     #[test]
     fn lookup_rights_subset_passes() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), ep(0x1000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), ep(KVA_A, 0)).unwrap();
         assert!(slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ)).is_ok());
         assert!(slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ | RIGHT_WRITE)).is_ok());
     }
@@ -344,7 +346,7 @@ mod tests {
     #[test]
     fn lookup_missing_rights_returns_insufficient() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, Rights::from_bits(RIGHT_READ), ep(0x1000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::from_bits(RIGHT_READ), ep(KVA_A, 0)).unwrap();
         assert_eq!(
             slot_lookup(&slots, 0, Rights::from_bits(RIGHT_GRANT)),
             Err(HandleError::InsufficientRights)
@@ -358,7 +360,7 @@ mod tests {
     #[test]
     fn lookup_no_required_rights_always_passes() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(KVA_A, 0)).unwrap();
         assert!(slot_lookup(&slots, 0, Rights::none()).is_ok());
     }
 
@@ -376,7 +378,7 @@ mod tests {
     #[test]
     fn remove_zeros_slot() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(KVA_A, 0)).unwrap();
         slot_remove(&mut slots, 0).unwrap();
         assert_eq!(slots[0].kind, HandleKind::Empty);
     }
@@ -413,7 +415,7 @@ mod tests {
     #[test]
     fn mapped_va_on_non_pageset_returns_invalid() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(KVA_A, 0)).unwrap();
         assert_eq!(slot_get_mapped_va(&slots, 0), Err(HandleError::InvalidHandle));
         assert_eq!(slot_set_mapped_va(&mut slots, 0, 0x400), Err(HandleError::InvalidHandle));
     }
@@ -455,7 +457,7 @@ mod tests {
         // Set the mapping VA explicitly to model an active mapping.
         let h0 = slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
         slot_set_mapped_va(&mut slots, h0, 0x400).unwrap();
-        slot_insert(&mut slots, Rights::none(), ep(0x2000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(KVA_B, 0)).unwrap();
         slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
 
         let snapshot = slots.clone();
@@ -477,7 +479,7 @@ mod tests {
         let mut slots = empty_table(4);
         slot_insert(&mut slots, Rights::none(),
             HandleKind::PageSet { kva: KernelVa::new(KVA_A), mapped_va_page: 0x400 }).unwrap();
-        slot_insert(&mut slots, Rights::none(), ep(0x2000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(KVA_B, 0)).unwrap();
         slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
 
         let n = slot_revoke_apply(&mut slots, KernelVa::new(KVA_A), |_| {});
@@ -485,7 +487,7 @@ mod tests {
 
         // Both KVA_A slots cleared; the 0x2000 slot survives.
         assert_eq!(slots[0], HandleEntry::EMPTY);
-        assert_eq!(slots[1].kind, ep(0x2000, 0));
+        assert_eq!(slots[1].kind, ep(KVA_B, 0));
         assert_eq!(slots[2], HandleEntry::EMPTY);
     }
 
@@ -531,7 +533,7 @@ mod tests {
     #[test]
     fn revoke_no_match_yields_zero() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(KVA_A, 0)).unwrap();
 
         let mut count = 0;
         let v = slot_revoke_validate(&slots, KernelVa::new(KVA_B), |_| count += 1);

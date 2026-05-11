@@ -210,13 +210,13 @@ pub fn create_process(
         // send/call on this handle. Same logic as sys_export_handle:
         // token==0 → fresh from endpoint counter, nonzero → copy (lineage).
         let child_kind = match parent.kind {
-            lockjaw_types::object::HandleKind::Endpoint { paddr, caller_token } if caller_token == 0 => {
+            lockjaw_types::object::HandleKind::Endpoint { kva, caller_token } if caller_token == 0 => {
                 let mut ep = unsafe {
-                    KernelMut::<crate::ipc::endpoint::EndpointObject>::from_paddr(paddr)
+                    KernelMut::<crate::ipc::endpoint::EndpointObject>::from_kva(kva)
                 };
                 let token = ep.get().next_token;
                 ep.get_mut().next_token = token + 1;
-                lockjaw_types::object::HandleKind::Endpoint { paddr, caller_token: token }
+                lockjaw_types::object::HandleKind::Endpoint { kva, caller_token: token }
             }
             other => other,
         };

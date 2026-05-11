@@ -1,7 +1,7 @@
 use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
 use crate::ipc::ep_queue;
 use crate::ipc::reply::ReplyObject;
-use crate::mm::addr::{PhysAddr, kva_of_raw, paddr_of_raw};
+use crate::mm::addr::{PhysAddr, kva_of_raw};
 use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::scheduler::{self, BlockToken, scoped_mut};
 use crate::sched::tcb::Tcb;
@@ -125,7 +125,9 @@ pub fn ipc_send(
             // Slow path: queue self as Send, block.
             let mut tok = BlockToken::new();
             let sender_tcb_paddr = scheduler::current_tcb_paddr();
-            let ep_paddr = paddr_of_raw(ep);
+            // Endpoint lives in the KVM pool; the carry-around value
+            // we stash in TCB.ipc_blocked_on is a KVA.
+            let ep_kva = kva_of_raw(ep);
             {
                 // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
                 let sender_tcb = unsafe { KernelMut::<Tcb>::from_paddr(sender_tcb_paddr) };
@@ -133,7 +135,7 @@ pub fn ipc_send(
                 s.ipc_msg = msg;
                 s.ipc_caller_token = caller_token;
                 s.ipc_wait_kind = WAIT_KIND_SEND;
-                s.ipc_blocked_on = ep_paddr.as_u64();
+                s.ipc_blocked_on = ep_kva.as_u64();
             }
             {
                 let ep_ref = unsafe { scoped_mut(ep, &mut tok) };
@@ -225,12 +227,14 @@ pub fn ipc_receive(
         ReceiveDecision::QueueAndBlock { next_ep_state } => {
             // Queue empty — enqueue self as Receiver, block.
             let mut tok = BlockToken::new();
-            let ep_paddr = paddr_of_raw(ep);
+            // Endpoint lives in the KVM pool; the carry-around value
+            // we stash in TCB.ipc_blocked_on is a KVA.
+            let ep_kva = kva_of_raw(ep);
             {
                 let receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr) };
                 let r = unsafe { scoped_mut(receiver_tcb.raw_ptr(), &mut tok) };
                 r.ipc_wait_kind = WAIT_KIND_RECEIVE;
-                r.ipc_blocked_on = ep_paddr.as_u64();
+                r.ipc_blocked_on = ep_kva.as_u64();
             }
             {
                 let ep_ref = unsafe { scoped_mut(ep, &mut tok) };
@@ -276,7 +280,9 @@ pub fn ipc_call(
             // unblock server, block self.
             let mut tok = BlockToken::new();
             let caller_tcb_paddr = scheduler::current_tcb_paddr();
-            let ep_paddr = paddr_of_raw(ep);
+            // Endpoint lives in the KVM pool; the carry-around value
+            // we stash in TCB.ipc_blocked_on is a KVA.
+            let ep_kva = kva_of_raw(ep);
             // Reply lives in the KVM pool; carry its KVA, not a paddr.
             let reply_kva = kva_of_raw(reply);
 
@@ -307,7 +313,7 @@ pub fn ipc_call(
             {
                 let caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_tcb_paddr) };
                 let c = unsafe { scoped_mut(caller_tcb.raw_ptr(), &mut tok) };
-                c.ipc_blocked_on = ep_paddr.as_u64();
+                c.ipc_blocked_on = ep_kva.as_u64();
             }
             // Caller always blocks — this is structural to Call.
             scheduler::block_current(tok);
@@ -319,7 +325,9 @@ pub fn ipc_call(
             // Slow path: store msg in own TCB, then enqueue on endpoint.
             let mut tok = BlockToken::new();
             let caller_tcb_paddr = scheduler::current_tcb_paddr();
-            let ep_paddr = paddr_of_raw(ep);
+            // Endpoint lives in the KVM pool; the carry-around value
+            // we stash in TCB.ipc_blocked_on is a KVA.
+            let ep_kva = kva_of_raw(ep);
             // Reply lives in the KVM pool; carry its KVA, not a paddr.
             let reply_kva = kva_of_raw(reply);
 
@@ -337,7 +345,7 @@ pub fn ipc_call(
                 c.ipc_caller_token = caller_token;
                 c.ipc_wait_kind = WAIT_KIND_CALL;
                 c.ipc_call_reply_kva = reply_kva.as_u64();
-                c.ipc_blocked_on = ep_paddr.as_u64();
+                c.ipc_blocked_on = ep_kva.as_u64();
             }
             {
                 let ep_ref = unsafe { scoped_mut(ep, &mut tok) };
@@ -378,10 +386,10 @@ pub fn ipc_receive_nb(ep: &mut EndpointObject) -> Result<[u64; 4], IpcError> {
 // ---------------------------------------------------------------------------
 
 /// Read the endpoint's model EpState. Used by sys_wait_any for readiness.
-pub fn read_state(ep_paddr: PhysAddr) -> EpState {
-    // SAFETY: ep_paddr is a trusted kernel object paddr (produced only via
+pub fn read_state(ep_kva: lockjaw_types::addr::KernelVa) -> EpState {
+    // SAFETY: ep_kva is a trusted kernel-object KVA (produced only via
     // handle-table lookup on an Endpoint handle).
-    let ep = unsafe { KernelMut::<EndpointObject>::from_paddr(ep_paddr) };
+    let ep = unsafe { KernelMut::<EndpointObject>::from_kva(ep_kva) };
     EpState::from_raw(ep.get().state).unwrap_or_else(|| panic!("corrupted endpoint state"))
 }
 
@@ -389,18 +397,18 @@ pub fn read_state(ep_paddr: PhysAddr) -> EpState {
 /// The thread will be woken (without consuming) when a sender/caller arrives.
 ///
 /// # Safety
-/// `ep_paddr` must point to a live `EndpointObject`.
-pub unsafe fn set_readiness_waiter(ep_paddr: PhysAddr, waiter_paddr: PhysAddr) {
-    let mut ep = KernelMut::<EndpointObject>::from_paddr(ep_paddr);
+/// `ep_kva` must point to a live `EndpointObject` mapped in KVM.
+pub unsafe fn set_readiness_waiter(ep_kva: lockjaw_types::addr::KernelVa, waiter_paddr: PhysAddr) {
+    let mut ep = KernelMut::<EndpointObject>::from_kva(ep_kva);
     let _ = ep.get_mut().readiness_waiter.register(waiter_paddr.as_u64());
 }
 
 /// Clear the readiness waiter if it matches the expected thread.
 ///
 /// # Safety
-/// `ep_paddr` must point to a live `EndpointObject`.
-pub unsafe fn clear_readiness_waiter(ep_paddr: PhysAddr, expected: PhysAddr) {
-    let mut ep = KernelMut::<EndpointObject>::from_paddr(ep_paddr);
+/// `ep_kva` must point to a live `EndpointObject` mapped in KVM.
+pub unsafe fn clear_readiness_waiter(ep_kva: lockjaw_types::addr::KernelVa, expected: PhysAddr) {
+    let mut ep = KernelMut::<EndpointObject>::from_kva(ep_kva);
     ep.get_mut().readiness_waiter.clear_if_match(expected.as_u64());
 }
 
