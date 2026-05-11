@@ -165,6 +165,19 @@ pub extern "C" fn kmain() -> ! {
     }
     kprintln!("Higher-half active — UART at ", Hex(plat.uart0_base + mm::addr::KERNEL_VA_OFFSET));
 
+    // Bring up the kernel VA (KVM) allocator. Carves a 512 GiB
+    // higher-half pool for kernel objects that need virtual
+    // contiguity but not physical contiguity (initially: PageSet
+    // headers — Phase 3 work). Must run after enable_higher_half
+    // (TTBR1 must be installed) and after page_alloc::init_with_gap
+    // (we need to allocate the KVM L1 page).
+    kprintln!();
+    kprintln!("Bringing up kernel VA allocator...");
+    unsafe {
+        mm::kvm::kvm_init();
+        mm::kvm::boot_self_test();
+    }
+
     // Verify DTB is readable at its higher-half VA (DTB discovered by platform::discover)
     unsafe {
         // SAFETY: kernel VA (via KERNEL_VA_OFFSET)

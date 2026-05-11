@@ -191,6 +191,15 @@ pub unsafe fn enable_mmu() {
 ///
 /// # Safety
 /// MMU must already be enabled with identity mapping.
+/// Physical address of the kernel L0 page table (TTBR1 root). The
+/// kernel binary is linked at physical addresses today, so
+/// `&raw const KERNEL_L0` returns the static's physical location.
+/// Used by the KVM allocator to install its L1 table at
+/// `KERNEL_L0[KVM_L0_INDEX]`.
+pub fn kernel_l0_paddr() -> PhysAddr {
+    PhysAddr::new(&raw const KERNEL_L0 as u64)
+}
+
 pub unsafe fn enable_higher_half() {
     // Build KERNEL_L1 with the same layout as BOOT_L1.
     let kernel_phys = &raw const BOOT_L0 as u64;

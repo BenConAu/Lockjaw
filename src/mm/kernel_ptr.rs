@@ -35,6 +35,7 @@
 
 use crate::mm::addr::{KERNEL_VA_OFFSET, PhysAddr};
 use core::marker::PhantomData;
+use lockjaw_types::addr::KernelVa;
 
 /// Shared reference to a `T` that lives in a donated physical page,
 /// accessed through the kernel's higher-half mapping. Analogous to
@@ -81,6 +82,26 @@ impl<'a, T> KernelRef<'a, T> {
     #[inline]
     pub fn as_ptr(&self) -> *const T {
         self.ptr
+    }
+
+    /// Construct a `KernelRef<T>` from a kernel virtual address in the
+    /// KVM pool. Distinct from [`from_paddr`]: the input is already a
+    /// kernel VA (no offset addition). Used for objects that live in
+    /// the KVM-pool higher-half region (see `lockjaw_types::kvm`),
+    /// which is backed by independently-allocated physical frames
+    /// stitched into a virtually-contiguous range.
+    ///
+    /// # Safety
+    /// - `kva` must point to a live, properly-initialized `T` in a
+    ///   range mapped by `kvm::alloc_kernel_pages` and not yet freed.
+    /// - The KVM range must outlive `'a`.
+    /// - Aliasing rules match [`from_paddr`].
+    #[inline]
+    pub unsafe fn from_kva(kva: KernelVa) -> Self {
+        // SAFETY: kernel VA in the KVM pool — caller upholds the
+        // mapping-is-live contract documented above.
+        let ptr = kva.as_u64() as *const T;
+        Self { ptr, _marker: PhantomData }
     }
 }
 
@@ -150,6 +171,21 @@ impl<'a, T> KernelMut<'a, T> {
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut T {
         self.ptr
+    }
+
+    /// Construct a `KernelMut<T>` from a kernel virtual address in
+    /// the KVM pool. Same contract as [`KernelRef::from_kva`] plus
+    /// exclusivity (no other `KernelMut` or `KernelRef` to the same
+    /// KVM range may coexist).
+    ///
+    /// # Safety
+    /// See [`KernelRef::from_kva`] and [`from_paddr`].
+    #[inline]
+    pub unsafe fn from_kva(kva: KernelVa) -> Self {
+        // SAFETY: kernel VA in the KVM pool — caller upholds the
+        // mapping-is-live and exclusive-access contracts above.
+        let ptr = kva.as_u64() as *mut T;
+        Self { ptr, _marker: PhantomData }
     }
 }
 

@@ -82,6 +82,16 @@ pub unsafe fn init_with_gap(
     crate::kprintln!("  Page allocator: ", reserved, " reserved, ", buddy.free_count(), " free");
 }
 
+/// Number of free physical pages currently in the allocator.
+/// Used by diagnostic / self-test code to detect leaks.
+pub fn free_count() -> usize {
+    // SAFETY: single-core, IRQs masked — exclusive access to allocator state.
+    unsafe {
+        let buddy = &*ALLOCATOR.buddy.get();
+        buddy.free_count()
+    }
+}
+
 /// Allocate a single physical page. Returns `None` if out of memory.
 pub fn alloc_page() -> Option<PhysPage> {
     // SAFETY: single-core, IRQs masked — exclusive access to allocator state.

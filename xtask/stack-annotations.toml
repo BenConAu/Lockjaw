@@ -16,6 +16,7 @@
 "<core::fmt::Formatter>::pad" = "fmt-internal"
 "<core::fmt::Formatter>::pad_integral" = "fmt-internal"
 "<core::fmt::Formatter>::pad_integral::write_prefix" = "fmt-internal"
+"<core::fmt::Arguments as core::fmt::Display>::fmt" = "fmt-internal"
 "<core::fmt::Formatter>::debug_tuple_field1_finish" = "fmt-internal"
 "<core::fmt::builders::PadAdapter as core::fmt::Write>::write_char" = "fmt-internal"
 "<core::fmt::builders::PadAdapter as core::fmt::Write>::write_str" = "fmt-internal"
@@ -121,3 +122,4 @@
 # Each new type requires its own entry — keeps the gate narrow.
 "<&lockjaw_types::object::ObjectType as core::fmt::Debug>::fmt" = "assert_eq panic formatting"
 "<&u64 as core::fmt::Debug>::fmt" = "assert_eq panic formatting"
+"<lockjaw::mm::kvm::KvmError as core::fmt::Debug>::fmt" = "Result::expect on alloc_kernel_pages failures"

@@ -286,8 +286,14 @@ impl Default for KvmFreeList {
 
 /// What the kernel must do next while installing one page of a KVM
 /// mapping. The kernel performs the side effect (read PTE, allocate
-/// page-table page, write PTE) and feeds the result back to the
-/// walker for the next step.
+/// page-table page, write PTE) and calls the matching `step_*`
+/// method to advance the state machine, then re-queries
+/// `current_step()` for the next action.
+///
+/// `#[must_use]` because dropping a step value silently halts the
+/// allocator — a previous version of `drive_map_walk` did exactly
+/// that and spun forever. Caught at compile time now.
+#[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvmMapStep {
     /// Read the L1 PTE at this physical address, hand the value back
@@ -348,21 +354,31 @@ pub struct KvmMapWalk {
     pending_phys: Option<PhysAddr>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PageState {
     /// About to read L1 PTE for the current page.
     NeedL1,
-    /// L1 has been read; about to read L2 PTE.
+    /// L1 entry was empty — kernel must allocate a fresh L2 table,
+    /// then call `step_l2_allocated`.
+    NeedAllocL2,
+    /// L1 has been resolved (existing or freshly allocated); about
+    /// to read L2 PTE.
     NeedL2,
-    /// L2 has been read; about to read the target L3 PTE to verify
-    /// the slot is invalid (must be unmapped before alloc writes
-    /// a new entry there).
+    /// L2 entry was empty — kernel must allocate a fresh L3 table,
+    /// then call `step_l3_allocated`.
+    NeedAllocL3,
+    /// L2 has been resolved; about to read the target L3 PTE to
+    /// verify the slot is invalid (must be unmapped before alloc
+    /// writes a new entry there).
     NeedL3,
     /// L3 PTE was confirmed invalid; walker is waiting for the
     /// kernel to supply a backing frame.
     NeedBacking,
     /// Backing supplied; about to write the page entry.
     NeedWritePte,
+    /// Walker hit an invariant violation. `current_step` returns
+    /// `Fault` from this state until the walker is dropped.
+    Faulted,
     /// All pages have been mapped.
     Done,
 }
@@ -384,19 +400,25 @@ impl KvmMapWalk {
         }
     }
 
-    /// What the kernel should do for the current page.
+    /// What the kernel should do for the current page. The single
+    /// source of truth for the next action — `step_*` methods only
+    /// mutate state; the kernel always re-queries `current_step()`
+    /// after each call.
     pub fn current_step(&self) -> KvmMapStep {
-        if self.state == PageState::Done {
-            return KvmMapStep::Done;
-        }
         let kva = self.base.add_pages(self.page_idx);
         let (_l0, l1, l2, l3) = kvm_pool_indices(kva);
         match self.state {
             PageState::NeedL1 => KvmMapStep::ReadL1Pte {
                 l1_pte_paddr: PhysAddr::new(self.l1_paddr + (l1 as u64) * 8),
             },
+            PageState::NeedAllocL2 => KvmMapStep::AllocL2 {
+                parent_pte_paddr: PhysAddr::new(self.l1_paddr + (l1 as u64) * 8),
+            },
             PageState::NeedL2 => KvmMapStep::ReadL2Pte {
                 l2_pte_paddr: PhysAddr::new(self.l2_paddr + (l2 as u64) * 8),
+            },
+            PageState::NeedAllocL3 => KvmMapStep::AllocL3 {
+                parent_pte_paddr: PhysAddr::new(self.l2_paddr + (l2 as u64) * 8),
             },
             PageState::NeedL3 => KvmMapStep::ReadL3Pte {
                 l3_pte_paddr: PhysAddr::new(self.l3_paddr + (l3 as u64) * 8),
@@ -414,72 +436,63 @@ impl KvmMapWalk {
                     entry: build_kernel_page(phys),
                 }
             }
+            PageState::Faulted => KvmMapStep::Fault,
             PageState::Done => KvmMapStep::Done,
         }
     }
 
-    /// Feed the L1 PTE the kernel just read. If the entry is empty
-    /// (no L2 table yet), the next step will be `AllocL2`; otherwise
-    /// the walker advances to read the L2 PTE.
-    pub fn step_l1(&mut self, pte_raw: u64) -> KvmMapStep {
-        debug_assert_eq!(self.state, PageState::NeedL1);
+    /// Feed the L1 PTE the kernel just read. State becomes
+    /// `NeedAllocL2` if the entry is empty, `NeedL2` if it's a
+    /// table, or `Faulted` if it's a block descriptor.
+    pub fn step_l1(&mut self, pte_raw: u64) {
+        debug_assert!(self.state == PageState::NeedL1);
         let pte = PageTableEntry::from_raw(pte_raw);
         if !pte.is_valid() {
-            // Need to allocate an L2 table.
-            let kva = self.base.add_pages(self.page_idx);
-            let (_l0, l1, _l2, _l3) = kvm_pool_indices(kva);
-            return KvmMapStep::AllocL2 {
-                parent_pte_paddr: PhysAddr::new(self.l1_paddr + (l1 as u64) * 8),
-            };
+            self.state = PageState::NeedAllocL2;
+            return;
         }
         if !pte.is_table() {
-            return KvmMapStep::Fault;
+            self.state = PageState::Faulted;
+            return;
         }
         self.l2_paddr = pte.output_addr().as_u64();
         self.state = PageState::NeedL2;
-        self.current_step()
     }
 
-    /// The kernel has allocated and installed a fresh L2 table at the
-    /// L1 slot. Tell the walker the new L2's paddr; it advances to
-    /// reading the L2 PTE (which the kernel just zeroed, so the
-    /// next read will return 0 and trigger an AllocL3).
-    pub fn step_l2_allocated(&mut self, l2_paddr: u64) -> KvmMapStep {
-        debug_assert_eq!(self.state, PageState::NeedL1);
+    /// The kernel has allocated and installed a fresh L2 table at
+    /// the L1 slot. Walker advances to reading the L2 PTE (which
+    /// will return 0 for a freshly-zeroed table → AllocL3 next).
+    pub fn step_l2_allocated(&mut self, l2_paddr: u64) {
+        debug_assert!(self.state == PageState::NeedAllocL2);
         self.l2_paddr = l2_paddr;
         self.state = PageState::NeedL2;
-        self.current_step()
     }
 
     /// Feed the L2 PTE the kernel just read.
-    pub fn step_l2(&mut self, pte_raw: u64) -> KvmMapStep {
-        debug_assert_eq!(self.state, PageState::NeedL2);
+    pub fn step_l2(&mut self, pte_raw: u64) {
+        debug_assert!(self.state == PageState::NeedL2);
         let pte = PageTableEntry::from_raw(pte_raw);
         if !pte.is_valid() {
-            let kva = self.base.add_pages(self.page_idx);
-            let (_l0, _l1, l2, _l3) = kvm_pool_indices(kva);
-            return KvmMapStep::AllocL3 {
-                parent_pte_paddr: PhysAddr::new(self.l2_paddr + (l2 as u64) * 8),
-            };
+            self.state = PageState::NeedAllocL3;
+            return;
         }
         if !pte.is_table() {
-            return KvmMapStep::Fault;
+            self.state = PageState::Faulted;
+            return;
         }
         self.l3_paddr = pte.output_addr().as_u64();
         self.state = PageState::NeedL3;
-        self.current_step()
     }
 
     /// The kernel has allocated and installed a fresh L3 table at
-    /// the L2 slot. Tell the walker the new L3's paddr; walker still
-    /// reads the target L3 PTE for symmetry with the existing-table
-    /// path (the read will return 0 for a fresh-and-zeroed table,
-    /// matching the invariant).
-    pub fn step_l3_allocated(&mut self, l3_paddr: u64) -> KvmMapStep {
-        debug_assert_eq!(self.state, PageState::NeedL2);
+    /// the L2 slot. Walker still reads the target L3 PTE for
+    /// symmetry with the existing-table path (the read will
+    /// return 0 for a fresh-and-zeroed table, matching the
+    /// invariant).
+    pub fn step_l3_allocated(&mut self, l3_paddr: u64) {
+        debug_assert!(self.state == PageState::NeedAllocL3);
         self.l3_paddr = l3_paddr;
         self.state = PageState::NeedL3;
-        self.current_step()
     }
 
     /// Feed the L3 PTE the kernel just read. The slot must be
@@ -487,34 +500,33 @@ impl KvmMapWalk {
     /// the slot is already valid the walker faults (freelist /
     /// page-table drift; the kernel must not silently clobber the
     /// existing entry).
-    pub fn step_l3(&mut self, pte_raw: u64) -> KvmMapStep {
-        debug_assert_eq!(self.state, PageState::NeedL3);
+    pub fn step_l3(&mut self, pte_raw: u64) {
+        debug_assert!(self.state == PageState::NeedL3);
         let pte = PageTableEntry::from_raw(pte_raw);
         if pte.is_valid() {
-            return KvmMapStep::Fault;
+            self.state = PageState::Faulted;
+            return;
         }
         self.state = PageState::NeedBacking;
-        self.current_step()
     }
 
-    /// The kernel allocated a backing frame (or an OOM check
-    /// returned a frame). Walker advances to `WritePagePte`.
-    pub fn supply_backing(&mut self, phys: PhysAddr) -> KvmMapStep {
-        debug_assert_eq!(self.state, PageState::NeedBacking);
+    /// The kernel allocated a backing frame. Walker advances to
+    /// `WritePagePte`.
+    pub fn supply_backing(&mut self, phys: PhysAddr) {
+        debug_assert!(self.state == PageState::NeedBacking);
         self.pending_phys = Some(phys);
         self.state = PageState::NeedWritePte;
-        self.current_step()
     }
 
     /// The kernel has written the page PTE. Advance to the next
     /// page in the range, or to `Done`.
-    pub fn step_pte_written(&mut self) -> KvmMapStep {
-        debug_assert_eq!(self.state, PageState::NeedWritePte);
+    pub fn step_pte_written(&mut self) {
+        debug_assert!(self.state == PageState::NeedWritePte);
         self.pending_phys = None;
         self.page_idx += 1;
         if self.page_idx >= self.pages {
             self.state = PageState::Done;
-            return KvmMapStep::Done;
+            return;
         }
         // Decide whether to re-walk or reuse cached table paddrs:
         // if the next page lives in the same L2 region (same L1, L2
@@ -537,7 +549,6 @@ impl KvmMapWalk {
             // "must be invalid" check.
             self.state = PageState::NeedL3;
         }
-        self.current_step()
     }
 }
 
@@ -549,6 +560,11 @@ impl KvmMapWalk {
 /// Symmetric with `KvmMapStep` but for the destructive direction:
 /// the walker decides which PTEs to read (to capture backing paddrs)
 /// and which to clear.
+///
+/// `#[must_use]` for the same reason as `KvmMapStep` — silently
+/// dropping a step from `current_step()` would silently halt the
+/// teardown.
+#[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvmFreeStep {
     /// Read the L1 PTE for the current page; feed back via `step_l1`.
@@ -584,12 +600,13 @@ pub struct KvmFreeWalk {
     captured_backing: Option<PhysAddr>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum FreeState {
     NeedL1,
     NeedL2,
     NeedL3,
     NeedClear,
+    Faulted,
     Done,
 }
 
@@ -607,10 +624,9 @@ impl KvmFreeWalk {
         }
     }
 
+    /// Single source of truth for the next action. Kernel always
+    /// re-queries this after each `step_*` call.
     pub fn current_step(&self) -> KvmFreeStep {
-        if self.state == FreeState::Done {
-            return KvmFreeStep::Done;
-        }
         let kva = self.base.add_pages(self.page_idx);
         let (_l0, l1, l2, l3) = kvm_pool_indices(kva);
         match self.state {
@@ -633,50 +649,51 @@ impl KvmFreeWalk {
                     backing,
                 }
             }
+            FreeState::Faulted => KvmFreeStep::Fault,
             FreeState::Done => KvmFreeStep::Done,
         }
     }
 
-    pub fn step_l1(&mut self, pte_raw: u64) -> KvmFreeStep {
-        debug_assert_eq!(self.state, FreeState::NeedL1);
+    pub fn step_l1(&mut self, pte_raw: u64) {
+        debug_assert!(self.state == FreeState::NeedL1);
         let pte = PageTableEntry::from_raw(pte_raw);
         if !pte.is_table() {
-            return KvmFreeStep::Fault;
+            self.state = FreeState::Faulted;
+            return;
         }
         self.l2_paddr = pte.output_addr().as_u64();
         self.state = FreeState::NeedL2;
-        self.current_step()
     }
 
-    pub fn step_l2(&mut self, pte_raw: u64) -> KvmFreeStep {
-        debug_assert_eq!(self.state, FreeState::NeedL2);
+    pub fn step_l2(&mut self, pte_raw: u64) {
+        debug_assert!(self.state == FreeState::NeedL2);
         let pte = PageTableEntry::from_raw(pte_raw);
         if !pte.is_table() {
-            return KvmFreeStep::Fault;
+            self.state = FreeState::Faulted;
+            return;
         }
         self.l3_paddr = pte.output_addr().as_u64();
         self.state = FreeState::NeedL3;
-        self.current_step()
     }
 
-    pub fn step_l3(&mut self, pte_raw: u64) -> KvmFreeStep {
-        debug_assert_eq!(self.state, FreeState::NeedL3);
+    pub fn step_l3(&mut self, pte_raw: u64) {
+        debug_assert!(self.state == FreeState::NeedL3);
         let pte = PageTableEntry::from_raw(pte_raw);
         if !pte.is_valid() {
-            return KvmFreeStep::Fault;
+            self.state = FreeState::Faulted;
+            return;
         }
         self.captured_backing = Some(pte.output_addr());
         self.state = FreeState::NeedClear;
-        self.current_step()
     }
 
-    pub fn step_pte_cleared(&mut self) -> KvmFreeStep {
-        debug_assert_eq!(self.state, FreeState::NeedClear);
+    pub fn step_pte_cleared(&mut self) {
+        debug_assert!(self.state == FreeState::NeedClear);
         self.captured_backing = None;
         self.page_idx += 1;
         if self.page_idx >= self.pages {
             self.state = FreeState::Done;
-            return KvmFreeStep::Done;
+            return;
         }
         let kva = self.base.add_pages(self.page_idx);
         let prev_kva = self.base.add_pages(self.page_idx - 1);
@@ -690,7 +707,6 @@ impl KvmFreeWalk {
             // Same L3 table — go straight to reading the next L3 PTE.
             self.state = FreeState::NeedL3;
         }
-        self.current_step()
     }
 }
 
@@ -861,25 +877,24 @@ mod tests {
             walk.current_step(),
             KvmMapStep::ReadL1Pte { l1_pte_paddr: PhysAddr::new(l1_paddr + (l1 as u64) * 8) },
         );
-        // L1 entry is empty → walker says AllocL2.
-        let next = walk.step_l1(0);
-        assert!(matches!(next, KvmMapStep::AllocL2 { .. }));
-        // Kernel allocates an L2 page at 0xBBBB_0000 and tells the walker.
-        let next = walk.step_l2_allocated(0xBBBB_0000);
-        assert!(matches!(next, KvmMapStep::ReadL2Pte { .. }));
+        // L1 entry is empty → next step is AllocL2.
+        walk.step_l1(0);
+        assert!(matches!(walk.current_step(), KvmMapStep::AllocL2 { .. }));
+        // Kernel allocates an L2 page at 0xBBBB_0000.
+        walk.step_l2_allocated(0xBBBB_0000);
+        assert!(matches!(walk.current_step(), KvmMapStep::ReadL2Pte { .. }));
         // L2 entry empty → AllocL3.
-        let next = walk.step_l2(0);
-        assert!(matches!(next, KvmMapStep::AllocL3 { .. }));
-        // Kernel allocates an L3 page → walker reads the target L3 PTE
-        // (must be invalid before alloc writes).
-        assert!(matches!(
-            walk.step_l3_allocated(0xCCCC_0000),
-            KvmMapStep::ReadL3Pte { .. },
-        ));
+        walk.step_l2(0);
+        assert!(matches!(walk.current_step(), KvmMapStep::AllocL3 { .. }));
+        // Kernel allocates an L3 page → walker reads the target L3 PTE.
+        walk.step_l3_allocated(0xCCCC_0000);
+        assert!(matches!(walk.current_step(), KvmMapStep::ReadL3Pte { .. }));
         // L3 PTE is zero (fresh table) → walker requests backing.
-        assert_eq!(walk.step_l3(0), KvmMapStep::WantBacking);
+        walk.step_l3(0);
+        assert_eq!(walk.current_step(), KvmMapStep::WantBacking);
         // Kernel supplies a backing paddr; walker emits WritePagePte.
-        let pte = match walk.supply_backing(PhysAddr::new(0x4020_0000)) {
+        walk.supply_backing(PhysAddr::new(0x4020_0000));
+        let pte = match walk.current_step() {
             KvmMapStep::WritePagePte { pte_paddr, entry } => {
                 assert_eq!(pte_paddr.as_u64(), 0xCCCC_0000); // L3 index = 0
                 entry
@@ -888,7 +903,8 @@ mod tests {
         };
         assert!(pte.is_uxn() && pte.is_pxn() && pte.ap() == AP_RW_EL1);
         assert_eq!(pte.output_addr().as_u64(), 0x4020_0000);
-        assert_eq!(walk.step_pte_written(), KvmMapStep::Done);
+        walk.step_pte_written();
+        assert_eq!(walk.current_step(), KvmMapStep::Done);
     }
 
     #[test]
@@ -898,16 +914,18 @@ mod tests {
         let l3_paddr = 0xCCCC_0000;
         let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 1, l1_paddr);
         // Populated L1 entry (table → l2_paddr).
-        let l1_entry = PageTableEntry::new_table(PhysAddr::new(l2_paddr)).raw();
-        assert!(matches!(walk.step_l1(l1_entry), KvmMapStep::ReadL2Pte { .. }));
+        walk.step_l1(PageTableEntry::new_table(PhysAddr::new(l2_paddr)).raw());
+        assert!(matches!(walk.current_step(), KvmMapStep::ReadL2Pte { .. }));
         // Populated L2 entry (table → l3_paddr) → walker reads target L3 PTE.
-        let l2_entry = PageTableEntry::new_table(PhysAddr::new(l3_paddr)).raw();
-        assert!(matches!(walk.step_l2(l2_entry), KvmMapStep::ReadL3Pte { .. }));
+        walk.step_l2(PageTableEntry::new_table(PhysAddr::new(l3_paddr)).raw());
+        assert!(matches!(walk.current_step(), KvmMapStep::ReadL3Pte { .. }));
         // L3 PTE invalid → request backing → write.
-        assert_eq!(walk.step_l3(0), KvmMapStep::WantBacking);
-        let step = walk.supply_backing(PhysAddr::new(0x4020_0000));
-        assert!(matches!(step, KvmMapStep::WritePagePte { .. }));
-        assert_eq!(walk.step_pte_written(), KvmMapStep::Done);
+        walk.step_l3(0);
+        assert_eq!(walk.current_step(), KvmMapStep::WantBacking);
+        walk.supply_backing(PhysAddr::new(0x4020_0000));
+        assert!(matches!(walk.current_step(), KvmMapStep::WritePagePte { .. }));
+        walk.step_pte_written();
+        assert_eq!(walk.current_step(), KvmMapStep::Done);
     }
 
     #[test]
@@ -923,25 +941,27 @@ mod tests {
         let l2_paddr = 0xBBBB_0000;
         let l3_paddr = 0xCCCC_0000;
         let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 1, l1_paddr);
-        let _ = walk.step_l1(PageTableEntry::new_table(PhysAddr::new(l2_paddr)).raw());
-        let _ = walk.step_l2(PageTableEntry::new_table(PhysAddr::new(l3_paddr)).raw());
+        walk.step_l1(PageTableEntry::new_table(PhysAddr::new(l2_paddr)).raw());
+        walk.step_l2(PageTableEntry::new_table(PhysAddr::new(l3_paddr)).raw());
         // The L3 slot already holds a valid kernel-page entry. This
         // should never happen with a healthy freelist; alloc must
         // fault rather than overwrite.
         let stale_entry = build_kernel_page(PhysAddr::new(0x4020_5000)).raw();
-        assert_eq!(walk.step_l3(stale_entry), KvmMapStep::Fault);
+        walk.step_l3(stale_entry);
+        assert_eq!(walk.current_step(), KvmMapStep::Fault);
     }
 
     #[test]
     fn map_walk_fault_on_block_in_l1_or_l2() {
         let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 1, 0xAAAA_0000);
         let block = PageTableEntry::new_block(PhysAddr::new(0x4000_0000), MAIR_NORMAL, AP_RW_EL1, SH_INNER).raw();
-        assert_eq!(walk.step_l1(block), KvmMapStep::Fault);
+        walk.step_l1(block);
+        assert_eq!(walk.current_step(), KvmMapStep::Fault);
 
         let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 1, 0xAAAA_0000);
-        let table_l1 = PageTableEntry::new_table(PhysAddr::new(0xBBBB_0000)).raw();
-        let _ = walk.step_l1(table_l1);
-        assert_eq!(walk.step_l2(block), KvmMapStep::Fault);
+        walk.step_l1(PageTableEntry::new_table(PhysAddr::new(0xBBBB_0000)).raw());
+        walk.step_l2(block);
+        assert_eq!(walk.current_step(), KvmMapStep::Fault);
     }
 
     #[test]
@@ -952,27 +972,31 @@ mod tests {
         // Two pages in same L3 (consecutive within the first L3 table).
         let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 2, l1_paddr);
         // Page 0: walk L1, L2, read L3, get backing, write L3.
-        let _ = walk.step_l1(PageTableEntry::new_table(PhysAddr::new(l2_paddr)).raw());
-        assert!(matches!(
-            walk.step_l2(PageTableEntry::new_table(PhysAddr::new(l3_paddr)).raw()),
-            KvmMapStep::ReadL3Pte { .. },
-        ));
-        assert_eq!(walk.step_l3(0), KvmMapStep::WantBacking);
-        let pte0 = match walk.supply_backing(PhysAddr::new(0x4000_0000)) {
+        walk.step_l1(PageTableEntry::new_table(PhysAddr::new(l2_paddr)).raw());
+        walk.step_l2(PageTableEntry::new_table(PhysAddr::new(l3_paddr)).raw());
+        assert!(matches!(walk.current_step(), KvmMapStep::ReadL3Pte { .. }));
+        walk.step_l3(0);
+        assert_eq!(walk.current_step(), KvmMapStep::WantBacking);
+        walk.supply_backing(PhysAddr::new(0x4000_0000));
+        let pte0 = match walk.current_step() {
             KvmMapStep::WritePagePte { pte_paddr, .. } => pte_paddr.as_u64(),
             other => panic!("expected WritePagePte for page 0, got {:?}", other),
         };
         // Advance — same L1/L2 → walker should jump straight to ReadL3Pte
         // for the next slot (must still verify it's invalid before writing).
-        assert!(matches!(walk.step_pte_written(), KvmMapStep::ReadL3Pte { .. }));
-        assert_eq!(walk.step_l3(0), KvmMapStep::WantBacking);
-        let pte1 = match walk.supply_backing(PhysAddr::new(0x4001_0000)) {
+        walk.step_pte_written();
+        assert!(matches!(walk.current_step(), KvmMapStep::ReadL3Pte { .. }));
+        walk.step_l3(0);
+        assert_eq!(walk.current_step(), KvmMapStep::WantBacking);
+        walk.supply_backing(PhysAddr::new(0x4001_0000));
+        let pte1 = match walk.current_step() {
             KvmMapStep::WritePagePte { pte_paddr, .. } => pte_paddr.as_u64(),
             other => panic!("expected WritePagePte for page 1, got {:?}", other),
         };
         // PTE addresses are 8 bytes apart (consecutive L3 entries).
         assert_eq!(pte1 - pte0, 8);
-        assert_eq!(walk.step_pte_written(), KvmMapStep::Done);
+        walk.step_pte_written();
+        assert_eq!(walk.current_step(), KvmMapStep::Done);
     }
 
     // -----------------------------------------------------------------------
@@ -992,37 +1016,37 @@ mod tests {
         let l3_paddr = 0xCCCC_0000;
         let backing = PhysAddr::new(0x4020_5000);
         let mut walk = KvmFreeWalk::start(KernelVa::new(KVM_POOL_BASE), 1, l1_paddr);
-        // L1 → L2 table.
-        let _ = walk.step_l1(PageTableEntry::new_table(PhysAddr::new(l2_paddr)).raw());
-        // L2 → L3 table.
-        let _ = walk.step_l2(PageTableEntry::new_table(PhysAddr::new(l3_paddr)).raw());
+        walk.step_l1(PageTableEntry::new_table(PhysAddr::new(l2_paddr)).raw());
+        walk.step_l2(PageTableEntry::new_table(PhysAddr::new(l3_paddr)).raw());
         // L3 → page entry pointing at `backing`.
-        let page_entry = build_kernel_page(backing).raw();
-        let step = walk.step_l3(page_entry);
-        match step {
+        walk.step_l3(build_kernel_page(backing).raw());
+        match walk.current_step() {
             KvmFreeStep::ClearPte { pte_paddr, backing: b } => {
                 assert_eq!(pte_paddr.as_u64(), l3_paddr); // L3 index = 0
                 assert_eq!(b.as_u64(), backing.as_u64());
             }
             other => panic!("expected ClearPte, got {:?}", other),
         }
-        assert_eq!(walk.step_pte_cleared(), KvmFreeStep::Done);
+        walk.step_pte_cleared();
+        assert_eq!(walk.current_step(), KvmFreeStep::Done);
     }
 
     #[test]
     fn free_walk_fault_on_invalid_l3_pte() {
         let mut walk = KvmFreeWalk::start(KernelVa::new(KVM_POOL_BASE), 1, 0xAAAA_0000);
-        let _ = walk.step_l1(PageTableEntry::new_table(PhysAddr::new(0xBBBB_0000)).raw());
-        let _ = walk.step_l2(PageTableEntry::new_table(PhysAddr::new(0xCCCC_0000)).raw());
+        walk.step_l1(PageTableEntry::new_table(PhysAddr::new(0xBBBB_0000)).raw());
+        walk.step_l2(PageTableEntry::new_table(PhysAddr::new(0xCCCC_0000)).raw());
         // L3 entry is invalid (zero) — accounting drift.
-        assert_eq!(walk.step_l3(0), KvmFreeStep::Fault);
+        walk.step_l3(0);
+        assert_eq!(walk.current_step(), KvmFreeStep::Fault);
     }
 
     #[test]
     fn free_walk_fault_on_missing_l1_l2_table() {
         let mut walk = KvmFreeWalk::start(KernelVa::new(KVM_POOL_BASE), 1, 0xAAAA_0000);
         // L1 entry is invalid — accounting drift.
-        assert_eq!(walk.step_l1(0), KvmFreeStep::Fault);
+        walk.step_l1(0);
+        assert_eq!(walk.current_step(), KvmFreeStep::Fault);
     }
 
     #[test]

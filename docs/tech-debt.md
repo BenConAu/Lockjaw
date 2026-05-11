@@ -165,6 +165,20 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ---
 
+## KVM free path: 64-page deferred-dealloc buffer
+
+**Where:** `src/mm/kvm.rs::free_kernel_pages_inner` (the `to_free: [PhysPage; 64]` buffer + the in-loop `dealloc_page` fallback when the buffer fills).
+
+**What:** Backing frames captured during `KvmFreeWalk` are queued in a fixed-size 64-entry stack array and drained AFTER the post-clear TLBI sequence. This guarantees no other caller can re-allocate a frame while its translation might still be cached in the TLB. If a free request exceeds 64 pages, the overflow path falls back to deallocating mid-walk — BEFORE the TLBI runs.
+
+**Why it's safe today:** Single-core kernel + GKL serializes all kernel paths; IRQs are masked through the create_process critical section. No concurrent caller can observe the freed-but-still-mapped frame. The largest current KVM allocation is `header_pages_for(MAX_PRACTICAL_PAGES_PER_SET=16384) = 33` pages, well under 64.
+
+**When it becomes a real bug:** (a) KVM is extended to back larger objects (>64 pages); (b) GKL breaks up for SMP and another CPU can observe the stale TLB entry → frame-aliasing memory corruption. Either makes the dead branch reachable.
+
+**Fix:** Defer all backing-frame deallocations through a mechanism that doesn't have a fixed-size stack buffer. Options: a per-CPU pending-free list maintained outside the walk; chaining the freed paddrs through the (now-cleared) L3 PTE slots themselves; or splitting large frees into ≤64-page batches each with their own TLBI sweep. Track this when KVM picks up its second user (handle tables, mapping scratch, etc.) or as part of the SMP work.
+
+---
+
 ## Audit: drop guards for resource cleanup
 
 **Where:** `src/syscall/handler.rs` (sys_create_thread), and any kernel path that allocates multiple resources and rolls back manually on failure.

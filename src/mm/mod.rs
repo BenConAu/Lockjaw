@@ -1,5 +1,6 @@
 pub mod addr;
 pub mod kernel_ptr;
+pub mod kvm;
 pub mod page_alloc;
 pub mod page_table;
 pub mod stack;
