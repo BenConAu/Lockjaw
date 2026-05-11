@@ -238,9 +238,21 @@ pub extern "C" fn kmain() -> ! {
     mm::stack::check_canary();
     kprintln!("Stack canary intact.");
 
-    // Initialize per-CPU data for the boot CPU (CPU 0)
+    // CPU 0's per-CPU init runs TWICE: once pre-pivot and once
+    // post-pivot. The PERCPU_DATA static is referenced via `&raw
+    // const`, which is PC-relative — the value stored in TPIDR_EL1
+    // is PA pre-pivot, L0[1] kernel-image VA post-pivot.
+    //
+    // Pre-pivot init: ensures TPIDR_EL1 is a valid PA so that any
+    // panic / exception during the SMP-boot or pivot window can
+    // dereference the per-CPU pointer through the BOOT_L0 identity
+    // map and produce useful crash diagnostics.
+    //
+    // Post-pivot re-init: refreshes TPIDR_EL1 to the L0[1] VA so
+    // that once the boot CPU's TTBR0 is later replaced with a user
+    // page table (which has no kernel identity), the per-CPU
+    // dereference still resolves through TTBR1.
     percpu::init_percpu(0);
-    kprintln!("CPU ", percpu::cpu_id(), " initialized (TPIDR_EL1)");
 
     // Boot secondary CPUs using method detected from DTB
     {
@@ -319,6 +331,14 @@ pub extern "C" fn kmain() -> ! {
         _pivot_to_higher_half(arch::aarch64::mmu::kernel_image_pivot_shift());
     }
     kprintln!("Pivoted to higher-half (TTBR1).");
+
+    // Refresh CPU 0's TPIDR_EL1 to the L0[1] VA pointer. The pre-
+    // pivot init (above the SMP-boot block) wrote the PA pointer
+    // for crash robustness; now that we're post-pivot, re-init so
+    // the value survives the eventual user-TTBR0 install (which
+    // has no kernel identity, so PA dereferences would fail).
+    percpu::init_percpu(0);
+    kprintln!("CPU ", percpu::cpu_id(), " initialized (TPIDR_EL1)");
 
     // Install exception vector table
     kprintln!();
@@ -944,6 +964,11 @@ pub extern "C" fn secondary_main(cpu_id: u64) -> ! {
     // Enable MMU with the same page tables CPU 0 built
     unsafe { arch::aarch64::mmu::enable_mmu_secondary(); }
 
+    // Pre-pivot per-CPU init: writes a PA pointer to TPIDR_EL1 so
+    // any panic in the pre-pivot window dereferences through
+    // BOOT_L0's identity. Same pattern as CPU 0 (see kmain).
+    percpu::init_percpu(cpu_id as u32);
+
     // Pivot to higher-half — same as CPU 0's pivot in kmain. The shift
     // is the boot-discovered LINKER_BASE - load_PA stored in
     // KERNEL_PHYS_OFFSET; CPU 0 set it before secondaries booted.
@@ -952,7 +977,8 @@ pub extern "C" fn secondary_main(cpu_id: u64) -> ! {
         _pivot_to_higher_half(arch::aarch64::mmu::kernel_image_pivot_shift());
     }
 
-    // Initialize per-CPU data (TPIDR_EL1)
+    // Post-pivot re-init: refresh TPIDR_EL1 to the L0[1] VA so it
+    // survives this CPU's eventual user-TTBR0 install.
     percpu::init_percpu(cpu_id as u32);
 
     // Install exception vectors (per-CPU VBAR_EL1)

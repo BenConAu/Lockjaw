@@ -16,18 +16,6 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ---
 
-## Kernel identity map in user TTBR0
-
-**Where:** `src/arch/aarch64/vmem.rs` (create_address_space, L1[1] and L2[4])
-
-**What:** Every user address space includes the kernel's physical address range (RAM at L1[1], device MMIO at L2[4]) with AP_RW_EL1. Despite the higher-half kernel pivot via TTBR1, the kernel binary is still linked at physical addresses (`linker.ld` ORIGIN = `0x40200000`); the higher-half mapping is an additional view of the same physical memory, not a relocation. Some kernel exception-handling paths still reference TTBR0-range addresses.
-
-**Why bootstrap:** Relinking the kernel at higher-half VAs requires changing the linker script origin, adding a boot trampoline that runs at physical addresses before jumping to higher-half, and updating every function/static address. Significant change.
-
-**Fix:** Relink the kernel at higher-half VAs (`linker.ld` ORIGIN = `0xFFFF_0000_4008_0000`). Add a boot trampoline in `boot.rs` that identity-maps initially, then jumps to higher-half after TTBR1 is installed. After that, TTBR0 can be pure user pages with no kernel entries. This unblocks the "kernel threads leave stale user TTBR0" item below.
-
----
-
 ## Syscall handler code repetition
 
 **Where:** `src/syscall/handler.rs`
@@ -98,7 +86,7 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 **Attempted fix (shelved):** Always write TTBR0 on context switch — `EMPTY_USER_L0` for kernel threads, user's table for user threads — with a conditional TLB flush only on kernel→user transitions to avoid a ~20x boot slowdown from per-switch `tlbi vmalle1is`. Patch archived at `docs/archive/fix2-ttbr0-always-write.patch`. Set aside because it still leaves a residual TLB-hit correctness gap and because the directional fix (below) subsumes it.
 
-**Fix:** Remove the kernel's dependency on lower-half VAs entirely. Once the kernel is relinked at higher-half (see "Kernel identity map in user TTBR0") and no kernel code references lower-half addresses, TTBR0 becomes purely user-owned: the scheduler can leave it alone on kernel-thread switches without any correctness concern, and the TLB flush only needs to happen at user↔user transitions.
+**Fix:** Now eligible. The kernel relink (commits `17baed3` + `c70c417`) moved the kernel image to L0[1] and removed every lower-half kernel reference; the user-TTBR0 kernel identity has since been deleted. The scheduler can now zero TTBR0 on switch to a kernel thread without breaking anything. The remaining work is: write TTBR0 = `EMPTY_USER_L0` (or zero) on kernel-thread switches, with a conditional TLB flush only on user→kernel transitions to avoid the boot slowdown.
 
 ---
 

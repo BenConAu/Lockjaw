@@ -74,58 +74,24 @@ impl AddressSpaceBuilder {
         // L0[0] → L1
         (*l0_va).entries[0] = PageTableEntry::new_table(l1_page.start_addr());
 
-        // Kernel physical RAM in user TTBR0 (kernel-only, normal memory).
-        // Required: some kernel exception handling path accesses TTBR0-range
-        // addresses in the kernel physical range. Removing this causes
-        // immediate crash on EL0 entry — must investigate which code path.
-        //
-        // QEMU: kernel at 0x4020_0000 in L1[1], ram_base = 0x4000_0000.
-        // Pi 4B: kernel at 0x8_0000 in L1[0], ram_base = 0x0. L1[0] is
-        // already used for user pages (L1[0] → L2), so a 1GB block won't
-        // work. Pi 4B fix requires identifying the TTBR0 access and either
-        // eliminating it or mapping kernel pages via L2/L3 entries.
-        (*l1_va).entries[1] = PageTableEntry::new_block(
-            PhysAddr::new(super::platform::info().ram_base),
-            MAIR_NORMAL,
-            AP_RW_EL1,
-            SH_INNER,
-        );
-
-        // We need L2 for user pages in the first 1GB range
+        // L1[0] → L2 (user pages live in the first 1 GB of TTBR0).
         let l2_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
         // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
         let l2_va = (l2_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
         ptr::write_bytes(l2_va, 0, 1);
-
-        // L1[0] → L2
         (*l1_va).entries[0] = PageTableEntry::new_table(l2_page.start_addr());
 
-        // Device MMIO — kernel-only, device memory attributes.
-        // On QEMU virt: GIC at 0x0800_0000, UART at 0x0900_0000 (first 1GB).
-        // On Pi 4B: peripherals at 0xFE00_0000 (fourth 1GB).
-        let device_mmio_base = super::platform::info().device_mmio_base;
-        let device_l1_idx = (device_mmio_base >> 30) as usize; // which 1GB slot
-        if device_l1_idx == 0 {
-            // Device MMIO in the first 1GB — use the L2 table (shared with
-            // user pages). Index is within the 512-entry L2.
-            let device_l2_idx = ((device_mmio_base >> 21) & 0x1FF) as usize;
-            (*l2_va).entries[device_l2_idx] = PageTableEntry::new_block(
-                PhysAddr::new(device_mmio_base),
-                MAIR_DEVICE,
-                AP_RW_EL1,
-                SH_NON,
-            );
-        } else {
-            // Device MMIO in a higher 1GB slot — map as a 1GB L1 block.
-            // Aligns down to the 1GB boundary containing device_mmio_base.
-            let block_base = device_l1_idx as u64 * (1 << 30);
-            (*l1_va).entries[device_l1_idx] = PageTableEntry::new_block(
-                PhysAddr::new(block_base),
-                MAIR_DEVICE,
-                AP_RW_EL1,
-                SH_NON,
-            );
-        }
+        // No kernel identity in user TTBR0 anymore. Pre-relink, every
+        // user TTBR0 carried L1[1] (1 GB block of kernel RAM) + L2[4]
+        // (device MMIO) because some kernel-mode code path on EL0
+        // entry depended on it (see docs/relink-notes.md "Phase 0:
+        // what depended on the user-TTBR0 kernel identity"). After
+        // the relink (commit 1b), the kernel image lives in L0[1]
+        // (TTBR1) and no longer references lower-half PAs, so the
+        // identity is dead weight. Userspace device MMIO mappings
+        // still flow through the normal sys_map_pages path with
+        // MAP_FLAG_DEVICE — drivers that need a device get a
+        // per-process mapping, not the kernel's.
 
         builder.l2_va = l2_va;
         Ok(builder)

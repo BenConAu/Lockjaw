@@ -63,12 +63,12 @@ and any unclassified addition fails CI.
 | 226  | PA-prepivot    | `__guard_page_1` | same |
 | 228  | PA-prepivot    | `__guard_page_2` | same |
 | 230  | PA-prepivot    | `__guard_page_3` | same |
-| 254  | PA-prepivot    | `_secondary_start` (`fn` cast) | PSCI cpu_on entry — needs PA |
-| 591  | VA-image       | `__stack_bottom` | wrapped as `KernelImageVa::new(...)` → `create_idle_tcb` |
-| 617  | VA-image       | `__guard_page_0` (+4096) | wrapped as `KernelImageVa::new(...)` → secondary idle |
-| 619  | VA-image       | `__guard_page_1` (+4096) | same |
-| 621  | VA-image       | `__guard_page_2` (+4096) | same |
-| 623  | VA-image       | `__guard_page_3` (+4096) | same |
+| 266  | PA-prepivot    | `_secondary_start` (`fn` cast) | PSCI cpu_on entry — needs PA |
+| 611  | VA-image       | `__stack_bottom` | wrapped as `KernelImageVa::new(...)` → `create_idle_tcb` |
+| 637  | VA-image       | `__guard_page_0` (+4096) | wrapped as `KernelImageVa::new(...)` → secondary idle |
+| 639  | VA-image       | `__guard_page_1` (+4096) | same |
+| 641  | VA-image       | `__guard_page_2` (+4096) | same |
+| 643  | VA-image       | `__guard_page_3` (+4096) | same |
 
 ### `src/mm/stack.rs` — stack canary helpers
 
