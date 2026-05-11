@@ -8,20 +8,31 @@ use lockjaw_types::addr::KernelVa;
 // Struct definitions and layout assertions live in lockjaw-types
 // (host-testable). Re-export so all existing kernel import sites
 // (`use crate::sched::tcb::Tcb`) work unchanged.
-pub use lockjaw_types::thread::{Tcb, TcbCreateInfo, ThreadBootstrap};
+pub use lockjaw_types::thread::{KernelStackBase, Tcb, TcbCreateInfo, ThreadBootstrap};
 
 /// Initialize a TCB in a KVM-mapped page and set up its stack with a
 /// synthetic frame so it can be context-switched into.
 ///
 /// # Safety
-/// `base_kva` must be a KVM-allocated page. `info.stack_kva` must
-/// be a separate KVM-allocated page for the thread's stack.
+/// `base_kva` must be a KVM-allocated page. `info.stack` must be a
+/// `KernelStackBase::Pool(KernelVa)` for dynamically-allocated stacks
+/// (the only kind that goes through this constructor; idle/boot
+/// threads use `create_idle_tcb` with `KernelStackBase::Image`).
 pub unsafe fn create_tcb(
     info: &TcbCreateInfo,
     base_kva: KernelVa,
 ) -> Result<(), CreateError> {
+    let stack_kva = match info.stack {
+        KernelStackBase::Pool(kva) => kva,
+        KernelStackBase::Image(_) => {
+            // create_tcb requires a Pool stack — Image stacks belong
+            // to idle/boot threads which use create_idle_tcb.
+            return Err(CreateError::InvalidParameter);
+        }
+    };
+
     let mut tcb_km = KernelMut::<Tcb>::from_kva(base_kva);
-    let mut stack_km = KernelMut::<u64>::from_kva(info.stack_kva);
+    let mut stack_km = KernelMut::<u64>::from_kva(stack_kva);
     // SAFETY: KernelMut pointer is the kernel VA of the stack page
     let stack_va = stack_km.as_mut_ptr() as usize as u64;
     let stack_top = stack_va + PAGE_SIZE;
@@ -55,7 +66,7 @@ pub unsafe fn create_tcb(
     let p = tcb_km.as_mut_ptr();
     Tcb::init_in_place(p, info.entry);
     (*p).saved_sp = boot.saved_sp;
-    (*p).stack_base = stack_va;
+    (*p).stack_base = info.stack;
     (*p).process_kva = info.process_kva.as_u64();
     (*p).user_entry_point = info.user_entry_point;
     (*p).user_stack_top = info.user_stack_top;

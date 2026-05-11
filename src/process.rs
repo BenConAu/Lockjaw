@@ -492,7 +492,7 @@ fn provision_resources(
         create_tcb(
             &TcbCreateInfo {
                 entry: process_entry,
-                stack_kva: tcb_stack_guard.kva(),
+                stack: lockjaw_types::thread::KernelStackBase::Pool(tcb_stack_guard.kva()),
                 process_kva: proc_kva,
                 user_entry_point: entry_point,
                 user_stack_top: stack_va + (stack_ps.count() as u64) * PAGE_SIZE,

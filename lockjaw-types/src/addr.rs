@@ -139,6 +139,75 @@ impl fmt::LowerHex for KernelVa {
 }
 
 // ---------------------------------------------------------------------------
+// KernelImageVa
+// ---------------------------------------------------------------------------
+
+/// A virtual address derived from a kernel-image linker symbol.
+/// Distinct from `KernelVa` (KVM allocator pool) and `PhysAddr`
+/// (physical memory) because the kernel image's address regime is
+/// independent of both: linker symbols resolve to a fixed
+/// higher-half VA chosen at link time, not to a paddr-shifted view
+/// of the linear map and not to a runtime-allocated KVM pool slot.
+///
+/// The relink work (see `docs/relink-notes.md`,
+/// `~/.claude/plans/nifty-rolling-naur.md`) moves the kernel image
+/// into a dedicated L0[1] region; until that lands, the runtime
+/// values still happen to coincide with `paddr + KERNEL_VA_OFFSET`
+/// via the linear map. The newtype's *meaning* is "an address
+/// derived from a kernel image linker symbol" regardless of where
+/// in the higher half that symbol actually resolves at any given
+/// boot stage. The PA-recovery helper
+/// (`mmu::kernel_image_kva_to_pa`) is what hides the regime
+/// difference at a single point.
+///
+/// The separation is enforced at compile time. The following
+/// snippets must not compile:
+///
+/// ```compile_fail
+/// use lockjaw_types::addr::{KernelImageVa, PhysAddr};
+/// let iva = KernelImageVa::new(0xFFFF_0080_0000_0000);
+/// let _: PhysAddr = iva; // PhysAddr ≠ KernelImageVa
+/// ```
+///
+/// ```compile_fail
+/// use lockjaw_types::addr::{KernelImageVa, KernelVa};
+/// let iva = KernelImageVa::new(0xFFFF_0080_0000_0000);
+/// let _: KernelVa = iva; // KernelVa ≠ KernelImageVa
+/// ```
+///
+/// ```compile_fail
+/// use lockjaw_types::addr::{KernelImageVa, KernelVa};
+/// let iva = KernelImageVa::new(0xFFFF_0080_0000_0000);
+/// let kva = KernelVa::new(0xFFFF_8000_0000_0000);
+/// let _ = iva == kva; // not comparable
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct KernelImageVa(u64);
+
+impl KernelImageVa {
+    pub const fn new(va: u64) -> Self {
+        Self(va)
+    }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Debug for KernelImageVa {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "KernelImageVa({:#x})", self.0)
+    }
+}
+
+impl fmt::LowerHex for KernelImageVa {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -902,7 +902,7 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
         if crate::sched::tcb::create_tcb(
             &crate::sched::tcb::TcbCreateInfo {
                 entry: crate::process::process_entry,
-                stack_kva,
+                stack: lockjaw_types::thread::KernelStackBase::Pool(stack_kva),
                 process_kva,
                 user_entry_point: entry_point,
                 user_stack_top: stack_top,

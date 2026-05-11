@@ -13,8 +13,45 @@
 /// These structs live in lockjaw-types so layout invariants are
 /// host-testable. The kernel accesses them via KernelRef/KernelMut.
 
+use crate::addr::{KernelImageVa, KernelVa};
 use crate::object::ObjectHeader;
 use crate::wait::MAX_WAIT_OBJECTS;
+
+// ---------------------------------------------------------------------------
+// KernelStackBase — typed regime for the kernel stack page
+// ---------------------------------------------------------------------------
+
+/// The kernel-side base address of a thread's kernel stack page,
+/// tagged with which VA regime owns the backing.
+///
+/// The two regimes have different lifecycles:
+/// - `Image`: the boot stack reserved by the linker (`__stack_bottom_N`
+///   etc.). Lives for the kernel's lifetime. Idle / boot threads use
+///   this — the page is part of the kernel image and is never freed.
+/// - `Pool`: a 4 KB page allocated from the KVM pool by the kernel
+///   stack allocator. Freed via `kvm::free_kernel_pages` when the
+///   thread exits.
+///
+/// `finish_exit` matches on the variant so the wrong free path
+/// is unrepresentable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum KernelStackBase {
+    Image(KernelImageVa),
+    Pool(KernelVa),
+}
+
+impl KernelStackBase {
+    /// The raw stack-base address as a u64. Used by the canary check
+    /// and crash diagnostics, both of which only need to dereference
+    /// the address — they do not care about the regime.
+    pub fn as_u64(self) -> u64 {
+        match self {
+            KernelStackBase::Image(va) => va.as_u64(),
+            KernelStackBase::Pool(va) => va.as_u64(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SavedContext — callee-saved register frame
@@ -100,7 +137,11 @@ pub struct Tcb {
     pub header: ObjectHeader,
     pub saved_sp: u64,
     pub entry: fn() -> !,
-    pub stack_base: u64,
+    /// Kernel stack base, regime-tagged. `Image` = boot stack from
+    /// the linker (idle threads); `Pool` = KVM-allocated dynamic
+    /// stack (everything else). `finish_exit` matches on this so
+    /// the wrong free path is unrepresentable.
+    pub stack_base: KernelStackBase,
     /// KVA of the owning ProcessObject. Every thread belongs to a
     /// process. The process owns the address space (TTBR0) and handle
     /// table. Access via process_ops narrow accessors.
@@ -193,11 +234,10 @@ impl Tcb {
 /// create_tcb() writes these values into a donated page.
 pub struct TcbCreateInfo {
     pub entry: fn() -> !,
-    /// KVA of this thread's kernel stack page. Kernel stacks live in
-    /// the KVM pool — see kernel-vmem-roadmap.md. The asm context
-    /// switch loads this VA into SP_EL1; same dereference semantics
-    /// as the prior linear-map VA, different range.
-    pub stack_kva: crate::addr::KernelVa,
+    /// Kernel stack base, regime-tagged. `create_tcb` writes this
+    /// straight into `Tcb.stack_base`; `finish_exit` later matches
+    /// on the variant to choose the correct free path.
+    pub stack: KernelStackBase,
     /// KVA of the owning ProcessObject — kernel objects live in the
     /// KVM pool. See kernel-vmem-roadmap.md.
     pub process_kva: crate::addr::KernelVa,

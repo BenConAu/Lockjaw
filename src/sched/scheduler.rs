@@ -521,10 +521,7 @@ fn finish_exit() {
 
     // Step 1: Read everything we need from the exiting TCB
     let tcb = unsafe { KernelRef::<Tcb>::from_kva(pending.tcb_kva) };
-    // Invariant (post-Phase-6b): stack_base is the KVA of the kernel
-    // stack page in the KVM pool. set_by create_tcb from
-    // TcbCreateInfo.stack_kva.
-    let stack_kva = lockjaw_types::addr::KernelVa::new(tcb.get().stack_base);
+    let stack_base = tcb.get().stack_base;
     let process_kva = lockjaw_types::addr::KernelVa::new(tcb.get().process_kva);
 
     // Step 2: Remove from scheduler array + model
@@ -534,13 +531,22 @@ fn finish_exit() {
         (*SCHEDULER.threads_ptr())[pending.thread_idx] = None;
     }
 
-    // Step 3: Free per-thread resources (kernel stack, TCB) — both
-    // live in the KVM pool. Tear down each KVA range, returning the
-    // backing frame to page_alloc and the VA to the KVM free list.
-    // SAFETY: stack_kva and tcb_kva each came from a prior
-    // kvm::alloc_kernel_pages(1) at thread create time; finish_exit
-    // holds the GKL and no live references into either page exist by
-    // this point.
+    // Step 3: Free per-thread resources (kernel stack, TCB).
+    // Stack regime determines the free path:
+    // - Pool: KVM-allocated dynamic stack — free via kvm.
+    // - Image: linker-reserved boot stack — never freed (idle threads
+    //   are immortal). Reaching this branch means an idle thread
+    //   somehow exited; that's an invariant violation.
+    // SAFETY: stack and tcb pages came from prior allocations at
+    // thread create time; finish_exit holds the GKL and no live
+    // references into either page exist by this point.
+    use lockjaw_types::thread::KernelStackBase;
+    let stack_kva = match stack_base {
+        KernelStackBase::Pool(kva) => kva,
+        KernelStackBase::Image(_) => {
+            panic!("finish_exit: idle/boot thread exited (Image-region stack)");
+        }
+    };
     unsafe {
         crate::mm::kvm::free_kernel_pages(
             crate::mm::kvm::OwnedKvmRange { kva: stack_kva, pages: 1 }
@@ -745,9 +751,12 @@ unsafe fn schedule(reason: SchedReason) {
 
 /// Check the stack canary for a thread.
 fn check_thread_canary(tcb: &Tcb) {
-    // SAFETY: kernel stack address — Tcb guarantees stack_base points
-    // at the base of a kernel-owned page whose first u64 is the canary.
-    let value = unsafe { ptr::read_volatile(tcb.stack_base as *const u64) };
+    // Tcb guarantees stack_base points at the base of a kernel-owned
+    // page whose first u64 is the canary. The regime (Image vs Pool)
+    // doesn't affect the dereference; both variants wrap a valid VA.
+    // SAFETY: stack_base points at a valid kernel-owned stack page.
+    let canary_ptr = tcb.stack_base.as_u64() as *const u64;
+    let value = unsafe { ptr::read_volatile(canary_ptr) };
     if value != lockjaw_types::constants::STACK_CANARY {
         use crate::print::{KPrint, Addr};
         let uart = crate::arch::aarch64::uart::Uart::new();

@@ -568,14 +568,14 @@ pub extern "C" fn kmain() -> ! {
         cap::process_obj::process_inc_thread_count(kernel_proc_kva);
         let stack_a_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("stack a kvm alloc")).kva;
         let tcb_a_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("tcb a kvm alloc")).kva;
-        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_kva: stack_a_kva, process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_kva)
+        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack: lockjaw_types::thread::KernelStackBase::Pool(stack_a_kva), process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_kva)
             .unwrap_or_else(|_| panic!("create tcb a"));
 
         // Thread B (receiver) — kernel thread in the kernel process
         cap::process_obj::process_inc_thread_count(kernel_proc_kva);
         let stack_b_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("stack b kvm alloc")).kva;
         let tcb_b_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("tcb b kvm alloc")).kva;
-        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_kva: stack_b_kva, process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_kva)
+        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack: lockjaw_types::thread::KernelStackBase::Pool(stack_b_kva), process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_kva)
             .unwrap_or_else(|_| panic!("create tcb b"));
 
         // Register idle/init thread (index 0 = this boot thread).
@@ -583,7 +583,9 @@ pub extern "C" fn kmain() -> ! {
         // gets its own user process (created later in the ELF loading path).
         // For now it belongs to the kernel process.
         // SAFETY: linker symbol — post-pivot, &__symbol gives higher-half VA directly
-        let idle_stack_base = &__stack_bottom as *const u8 as u64;
+        let idle_stack_base = lockjaw_types::addr::KernelImageVa::new(
+            &__stack_bottom as *const u8 as u64,
+        );
         cap::process_obj::process_inc_thread_count(kernel_proc_kva);
 
         let idle_tcb_page = create_idle_tcb(
@@ -604,15 +606,17 @@ pub extern "C" fn kmain() -> ! {
             // Post-pivot: &__symbol gives higher-half VA directly (PC-relative
             // from higher-half PC). No explicit + KERNEL_VA_OFFSET needed.
             // Indexed by MPIDR (= linear CPU index on single-cluster).
-            let stack_bottoms: [u64; 4] = [
+            // Each per-CPU stack bottom is in the kernel image
+            // (linker-reserved), so wrap as KernelImageVa.
+            let stack_bottoms: [lockjaw_types::addr::KernelImageVa; 4] = [
                 // SAFETY: linker symbol — per-CPU stack bottom for CPU 0
-                &__guard_page_0 as *const u8 as u64 + 4096,
+                lockjaw_types::addr::KernelImageVa::new(&__guard_page_0 as *const u8 as u64 + 4096),
                 // SAFETY: linker symbol — per-CPU stack bottom for CPU 1
-                &__guard_page_1 as *const u8 as u64 + 4096,
+                lockjaw_types::addr::KernelImageVa::new(&__guard_page_1 as *const u8 as u64 + 4096),
                 // SAFETY: linker symbol — per-CPU stack bottom for CPU 2
-                &__guard_page_2 as *const u8 as u64 + 4096,
+                lockjaw_types::addr::KernelImageVa::new(&__guard_page_2 as *const u8 as u64 + 4096),
                 // SAFETY: linker symbol — per-CPU stack bottom for CPU 3
-                &__guard_page_3 as *const u8 as u64 + 4096,
+                lockjaw_types::addr::KernelImageVa::new(&__guard_page_3 as *const u8 as u64 + 4096),
             ];
             let plat = arch::aarch64::platform::info();
             for i in 0..plat.cpu_count as usize {
@@ -884,8 +888,14 @@ fn ipc_receiver() -> ! {
 /// Unlike create_tcb(), this does NOT set up a SavedContext or canary —
 /// idle threads are the initial thread on each CPU and start running
 /// directly, not via context_switch.
+///
+/// Takes the stack base as `KernelImageVa` because boot stacks are
+/// reserved in the kernel image (linker symbols `__stack_bottom_*`),
+/// not allocated from the KVM pool. The regime distinction is
+/// preserved through Tcb.stack_base so finish_exit refuses to free
+/// an idle thread's stack.
 unsafe fn create_idle_tcb(
-    stack_base: u64,
+    stack_image_va: lockjaw_types::addr::KernelImageVa,
     process_kva: lockjaw_types::addr::KernelVa,
     name: [u8; 16],
 ) -> lockjaw_types::addr::KernelVa {
@@ -901,7 +911,7 @@ unsafe fn create_idle_tcb(
     // in place — no by-value Tcb on the kernel stack.
     let p = tcb_km.as_mut_ptr();
     sched::tcb::Tcb::init_in_place(p, idle_thread);
-    (*p).stack_base = stack_base;
+    (*p).stack_base = lockjaw_types::thread::KernelStackBase::Image(stack_image_va);
     (*p).process_kva = process_kva.as_u64();
     (*p).name = name;
     tcb_kva

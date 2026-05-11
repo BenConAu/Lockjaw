@@ -29,13 +29,15 @@ fn main() {
         Some("check-pointers") => check_pointers(),
         Some("check-vtables") => check_vtables(),
         Some("check-init-size") => check_init_size(),
+        Some("check-linker-symbols") => check_linker_symbols(),
         _ => {
             eprintln!("Usage: cargo xtask <command>");
             eprintln!("Commands:");
-            eprintln!("  check-stack      Verify stack depth budgets and no recursion");
-            eprintln!("  check-pointers   Verify all pointer casts have SAFETY comments");
-            eprintln!("  check-vtables    Scan data sections for absolute code pointers");
-            eprintln!("  check-init-size  Verify init ELF fits in kernel mapping buffer");
+            eprintln!("  check-stack            Verify stack depth budgets and no recursion");
+            eprintln!("  check-pointers         Verify all pointer casts have SAFETY comments");
+            eprintln!("  check-vtables          Scan data sections for absolute code pointers");
+            eprintln!("  check-init-size        Verify init ELF fits in kernel mapping buffer");
+            eprintln!("  check-linker-symbols   Enforce docs/linker-symbol-audit.md allowlist");
             process::exit(1);
         }
     }
@@ -1384,6 +1386,147 @@ fn check_pointers() {
 /// Check if a line contains `as *const` or `as *mut` (pointer cast).
 fn has_pointer_cast(line: &str) -> bool {
     line.contains("as *const") || line.contains("as *mut")
+}
+
+// ---------------------------------------------------------------------------
+// check-linker-symbols
+// ---------------------------------------------------------------------------
+
+/// Enforce that every linker-symbol-to-integer site in `src/` is
+/// classified in `docs/linker-symbol-audit.md`. Catches the
+/// regression class where a future PR adds a `&__symbol as u64`
+/// (or a function-pointer cast for `_secondary_start`) that
+/// silently feeds a PA consumer and breaks after the kernel relink.
+///
+/// Sites are matched by (file, line) against entries parsed from
+/// the audit doc's `| Line | ... |` Markdown table rows. Any source
+/// site without a corresponding doc entry — or any doc entry whose
+/// line does not match a real source site — fails CI.
+fn check_linker_symbols() {
+    use std::path::Path;
+
+    println!("=== Linker-Symbol Audit Check ===");
+    println!("  Every &__symbol / &raw const __symbol / fn-ptr cast in src/");
+    println!("  must be classified in docs/linker-symbol-audit.md.");
+    println!();
+
+    let src_dir = Path::new("src");
+    if !src_dir.exists() {
+        eprintln!("ERROR: src/ directory not found (run from project root)");
+        process::exit(1);
+    }
+    let audit_path = Path::new("docs/linker-symbol-audit.md");
+    if !audit_path.exists() {
+        eprintln!("ERROR: docs/linker-symbol-audit.md not found");
+        process::exit(1);
+    }
+
+    // Collect source sites.
+    let mut source_sites: HashSet<(String, usize)> = HashSet::new();
+    visit_rs_files(src_dir, &mut |path| {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let rel_path = path.to_string_lossy().to_string();
+        for (i, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("*") {
+                continue;
+            }
+            if line_has_linker_symbol_site(line) {
+                source_sites.insert((rel_path.clone(), i + 1));
+            }
+        }
+    });
+
+    // Parse audit doc. Entries are "| <line> | <classification> |
+    // ..." where the file is named in a "### `path`" heading
+    // immediately above the table.
+    let audit = std::fs::read_to_string(audit_path).expect("read audit doc");
+    let mut audited_sites: HashSet<(String, usize)> = HashSet::new();
+    let mut current_file: Option<String> = None;
+    for line in audit.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("### ") {
+            // Heading: extract the path between backticks.
+            if let Some(start) = rest.find('`') {
+                if let Some(end) = rest[start + 1..].find('`') {
+                    current_file = Some(rest[start + 1..start + 1 + end].to_string());
+                    continue;
+                }
+            }
+        }
+        if let (Some(file), Some(rest)) = (current_file.as_ref(), trimmed.strip_prefix("|")) {
+            // Markdown table row: |line|class|...|
+            let cells: Vec<&str> = rest.split('|').map(str::trim).collect();
+            if let Some(line_str) = cells.first() {
+                if let Ok(n) = line_str.parse::<usize>() {
+                    audited_sites.insert((file.clone(), n));
+                }
+            }
+        }
+    }
+
+    println!("  source sites found: {}", source_sites.len());
+    println!("  audited sites listed: {}", audited_sites.len());
+    println!();
+
+    let mut missing: Vec<&(String, usize)> = source_sites.difference(&audited_sites).collect();
+    let mut stale: Vec<&(String, usize)> = audited_sites.difference(&source_sites).collect();
+    missing.sort();
+    stale.sort();
+
+    if missing.is_empty() && stale.is_empty() {
+        println!("=== Linker-symbol audit check PASSED ===");
+        return;
+    }
+
+    eprintln!("=== Linker-symbol audit check FAILED ===");
+    if !missing.is_empty() {
+        eprintln!();
+        eprintln!("Source sites missing from docs/linker-symbol-audit.md:");
+        for (f, l) in &missing {
+            eprintln!("  {}:{}", f, l);
+        }
+    }
+    if !stale.is_empty() {
+        eprintln!();
+        eprintln!("Audit entries with no matching source site:");
+        for (f, l) in &stale {
+            eprintln!("  {}:{}", f, l);
+        }
+    }
+    eprintln!();
+    eprintln!("Add a row in the right table of docs/linker-symbol-audit.md");
+    eprintln!("for any new linker-symbol-to-integer site, classified as");
+    eprintln!("VA-image / PA / PA-prepivot-static / DISPLAY.");
+    process::exit(1);
+}
+
+/// True if a line takes the address of something that resolves to a
+/// linker-defined kernel-image symbol — `&__sym`, `&raw const __sym`,
+/// `&raw const STATIC` (kernel boot statics), or a function-pointer
+/// cast that yields a symbol address (`fn as *const () as u64`).
+///
+/// Conservative: any false positive is harmless (an extra audit row);
+/// any false negative is the dangerous case we're guarding against.
+fn line_has_linker_symbol_site(line: &str) -> bool {
+    // Linker symbols: &__name or &raw const __name
+    if line.contains("&__") || line.contains("&raw const __") {
+        return true;
+    }
+    // Kernel boot statics in mmu.rs: &raw const BOOT_/KERNEL_
+    if line.contains("&raw const BOOT_") || line.contains("&raw const KERNEL_") {
+        return true;
+    }
+    // Function-pointer cast to integer (PSCI _secondary_start, etc.).
+    // Matches `<thing> as *const () as u64`. Narrow enough to skip
+    // the common `as *mut T` / `as *const T` casts caught elsewhere.
+    if line.contains(" as *const () as u64") {
+        return true;
+    }
+    false
 }
 
 /// Recursively visit all .rs files under a directory.
