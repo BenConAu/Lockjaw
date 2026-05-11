@@ -1,0 +1,1033 @@
+//! Pure scaffolding for the kernel virtual-address (KVM) allocator.
+//!
+//! The KVM allocator hands out N-page virtually-contiguous ranges from a
+//! dedicated higher-half pool, backed by N independently-allocated
+//! physical frames. The kernel uses it for objects that need virtual
+//! contiguity but not physical contiguity (initially: PageSet headers
+//! whose `BackedHeader` accessors do `base.add(byte_offset)` arithmetic
+//! across page boundaries).
+//!
+//! This module owns the *pure* pieces:
+//! - the `KvmFreeList` state machine (region tracking, alloc/free,
+//!   coalesce);
+//! - `build_kernel_page` for the EL1-only / UXN / PXN PTE attributes
+//!   used by KVM mappings;
+//! - the `KvmMapWalk` and `KvmFreeWalk` state machines that decide,
+//!   step-by-step, what the kernel must read or write next when
+//!   stitching pages into the TTBR1 tree.
+//!
+//! The kernel side (`src/mm/kvm.rs`) holds the singleton, performs
+//! the raw PTE reads/writes and TLB invalidations, and calls
+//! `page_alloc::alloc_page` for backing frames and page-table pages.
+
+use crate::addr::{KernelVa, PhysAddr, PAGE_SIZE};
+use crate::page_table::{
+    PageTableEntry, AP_RW_EL1, MAIR_NORMAL, SH_INNER,
+};
+
+// ---------------------------------------------------------------------------
+// Pool layout
+// ---------------------------------------------------------------------------
+
+/// Base of the KVM pool: midway up the canonical AArch64 high half,
+/// well above the linear map's `0xFFFF_0000_..` window. Aligned on a
+/// 256 TiB boundary so the KVM pool occupies its own L0 entry and
+/// never shares an L0 slot with the linear map.
+pub const KVM_POOL_BASE: u64 = 0xFFFF_8000_0000_0000;
+
+/// Size of the KVM pool: one L1 entry (512 GiB) of address space.
+/// The pool is a virtual reservation; physical memory is only
+/// consumed as ranges get filled in.
+pub const KVM_POOL_SIZE: u64 = 1u64 << 39;
+
+pub const KVM_POOL_END: u64 = KVM_POOL_BASE + KVM_POOL_SIZE;
+
+/// Index of the KVM pool's L0 entry. With a 4 KB granule the L0
+/// index is bits 47:39 of the VA. For `KVM_POOL_BASE`:
+/// `(0xFFFF_8000_0000_0000 >> 39) & 0x1FF == 0x100 == 256`.
+pub const KVM_L0_INDEX: usize = 256;
+
+/// Decompose a KVA in the KVM pool into (L0, L1, L2, L3) page-table
+/// indices. Reuses `vmem::page_table_indices` so all 4-level
+/// page-table arithmetic in this kernel goes through one helper.
+pub const fn kvm_pool_indices(kva: KernelVa) -> (usize, usize, usize, usize) {
+    crate::vmem::page_table_indices(kva.as_u64())
+}
+
+/// Build the PTE for a kernel page mapping in the KVM pool.
+///
+/// Attributes: `MAIR_NORMAL | AP_RW_EL1 | SH_INNER | UXN | PXN`.
+/// EL1-only access (no AP_RW_ALL) so a stray user TTBR0 lookup
+/// cannot reach a kernel header. UXN+PXN because no one executes
+/// from KVM-backed objects.
+pub fn build_kernel_page(phys: PhysAddr) -> PageTableEntry {
+    PageTableEntry::new_page(phys, MAIR_NORMAL, AP_RW_EL1, SH_INNER)
+        .with_uxn()
+        .with_pxn()
+}
+
+// ---------------------------------------------------------------------------
+// KvmFreeList — pure free-region tracker
+// ---------------------------------------------------------------------------
+
+/// Maximum number of distinct free regions tracked at once. Empirically
+/// this stays small: PageSet header allocation is the only caller
+/// today, lifetimes correlate with process lifetimes, and free
+/// coalesces neighboring regions immediately.
+pub const KVM_MAX_FREE_REGIONS: usize = 64;
+
+/// One free region in the KVM pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvmFreeRegion {
+    pub start: KernelVa,
+    pub pages: usize,
+}
+
+/// Errors from the free-list operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvmFreeListError {
+    /// `try_alloc` could not find a contiguous run of the requested
+    /// size in any region.
+    OutOfVirtualMemory,
+    /// `free` would split or insert a region but the fixed-size
+    /// region table is full. Should not happen under normal
+    /// workloads; surfaces as a kernel bug if it does.
+    RegionTableFull,
+    /// `free` was given a range that overlaps the existing free
+    /// list (caller bug — double-free or accounting drift).
+    DoubleFree,
+    /// `free` was given a range outside the pool.
+    OutOfPool,
+}
+
+/// Sorted free-region list. First-fit on alloc, two-sided coalesce
+/// on free. Storage is a fixed-size array; the kernel side wraps
+/// this in an `UnsafeCell` singleton serialised by the GKL.
+#[derive(Debug)]
+pub struct KvmFreeList {
+    regions: [KvmFreeRegion; KVM_MAX_FREE_REGIONS],
+    count: usize,
+}
+
+impl KvmFreeList {
+    /// New free list covering the entire pool.
+    pub const fn new() -> Self {
+        let mut regions = [KvmFreeRegion {
+            start: KernelVa::new(KVM_POOL_BASE),
+            pages: 0,
+        }; KVM_MAX_FREE_REGIONS];
+        regions[0] = KvmFreeRegion {
+            start: KernelVa::new(KVM_POOL_BASE),
+            pages: (KVM_POOL_SIZE / PAGE_SIZE) as usize,
+        };
+        Self { regions, count: 1 }
+    }
+
+    /// Number of free regions currently tracked. For tests and diagnostics.
+    pub fn region_count(&self) -> usize {
+        self.count
+    }
+
+    /// Total free pages across all regions. For diagnostics.
+    pub fn free_pages(&self) -> usize {
+        let mut total = 0usize;
+        for i in 0..self.count {
+            total += self.regions[i].pages;
+        }
+        total
+    }
+
+    /// Snapshot a region (for tests and diagnostics).
+    pub fn region(&self, idx: usize) -> Option<KvmFreeRegion> {
+        if idx < self.count { Some(self.regions[idx]) } else { None }
+    }
+
+    /// Allocate `pages` virtually-contiguous pages. Returns the base
+    /// `KernelVa` of the allocation, or `OutOfVirtualMemory` if no
+    /// region is large enough. First-fit: walks regions in address
+    /// order, picks the first one that fits.
+    pub fn try_alloc(&mut self, pages: usize) -> Result<KernelVa, KvmFreeListError> {
+        if pages == 0 {
+            // Zero-page allocation is meaningless; reject explicitly.
+            return Err(KvmFreeListError::OutOfVirtualMemory);
+        }
+        for i in 0..self.count {
+            if self.regions[i].pages >= pages {
+                let base = self.regions[i].start;
+                let remaining = self.regions[i].pages - pages;
+                if remaining == 0 {
+                    // Region consumed entirely — remove it.
+                    for j in i..self.count - 1 {
+                        self.regions[j] = self.regions[j + 1];
+                    }
+                    self.count -= 1;
+                } else {
+                    // Region shrinks at the front.
+                    self.regions[i] = KvmFreeRegion {
+                        start: base.add_pages(pages),
+                        pages: remaining,
+                    };
+                }
+                return Ok(base);
+            }
+        }
+        Err(KvmFreeListError::OutOfVirtualMemory)
+    }
+
+    /// Return a range to the pool. Coalesces with neighbouring free
+    /// regions (two-sided merge) so the free list stays compact.
+    pub fn free(&mut self, start: KernelVa, pages: usize) -> Result<(), KvmFreeListError> {
+        if pages == 0 {
+            return Ok(());
+        }
+        let start_va = start.as_u64();
+        let end_va = start_va + (pages as u64) * PAGE_SIZE;
+        if start_va < KVM_POOL_BASE || end_va > KVM_POOL_END {
+            return Err(KvmFreeListError::OutOfPool);
+        }
+
+        // Find insertion point (first region with start > start_va).
+        let mut insert_at = self.count;
+        for i in 0..self.count {
+            if self.regions[i].start.as_u64() > start_va {
+                insert_at = i;
+                break;
+            }
+        }
+
+        // Overlap check against neighbours.
+        if insert_at > 0 {
+            let prev = self.regions[insert_at - 1];
+            let prev_end = prev.start.as_u64() + (prev.pages as u64) * PAGE_SIZE;
+            if prev_end > start_va {
+                return Err(KvmFreeListError::DoubleFree);
+            }
+        }
+        if insert_at < self.count {
+            let next = self.regions[insert_at];
+            if end_va > next.start.as_u64() {
+                return Err(KvmFreeListError::DoubleFree);
+            }
+        }
+
+        // Try to coalesce with previous (touching at the front).
+        let merged_with_prev = if insert_at > 0 {
+            let prev = self.regions[insert_at - 1];
+            let prev_end = prev.start.as_u64() + (prev.pages as u64) * PAGE_SIZE;
+            if prev_end == start_va {
+                self.regions[insert_at - 1] = KvmFreeRegion {
+                    start: prev.start,
+                    pages: prev.pages + pages,
+                };
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Try to coalesce with next (touching at the back).
+        if merged_with_prev {
+            // We expanded prev. Check if it now touches next.
+            let prev_idx = insert_at - 1;
+            let prev = self.regions[prev_idx];
+            let prev_end = prev.start.as_u64() + (prev.pages as u64) * PAGE_SIZE;
+            if insert_at < self.count
+                && self.regions[insert_at].start.as_u64() == prev_end
+            {
+                let next = self.regions[insert_at];
+                self.regions[prev_idx] = KvmFreeRegion {
+                    start: prev.start,
+                    pages: prev.pages + next.pages,
+                };
+                // Shift to remove next.
+                for j in insert_at..self.count - 1 {
+                    self.regions[j] = self.regions[j + 1];
+                }
+                self.count -= 1;
+            }
+            return Ok(());
+        }
+
+        // Try to coalesce with next only.
+        if insert_at < self.count
+            && self.regions[insert_at].start.as_u64() == end_va
+        {
+            let next = self.regions[insert_at];
+            self.regions[insert_at] = KvmFreeRegion {
+                start,
+                pages: pages + next.pages,
+            };
+            return Ok(());
+        }
+
+        // No coalesce — insert a new region.
+        if self.count >= KVM_MAX_FREE_REGIONS {
+            return Err(KvmFreeListError::RegionTableFull);
+        }
+        // Shift to make room at insert_at.
+        for j in (insert_at..self.count).rev() {
+            self.regions[j + 1] = self.regions[j];
+        }
+        self.regions[insert_at] = KvmFreeRegion { start, pages };
+        self.count += 1;
+        Ok(())
+    }
+}
+
+impl Default for KvmFreeList {
+    fn default() -> Self { Self::new() }
+}
+
+// ---------------------------------------------------------------------------
+// KvmMapWalk — pure step-by-step walker for installing a kernel mapping
+// ---------------------------------------------------------------------------
+
+/// What the kernel must do next while installing one page of a KVM
+/// mapping. The kernel performs the side effect (read PTE, allocate
+/// page-table page, write PTE) and feeds the result back to the
+/// walker for the next step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvmMapStep {
+    /// Read the L1 PTE at this physical address, hand the value back
+    /// via `step_l1`. The kernel obtains the L1 table paddr from
+    /// `KERNEL_L0[KVM_L0_INDEX]` (set up once at `kvm_init`).
+    ReadL1Pte { l1_pte_paddr: PhysAddr },
+    /// L2 table is missing here — allocate a fresh page-table page,
+    /// install it as a table descriptor at `parent_pte_paddr`, and
+    /// then call `step_l2_allocated` with the new L2's paddr.
+    AllocL2 { parent_pte_paddr: PhysAddr },
+    /// Read the L2 PTE at this physical address; feed via `step_l2`.
+    ReadL2Pte { l2_pte_paddr: PhysAddr },
+    /// L3 table is missing here — allocate a page-table page, install
+    /// it at `parent_pte_paddr`, and call `step_l3_allocated`.
+    AllocL3 { parent_pte_paddr: PhysAddr },
+    /// Read the target L3 PTE so the walker can verify the slot is
+    /// invalid before writing — symmetric with `KvmFreeWalk`'s L3
+    /// read. Without this check the allocator would trust the
+    /// freelist as the sole source of truth for "this VA is
+    /// unmapped"; a freelist/page-table drift would silently
+    /// overwrite a live mapping. The walker faults instead if the
+    /// L3 entry is valid.
+    ReadL3Pte { l3_pte_paddr: PhysAddr },
+    /// Walker has reached the L3 slot for the current page and needs
+    /// a backing frame. The kernel calls `page_alloc::alloc_page`
+    /// (or returns OOM) and feeds the result via `supply_backing`,
+    /// which advances to `WritePagePte`.
+    WantBacking,
+    /// Write the L3 PTE: the page entry the walker built (via
+    /// `build_kernel_page`) goes at `pte_paddr`. Then call
+    /// `step_pte_written` to advance to the next page in the range.
+    WritePagePte { pte_paddr: PhysAddr, entry: PageTableEntry },
+    /// All pages in the range have been mapped.
+    Done,
+    /// An invariant was violated. Possible causes: an L1/L2 entry
+    /// exists but is a block descriptor (not a table); the target
+    /// L3 slot is already valid (alloc would overwrite a live
+    /// mapping — freelist/page-table drift). Surfaces as a kernel
+    /// bug.
+    Fault,
+}
+
+/// State machine for installing a KVM mapping page by page. The
+/// kernel constructs one walker per `kvm_alloc` call, feeds in the
+/// L1 paddr and the per-page backing paddrs, and obeys the steps.
+pub struct KvmMapWalk {
+    base: KernelVa,
+    pages: usize,
+    page_idx: usize,
+    /// Per-page state.
+    state: PageState,
+    /// Cached table paddrs for the current page's walk.
+    l1_paddr: u64,
+    l2_paddr: u64,
+    l3_paddr: u64,
+    /// Backing paddr the kernel supplied for the current page; the
+    /// walker uses it to build the PTE.
+    pending_phys: Option<PhysAddr>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageState {
+    /// About to read L1 PTE for the current page.
+    NeedL1,
+    /// L1 has been read; about to read L2 PTE.
+    NeedL2,
+    /// L2 has been read; about to read the target L3 PTE to verify
+    /// the slot is invalid (must be unmapped before alloc writes
+    /// a new entry there).
+    NeedL3,
+    /// L3 PTE was confirmed invalid; walker is waiting for the
+    /// kernel to supply a backing frame.
+    NeedBacking,
+    /// Backing supplied; about to write the page entry.
+    NeedWritePte,
+    /// All pages have been mapped.
+    Done,
+}
+
+impl KvmMapWalk {
+    /// Begin walking a KVM mapping for `pages` pages starting at
+    /// `base`. The kernel passes in the L1 table paddr it read from
+    /// `KERNEL_L0[KVM_L0_INDEX]` once at init.
+    pub fn start(base: KernelVa, pages: usize, l1_paddr: u64) -> Self {
+        Self {
+            base,
+            pages,
+            page_idx: 0,
+            state: if pages == 0 { PageState::Done } else { PageState::NeedL1 },
+            l1_paddr,
+            l2_paddr: 0,
+            l3_paddr: 0,
+            pending_phys: None,
+        }
+    }
+
+    /// What the kernel should do for the current page.
+    pub fn current_step(&self) -> KvmMapStep {
+        if self.state == PageState::Done {
+            return KvmMapStep::Done;
+        }
+        let kva = self.base.add_pages(self.page_idx);
+        let (_l0, l1, l2, l3) = kvm_pool_indices(kva);
+        match self.state {
+            PageState::NeedL1 => KvmMapStep::ReadL1Pte {
+                l1_pte_paddr: PhysAddr::new(self.l1_paddr + (l1 as u64) * 8),
+            },
+            PageState::NeedL2 => KvmMapStep::ReadL2Pte {
+                l2_pte_paddr: PhysAddr::new(self.l2_paddr + (l2 as u64) * 8),
+            },
+            PageState::NeedL3 => KvmMapStep::ReadL3Pte {
+                l3_pte_paddr: PhysAddr::new(self.l3_paddr + (l3 as u64) * 8),
+            },
+            PageState::NeedBacking => KvmMapStep::WantBacking,
+            PageState::NeedWritePte => {
+                let phys = match self.pending_phys {
+                    Some(p) => p,
+                    // Logic error: NeedWritePte without backing is
+                    // a state-machine bug; surface as Fault.
+                    None => return KvmMapStep::Fault,
+                };
+                KvmMapStep::WritePagePte {
+                    pte_paddr: PhysAddr::new(self.l3_paddr + (l3 as u64) * 8),
+                    entry: build_kernel_page(phys),
+                }
+            }
+            PageState::Done => KvmMapStep::Done,
+        }
+    }
+
+    /// Feed the L1 PTE the kernel just read. If the entry is empty
+    /// (no L2 table yet), the next step will be `AllocL2`; otherwise
+    /// the walker advances to read the L2 PTE.
+    pub fn step_l1(&mut self, pte_raw: u64) -> KvmMapStep {
+        debug_assert_eq!(self.state, PageState::NeedL1);
+        let pte = PageTableEntry::from_raw(pte_raw);
+        if !pte.is_valid() {
+            // Need to allocate an L2 table.
+            let kva = self.base.add_pages(self.page_idx);
+            let (_l0, l1, _l2, _l3) = kvm_pool_indices(kva);
+            return KvmMapStep::AllocL2 {
+                parent_pte_paddr: PhysAddr::new(self.l1_paddr + (l1 as u64) * 8),
+            };
+        }
+        if !pte.is_table() {
+            return KvmMapStep::Fault;
+        }
+        self.l2_paddr = pte.output_addr().as_u64();
+        self.state = PageState::NeedL2;
+        self.current_step()
+    }
+
+    /// The kernel has allocated and installed a fresh L2 table at the
+    /// L1 slot. Tell the walker the new L2's paddr; it advances to
+    /// reading the L2 PTE (which the kernel just zeroed, so the
+    /// next read will return 0 and trigger an AllocL3).
+    pub fn step_l2_allocated(&mut self, l2_paddr: u64) -> KvmMapStep {
+        debug_assert_eq!(self.state, PageState::NeedL1);
+        self.l2_paddr = l2_paddr;
+        self.state = PageState::NeedL2;
+        self.current_step()
+    }
+
+    /// Feed the L2 PTE the kernel just read.
+    pub fn step_l2(&mut self, pte_raw: u64) -> KvmMapStep {
+        debug_assert_eq!(self.state, PageState::NeedL2);
+        let pte = PageTableEntry::from_raw(pte_raw);
+        if !pte.is_valid() {
+            let kva = self.base.add_pages(self.page_idx);
+            let (_l0, _l1, l2, _l3) = kvm_pool_indices(kva);
+            return KvmMapStep::AllocL3 {
+                parent_pte_paddr: PhysAddr::new(self.l2_paddr + (l2 as u64) * 8),
+            };
+        }
+        if !pte.is_table() {
+            return KvmMapStep::Fault;
+        }
+        self.l3_paddr = pte.output_addr().as_u64();
+        self.state = PageState::NeedL3;
+        self.current_step()
+    }
+
+    /// The kernel has allocated and installed a fresh L3 table at
+    /// the L2 slot. Tell the walker the new L3's paddr; walker still
+    /// reads the target L3 PTE for symmetry with the existing-table
+    /// path (the read will return 0 for a fresh-and-zeroed table,
+    /// matching the invariant).
+    pub fn step_l3_allocated(&mut self, l3_paddr: u64) -> KvmMapStep {
+        debug_assert_eq!(self.state, PageState::NeedL2);
+        self.l3_paddr = l3_paddr;
+        self.state = PageState::NeedL3;
+        self.current_step()
+    }
+
+    /// Feed the L3 PTE the kernel just read. The slot must be
+    /// invalid — alloc walks must not overwrite a live mapping. If
+    /// the slot is already valid the walker faults (freelist /
+    /// page-table drift; the kernel must not silently clobber the
+    /// existing entry).
+    pub fn step_l3(&mut self, pte_raw: u64) -> KvmMapStep {
+        debug_assert_eq!(self.state, PageState::NeedL3);
+        let pte = PageTableEntry::from_raw(pte_raw);
+        if pte.is_valid() {
+            return KvmMapStep::Fault;
+        }
+        self.state = PageState::NeedBacking;
+        self.current_step()
+    }
+
+    /// The kernel allocated a backing frame (or an OOM check
+    /// returned a frame). Walker advances to `WritePagePte`.
+    pub fn supply_backing(&mut self, phys: PhysAddr) -> KvmMapStep {
+        debug_assert_eq!(self.state, PageState::NeedBacking);
+        self.pending_phys = Some(phys);
+        self.state = PageState::NeedWritePte;
+        self.current_step()
+    }
+
+    /// The kernel has written the page PTE. Advance to the next
+    /// page in the range, or to `Done`.
+    pub fn step_pte_written(&mut self) -> KvmMapStep {
+        debug_assert_eq!(self.state, PageState::NeedWritePte);
+        self.pending_phys = None;
+        self.page_idx += 1;
+        if self.page_idx >= self.pages {
+            self.state = PageState::Done;
+            return KvmMapStep::Done;
+        }
+        // Decide whether to re-walk or reuse cached table paddrs:
+        // if the next page lives in the same L2 region (same L1, L2
+        // indices), the L2/L3 paddrs are still valid. If the next
+        // page crosses an L2 boundary (`l2` index changed), we need
+        // to read the L2 entry for the new index — but we can reuse
+        // the L1 paddr until `l1` changes.
+        let kva = self.base.add_pages(self.page_idx);
+        let prev_kva = self.base.add_pages(self.page_idx - 1);
+        let (_l0_p, l1_p, l2_p, _l3_p) = kvm_pool_indices(prev_kva);
+        let (_l0, l1, l2, _l3) = kvm_pool_indices(kva);
+        if l1 != l1_p {
+            self.state = PageState::NeedL1;
+        } else if l2 != l2_p {
+            self.state = PageState::NeedL2;
+        } else {
+            // Same L3 table — must still read the next L3 slot to
+            // verify it's invalid before writing. Symmetry with the
+            // first-page path: every PTE write is preceded by a
+            // "must be invalid" check.
+            self.state = PageState::NeedL3;
+        }
+        self.current_step()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KvmFreeWalk — pure step-by-step walker for tearing a kernel mapping down
+// ---------------------------------------------------------------------------
+
+/// What the kernel must do next while tearing down a KVM mapping.
+/// Symmetric with `KvmMapStep` but for the destructive direction:
+/// the walker decides which PTEs to read (to capture backing paddrs)
+/// and which to clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvmFreeStep {
+    /// Read the L1 PTE for the current page; feed back via `step_l1`.
+    ReadL1Pte { l1_pte_paddr: PhysAddr },
+    /// Read the L2 PTE; feed back via `step_l2`.
+    ReadL2Pte { l2_pte_paddr: PhysAddr },
+    /// Read the L3 PTE; feed back via `step_l3`. The walker extracts
+    /// the backing paddr from the value and yields it via the next
+    /// step.
+    ReadL3Pte { l3_pte_paddr: PhysAddr },
+    /// Clear the L3 PTE for the current page; the kernel zeroes it
+    /// and calls `step_pte_cleared`. The walker yields the backing
+    /// paddr it captured from the previous read so the kernel can
+    /// queue the frame for `dealloc_page` after the TLBI sequence.
+    ClearPte { pte_paddr: PhysAddr, backing: PhysAddr },
+    /// All pages in the range have been processed.
+    Done,
+    /// Invariant violation: a table entry on the path was missing
+    /// or non-table. Indicates accounting drift between the free
+    /// list and the actual page tables.
+    Fault,
+}
+
+pub struct KvmFreeWalk {
+    base: KernelVa,
+    pages: usize,
+    page_idx: usize,
+    state: FreeState,
+    l1_paddr: u64,
+    l2_paddr: u64,
+    l3_paddr: u64,
+    /// Backing paddr captured from the most-recently-read L3 PTE.
+    captured_backing: Option<PhysAddr>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreeState {
+    NeedL1,
+    NeedL2,
+    NeedL3,
+    NeedClear,
+    Done,
+}
+
+impl KvmFreeWalk {
+    pub fn start(base: KernelVa, pages: usize, l1_paddr: u64) -> Self {
+        Self {
+            base,
+            pages,
+            page_idx: 0,
+            state: if pages == 0 { FreeState::Done } else { FreeState::NeedL1 },
+            l1_paddr,
+            l2_paddr: 0,
+            l3_paddr: 0,
+            captured_backing: None,
+        }
+    }
+
+    pub fn current_step(&self) -> KvmFreeStep {
+        if self.state == FreeState::Done {
+            return KvmFreeStep::Done;
+        }
+        let kva = self.base.add_pages(self.page_idx);
+        let (_l0, l1, l2, l3) = kvm_pool_indices(kva);
+        match self.state {
+            FreeState::NeedL1 => KvmFreeStep::ReadL1Pte {
+                l1_pte_paddr: PhysAddr::new(self.l1_paddr + (l1 as u64) * 8),
+            },
+            FreeState::NeedL2 => KvmFreeStep::ReadL2Pte {
+                l2_pte_paddr: PhysAddr::new(self.l2_paddr + (l2 as u64) * 8),
+            },
+            FreeState::NeedL3 => KvmFreeStep::ReadL3Pte {
+                l3_pte_paddr: PhysAddr::new(self.l3_paddr + (l3 as u64) * 8),
+            },
+            FreeState::NeedClear => {
+                let backing = match self.captured_backing {
+                    Some(p) => p,
+                    None => return KvmFreeStep::Fault,
+                };
+                KvmFreeStep::ClearPte {
+                    pte_paddr: PhysAddr::new(self.l3_paddr + (l3 as u64) * 8),
+                    backing,
+                }
+            }
+            FreeState::Done => KvmFreeStep::Done,
+        }
+    }
+
+    pub fn step_l1(&mut self, pte_raw: u64) -> KvmFreeStep {
+        debug_assert_eq!(self.state, FreeState::NeedL1);
+        let pte = PageTableEntry::from_raw(pte_raw);
+        if !pte.is_table() {
+            return KvmFreeStep::Fault;
+        }
+        self.l2_paddr = pte.output_addr().as_u64();
+        self.state = FreeState::NeedL2;
+        self.current_step()
+    }
+
+    pub fn step_l2(&mut self, pte_raw: u64) -> KvmFreeStep {
+        debug_assert_eq!(self.state, FreeState::NeedL2);
+        let pte = PageTableEntry::from_raw(pte_raw);
+        if !pte.is_table() {
+            return KvmFreeStep::Fault;
+        }
+        self.l3_paddr = pte.output_addr().as_u64();
+        self.state = FreeState::NeedL3;
+        self.current_step()
+    }
+
+    pub fn step_l3(&mut self, pte_raw: u64) -> KvmFreeStep {
+        debug_assert_eq!(self.state, FreeState::NeedL3);
+        let pte = PageTableEntry::from_raw(pte_raw);
+        if !pte.is_valid() {
+            return KvmFreeStep::Fault;
+        }
+        self.captured_backing = Some(pte.output_addr());
+        self.state = FreeState::NeedClear;
+        self.current_step()
+    }
+
+    pub fn step_pte_cleared(&mut self) -> KvmFreeStep {
+        debug_assert_eq!(self.state, FreeState::NeedClear);
+        self.captured_backing = None;
+        self.page_idx += 1;
+        if self.page_idx >= self.pages {
+            self.state = FreeState::Done;
+            return KvmFreeStep::Done;
+        }
+        let kva = self.base.add_pages(self.page_idx);
+        let prev_kva = self.base.add_pages(self.page_idx - 1);
+        let (_l0_p, l1_p, l2_p, _l3_p) = kvm_pool_indices(prev_kva);
+        let (_l0, l1, l2, _l3) = kvm_pool_indices(kva);
+        if l1 != l1_p {
+            self.state = FreeState::NeedL1;
+        } else if l2 != l2_p {
+            self.state = FreeState::NeedL2;
+        } else {
+            // Same L3 table — go straight to reading the next L3 PTE.
+            self.state = FreeState::NeedL3;
+        }
+        self.current_step()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // KvmFreeList
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn free_list_initial_state_covers_pool() {
+        let fl = KvmFreeList::new();
+        assert_eq!(fl.region_count(), 1);
+        let r = fl.region(0).unwrap();
+        assert_eq!(r.start.as_u64(), KVM_POOL_BASE);
+        assert_eq!(r.pages, (KVM_POOL_SIZE / PAGE_SIZE) as usize);
+    }
+
+    #[test]
+    fn free_list_alloc_consumes_from_front() {
+        let mut fl = KvmFreeList::new();
+        let kva = fl.try_alloc(33).unwrap();
+        assert_eq!(kva.as_u64(), KVM_POOL_BASE);
+        let r = fl.region(0).unwrap();
+        assert_eq!(r.start.as_u64(), KVM_POOL_BASE + 33 * PAGE_SIZE);
+        assert_eq!(r.pages, (KVM_POOL_SIZE / PAGE_SIZE) as usize - 33);
+    }
+
+    #[test]
+    fn free_list_zero_pages_is_oom() {
+        let mut fl = KvmFreeList::new();
+        assert_eq!(fl.try_alloc(0), Err(KvmFreeListError::OutOfVirtualMemory));
+    }
+
+    #[test]
+    fn free_list_alloc_then_free_round_trips() {
+        let mut fl = KvmFreeList::new();
+        let initial_total = fl.free_pages();
+        let kva = fl.try_alloc(10).unwrap();
+        assert_eq!(fl.free_pages(), initial_total - 10);
+        fl.free(kva, 10).unwrap();
+        assert_eq!(fl.free_pages(), initial_total);
+        assert_eq!(fl.region_count(), 1);
+    }
+
+    #[test]
+    fn free_list_three_way_coalesce() {
+        let mut fl = KvmFreeList::new();
+        let a = fl.try_alloc(1).unwrap();
+        let b = fl.try_alloc(1).unwrap();
+        let c = fl.try_alloc(1).unwrap();
+        // Tail layout after 3 allocs: [used(A) | used(B) | used(C) | free(tail)].
+        // free(A): inserts an A-region at the front; not adjacent to tail.
+        // → [free(A) | used(B) | used(C) | free(tail)]  ⇒ 2 free regions.
+        fl.free(a, 1).unwrap();
+        assert_eq!(fl.region_count(), 2);
+        // free(C): C is adjacent to the front of the tail-free region, so
+        // it coalesces with it. → [free(A) | used(B) | free(C+tail)] ⇒ 2.
+        fl.free(c, 1).unwrap();
+        assert_eq!(fl.region_count(), 2);
+        // free(B): B is adjacent to A on the left and to (C+tail) on the
+        // right — three-way coalesce into one region covering the pool.
+        fl.free(b, 1).unwrap();
+        assert_eq!(fl.region_count(), 1);
+        assert_eq!(fl.free_pages(), (KVM_POOL_SIZE / PAGE_SIZE) as usize);
+    }
+
+    #[test]
+    fn free_list_first_fit_picks_first_sufficient() {
+        let mut fl = KvmFreeList::new();
+        // Carve three holes of distinct sizes by allocating then freeing.
+        let a = fl.try_alloc(2).unwrap();
+        let _ = fl.try_alloc(1).unwrap(); // separator
+        let c = fl.try_alloc(8).unwrap();
+        let _ = fl.try_alloc(1).unwrap(); // separator
+        let e = fl.try_alloc(4).unwrap();
+        fl.free(a, 2).unwrap();
+        fl.free(c, 8).unwrap();
+        fl.free(e, 4).unwrap();
+        // Free regions in address order: 2, 8, 4, then the tail.
+        // Asking for 3 must come from the 8-page region (first-fit
+        // skips the 2-page region).
+        let kva = fl.try_alloc(3).unwrap();
+        // The 8-page hole started at base + (2+1) pages = base + 3 pages.
+        assert_eq!(kva.as_u64(), KVM_POOL_BASE + 3 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn free_list_oom_when_no_region_large_enough() {
+        let mut fl = KvmFreeList {
+            regions: [KvmFreeRegion { start: KernelVa::new(KVM_POOL_BASE), pages: 0 };
+                      KVM_MAX_FREE_REGIONS],
+            count: 1,
+        };
+        fl.regions[0] = KvmFreeRegion { start: KernelVa::new(KVM_POOL_BASE), pages: 5 };
+        assert_eq!(fl.try_alloc(6), Err(KvmFreeListError::OutOfVirtualMemory));
+    }
+
+    #[test]
+    fn free_list_split_consumes_only_what_asked() {
+        let mut fl = KvmFreeList::new();
+        let _ = fl.try_alloc(10).unwrap();
+        let r = fl.region(0).unwrap();
+        // Remaining region is shifted by exactly 10 pages.
+        assert_eq!(r.start.as_u64(), KVM_POOL_BASE + 10 * PAGE_SIZE);
+        assert_eq!(r.pages, (KVM_POOL_SIZE / PAGE_SIZE) as usize - 10);
+    }
+
+    #[test]
+    fn free_rejects_out_of_pool() {
+        let mut fl = KvmFreeList::new();
+        assert_eq!(
+            fl.free(KernelVa::new(0xFFFF_0000_0000_0000), 1),
+            Err(KvmFreeListError::OutOfPool),
+        );
+    }
+
+    #[test]
+    fn free_rejects_overlap_with_existing_free_region() {
+        let mut fl = KvmFreeList::new();
+        let _ = fl.try_alloc(1).unwrap(); // pool now [used(1) | free(rest)]
+        // Try to free a range that's still inside the (already-free) tail.
+        let inside_tail = KernelVa::new(KVM_POOL_BASE + 5 * PAGE_SIZE);
+        assert_eq!(fl.free(inside_tail, 1), Err(KvmFreeListError::DoubleFree));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_kernel_page
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_kernel_page_sets_el1_only_uxn_pxn() {
+        let pte = build_kernel_page(PhysAddr::new(0x4020_0000));
+        assert!(pte.is_valid());
+        assert!(pte.is_table()); // page descriptor uses the same TABLE bit at L3
+        assert!(pte.is_uxn(), "kernel pages must be UXN");
+        assert!(pte.is_pxn(), "kernel pages must be PXN");
+        assert_eq!(pte.ap(), AP_RW_EL1, "kernel pages must be EL1-only");
+        assert_eq!(pte.attr_index(), MAIR_NORMAL);
+        assert_eq!(pte.sh(), SH_INNER);
+        assert!(pte.af());
+        assert_eq!(pte.output_addr().as_u64(), 0x4020_0000);
+    }
+
+    // -----------------------------------------------------------------------
+    // KvmMapWalk
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_walk_zero_pages_done_immediately() {
+        let walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 0, 0xCAFE_0000);
+        assert_eq!(walk.current_step(), KvmMapStep::Done);
+    }
+
+    #[test]
+    fn map_walk_single_page_into_empty_l1_allocs_l2_and_l3() {
+        let l1_paddr = 0xAAAA_0000;
+        let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 1, l1_paddr);
+        // First step: read the L1 PTE. Index = (KVM_POOL_BASE >> 30) & 0x1FF.
+        let (_l0, l1, _l2, _l3) = kvm_pool_indices(KernelVa::new(KVM_POOL_BASE));
+        assert_eq!(
+            walk.current_step(),
+            KvmMapStep::ReadL1Pte { l1_pte_paddr: PhysAddr::new(l1_paddr + (l1 as u64) * 8) },
+        );
+        // L1 entry is empty → walker says AllocL2.
+        let next = walk.step_l1(0);
+        assert!(matches!(next, KvmMapStep::AllocL2 { .. }));
+        // Kernel allocates an L2 page at 0xBBBB_0000 and tells the walker.
+        let next = walk.step_l2_allocated(0xBBBB_0000);
+        assert!(matches!(next, KvmMapStep::ReadL2Pte { .. }));
+        // L2 entry empty → AllocL3.
+        let next = walk.step_l2(0);
+        assert!(matches!(next, KvmMapStep::AllocL3 { .. }));
+        // Kernel allocates an L3 page → walker reads the target L3 PTE
+        // (must be invalid before alloc writes).
+        assert!(matches!(
+            walk.step_l3_allocated(0xCCCC_0000),
+            KvmMapStep::ReadL3Pte { .. },
+        ));
+        // L3 PTE is zero (fresh table) → walker requests backing.
+        assert_eq!(walk.step_l3(0), KvmMapStep::WantBacking);
+        // Kernel supplies a backing paddr; walker emits WritePagePte.
+        let pte = match walk.supply_backing(PhysAddr::new(0x4020_0000)) {
+            KvmMapStep::WritePagePte { pte_paddr, entry } => {
+                assert_eq!(pte_paddr.as_u64(), 0xCCCC_0000); // L3 index = 0
+                entry
+            }
+            other => panic!("expected WritePagePte, got {:?}", other),
+        };
+        assert!(pte.is_uxn() && pte.is_pxn() && pte.ap() == AP_RW_EL1);
+        assert_eq!(pte.output_addr().as_u64(), 0x4020_0000);
+        assert_eq!(walk.step_pte_written(), KvmMapStep::Done);
+    }
+
+    #[test]
+    fn map_walk_reuses_existing_l1_l2_l3_when_present() {
+        let l1_paddr = 0xAAAA_0000;
+        let l2_paddr = 0xBBBB_0000;
+        let l3_paddr = 0xCCCC_0000;
+        let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 1, l1_paddr);
+        // Populated L1 entry (table → l2_paddr).
+        let l1_entry = PageTableEntry::new_table(PhysAddr::new(l2_paddr)).raw();
+        assert!(matches!(walk.step_l1(l1_entry), KvmMapStep::ReadL2Pte { .. }));
+        // Populated L2 entry (table → l3_paddr) → walker reads target L3 PTE.
+        let l2_entry = PageTableEntry::new_table(PhysAddr::new(l3_paddr)).raw();
+        assert!(matches!(walk.step_l2(l2_entry), KvmMapStep::ReadL3Pte { .. }));
+        // L3 PTE invalid → request backing → write.
+        assert_eq!(walk.step_l3(0), KvmMapStep::WantBacking);
+        let step = walk.supply_backing(PhysAddr::new(0x4020_0000));
+        assert!(matches!(step, KvmMapStep::WritePagePte { .. }));
+        assert_eq!(walk.step_pte_written(), KvmMapStep::Done);
+    }
+
+    #[test]
+    fn map_walk_fault_when_target_l3_already_valid() {
+        // Lockdown for the bug Codex flagged: alloc must read the
+        // target L3 PTE and reject if a live mapping exists. Tests
+        // the freelist/page-table-drift scenario where the freelist
+        // says "this VA is free" but the page table still has an
+        // entry for it — alloc must fault loudly, not silently
+        // overwrite (which would alias / leak the previous
+        // backing frame).
+        let l1_paddr = 0xAAAA_0000;
+        let l2_paddr = 0xBBBB_0000;
+        let l3_paddr = 0xCCCC_0000;
+        let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 1, l1_paddr);
+        let _ = walk.step_l1(PageTableEntry::new_table(PhysAddr::new(l2_paddr)).raw());
+        let _ = walk.step_l2(PageTableEntry::new_table(PhysAddr::new(l3_paddr)).raw());
+        // The L3 slot already holds a valid kernel-page entry. This
+        // should never happen with a healthy freelist; alloc must
+        // fault rather than overwrite.
+        let stale_entry = build_kernel_page(PhysAddr::new(0x4020_5000)).raw();
+        assert_eq!(walk.step_l3(stale_entry), KvmMapStep::Fault);
+    }
+
+    #[test]
+    fn map_walk_fault_on_block_in_l1_or_l2() {
+        let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 1, 0xAAAA_0000);
+        let block = PageTableEntry::new_block(PhysAddr::new(0x4000_0000), MAIR_NORMAL, AP_RW_EL1, SH_INNER).raw();
+        assert_eq!(walk.step_l1(block), KvmMapStep::Fault);
+
+        let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 1, 0xAAAA_0000);
+        let table_l1 = PageTableEntry::new_table(PhysAddr::new(0xBBBB_0000)).raw();
+        let _ = walk.step_l1(table_l1);
+        assert_eq!(walk.step_l2(block), KvmMapStep::Fault);
+    }
+
+    #[test]
+    fn map_walk_multiple_pages_within_one_l3_skips_table_rewalks_but_still_reads_l3() {
+        let l1_paddr = 0xAAAA_0000;
+        let l2_paddr = 0xBBBB_0000;
+        let l3_paddr = 0xCCCC_0000;
+        // Two pages in same L3 (consecutive within the first L3 table).
+        let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 2, l1_paddr);
+        // Page 0: walk L1, L2, read L3, get backing, write L3.
+        let _ = walk.step_l1(PageTableEntry::new_table(PhysAddr::new(l2_paddr)).raw());
+        assert!(matches!(
+            walk.step_l2(PageTableEntry::new_table(PhysAddr::new(l3_paddr)).raw()),
+            KvmMapStep::ReadL3Pte { .. },
+        ));
+        assert_eq!(walk.step_l3(0), KvmMapStep::WantBacking);
+        let pte0 = match walk.supply_backing(PhysAddr::new(0x4000_0000)) {
+            KvmMapStep::WritePagePte { pte_paddr, .. } => pte_paddr.as_u64(),
+            other => panic!("expected WritePagePte for page 0, got {:?}", other),
+        };
+        // Advance — same L1/L2 → walker should jump straight to ReadL3Pte
+        // for the next slot (must still verify it's invalid before writing).
+        assert!(matches!(walk.step_pte_written(), KvmMapStep::ReadL3Pte { .. }));
+        assert_eq!(walk.step_l3(0), KvmMapStep::WantBacking);
+        let pte1 = match walk.supply_backing(PhysAddr::new(0x4001_0000)) {
+            KvmMapStep::WritePagePte { pte_paddr, .. } => pte_paddr.as_u64(),
+            other => panic!("expected WritePagePte for page 1, got {:?}", other),
+        };
+        // PTE addresses are 8 bytes apart (consecutive L3 entries).
+        assert_eq!(pte1 - pte0, 8);
+        assert_eq!(walk.step_pte_written(), KvmMapStep::Done);
+    }
+
+    // -----------------------------------------------------------------------
+    // KvmFreeWalk
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn free_walk_zero_pages_done_immediately() {
+        let walk = KvmFreeWalk::start(KernelVa::new(KVM_POOL_BASE), 0, 0xCAFE_0000);
+        assert_eq!(walk.current_step(), KvmFreeStep::Done);
+    }
+
+    #[test]
+    fn free_walk_extracts_backing_paddr_and_clears_pte() {
+        let l1_paddr = 0xAAAA_0000;
+        let l2_paddr = 0xBBBB_0000;
+        let l3_paddr = 0xCCCC_0000;
+        let backing = PhysAddr::new(0x4020_5000);
+        let mut walk = KvmFreeWalk::start(KernelVa::new(KVM_POOL_BASE), 1, l1_paddr);
+        // L1 → L2 table.
+        let _ = walk.step_l1(PageTableEntry::new_table(PhysAddr::new(l2_paddr)).raw());
+        // L2 → L3 table.
+        let _ = walk.step_l2(PageTableEntry::new_table(PhysAddr::new(l3_paddr)).raw());
+        // L3 → page entry pointing at `backing`.
+        let page_entry = build_kernel_page(backing).raw();
+        let step = walk.step_l3(page_entry);
+        match step {
+            KvmFreeStep::ClearPte { pte_paddr, backing: b } => {
+                assert_eq!(pte_paddr.as_u64(), l3_paddr); // L3 index = 0
+                assert_eq!(b.as_u64(), backing.as_u64());
+            }
+            other => panic!("expected ClearPte, got {:?}", other),
+        }
+        assert_eq!(walk.step_pte_cleared(), KvmFreeStep::Done);
+    }
+
+    #[test]
+    fn free_walk_fault_on_invalid_l3_pte() {
+        let mut walk = KvmFreeWalk::start(KernelVa::new(KVM_POOL_BASE), 1, 0xAAAA_0000);
+        let _ = walk.step_l1(PageTableEntry::new_table(PhysAddr::new(0xBBBB_0000)).raw());
+        let _ = walk.step_l2(PageTableEntry::new_table(PhysAddr::new(0xCCCC_0000)).raw());
+        // L3 entry is invalid (zero) — accounting drift.
+        assert_eq!(walk.step_l3(0), KvmFreeStep::Fault);
+    }
+
+    #[test]
+    fn free_walk_fault_on_missing_l1_l2_table() {
+        let mut walk = KvmFreeWalk::start(KernelVa::new(KVM_POOL_BASE), 1, 0xAAAA_0000);
+        // L1 entry is invalid — accounting drift.
+        assert_eq!(walk.step_l1(0), KvmFreeStep::Fault);
+    }
+
+    #[test]
+    fn pool_constants_consistent() {
+        assert_eq!(KVM_L0_INDEX, ((KVM_POOL_BASE >> 39) & 0x1FF) as usize);
+        assert_eq!(KVM_POOL_END - KVM_POOL_BASE, KVM_POOL_SIZE);
+    }
+}

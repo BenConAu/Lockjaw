@@ -55,7 +55,7 @@ const PTE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 // ---------------------------------------------------------------------------
 
 /// A single 64-bit AArch64 page table entry.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct PageTableEntry(u64);
 

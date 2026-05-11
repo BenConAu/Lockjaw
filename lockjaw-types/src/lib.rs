@@ -6,6 +6,7 @@ pub mod constants;
 pub mod elf;
 pub mod elf_loader;
 pub mod ipc_state;
+pub mod kvm;
 pub mod notification_state;
 pub mod object;
 pub mod pageset_table;
