@@ -50,7 +50,10 @@ pub enum RevokeError {
     /// table diverged from the kernel's PageSet record, or someone
     /// installed a block mapping over the L3 entries.
     UnmapFailed {
-        process_paddr: u64,
+        /// KVA of the offending process's ProcessObject (since the
+        /// kernel-objects-to-KVA migration, all ProcessObjects live
+        /// in the KVM pool — pre-migration this was a paddr).
+        process_kva: u64,
         va: u64,
     },
 }
@@ -117,7 +120,7 @@ pub fn revoke_validate(header_kva: KernelVa) -> Result<(), RevokeError> {
                 };
                 if ok.is_err() {
                     first_error = Some(RevokeError::UnmapFailed {
-                        process_paddr: process_kva_u64,
+                        process_kva: process_kva_u64,
                         va,
                     });
                     return;
@@ -229,9 +232,9 @@ pub struct RevokeStats {
     pub mappings: usize,
 }
 
-/// Walk the run queue, deduplicate by process_paddr, and invoke
+/// Walk the run queue, deduplicate by process_kva, and invoke
 /// `f` once per unique non-kernel process. Kernel threads
-/// (process_paddr == 0) are skipped — they do not own a handle
+/// (process_kva == 0) are skipped — they do not own a handle
 /// table that could hold user-visible PageSet handles.
 fn for_each_unique_process(mut f: impl FnMut(u64)) {
     let mut visited = [0u64; MAX_VISITED_PROCESSES];
