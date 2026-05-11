@@ -138,24 +138,39 @@ fn create_kernel_object_kvm(
 
     // -- Validate phase (every step here is fallible, no state changes
     //    that the caller can't recover from). --
+    //
+    // Critical: `init_fn` writes the new object's bytes into the
+    // donated page in place. That write is observable to the caller
+    // through their PageSet handle until `consume_pageset_apply`
+    // runs. So every fallible step — including the KVA reservation —
+    // must complete BEFORE `init_fn`. If we ran init_fn first and
+    // then map_existing failed, we'd return OUT_OF_MEMORY without
+    // consuming the PageSet, leaving the caller with intact handle
+    // ownership but a frame whose contents we already overwrote.
 
     if crate::cap::pageset_table::consume_pageset_validate(header_kva).is_err() {
         return Err(SyscallError::INVALID_HANDLE);
     }
 
-    // Init writes the new object's bytes through the linear map; the
-    // same bytes are visible through the KVA after `map_existing`.
-    if init_fn(init_page).is_err() {
-        return Err(SyscallError::UNKNOWN);
-    }
-
-    // Reserve the KVA mapping for the donated frame **before** the
-    // irreversible apply boundary. If this fails, the caller still
-    // holds their PageSet handle — no destructive state mutated.
+    // Reserve the KVA mapping for the donated frame. PTE writes only —
+    // does not touch the frame's contents. If this fails, the caller
+    // still holds their PageSet handle and the page bytes are
+    // unchanged.
     let mapped = crate::mm::kvm::map_existing(crate::mm::addr::PhysPage::containing(
         PhysAddr::new(page_paddr),
     )).map_err(|_| SyscallError::OUT_OF_MEMORY)?;
     let mut guard = crate::mm::kvm::MappedKvmRangeGuard::new(mapped);
+
+    // Init writes the new object's bytes through the linear map; the
+    // same bytes are visible through the KVA reserved above. This is
+    // the first destructive step on the caller's frame, but the only
+    // remaining work is consume_pageset_apply (infallible) and
+    // ht.insert (residual fallible — leaks the donated frame on the
+    // failure path same as before, but the KVA range is recovered by
+    // the guard's Drop).
+    if init_fn(init_page).is_err() {
+        return Err(SyscallError::UNKNOWN);
+    }
 
     // -- Apply phase: every step here must be infallible (or its
     //    failure must leave a self-cleaning footprint). --
