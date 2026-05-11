@@ -68,14 +68,14 @@ pub fn call(
         HandleKind::Endpoint { .. } => return Err(SyscallError::INVALID_PARAMETER),
         _ => return Err(SyscallError::INVALID_PARAMETER),
     };
-    let HandleKind::Reply { paddr: reply_paddr } = reply_entry.kind else {
+    let HandleKind::Reply { kva: reply_kva } = reply_entry.kind else {
         return Err(SyscallError::INVALID_PARAMETER);
     };
     // SAFETY: both types verified; endpoint and reply are distinct objects
     // on distinct pages; both KernelMuts scoped to this call.
     // Blocking — pass raw pointers so no &mut T survives across block_current().
     let ep_km = unsafe { KernelMut::<endpoint::EndpointObject>::from_paddr(ep_paddr) };
-    let reply_km = unsafe { KernelMut::<reply::ReplyObject>::from_paddr(reply_paddr) };
+    let reply_km = unsafe { KernelMut::<reply::ReplyObject>::from_kva(reply_kva) };
     Ok(endpoint::ipc_call(ep_km.raw_ptr(), reply_km.raw_ptr(), msg, caller_token))
 }
 

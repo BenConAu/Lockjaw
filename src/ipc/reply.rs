@@ -4,6 +4,7 @@ use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::scheduler;
 use crate::sched::tcb::Tcb;
 use core::ptr;
+use lockjaw_types::addr::KernelVa;
 
 // Single source of truth: constants and decisions from types.
 use lockjaw_types::ipc_state::{
@@ -45,7 +46,7 @@ pub fn create_reply(page: crate::mm::addr::ObjectInitPage) -> Result<(), CreateE
 }
 
 /// Reply to the call currently bound on the current thread. Reads the
-/// replier's `current_reply_paddr` (set earlier by `ipc_receive` when it
+/// replier's `current_reply_kva` (set earlier by `ipc_receive` when it
 /// dequeued a Call waiter), writes `msg` into the caller's TCB, returns
 /// the Reply object to Fresh, and unblocks the caller.
 ///
@@ -59,12 +60,13 @@ pub fn ipc_reply(
     let replier_tcb_paddr = scheduler::current_tcb_paddr();
     // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
     let replier_tcb = unsafe { KernelMut::<Tcb>::from_paddr(replier_tcb_paddr) };
-    let reply_paddr_u64 = replier_tcb.get().current_reply_paddr;
+    let reply_kva_u64 = replier_tcb.get().current_reply_kva;
 
-    let has_reply = reply_paddr_u64 != 0;
+    let has_reply = reply_kva_u64 != 0;
     let reply_is_bound = if has_reply {
-        // SAFETY: current_reply_paddr was set by ipc_receive from a valid Reply.
-        let reply = unsafe { KernelMut::<ReplyObject>::from_paddr(PhysAddr::new(reply_paddr_u64)) };
+        // SAFETY: current_reply_kva was set by ipc_receive from a valid Reply
+        // KVA produced by `kvm::map_existing` in `sys_create_reply`.
+        let reply = unsafe { KernelMut::<ReplyObject>::from_kva(KernelVa::new(reply_kva_u64)) };
         debug_assert_eq!(reply.get().header.obj_type, ObjectType::Reply);
         reply.get().state == REPLY_STATE_BOUND
     } else {
@@ -73,7 +75,7 @@ pub fn ipc_reply(
 
     match decide_reply(has_reply, reply_is_bound) {
         ReplyDecision::Deliver => {
-            let mut reply = unsafe { KernelMut::<ReplyObject>::from_paddr(PhysAddr::new(reply_paddr_u64)) };
+            let mut reply = unsafe { KernelMut::<ReplyObject>::from_kva(KernelVa::new(reply_kva_u64)) };
             let caller_paddr = PhysAddr::new(reply.get().caller_tcb_paddr);
             // SAFETY: Reply.caller_tcb_paddr was set by ipc_call from a valid TCB.
             let mut caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_paddr) };
@@ -96,7 +98,7 @@ pub fn ipc_reply(
                 r.caller_tcb_paddr = 0;
             }
             let mut replier_tcb = unsafe { KernelMut::<Tcb>::from_paddr(replier_tcb_paddr) };
-            replier_tcb.get_mut().current_reply_paddr = 0;
+            replier_tcb.get_mut().current_reply_kva = 0;
 
             Ok(())
         }

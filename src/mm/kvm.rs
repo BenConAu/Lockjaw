@@ -86,10 +86,6 @@ pub struct OwnedKvmRange {
 /// Distinct from `OwnedKvmRange` so the two free paths can never be
 /// crossed: passing an `OwnedKvmRange` to `unmap_existing` (or vice
 /// versa) is a compile error.
-///
-/// `#[allow(dead_code)]` until the per-kind kernel-object migrations
-/// land — first user is `sys_create_reply` in the next commit.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct MappedKvmRange {
     pub kva: KernelVa,
@@ -134,12 +130,10 @@ impl Drop for OwnedKvmRangeGuard {
 /// RAII guard for a `MappedKvmRange`. Drop calls `unmap_existing`
 /// (clears PTEs + TLBI; does not touch backing frames). `take()`
 /// transfers ownership to the caller.
-#[allow(dead_code)]
 pub struct MappedKvmRangeGuard {
     range: Option<MappedKvmRange>,
 }
 
-#[allow(dead_code)]
 impl MappedKvmRangeGuard {
     pub fn new(range: MappedKvmRange) -> Self {
         Self { range: Some(range) }
@@ -332,7 +326,6 @@ pub fn alloc_kernel_pages(pages: usize) -> Result<OwnedKvmRange, KvmError> {
 ///
 /// Currently 1-page only. Multi-page `map_existing` would take a
 /// `&[PhysPage]` slice; not yet needed.
-#[allow(dead_code)]
 pub fn map_existing(page: PhysPage) -> Result<MappedKvmRange, KvmError> {
     if !ALLOCATOR.initialized.load(Ordering::Acquire) {
         panic!("map_existing before kvm_init");
@@ -496,7 +489,6 @@ pub unsafe fn free_kernel_pages(range: OwnedKvmRange) {
 /// # Safety
 /// `range` must come from a prior `map_existing` and must not have
 /// been unmapped already. No live references into the range.
-#[allow(dead_code)]
 pub unsafe fn unmap_existing(range: MappedKvmRange) {
     if !ALLOCATOR.initialized.load(Ordering::Acquire) {
         panic!("unmap_existing before kvm_init");

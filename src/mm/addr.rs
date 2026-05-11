@@ -78,3 +78,16 @@ pub(crate) fn paddr_of_raw<T>(ptr: *const T) -> PhysAddr {
     // KERNEL_VA_OFFSET reverses the KernelMut::from_paddr cast.
     PhysAddr::new(ptr as usize as u64 - KERNEL_VA_OFFSET)
 }
+
+/// Derive the kernel VA of a kernel object from a raw pointer
+/// obtained via `KernelMut::raw_ptr()` after `from_kva`. Unlike
+/// `paddr_of_raw`, no offset translation — KVAs already are kernel
+/// virtual addresses, so the pointer's bits are the KVA verbatim.
+///
+/// Used by IPC fast paths that need to stash a Reply object's KVA in
+/// a TCB field (`current_reply_kva`, `ipc_call_reply_kva`) for later
+/// retrieval across the block/wake boundary.
+#[inline]
+pub(crate) fn kva_of_raw<T>(ptr: *const T) -> KernelVa {
+    KernelVa::new(ptr as usize as u64)
+}

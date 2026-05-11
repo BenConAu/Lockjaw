@@ -158,11 +158,94 @@ fn create_kernel_object(
     // header page. Cannot fail under the validate→apply contract.
     crate::cap::pageset_table::consume_pageset_apply(header_kva);
 
-    // Insert a new handle for the created object. The make_kind callback
-    // builds the typed kind variant carrying page_paddr — each kernel
-    // object kind owns its address inside its HandleKind variant.
+    // Insert a new handle for the created object. The factory is
+    // infallible — it just packages the donated paddr into the
+    // matching HandleKind variant. Used by not-yet-KVA-migrated
+    // kinds (Endpoint, Notification today).
     ht.insert(Rights::from_bits(RIGHT_READ | RIGHT_WRITE), make_kind(PhysAddr::new(page_paddr)))
         .map(|h| h as u64)
+}
+
+/// Same shape as `create_kernel_object`, but the new object is
+/// addressed through the KVM pool: every fallible step (including
+/// `kvm::map_existing` for the donated frame) runs **before**
+/// `consume_pageset_apply`, so a KVM-OOM cannot strand the caller
+/// with their PageSet revoked.
+///
+/// The factory takes the donated page's KVA — already mapped — and
+/// packages it into the appropriate `HandleKind` variant. The KVA
+/// reservation is held under a `MappedKvmRangeGuard`; on
+/// `ht.insert` failure the guard drops and unmaps, returning the
+/// VA range to the KVM free list (the donated physical frame still
+/// leaks in that path — same as the pre-migration leak when no
+/// destroy path exists; tracked in `docs/tech-debt.md`).
+fn create_kernel_object_kvm(
+    ps_handle: u32,
+    make_kind: fn(lockjaw_types::addr::KernelVa) -> lockjaw_types::object::HandleKind,
+    init_fn: fn(crate::mm::addr::ObjectInitPage) -> Result<(), crate::cap::object::CreateError>,
+) -> Result<u64, SyscallError> {
+    let ht = CurrentThread::handle_table();
+    // Require WRITE rights — destructive operation that consumes the PageSet.
+    let entry = ht.lookup(ps_handle, Rights::from_bits(RIGHT_WRITE), ObjectType::PageSet)?;
+    let header_kva = match entry.kind {
+        lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
+        _ => return Err(SyscallError::INVALID_HANDLE),
+    };
+
+    // SAFETY: PageSet handle → registered header.
+    let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
+    if backed.data_page_count() != 1 {
+        return Err(SyscallError::INVALID_PARAMETER);
+    }
+    let page_paddr = backed.get_page(0).ok_or(SyscallError::INVALID_HANDLE)?;
+    // SAFETY: page came from a registered PageSet — valid kernel page.
+    let init_page = unsafe { crate::mm::addr::ObjectInitPage::new(PhysAddr::new(page_paddr)) };
+
+    // -- Validate phase (every step here is fallible, no state changes
+    //    that the caller can't recover from). --
+
+    if crate::cap::pageset_table::consume_pageset_validate(header_kva).is_err() {
+        return Err(SyscallError::INVALID_HANDLE);
+    }
+
+    // Init writes the new object's bytes through the linear map; the
+    // same bytes are visible through the KVA after `map_existing`.
+    if init_fn(init_page).is_err() {
+        return Err(SyscallError::UNKNOWN);
+    }
+
+    // Reserve the KVA mapping for the donated frame **before** the
+    // irreversible apply boundary. If this fails, the caller still
+    // holds their PageSet handle — no destructive state mutated.
+    let mapped = crate::mm::kvm::map_existing(crate::mm::addr::PhysPage::containing(
+        PhysAddr::new(page_paddr),
+    )).map_err(|_| SyscallError::OUT_OF_MEMORY)?;
+    let mut guard = crate::mm::kvm::MappedKvmRangeGuard::new(mapped);
+
+    // -- Apply phase: every step here must be infallible (or its
+    //    failure must leave a self-cleaning footprint). --
+
+    // Phase 2: revoke every cross-process handle, clear PTEs,
+    // dec refcount/map_count, unlink and free the header.
+    // Cannot fail under the validate→apply contract.
+    crate::cap::pageset_table::consume_pageset_apply(header_kva);
+
+    let kva = guard.kva();
+    match ht.insert(Rights::from_bits(RIGHT_READ | RIGHT_WRITE), make_kind(kva)) {
+        Ok(h) => {
+            // Success: transfer KVA ownership to the handle.
+            guard.take();
+            Ok(h as u64)
+        }
+        Err(e) => {
+            // ht.insert is the one residual fallible step after the
+            // irreversible boundary — pre-migration this leaked the
+            // donated page (no destroy path). Now the donated frame
+            // still leaks, but the guard's Drop returns the KVA to
+            // the KVM free list so the VA pool doesn't bleed.
+            Err(e)
+        }
+    }
 }
 
 fn sys_debug_puts(ctx: &mut ExceptionContext) -> SyscallError {
@@ -516,9 +599,13 @@ fn sys_create_endpoint(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> 
 /// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_reply(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(
+    // Reply lives in the KVM pool — use the _kvm orchestrator so
+    // map_existing runs in the validate phase (before consume_apply).
+    // The factory just packages the already-mapped KVA into the
+    // HandleKind variant.
+    create_kernel_object_kvm(
         ctx.gpr[0] as u32,
-        |paddr| lockjaw_types::object::HandleKind::Reply { paddr },
+        |kva| lockjaw_types::object::HandleKind::Reply { kva },
         crate::ipc::reply::create_reply,
     )
 }
@@ -672,18 +759,18 @@ fn check_readiness(
 /// NO_CALLER if the exporting thread has no bound call.
 ///
 /// The caller is identified via the exporter's own TCB's
-/// `current_reply_paddr` → Reply object → `caller_tcb_paddr`.
+/// `current_reply_kva` → Reply object → `caller_tcb_paddr`.
 fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let handle_to_export = ctx.gpr[0] as u32;
 
     unsafe {
-        // Find the bound caller via our TCB's current_reply_paddr.
-        let reply_paddr_u64 = CurrentThread::current_reply_paddr();
-        if reply_paddr_u64 == 0 {
+        // Find the bound caller via our TCB's current_reply_kva.
+        let reply_kva_u64 = CurrentThread::current_reply_kva();
+        if reply_kva_u64 == 0 {
             return Err(SyscallError::NO_CALLER);
         }
-        let reply = KernelRef::<crate::ipc::reply::ReplyObject>::from_paddr(
-            PhysAddr::new(reply_paddr_u64),
+        let reply = KernelRef::<crate::ipc::reply::ReplyObject>::from_kva(
+            lockjaw_types::addr::KernelVa::new(reply_kva_u64),
         );
         let caller_tcb_paddr_u64 = reply.get().caller_tcb_paddr;
         if caller_tcb_paddr_u64 == 0 {

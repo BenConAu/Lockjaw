@@ -1,7 +1,7 @@
 use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
 use crate::ipc::ep_queue;
 use crate::ipc::reply::ReplyObject;
-use crate::mm::addr::{PhysAddr, paddr_of_raw};
+use crate::mm::addr::{PhysAddr, kva_of_raw, paddr_of_raw};
 use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::scheduler::{self, BlockToken, scoped_mut};
 use crate::sched::tcb::Tcb;
@@ -165,7 +165,7 @@ pub fn ipc_receive(
     let ep_state = EpState::from_raw(unsafe { (*ep).state })
         .unwrap_or_else(|| panic!("corrupted endpoint state"));
     let has_outstanding_reply = unsafe {
-        KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr).get().current_reply_paddr != 0
+        KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr).get().current_reply_kva != 0
     };
     // Read queue head's wait kind (if there is a head).
     let (head_wait_kind, queue_has_more) = if ep_state == EpState::HasWaiters {
@@ -213,10 +213,11 @@ pub fn ipc_receive(
             let sender_token = head_tcb.get().ipc_caller_token;
             head_tcb.get_mut().ipc_wait_kind = WAIT_KIND_NONE;
             // Bind the caller's Reply object to THIS receiver's current_reply slot.
-            let reply_paddr = head_tcb.get().ipc_call_reply_paddr;
-            head_tcb.get_mut().ipc_call_reply_paddr = 0;
+            // Reply objects live in KVM, so the carry-around value is a KVA.
+            let reply_kva = head_tcb.get().ipc_call_reply_kva;
+            head_tcb.get_mut().ipc_call_reply_kva = 0;
             let mut receiver_tcb = unsafe { KernelMut::<Tcb>::from_paddr(receiver_tcb_paddr) };
-            receiver_tcb.get_mut().current_reply_paddr = reply_paddr;
+            receiver_tcb.get_mut().current_reply_kva = reply_kva;
             receiver_tcb.get_mut().last_caller_token = sender_token;
             ep_ref.state = next_ep_state.to_raw();
             Ok(msg)
@@ -276,7 +277,8 @@ pub fn ipc_call(
             let mut tok = BlockToken::new();
             let caller_tcb_paddr = scheduler::current_tcb_paddr();
             let ep_paddr = paddr_of_raw(ep);
-            let reply_paddr = paddr_of_raw(reply);
+            // Reply lives in the KVM pool; carry its KVA, not a paddr.
+            let reply_kva = kva_of_raw(reply);
 
             // Bind the Reply to this caller before delivering.
             {
@@ -295,7 +297,7 @@ pub fn ipc_call(
                     r.ipc_msg = msg;
                     r.last_caller_token = caller_token;
                     r.ipc_wait_kind = WAIT_KIND_NONE;
-                    r.current_reply_paddr = reply_paddr.as_u64();
+                    r.current_reply_kva = reply_kva.as_u64();
                     r.ipc_blocked_on = 0;
                 }
                 scheduler::unblock_thread(receiver);
@@ -318,7 +320,8 @@ pub fn ipc_call(
             let mut tok = BlockToken::new();
             let caller_tcb_paddr = scheduler::current_tcb_paddr();
             let ep_paddr = paddr_of_raw(ep);
-            let reply_paddr = paddr_of_raw(reply);
+            // Reply lives in the KVM pool; carry its KVA, not a paddr.
+            let reply_kva = kva_of_raw(reply);
 
             // Bind the Reply to this caller.
             {
@@ -333,7 +336,7 @@ pub fn ipc_call(
                 c.ipc_msg = msg;
                 c.ipc_caller_token = caller_token;
                 c.ipc_wait_kind = WAIT_KIND_CALL;
-                c.ipc_call_reply_paddr = reply_paddr.as_u64();
+                c.ipc_call_reply_kva = reply_kva.as_u64();
                 c.ipc_blocked_on = ep_paddr.as_u64();
             }
             {

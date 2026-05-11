@@ -475,7 +475,7 @@ pub struct SystemState {
     /// Reply-object state for each client. Server has no Reply.
     pub reply_state: [ReplyState; 2],
     /// Per-thread binding of "whose Reply am I currently handling?" Mirrors
-    /// the kernel's `current_reply_paddr` TCB field. Set on Receive-of-Call,
+    /// the kernel's `current_reply_kva` TCB field. Set on Receive-of-Call,
     /// cleared on the corresponding Reply. Indexed by `ThreadId::as_index`.
     pub current_reply: [Option<ClientId>; 3],
     /// Per-thread scheduler state (indexed by `ThreadId::as_index`).
@@ -761,7 +761,7 @@ fn step_reply(
     who: ThreadId,
 ) -> Result<(SystemState, [IpcEffect; MAX_EFFECTS], usize), TransitionError> {
     // The replier must have a non-None current_reply. Kernel-side this is
-    // the current thread's TCB.current_reply_paddr.
+    // the current thread's TCB.current_reply_kva.
     let client = state.current_reply[who.as_index()].ok_or(TransitionError::NoCaller)?;
 
     // Reply target must currently be Bound to that client.

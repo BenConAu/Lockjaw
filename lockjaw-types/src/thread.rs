@@ -121,18 +121,19 @@ pub struct Tcb {
     /// Caller token from the endpoint handle used for this send/call.
     /// Set on sys_send/sys_call, read by sys_receive on dequeue.
     pub ipc_caller_token: u64,
-    /// Server-side: paddr of the Reply object bound to the call currently
+    /// Server-side: KVA of the Reply object bound to the call currently
     /// being handled by this thread. Set by sys_receive when dequeuing a
     /// Call; cleared by sys_reply. 0 = no outstanding call.
-    pub current_reply_paddr: u64,
+    /// Reply objects live in the KVM pool — see kernel-vmem-roadmap.md.
+    pub current_reply_kva: u64,
     /// Token of the most recently dequeued sender/caller on this thread.
     /// Written on every successful sys_receive/sys_recv_nb dequeue.
     /// Read by sys_query_caller_token. Overwritten on next dequeue.
     pub last_caller_token: u64,
-    /// Caller-side: paddr of this thread's own Reply object while queued
+    /// Caller-side: KVA of this thread's own Reply object while queued
     /// as a Call waiter, so the server can pick it up on sys_receive.
     /// 0 when not queued as a Call.
-    pub ipc_call_reply_paddr: u64,
+    pub ipc_call_reply_kva: u64,
     /// ELF entry point VA for user processes (0 for kernel threads).
     pub user_entry_point: u64,
     /// User stack top VA for user processes (0 for kernel threads).

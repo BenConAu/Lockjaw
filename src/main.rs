@@ -495,11 +495,15 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("  Endpoint created at phys ", Hex(ep_page.as_u64()));
 
         // Reply object for the ipc_sender benchmark thread. One page,
-        // pre-allocated and stashed in a static so ipc_sender can pass it
-        // on every call without needing a handle table lookup.
-        let bench_reply_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("bench reply alloc")).start_addr();
-        ipc::reply::create_reply(mm::addr::ObjectInitPage::new(bench_reply_page)).unwrap_or_else(|_| panic!("create bench reply"));
-        IPC_BENCH_REPLY_PADDR.set(bench_reply_page.as_u64());
+        // pre-allocated and exposed via KVA so the handle slot can carry
+        // a `HandleKind::Reply { kva }`. Init runs through the linear
+        // map (paddr); map_existing then makes the same frame reachable
+        // through a KVM-pool VA. The bench Reply lives for the kernel's
+        // lifetime — no destroy path needed.
+        let bench_reply_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("bench reply alloc"));
+        ipc::reply::create_reply(mm::addr::ObjectInitPage::new(bench_reply_page.start_addr())).unwrap_or_else(|_| panic!("create bench reply"));
+        let bench_reply_kva = mm::kvm::map_existing(bench_reply_page)
+            .unwrap_or_else(|_| panic!("bench reply kvm map")).kva;
 
         // Create kernel process — immortal, ttbr0=0, owns all kernel threads.
         let kernel_ht_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("kernel ht alloc")).start_addr();
@@ -534,7 +538,7 @@ pub extern "C" fn kmain() -> ! {
         handle_table::handle_insert(
             kernel_ht_page,
             cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
-            lockjaw_types::object::HandleKind::Reply { paddr: bench_reply_page },
+            lockjaw_types::object::HandleKind::Reply { kva: bench_reply_kva },
         ).unwrap_or_else(|_| panic!("insert reply handle"));
 
         // Thread A (sender) — kernel thread in the kernel process
@@ -799,11 +803,6 @@ pub extern "C" fn kmain() -> ! {
 // ---------------------------------------------------------------------------
 // IPC test threads (Phase 7)
 // ---------------------------------------------------------------------------
-
-/// Reply object used by the ipc_sender benchmark kernel thread. Allocated
-/// and initialized in kmain before the scheduler starts. Stored as a raw
-/// paddr so both threads can read it without needing a handle table.
-static IPC_BENCH_REPLY_PADDR: BootOnce = BootOnce::new();
 
 /// Client thread: calls the server with a request, gets a reply.
 /// Uses ipc_call (send + block for reply in one operation).

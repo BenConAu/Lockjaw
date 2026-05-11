@@ -70,7 +70,7 @@ pub enum HandleKind {
     ThreadControlBlock { paddr: crate::addr::PhysAddr } = 2,
     Endpoint { paddr: crate::addr::PhysAddr, caller_token: u64 } = 3,
     Notification { paddr: crate::addr::PhysAddr } = 4,
-    Reply { paddr: crate::addr::PhysAddr } = 5,
+    Reply { kva: crate::addr::KernelVa } = 5,
     Process { paddr: crate::addr::PhysAddr } = 6,
     PageSet { kva: crate::addr::KernelVa, mapped_va_page: u32 } = 7,
 }

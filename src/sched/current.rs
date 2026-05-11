@@ -68,10 +68,11 @@ impl CurrentThread {
         Some(unsafe { crate::mm::user_access::UserAddressSpace::from_ttbr0(ttbr0) })
     }
 
-    /// The Reply paddr currently bound on this thread (set by sys_receive
+    /// The Reply KVA currently bound on this thread (set by sys_receive
     /// when dequeuing a Call waiter; read by sys_export_handle/sys_reply).
-    pub fn current_reply_paddr() -> u64 {
-        Self::ref_().get().current_reply_paddr
+    /// Reply objects live in the KVM pool — see kernel-vmem-roadmap.md.
+    pub fn current_reply_kva() -> u64 {
+        Self::ref_().get().current_reply_kva
     }
 
     /// Number of valid entries in the wait_objects array (0 = not waiting).

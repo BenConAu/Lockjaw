@@ -261,8 +261,8 @@ mod tests {
     fn notif(paddr: u64) -> HandleKind {
         HandleKind::Notification { paddr: PhysAddr::new(paddr) }
     }
-    fn reply(paddr: u64) -> HandleKind {
-        HandleKind::Reply { paddr: PhysAddr::new(paddr) }
+    fn reply(kva: u64) -> HandleKind {
+        HandleKind::Reply { kva: KernelVa::new(kva) }
     }
     fn ps(kva: u64) -> HandleKind {
         HandleKind::PageSet { kva: KernelVa::new(kva), mapped_va_page: 0 }
@@ -285,7 +285,7 @@ mod tests {
         let mut slots = empty_table(4);
         assert_eq!(slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)), Ok(0));
         assert_eq!(slot_insert(&mut slots, Rights::none(), notif(0x2000)), Ok(1));
-        assert_eq!(slot_insert(&mut slots, Rights::none(), reply(0x3000)), Ok(2));
+        assert_eq!(slot_insert(&mut slots, Rights::none(), reply(KVA_A)), Ok(2));
         assert_eq!(slot_insert(&mut slots, Rights::none(), ps(KVA_A)), Ok(3));
     }
 
