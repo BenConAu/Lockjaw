@@ -93,63 +93,56 @@ pub fn on_thread_create(thread_count: u32) -> u32 {
 /// Maximum number of distinct PageSet headers that can be consumed
 /// during a single sys_create_process. 32 is generous — a process
 /// typically has 3–5 PageSets (code, rodata, data, bss, stack).
+/// The cap is part of the userspace-visible contract: the kernel
+/// rejects mapping lists whose deduplicated header count exceeds
+/// this with TooManyHeaders / INVALID_PARAMETER.
 pub const MAX_CONSUMED_HEADERS: usize = 32;
 
-/// Errors from building a process transfer plan.
+/// Errors from deduplicating a PageSet header list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferError {
-    /// consumed_headers array is full (MAX_CONSUMED_HEADERS reached).
+    /// `headers` slice is full — caller-supplied storage exhausted.
     TooManyHeaders,
 }
 
 /// Pure deduplication for the PageSet headers a `sys_create_process`
 /// must consume. The kernel walks the user-supplied mapping list and
-/// pushes every referenced header through `add_header`; the plan
-/// collapses duplicates so the consume loop runs exactly once per
-/// unique header.
+/// pushes every referenced header through `dedup_add_header`; the
+/// helper collapses duplicates so the consume loop runs exactly once
+/// per unique header.
 ///
 /// Without dedup, an N-page PageSet mapped at N VAs would yield N
 /// validate/apply pairs against the same header — the second pair
 /// would see refcount == 0 (revoke_apply already drained it) and
 /// double-consume the global PageSet table slot.
 ///
+/// Storage is caller-supplied (a `&mut [u64]` slice + `&mut usize`
+/// count). The kernel's caller stores the deduplicated list in the
+/// proc page so the kernel sync-exception stack does not have to
+/// carry a `[u64; MAX_CONSUMED_HEADERS]` array. Pure tests use a
+/// stack-local array.
+///
 /// Side effects (revoke walk, PTE ops, handle table mutation) live
-/// in the kernel. This struct only owns the deduplicated header set.
-#[derive(Debug)]
-pub struct ProcessTransferPlan {
-    headers: [u64; MAX_CONSUMED_HEADERS],
-    header_count: usize,
-}
-
-impl ProcessTransferPlan {
-    pub fn new() -> Self {
-        Self {
-            headers: [0; MAX_CONSUMED_HEADERS],
-            header_count: 0,
+/// entirely in the kernel.
+///
+/// Returns `Ok(true)` if the header was new (added), `Ok(false)` if
+/// it was already present.
+pub fn dedup_add_header(
+    header_paddr: u64,
+    headers: &mut [u64],
+    count: &mut usize,
+) -> Result<bool, TransferError> {
+    for i in 0..*count {
+        if headers[i] == header_paddr {
+            return Ok(false);
         }
     }
-
-    /// Record a PageSet header for consumption. Deduplicates —
-    /// multiple mappings from the same PageSet produce one entry.
-    pub fn add_header(&mut self, header_paddr: u64) -> Result<(), TransferError> {
-        // Dedup: skip if already tracked.
-        for i in 0..self.header_count {
-            if self.headers[i] == header_paddr {
-                return Ok(());
-            }
-        }
-        if self.header_count >= MAX_CONSUMED_HEADERS {
-            return Err(TransferError::TooManyHeaders);
-        }
-        self.headers[self.header_count] = header_paddr;
-        self.header_count += 1;
-        Ok(())
+    if *count >= headers.len() {
+        return Err(TransferError::TooManyHeaders);
     }
-
-    /// The deduplicated list of PageSet headers to consume.
-    pub fn headers(&self) -> &[u64] {
-        &self.headers[..self.header_count]
-    }
+    headers[*count] = header_paddr;
+    *count += 1;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -170,17 +163,6 @@ pub struct ParentHandleCopy {
     /// transfer routes through `sys_export_handle` instead, which
     /// inc_refcount's correctly.
     pub kind: HandleKind,
-}
-
-/// User-mode entry context for the new process. Captured early so
-/// the plan carries everything `apply_validated_plan` needs to set
-/// up the first thread.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UserEntryInfo {
-    pub user_entry_point: u64,
-    pub user_stack_top: u64,
-    pub user_stack_base: u64,
-    pub name: [u8; 16],
 }
 
 /// Errors from the pure structural validate. Each variant identifies
@@ -223,60 +205,57 @@ pub enum CreateProcessPlanError {
 
 /// Mutable builder used by the kernel to accumulate plan decisions
 /// while iterating user-supplied mappings. Pure — owns no kernel
-/// resources, performs no allocations.
+/// resources, performs no allocations, and does NOT carry the
+/// deduplicated header list itself: the caller (kernel) stores
+/// the headers in long-lived storage (the proc page) so the kernel
+/// sync-exception stack stays small. The builder tracks only the
+/// structural facts that don't have a single source of truth
+/// elsewhere — `unique_header_count` is owned by the kernel-side
+/// storage and supplied to `validate(...)` directly, so the two
+/// counts can never drift.
+///
+/// The kernel passes user-mode entry/stack/name values directly to
+/// `create_tcb` in the provisioning phase; those facts are kernel-
+/// only and don't belong in the plan token.
+#[derive(Debug)]
 pub struct ProcessCreationPlanBuilder {
-    transfer_plan: ProcessTransferPlan,
     mapping_count: usize,
     stack_pages: usize,
     stack_recorded: bool,
     parent_copy: Option<ParentHandleCopy>,
-    user_entry: UserEntryInfo,
 }
 
 impl ProcessCreationPlanBuilder {
-    pub fn new(user_entry: UserEntryInfo) -> Self {
+    pub fn new() -> Self {
         Self {
-            transfer_plan: ProcessTransferPlan::new(),
             mapping_count: 0,
             stack_pages: 0,
             stack_recorded: false,
             parent_copy: None,
-            user_entry,
         }
     }
 
-    /// Record one ProcessMapping. Increments `mapping_count` and
-    /// adds the mapping's header to the dedup set in a single call —
-    /// the two counters cannot drift because the caller cannot
-    /// update one without the other. Transactional: on Err, no
-    /// builder field is mutated.
-    pub fn record_mapping(
-        &mut self,
-        header_paddr: u64,
-    ) -> Result<(), CreateProcessPlanError> {
-        self.transfer_plan
-            .add_header(header_paddr)
-            .map_err(|_| CreateProcessPlanError::TooManyHeaders)?;
+    /// Record that one ProcessMapping was added to the kernel-side
+    /// header list. Bumps `mapping_count`; the per-mapping dedup
+    /// happens in the kernel-side `process_record_consumed_header`
+    /// helper, which is the single API boundary callers thread
+    /// through. Infallible — the dedup-and-overflow check lives in
+    /// `dedup_add_header`.
+    pub fn record_mapping(&mut self) {
         self.mapping_count += 1;
-        Ok(())
     }
 
     /// Record the stack region. At most once per builder — a second
-    /// call returns `StackAlreadyRecorded`. Adds the stack header
-    /// to the dedup set and stores `stack_pages` for the scratch
-    /// capacity check. Transactional: on Err, no builder field is
-    /// mutated.
+    /// call returns `StackAlreadyRecorded`. Stores `stack_pages`
+    /// for the scratch capacity check. Per-stack dedup happens in
+    /// the kernel-side helper alongside the call to this method.
     pub fn record_stack(
         &mut self,
-        header_paddr: u64,
         stack_pages: usize,
     ) -> Result<(), CreateProcessPlanError> {
         if self.stack_recorded {
             return Err(CreateProcessPlanError::StackAlreadyRecorded);
         }
-        self.transfer_plan
-            .add_header(header_paddr)
-            .map_err(|_| CreateProcessPlanError::TooManyHeaders)?;
         self.stack_pages = stack_pages;
         self.stack_recorded = true;
         Ok(())
@@ -310,16 +289,23 @@ impl ProcessCreationPlanBuilder {
         Ok(())
     }
 
-    /// Pure structural validation. Returns the apply-phase token if
-    /// every precondition holds. Per-header `consume_pageset_validate`
-    /// is the kernel's job and runs in `validate_creation` after
-    /// this returns Ok — kernel state stays out of lockjaw-types.
-    /// Consumes self — once a builder yields a token, it cannot be
-    /// re-validated.
+    /// Pure structural validation. Consumes the builder and returns
+    /// an owned apply-phase token if every precondition holds.
+    /// Per-header `consume_pageset_validate` is the kernel's job
+    /// and runs in the kernel's validate gate after this returns
+    /// Ok — live kernel state stays out of lockjaw-types.
+    ///
+    /// `unique_header_count` is supplied by the caller from the
+    /// kernel-owned dedup storage (the proc page's
+    /// `consumed_header_count` field) — it is the single source of
+    /// truth for "how many distinct headers were consumed", so the
+    /// builder cannot drift out of step with the actual stored
+    /// list.
     pub fn validate(
         self,
         scratch_capacity: usize,
         scheduler_has_room: bool,
+        unique_header_count: usize,
     ) -> Result<ValidatedProcessCreationPlan, CreateProcessPlanError> {
         if !crate::vmem::validate_process_mappings(
             self.mapping_count,
@@ -332,45 +318,49 @@ impl ProcessCreationPlanBuilder {
             return Err(CreateProcessPlanError::SchedulerFull);
         }
         let parent_copy_count = if self.parent_copy.is_some() { 1 } else { 0 };
-        let post_consume_occupancy =
-            self.transfer_plan.headers().len() + parent_copy_count;
+        let post_consume_occupancy = unique_header_count + parent_copy_count;
         if post_consume_occupancy > HANDLE_SLOTS_PER_PAGE as usize {
             return Err(CreateProcessPlanError::HandleTableTooSmall);
         }
         Ok(ValidatedProcessCreationPlan {
-            transfer_plan: self.transfer_plan,
+            unique_header_count,
             parent_copy: self.parent_copy,
-            user_entry: self.user_entry,
         })
     }
 }
 
-/// The apply-phase token. Constructible only via
-/// `ProcessCreationPlanBuilder::validate(...)`. Pass to
-/// `apply_validated_plan` by value — the kernel cannot run apply
+impl Default for ProcessCreationPlanBuilder {
+    fn default() -> Self { Self::new() }
+}
+
+/// Owned apply-phase token. Constructible only via
+/// `ProcessCreationPlanBuilder::validate(...)`, which consumes the
+/// builder and moves the small (post-validation) plan data into the
+/// token. Apply takes this by value — the kernel cannot run apply
 /// without first running both the pure structural validate AND its
-/// own consume-validate observations in `validate_creation`.
+/// own consume-validate observations in the kernel's validate gate.
+///
+/// The token does NOT carry the header list itself: the kernel
+/// stored each unique header in the proc page during provisioning
+/// and reads them back by index. The token tells apply how many
+/// headers there are and what (if anything) the parent copy is.
 #[derive(Debug)]
 pub struct ValidatedProcessCreationPlan {
-    transfer_plan: ProcessTransferPlan,
+    unique_header_count: usize,
     parent_copy: Option<ParentHandleCopy>,
-    user_entry: UserEntryInfo,
 }
 
 impl ValidatedProcessCreationPlan {
-    /// Deduplicated list of PageSet headers the kernel must
-    /// consume_pageset_apply over.
-    pub fn headers_to_consume(&self) -> &[u64] {
-        self.transfer_plan.headers()
+    /// Number of distinct PageSet headers the kernel stored during
+    /// provisioning. Apply iterates `0..unique_header_count()` and
+    /// reads each header from the proc page.
+    pub fn unique_header_count(&self) -> usize {
+        self.unique_header_count
     }
 
     /// Resolved parent-handle copy info, if the caller requested one.
     pub fn parent_copy(&self) -> Option<&ParentHandleCopy> {
         self.parent_copy.as_ref()
-    }
-
-    pub fn user_entry(&self) -> &UserEntryInfo {
-        &self.user_entry
     }
 }
 
@@ -522,66 +512,80 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ProcessTransferPlan tests
+    // dedup_add_header tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn duplicate_headers_deduped() {
-        let mut plan = ProcessTransferPlan::new();
-        plan.add_header(0xA000).unwrap();
-        plan.add_header(0xB000).unwrap();
-        plan.add_header(0xA000).unwrap(); // duplicate — collapsed
-        assert_eq!(plan.headers(), &[0xA000, 0xB000]);
+        let mut storage = [0u64; MAX_CONSUMED_HEADERS];
+        let mut count = 0;
+        assert_eq!(dedup_add_header(0xA000, &mut storage, &mut count), Ok(true));
+        assert_eq!(dedup_add_header(0xB000, &mut storage, &mut count), Ok(true));
+        // duplicate — not added
+        assert_eq!(dedup_add_header(0xA000, &mut storage, &mut count), Ok(false));
+        assert_eq!(count, 2);
+        assert_eq!(&storage[..count], &[0xA000, 0xB000]);
     }
 
     #[test]
     fn headers_full_returns_error() {
-        let mut plan = ProcessTransferPlan::new();
+        let mut storage = [0u64; MAX_CONSUMED_HEADERS];
+        let mut count = 0;
         for i in 0..MAX_CONSUMED_HEADERS {
-            plan.add_header(i as u64 * 0x1000).unwrap();
+            assert_eq!(
+                dedup_add_header(i as u64 * 0x1000, &mut storage, &mut count),
+                Ok(true),
+            );
         }
         assert_eq!(
-            plan.add_header(0xFFFF_0000),
+            dedup_add_header(0xFFFF_0000, &mut storage, &mut count),
             Err(TransferError::TooManyHeaders),
         );
     }
 
     #[test]
     fn stack_header_tracked_separately() {
-        let mut plan = ProcessTransferPlan::new();
-        plan.add_header(0xA000).unwrap(); // code PageSet
-        plan.add_header(0xB000).unwrap(); // stack PageSet
-        assert_eq!(plan.headers().len(), 2);
+        let mut storage = [0u64; MAX_CONSUMED_HEADERS];
+        let mut count = 0;
+        dedup_add_header(0xA000, &mut storage, &mut count).unwrap(); // code PageSet
+        dedup_add_header(0xB000, &mut storage, &mut count).unwrap(); // stack PageSet
+        assert_eq!(count, 2);
     }
 
     #[test]
     fn same_header_from_multiple_mappings_deduped() {
         // Models: an N-page PageSet mapped at N contiguous VAs
-        // produces N add_header calls but exactly one consume_pageset
-        // pair downstream.
-        let mut plan = ProcessTransferPlan::new();
-        plan.add_header(0xA000).unwrap();
-        plan.add_header(0xA000).unwrap();
-        plan.add_header(0xA000).unwrap();
-        assert_eq!(plan.headers(), &[0xA000]);
+        // produces N dedup_add_header calls but exactly one consume_pageset
+        // pair downstream. The first call returns Ok(true) (new),
+        // subsequent calls return Ok(false) (duplicate).
+        let mut storage = [0u64; MAX_CONSUMED_HEADERS];
+        let mut count = 0;
+        assert_eq!(dedup_add_header(0xA000, &mut storage, &mut count), Ok(true));
+        assert_eq!(dedup_add_header(0xA000, &mut storage, &mut count), Ok(false));
+        assert_eq!(dedup_add_header(0xA000, &mut storage, &mut count), Ok(false));
+        assert_eq!(count, 1);
+        assert_eq!(&storage[..count], &[0xA000]);
     }
 
     #[test]
-    fn empty_plan_has_empty_headers() {
-        let plan = ProcessTransferPlan::new();
-        assert!(plan.headers().is_empty());
+    fn empty_storage_starts_empty() {
+        let count = 0usize;
+        let storage = [0u64; MAX_CONSUMED_HEADERS];
+        assert_eq!(&storage[..count], &[] as &[u64]);
     }
 
     #[test]
     fn dedup_after_full_does_not_overflow() {
-        // Already-tracked header is accepted even when the array is
-        // at capacity, since dedup short-circuits.
-        let mut plan = ProcessTransferPlan::new();
+        // Already-tracked header is accepted even when storage is at
+        // capacity, since dedup short-circuits before the bounds check.
+        let mut storage = [0u64; MAX_CONSUMED_HEADERS];
+        let mut count = 0;
         for i in 0..MAX_CONSUMED_HEADERS {
-            plan.add_header(i as u64 * 0x1000).unwrap();
+            dedup_add_header(i as u64 * 0x1000, &mut storage, &mut count).unwrap();
         }
-        assert!(plan.add_header(0).is_ok()); // duplicate of headers[0]
-        assert_eq!(plan.headers().len(), MAX_CONSUMED_HEADERS);
+        // duplicate of storage[0] (which is 0)
+        assert_eq!(dedup_add_header(0, &mut storage, &mut count), Ok(false));
+        assert_eq!(count, MAX_CONSUMED_HEADERS);
     }
 
     // -----------------------------------------------------------------------
@@ -655,15 +659,6 @@ mod tests {
     // ProcessCreationPlanBuilder tests
     // -----------------------------------------------------------------------
 
-    fn make_user_entry() -> UserEntryInfo {
-        UserEntryInfo {
-            user_entry_point: 0x40_0000,
-            user_stack_top: 0x80_0000,
-            user_stack_base: 0x70_0000,
-            name: *b"test\0\0\0\0\0\0\0\0\0\0\0\0",
-        }
-    }
-
     fn endpoint_entry(paddr: u64) -> HandleEntry {
         HandleEntry {
             object_paddr: paddr,
@@ -673,34 +668,26 @@ mod tests {
     }
 
     #[test]
-    fn record_mapping_dedupes_headers_but_increments_count() {
-        // Two mappings sharing one header: mapping_count == 2,
-        // unique headers == 1. The two counters must move
-        // independently — that is exactly the property `record_mapping`
-        // exists to enforce in a single call.
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
-        b.record_mapping(0xA000).unwrap();
-        b.record_mapping(0xA000).unwrap();
-        b.record_stack(0xB000, 1).unwrap();
-        // Two record_mapping calls + one stack header = 2 unique headers,
-        // mapping_count==2, stack_pages==1. Capacity 8 covers it.
-        let plan = b.validate(8, true).unwrap();
-        assert_eq!(plan.headers_to_consume(), &[0xA000, 0xB000]);
-    }
-
-    #[test]
-    fn record_stack_dedupes_with_record_mapping() {
-        // Stack and a mapping share one header — dedup collapses to one.
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
-        b.record_mapping(0xA000).unwrap();
-        b.record_stack(0xA000, 1).unwrap();
-        let plan = b.validate(8, true).unwrap();
-        assert_eq!(plan.headers_to_consume(), &[0xA000]);
+    fn record_mapping_increments_mapping_count() {
+        // Builder's mapping_count moves per call; the deduplicated
+        // unique_header_count lives in kernel storage (proc page)
+        // and is supplied to validate explicitly. Pure tests
+        // simulate the kernel by passing the count manually.
+        let mut b = ProcessCreationPlanBuilder::new();
+        b.record_mapping();   // mapping #1, header A new
+        b.record_mapping();   // mapping #2, header A dup (kernel-side)
+        b.record_stack(1).unwrap();  // stack header B new
+        let mapping_count = b.mapping_count;
+        assert_eq!(mapping_count, 2);
+        // Caller passes unique_header_count from kernel storage:
+        // 2 unique headers (A + B) here.
+        let plan = b.validate(8, true, 2).unwrap();
+        assert_eq!(plan.unique_header_count(), 2);
     }
 
     #[test]
     fn record_parent_copy_rejects_pageset_kind() {
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
+        let mut b = ProcessCreationPlanBuilder::new();
         let pageset = HandleEntry {
             object_paddr: 0x1000,
             rights: Rights::from_bits(0),
@@ -719,7 +706,7 @@ mod tests {
             HandleKind::Notification,
             HandleKind::Reply,
         ] {
-            let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
+            let mut b = ProcessCreationPlanBuilder::new();
             let entry = HandleEntry {
                 object_paddr: 0x2000,
                 rights: Rights::from_bits(0),
@@ -731,38 +718,24 @@ mod tests {
 
     #[test]
     fn validate_rejects_when_mappings_exceed_scratch_capacity() {
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
-        b.record_mapping(0xA000).unwrap();
-        b.record_mapping(0xB000).unwrap();
-        b.record_stack(0xC000, 2).unwrap();
+        let mut b = ProcessCreationPlanBuilder::new();
+        b.record_mapping();
+        b.record_mapping();
+        b.record_stack(2).unwrap();
         // mapping_count==2 + stack_pages==2 == 4 > capacity==3
         assert_eq!(
-            b.validate(3, true).unwrap_err(),
+            b.validate(3, true, 2).unwrap_err(),
             CreateProcessPlanError::BufferCapacityExceeded,
         );
     }
 
     #[test]
-    fn validate_rejects_on_header_overflow() {
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
-        for i in 0..MAX_CONSUMED_HEADERS {
-            b.record_mapping(i as u64 * 0x1000).unwrap();
-        }
-        // One past capacity — exposed through record_mapping, not the
-        // raw transfer plan.
-        assert_eq!(
-            b.record_mapping(0xFFFF_0000),
-            Err(CreateProcessPlanError::TooManyHeaders),
-        );
-    }
-
-    #[test]
     fn validate_rejects_when_scheduler_full() {
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
-        b.record_mapping(0xA000).unwrap();
-        b.record_stack(0xB000, 1).unwrap();
+        let mut b = ProcessCreationPlanBuilder::new();
+        b.record_mapping();
+        b.record_stack(1).unwrap();
         assert_eq!(
-            b.validate(8, false).unwrap_err(),
+            b.validate(8, false, 2).unwrap_err(),
             CreateProcessPlanError::SchedulerFull,
         );
     }
@@ -772,32 +745,20 @@ mod tests {
         // Named parent-copy infallibility invariant: if unique
         // headers + parent_copy_count > HANDLE_SLOTS_PER_PAGE, apply
         // could not insert the parent copy without runtime failure —
-        // so structural validate must reject up front.
-        //
-        // HANDLE_SLOTS_PER_PAGE == 127, MAX_CONSUMED_HEADERS == 32
-        // (validate_process_mappings caps mapping_count too), so we
-        // can't actually exceed via record_mapping. Instead, build
-        // the plan at MAX_CONSUMED_HEADERS unique entries and add
-        // a parent copy. With HANDLE_SLOTS_PER_PAGE >> 32, this must
-        // succeed. We reproduce HandleTableTooSmall by asserting the
-        // boundary via direct construction once the const grows
-        // beyond the table — codified here as a guard against future
-        // const tuning that would silently break the invariant.
-        assert!(
-            (MAX_CONSUMED_HEADERS as u64) + 1 <= HANDLE_SLOTS_PER_PAGE,
-            "MAX_CONSUMED_HEADERS + 1 must fit in handle table for parent-copy invariant",
+        // structural validate must reject up front. Here we pass an
+        // oversized unique_header_count directly to exercise the
+        // check (in production the proc-page storage caps it at
+        // MAX_CONSUMED_HEADERS, but the rejection arithmetic must
+        // hold for any caller).
+        let mut b = ProcessCreationPlanBuilder::new();
+        b.record_mapping();
+        b.record_stack(1).unwrap();
+        b.record_parent_copy(endpoint_entry(0xCAFE_0000)).unwrap();
+        let oversized = HANDLE_SLOTS_PER_PAGE as usize; // + 1 (parent) > limit
+        assert_eq!(
+            b.validate(8, true, oversized).unwrap_err(),
+            CreateProcessPlanError::HandleTableTooSmall,
         );
-
-        // Negative path proper: synthesize an oversized capacity
-        // by rejecting via validate. With current consts, every
-        // legal input passes the post-consume check.
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
-        for i in 0..MAX_CONSUMED_HEADERS - 1 {
-            b.record_mapping(i as u64 * 0x1000).unwrap();
-        }
-        b.record_stack((MAX_CONSUMED_HEADERS - 1) as u64 * 0x1000, 1).unwrap();
-        // happy path: 32 headers + 0 parent_copy <= 127 → ok
-        assert!(b.validate(64, true).is_ok());
     }
 
     #[test]
@@ -805,98 +766,59 @@ mod tests {
         // Boundary: unique_headers + parent_copy_count ==
         // HANDLE_SLOTS_PER_PAGE must accept (the inequality is `<=`,
         // not `<`).
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
-        for i in 0..MAX_CONSUMED_HEADERS - 1 {
-            b.record_mapping(i as u64 * 0x1000).unwrap();
-        }
-        b.record_stack((MAX_CONSUMED_HEADERS - 1) as u64 * 0x1000, 1).unwrap();
+        let mut b = ProcessCreationPlanBuilder::new();
+        b.record_mapping();
+        b.record_stack(1).unwrap();
         b.record_parent_copy(endpoint_entry(0xCAFE_0000)).unwrap();
-        // 32 + 1 == 33 <= HANDLE_SLOTS_PER_PAGE (127) — accepts.
-        assert!(b.validate(64, true).is_ok());
+        // unique_headers = HANDLE_SLOTS_PER_PAGE - 1, +1 parent = exactly the limit.
+        let at_boundary = (HANDLE_SLOTS_PER_PAGE - 1) as usize;
+        assert!(b.validate(64, true, at_boundary).is_ok());
     }
 
     #[test]
     fn happy_path_token_carries_pre_validation_values() {
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
-        b.record_mapping(0xA000).unwrap();
-        b.record_mapping(0xA000).unwrap(); // dedup
-        b.record_mapping(0xB000).unwrap();
-        b.record_stack(0xC000, 4).unwrap();
+        let mut b = ProcessCreationPlanBuilder::new();
+        b.record_mapping();
+        b.record_mapping();
+        b.record_mapping();
+        b.record_stack(4).unwrap();
         b.record_parent_copy(endpoint_entry(0xDEAD_0000)).unwrap();
-        let plan = b.validate(16, true).unwrap();
+        // Caller threads unique_header_count from proc-page storage.
+        let plan = b.validate(16, true, 3).unwrap();
 
-        assert_eq!(plan.headers_to_consume(), &[0xA000, 0xB000, 0xC000]);
+        assert_eq!(plan.unique_header_count(), 3);
         let parent = plan.parent_copy().unwrap();
         assert_eq!(parent.object_paddr, 0xDEAD_0000);
         assert!(matches!(parent.kind, HandleKind::Endpoint { .. }));
-        let entry = plan.user_entry();
-        assert_eq!(entry.user_entry_point, 0x40_0000);
-        assert_eq!(entry.user_stack_top, 0x80_0000);
     }
 
     #[test]
     fn validate_consumes_builder() {
-        // Compile-time guarantee: validate(self) takes ownership, so
-        // the builder cannot be re-validated. This test asserts the
-        // shape; if validate ever switches to &self, this will not
-        // compile (the second use of `b` would error).
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
-        b.record_mapping(0xA000).unwrap();
-        b.record_stack(0xB000, 1).unwrap();
-        let _plan = b.validate(8, true).unwrap();
-        // Uncommenting the next line must be a compile error:
-        // let _plan2 = b.validate(8, true);
-    }
-
-    #[test]
-    fn record_mapping_transactional_on_err() {
-        // Lockdown: when add_header overflows, record_mapping must
-        // leave mapping_count unchanged. Reverting the fix (bumping
-        // mapping_count before add_header) would let this test
-        // observe a mismatched count after the failed call.
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
-        for i in 0..MAX_CONSUMED_HEADERS {
-            b.record_mapping(i as u64 * 0x1000).unwrap();
-        }
-        // mapping_count==32, transfer plan full. New header overflows.
-        let before = b.mapping_count;
-        assert_eq!(
-            b.record_mapping(0xFFFF_0000).unwrap_err(),
-            CreateProcessPlanError::TooManyHeaders,
-        );
-        assert_eq!(b.mapping_count, before, "mapping_count must not change on Err");
-    }
-
-    #[test]
-    fn record_stack_transactional_on_err() {
-        // Lockdown: when add_header overflows, record_stack must
-        // leave stack_pages unchanged. Same shape as record_mapping.
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
-        for i in 0..MAX_CONSUMED_HEADERS {
-            b.record_mapping(i as u64 * 0x1000).unwrap();
-        }
-        let before = b.stack_pages;
-        assert_eq!(
-            b.record_stack(0xFFFF_0000, 99).unwrap_err(),
-            CreateProcessPlanError::TooManyHeaders,
-        );
-        assert_eq!(b.stack_pages, before, "stack_pages must not change on Err");
+        // Compile-time guarantee: validate(self) takes ownership and
+        // moves the small (post-validation) plan data into the
+        // returned token. The builder cannot be re-validated.
+        // Uncommenting the second `b.validate(...)` call below must
+        // be a compile error.
+        let mut b = ProcessCreationPlanBuilder::new();
+        b.record_mapping();
+        b.record_stack(1).unwrap();
+        let _plan = b.validate(8, true, 2).unwrap();
+        // let _plan2 = b.validate(8, true, 2);
     }
 
     #[test]
     fn record_stack_rejects_second_call() {
         // Lockdown: silent last-write-wins on a second record_stack
-        // call would leave stack_pages decoupled from the dedup
-        // set's first stack header. The API rejects instead.
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
-        b.record_stack(0xA000, 4).unwrap();
+        // call would leave stack_pages decoupled from the kernel-side
+        // first-stack-header storage. The API rejects instead.
+        let mut b = ProcessCreationPlanBuilder::new();
+        b.record_stack(4).unwrap();
         assert_eq!(
-            b.record_stack(0xB000, 7).unwrap_err(),
+            b.record_stack(7).unwrap_err(),
             CreateProcessPlanError::StackAlreadyRecorded,
         );
         // First call's state survives; second was rejected outright.
         assert_eq!(b.stack_pages, 4);
-        assert_eq!(b.transfer_plan.headers(), &[0xA000]);
     }
 
     #[test]
@@ -906,7 +828,7 @@ mod tests {
         // insert the empty sentinel into the child table as a real
         // copied handle. The pure API rejects up front rather than
         // trust the kernel to filter.
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
+        let mut b = ProcessCreationPlanBuilder::new();
         assert_eq!(
             b.record_parent_copy(HandleEntry::EMPTY).unwrap_err(),
             CreateProcessPlanError::EmptyParentHandle,
@@ -932,7 +854,7 @@ mod tests {
         // Lockdown: silent last-write-wins on a second
         // record_parent_copy call would let only the second copy
         // survive into apply, with no signal about the first.
-        let mut b = ProcessCreationPlanBuilder::new(make_user_entry());
+        let mut b = ProcessCreationPlanBuilder::new();
         b.record_parent_copy(endpoint_entry(0xAAAA_0000)).unwrap();
         let second = HandleEntry {
             object_paddr: 0xBBBB_0000,
@@ -951,10 +873,82 @@ mod tests {
     fn validate_rejects_zero_mappings() {
         // validate_process_mappings rejects mapping_count == 0 even
         // with capacity headroom. Confirms the empty-builder case.
-        let b = ProcessCreationPlanBuilder::new(make_user_entry());
+        let b = ProcessCreationPlanBuilder::new();
         assert_eq!(
-            b.validate(8, true).unwrap_err(),
+            b.validate(8, true, 0).unwrap_err(),
             CreateProcessPlanError::BufferCapacityExceeded,
         );
+    }
+
+    #[test]
+    fn record_parent_copy_preserves_endpoint_caller_token() {
+        // Lockdown: ParentHandleCopy must preserve the full
+        // HandleKind::Endpoint payload, including the inner u64
+        // caller_token. Other tests use caller_token == 0 (the
+        // identity value) and pattern-match with `..`, which would
+        // miss a bug that drops or zeros the field. A wrong
+        // caller_token reaching the child means IPC replies route
+        // to the wrong reply slot — the kind of corruption that
+        // surfaces as heap damage in the child's allocator.
+        let entry = HandleEntry {
+            object_paddr: 0x1234_5000,
+            rights: Rights::from_bits(0),
+            kind: HandleKind::Endpoint { caller_token: 0xDEAD_BEEF_CAFE_BABE },
+        };
+        let mut b = ProcessCreationPlanBuilder::new();
+        b.record_parent_copy(entry).unwrap();
+        b.record_mapping();
+        b.record_stack(1).unwrap();
+        let plan = b.validate(8, true, 2).unwrap();
+        let parent = plan.parent_copy().expect("parent copy stored");
+        match parent.kind {
+            HandleKind::Endpoint { caller_token } => {
+                assert_eq!(
+                    caller_token, 0xDEAD_BEEF_CAFE_BABE,
+                    "Endpoint caller_token must round-trip through record_parent_copy"
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn record_parent_copy_preserves_rights() {
+        // Lockdown: ParentHandleCopy must preserve the rights bits.
+        // Other tests use Rights::from_bits(0) (the identity value)
+        // — a bug that zeroed the rights field would be invisible.
+        // Wrong rights reaching the child can drop messages or
+        // bypass capability checks downstream.
+        let entry = HandleEntry {
+            object_paddr: 0x1234_5000,
+            rights: Rights::from_bits(0b1010_1010),
+            kind: HandleKind::Endpoint { caller_token: 0 },
+        };
+        let mut b = ProcessCreationPlanBuilder::new();
+        b.record_parent_copy(entry).unwrap();
+        b.record_mapping();
+        b.record_stack(1).unwrap();
+        let plan = b.validate(8, true, 2).unwrap();
+        let parent = plan.parent_copy().expect("parent copy stored");
+        assert_eq!(
+            parent.rights.bits(), 0b1010_1010,
+            "rights bits must round-trip through record_parent_copy"
+        );
+    }
+
+    #[test]
+    fn dedup_add_header_preserves_interleaved_order() {
+        // Lockdown: the kernel's apply iterates the proc-page header
+        // list in insertion order. dedup_add_header (which the kernel
+        // calls per record_mapping/record_stack) must preserve that
+        // ordering across interleaved sites. If order changes,
+        // anything that pairs apply's loop position with the ordering
+        // (e.g. parent-copy insert assumptions) breaks.
+        let mut storage = [0u64; MAX_CONSUMED_HEADERS];
+        let mut count = 0;
+        dedup_add_header(0xAA00, &mut storage, &mut count).unwrap();
+        dedup_add_header(0xBB00, &mut storage, &mut count).unwrap();
+        dedup_add_header(0xCC00, &mut storage, &mut count).unwrap();
+        assert_eq!(&storage[..count], &[0xAA00, 0xBB00, 0xCC00]);
     }
 }

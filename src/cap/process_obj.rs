@@ -1,7 +1,7 @@
 use crate::mm::addr::PhysAddr;
 use crate::mm::kernel_ptr::{KernelMut, KernelRef};
 use lockjaw_types::object::{ObjectHeader, ObjectType};
-use lockjaw_types::process::{self, ProcessLifecycle};
+use lockjaw_types::process::{self, ProcessLifecycle, TransferError, MAX_CONSUMED_HEADERS};
 
 // ---------------------------------------------------------------------------
 // ProcessObject — kernel-side live struct, stored in a donated page
@@ -24,6 +24,21 @@ pub struct ProcessObject {
     pub owned_page_count: u32,
     /// Physical addresses of process-owned pages.
     pub owned_pages: [u64; lockjaw_types::process::MAX_OWNED_PAGES],
+    /// Number of distinct PageSet headers consumed during creation.
+    /// Populated by `process_record_consumed_header` while building
+    /// the new process; read by `consume_pageset_validate` /
+    /// `consume_pageset_apply` loops in `create_process`. Ephemeral
+    /// to creation — no code outside `create_process` reads it.
+    pub consumed_header_count: u32,
+    /// Physical addresses of distinct PageSet headers consumed
+    /// during creation (deduplicated). Stored here rather than on
+    /// the kernel sync-exception stack: the kernel's per-thread
+    /// stack is 4 KB, and this 256-byte array would not safely fit
+    /// alongside the AddressSpaceBuilder + scratch state during
+    /// provisioning. The proc page is the natural owner — it has
+    /// the right lifetime (alive while creation is in flight, freed
+    /// with the page if creation aborts).
+    pub consumed_headers: [u64; MAX_CONSUMED_HEADERS],
 }
 
 // ProcessObject must fit in a single donated 4KB page.
@@ -139,6 +154,50 @@ pub fn process_owned_page(process_paddr: PhysAddr, index: usize) -> Option<u64> 
     let proc = p.get();
     if index < proc.owned_page_count as usize {
         Some(proc.owned_pages[index])
+    } else {
+        None
+    }
+}
+
+/// Append a PageSet header to this process's `consumed_headers`
+/// list, deduplicating. Used by `create_process` while building
+/// the new process — keeps the deduplicated list off the kernel
+/// stack. Returns `Ok(true)` if the header was new (added),
+/// `Ok(false)` if it was already present, `Err(TooManyHeaders)`
+/// if the array is full.
+pub fn process_record_consumed_header(
+    process_paddr: PhysAddr,
+    header_paddr: u64,
+) -> Result<bool, TransferError> {
+    // SAFETY: process_paddr is a valid ProcessObject (page already zeroed
+    // by create_process). The dedup helper takes the array slice + count
+    // by mutable reference; we pass the proc page's storage directly.
+    let mut p = unsafe { KernelMut::<ProcessObject>::from_paddr(process_paddr) };
+    let proc = p.get_mut();
+    let mut count = proc.consumed_header_count as usize;
+    let result = process::dedup_add_header(header_paddr, &mut proc.consumed_headers, &mut count);
+    proc.consumed_header_count = count as u32;
+    result
+}
+
+/// Number of distinct PageSet headers consumed during creation.
+/// Read by `create_process` apply paths; not currently called from
+/// elsewhere but mirrors `process_owned_page_count` for symmetry.
+#[allow(dead_code)]
+pub fn process_consumed_header_count(process_paddr: PhysAddr) -> u32 {
+    // SAFETY: process_paddr is a valid ProcessObject.
+    let p = unsafe { KernelRef::<ProcessObject>::from_paddr(process_paddr) };
+    p.get().consumed_header_count
+}
+
+/// Read one consumed PageSet header by index. Returns None if out
+/// of range.
+pub fn process_consumed_header(process_paddr: PhysAddr, index: usize) -> Option<u64> {
+    // SAFETY: process_paddr is a valid ProcessObject.
+    let p = unsafe { KernelRef::<ProcessObject>::from_paddr(process_paddr) };
+    let proc = p.get();
+    if index < proc.consumed_header_count as usize {
+        Some(proc.consumed_headers[index])
     } else {
         None
     }

@@ -82,30 +82,36 @@ These are functions where the kernel orchestrates multi-step
 sequencing inline. Sequencing bugs in this shape have historically
 needed multiple review rounds to catch.
 
-#### 1. `create_process` outer orchestration
+#### 1. `create_process` outer orchestration — DONE
 
-**Source**: `src/process.rs` `create_process()` (~382 lines)
+`ProcessCreationPlanBuilder` and `ValidatedProcessCreationPlan` live
+in `lockjaw-types/src/process.rs`. `validate(self)` consumes the
+builder and returns an owned token; apply takes the token by value.
+The pure layer carries only structural facts (counts, parent-copy
+metadata) — the deduplicated header list lives in the proc page
+(`ProcessObject::consumed_headers`), kept off the kernel sync-
+exception stack. `validate` takes `unique_header_count` as an
+explicit parameter sourced from the proc-page storage, so the
+"how many unique headers were consumed" count has a single source
+of truth and cannot drift between the kernel storage and a builder
+mirror. Per-mapping/per-stack registration goes through one kernel
+helper (`record_mapping_into_plan` / `record_stack_into_plan`) that
+wraps the proc-page write and the builder count update — callers
+can't accidentally do one without the other.
 
-`ProcessTransferPlan`, `AddressSpaceBuilder`, `ScratchCursor`, and
-`validate_process_mappings` are all in lockjaw-types. What remains is
-the *outer sequencing*: which steps run in which order, where the
-fallible/infallible boundary sits, and which drop guard protects what.
-This is a push-shaped outer shell wrapping already-extracted innards.
+The kernel splits the work between `provision_resources` (heavy
+frame: address-space builder, scratch state, per-iteration locals,
+kernel-page allocation) and `create_process` (orchestrator: holds
+the builder, the guards, runs validate + apply). The plan token is
+constructible only by the pure validate, so a future edit cannot
+move a fallible step past the point-of-no-return without
+restructuring the type seam.
 
-The concrete residual bug class: a future change could move a
-fallible step past the point-of-no-return without the type system
-catching it, because the boundary is currently a comment, not a type.
-
-**Suggested shape**: a `ProcessCreationPlan` state machine or a
-two-phase split (`ProcessCreationSetup` / `ProcessCreationCommit`)
-where the commit phase accepts only infallible inputs. This makes the
-"no error after this point" invariant representable.
-
-**Effort**: medium — the inner pure types already exist; the work is
-wiring the outer state machine.
-
-**Test gain**: ~10 host tests covering sequencing decisions (which
-guard fires on which failure, where the commit boundary falls).
+Test gain: ~16 host tests (at-most-once invariants, post-consume
+handle-table capacity, caller_token / rights preservation, dedup
+ordering and overflow). Pure dedup logic factored into the free
+function `dedup_add_header(header, &mut [u64], &mut usize)` which
+the kernel calls with the proc page's storage slice.
 
 #### 2. `sys_map_pages` VA decision
 

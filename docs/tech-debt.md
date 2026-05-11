@@ -167,11 +167,11 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ## Audit: drop guards for resource cleanup
 
-**Where:** `src/process.rs` (create_process), `src/syscall/handler.rs` (sys_create_thread), and any kernel path that allocates multiple resources and rolls back manually on failure.
+**Where:** `src/syscall/handler.rs` (sys_create_thread), and any kernel path that allocates multiple resources and rolls back manually on failure.
 
-**What:** The `HeaderPageGuard` pattern in `src/cap/pageset_table.rs` is the model: RAII guards that free resources on drop unless explicitly taken. `create_process` (`src/process.rs:18-46`) now uses `PageGuard` and `Ttbr0Guard` throughout. But other allocation paths still use manual rollback — most visibly `sys_create_thread` in `src/syscall/handler.rs` (around line 757) where TCB and stack pages are deallocated by hand on error.
+**What:** The `HeaderPageGuard` pattern in `src/cap/pageset_table.rs` is the model: RAII guards that free resources on drop unless explicitly taken. `create_process` now uses `PageGuard` + `Ttbr0Guard` bundled into a `ProvisionedResources` struct returned by `provision_resources`; the orchestrator defuses each guard explicitly before handing the addresses off to apply. The pattern still needs to spread to other manual-rollback paths — most visibly `sys_create_thread` in `src/syscall/handler.rs` (around line 757) where TCB and stack pages are deallocated by hand on error.
 
-**Fix:** Continue applying the guard pattern to remaining manual-rollback paths. Each new fallible allocation chain should reach for guards by default.
+**Fix:** Continue applying the guard pattern to remaining manual-rollback paths. Each new fallible allocation chain should reach for guards by default; multi-resource allocations should bundle them in a struct so future additions force an explicit defuse step.
 
 ---
 
@@ -194,8 +194,7 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 **What:** Substantial progress: lockjaw-types has grown to ~16 K LOC across 25+ modules covering IPC state machine, scheduler model, process lifecycle/transfer/teardown, PageSet table + variable-size header, POSIX dispatch + VA layout, FAT32, FDT, and ELF loader. Kernel-side `src/cap` + `src/ipc` + `src/sched` together still hold ~3300 LOC. `docs/extraction-roadmap.md` lists the remaining priority targets.
 
 **Outstanding push-shaped kernel code:**
-- `create_process` outer orchestration (Priority 1 in extraction-roadmap)
-- `sys_map_pages` VA decision (Priority 1)
+- `sys_map_pages` VA decision (Priority 1 in extraction-roadmap)
 - PageSet alloc rollback (Priority 1)
 - Endpoint and notification runtime handlers (~560 LOC combined)
 - Scheduler context-switch integration (~730 LOC)

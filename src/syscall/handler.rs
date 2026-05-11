@@ -415,7 +415,7 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
 
     match crate::process::create_process(&addr_space, mappings_va, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy, name) {
         Ok(()) => SyscallError::OK,
-        Err(_) => SyscallError::UNKNOWN,
+        Err(e) => e.to_syscall_error(),
     }
 }
 
