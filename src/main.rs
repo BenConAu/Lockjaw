@@ -445,7 +445,9 @@ pub extern "C" fn kmain() -> ! {
                 test_ht,
             ).unwrap_or_else(|_| panic!("test ht create"));
         }
-        let test_proc = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("test proc")).start_addr();
+        let test_proc_range = mm::kvm::alloc_kernel_pages(1)
+            .unwrap_or_else(|_| panic!("test proc kvm alloc"));
+        let test_proc = test_proc_range.kva;
         cap::process_obj::create_process_object(
             test_proc, 0, test_ht.as_u64(), false, b"test-process\0\0\0\0",
         );
@@ -475,7 +477,8 @@ pub extern "C" fn kmain() -> ! {
 
         // Clean up test pages (process would normally be freed by finish_exit)
         mm::page_alloc::dealloc_page(mm::addr::PhysPage::containing(test_ht));
-        mm::page_alloc::dealloc_page(mm::addr::PhysPage::containing(test_proc));
+        // SAFETY: range came from kvm::alloc_kernel_pages above; no live refs.
+        unsafe { mm::kvm::free_kernel_pages(test_proc_range); }
         kprintln!("Process lifecycle test passed.");
     }
 
@@ -519,9 +522,10 @@ pub extern "C" fn kmain() -> ! {
             kernel_ht_page,
         ).unwrap_or_else(|_| panic!("kernel ht create"));
 
-        let kernel_proc_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("kernel proc alloc")).start_addr();
+        let kernel_proc_kva = mm::kvm::alloc_kernel_pages(1)
+            .unwrap_or_else(|_| panic!("kernel proc kvm alloc")).kva;
         cap::process_obj::create_process_object(
-            kernel_proc_page,
+            kernel_proc_kva,
             0, // ttbr0 = 0 (kernel process)
             kernel_ht_page.as_u64(),
             true, // immortal
@@ -549,17 +553,17 @@ pub extern "C" fn kmain() -> ! {
         ).unwrap_or_else(|_| panic!("insert reply handle"));
 
         // Thread A (sender) — kernel thread in the kernel process
-        cap::process_obj::process_inc_thread_count(kernel_proc_page);
+        cap::process_obj::process_inc_thread_count(kernel_proc_kva);
         let stack_a = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("stack alloc")).start_addr();
         let tcb_a_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("tcb alloc")).start_addr();
-        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, process_paddr: kernel_proc_page, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_page)
+        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_page)
             .unwrap_or_else(|_| panic!("create tcb a"));
 
         // Thread B (receiver) — kernel thread in the kernel process
-        cap::process_obj::process_inc_thread_count(kernel_proc_page);
+        cap::process_obj::process_inc_thread_count(kernel_proc_kva);
         let stack_b = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("stack alloc")).start_addr();
         let tcb_b_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("tcb alloc")).start_addr();
-        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, process_paddr: kernel_proc_page, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_page)
+        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_page)
             .unwrap_or_else(|_| panic!("create tcb b"));
 
         // Register idle/init thread (index 0 = this boot thread).
@@ -568,10 +572,10 @@ pub extern "C" fn kmain() -> ! {
         // For now it belongs to the kernel process.
         // SAFETY: linker symbol — post-pivot, &__symbol gives higher-half VA directly
         let idle_stack_base = &__stack_bottom as *const u8 as u64;
-        cap::process_obj::process_inc_thread_count(kernel_proc_page);
+        cap::process_obj::process_inc_thread_count(kernel_proc_kva);
 
         let idle_tcb_page = create_idle_tcb(
-            idle_stack_base, kernel_proc_page, *b"init\0\0\0\0\0\0\0\0\0\0\0\0",
+            idle_stack_base, kernel_proc_kva, *b"init\0\0\0\0\0\0\0\0\0\0\0\0",
         );
 
         sched::scheduler::add_thread(idle_tcb_page);  // index 0: idle/boot (CPU 0)
@@ -603,11 +607,11 @@ pub extern "C" fn kmain() -> ! {
                 let mpidr = plat.cpus[i].mpidr as usize;
                 if mpidr == 0 { continue; } // skip boot CPU
                 if mpidr >= 4 { continue; } // safety bound
-                cap::process_obj::process_inc_thread_count(kernel_proc_page);
+                cap::process_obj::process_inc_thread_count(kernel_proc_kva);
                 let mut name = *b"idle-cpu0\0\0\0\0\0\0\0";
                 name[8] = b'0' + mpidr as u8;
                 let tcb_page = create_idle_tcb(
-                    stack_bottoms[mpidr], kernel_proc_page, name);
+                    stack_bottoms[mpidr], kernel_proc_kva, name);
                 sched::scheduler::add_thread_for_cpu(tcb_page, mpidr);
             }
         }
@@ -753,22 +757,23 @@ pub extern "C" fn kmain() -> ! {
             init_ht_page,
         ).unwrap_or_else(|_| panic!("init ht create"));
 
-        let init_proc_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("init proc alloc")).start_addr();
+        let init_proc_kva = mm::kvm::alloc_kernel_pages(1)
+            .unwrap_or_else(|_| panic!("init proc kvm alloc")).kva;
         cap::process_obj::create_process_object(
-            init_proc_page,
+            init_proc_kva,
             ttbr0.as_u64(),
             init_ht_page.as_u64(),
             false, // not immortal
             b"init\0\0\0\0\0\0\0\0\0\0\0\0",
         );
-        cap::process_obj::process_inc_thread_count(init_proc_page);
+        cap::process_obj::process_inc_thread_count(init_proc_kva);
 
         // Decrement kernel process thread count (this thread is leaving)
         {
             let current_tcb_paddr = sched::scheduler::current_tcb_paddr();
-            let old_process = mm::addr::PhysAddr::new(
+            let old_process = lockjaw_types::addr::KernelVa::new(
                 mm::kernel_ptr::KernelRef::<sched::tcb::Tcb>::from_paddr(current_tcb_paddr)
-                    .get().process_paddr
+                    .get().process_kva
             );
             cap::process_obj::process_dec_thread_count(old_process);
         }
@@ -776,7 +781,7 @@ pub extern "C" fn kmain() -> ! {
         // Re-point TCB to the init process
         let current_tcb_paddr = sched::scheduler::current_tcb_paddr();
         let mut current_tcb = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(current_tcb_paddr);
-        current_tcb.get_mut().process_paddr = init_proc_page.as_u64();
+        current_tcb.get_mut().process_kva = init_proc_kva.as_u64();
 
         // Flush I-cache (we copied code into pages)
         core::arch::asm!(
@@ -868,7 +873,7 @@ fn ipc_receiver() -> ! {
 /// directly, not via context_switch.
 unsafe fn create_idle_tcb(
     stack_base: u64,
-    process_paddr: mm::addr::PhysAddr,
+    process_kva: lockjaw_types::addr::KernelVa,
     name: [u8; 16],
 ) -> mm::addr::PhysAddr {
     let tcb_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("idle tcb alloc")).start_addr();
@@ -880,7 +885,7 @@ unsafe fn create_idle_tcb(
     let p = tcb_km.as_mut_ptr();
     sched::tcb::Tcb::init_in_place(p, idle_thread);
     (*p).stack_base = stack_base;
-    (*p).process_paddr = process_paddr.as_u64();
+    (*p).process_kva = process_kva.as_u64();
     (*p).name = name;
     tcb_page
 }

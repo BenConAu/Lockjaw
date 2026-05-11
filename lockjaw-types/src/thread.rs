@@ -101,10 +101,11 @@ pub struct Tcb {
     pub saved_sp: u64,
     pub entry: fn() -> !,
     pub stack_base: u64,
-    /// Physical address of the owning ProcessObject. Every thread belongs
-    /// to a process. The process owns the address space (TTBR0) and handle
+    /// KVA of the owning ProcessObject. Every thread belongs to a
+    /// process. The process owns the address space (TTBR0) and handle
     /// table. Access via process_ops narrow accessors.
-    pub process_paddr: u64,
+    /// ProcessObject lives in the KVM pool — see kernel-vmem-roadmap.md.
+    pub process_kva: u64,
     pub ipc_blocked_on: u64,
     /// Kernel-internal IPC mailbox. The IPC state machine writes received
     /// messages here; the syscall handler copies them to the exception
@@ -193,7 +194,9 @@ impl Tcb {
 pub struct TcbCreateInfo {
     pub entry: fn() -> !,
     pub stack_paddr: crate::addr::PhysAddr,
-    pub process_paddr: crate::addr::PhysAddr,
+    /// KVA of the owning ProcessObject — kernel objects live in the
+    /// KVM pool. See kernel-vmem-roadmap.md.
+    pub process_kva: crate::addr::KernelVa,
     pub user_entry_point: u64,
     pub user_stack_base: u64,
     pub user_stack_top: u64,

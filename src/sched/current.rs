@@ -28,16 +28,17 @@ impl CurrentThread {
 
     // --- Read-only field accessors ---
 
-    /// Physical address of the current thread's owning process.
-    pub fn process_paddr() -> PhysAddr {
+    /// KVA of the current thread's owning ProcessObject.
+    /// ProcessObject lives in the KVM pool — see kernel-vmem-roadmap.md.
+    pub fn process_kva() -> lockjaw_types::addr::KernelVa {
         let tcb = Self::ref_();
-        PhysAddr::new(tcb.get().process_paddr)
+        lockjaw_types::addr::KernelVa::new(tcb.get().process_kva)
     }
 
     /// Physical address of the current thread's handle table.
     /// Two hops: TCB → process → handle table, via narrow process_ops.
     pub fn handle_table_paddr() -> PhysAddr {
-        crate::cap::process_obj::process_handle_table(Self::process_paddr())
+        crate::cap::process_obj::process_handle_table(Self::process_kva())
     }
 
     /// Safe typed reference to the current thread's handle table.
@@ -52,7 +53,7 @@ impl CurrentThread {
     /// Physical address of the current thread's TTBR0 (user page table).
     /// Two hops: TCB → process → ttbr0, via narrow process_ops.
     pub fn ttbr0() -> PhysAddr {
-        let ttbr0 = crate::cap::process_obj::process_ttbr0(Self::process_paddr());
+        let ttbr0 = crate::cap::process_obj::process_ttbr0(Self::process_kva());
         PhysAddr::new(ttbr0)
     }
 

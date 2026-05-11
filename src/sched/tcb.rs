@@ -51,7 +51,7 @@ pub unsafe fn create_tcb(
     Tcb::init_in_place(p, info.entry);
     (*p).saved_sp = boot.saved_sp;
     (*p).stack_base = stack_va;
-    (*p).process_paddr = info.process_paddr.as_u64();
+    (*p).process_kva = info.process_kva.as_u64();
     (*p).user_entry_point = info.user_entry_point;
     (*p).user_stack_top = info.user_stack_top;
     (*p).user_stack_base = info.user_stack_base;

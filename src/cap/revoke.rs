@@ -82,15 +82,14 @@ pub fn revoke_validate(header_kva: KernelVa) -> Result<(), RevokeError> {
     let mut walked_map_count: usize = 0;
     let mut first_error: Option<RevokeError> = None;
 
-    for_each_unique_process(|process_paddr| {
+    for_each_unique_process(|process_kva_u64| {
         if first_error.is_some() {
             return;
         }
-        let ttbr0 = process_obj::process_ttbr0(PhysAddr::new(process_paddr));
+        let process_kva = KernelVa::new(process_kva_u64);
+        let ttbr0 = process_obj::process_ttbr0(process_kva);
         let ht = unsafe {
-            HandleTableRef::from_paddr(process_obj::process_handle_table(
-                PhysAddr::new(process_paddr),
-            ))
+            HandleTableRef::from_paddr(process_obj::process_handle_table(process_kva))
         };
         // The PageSet revoke walks ignore non-PageSet kinds — pass
         // the typed KernelVa directly.
@@ -118,7 +117,7 @@ pub fn revoke_validate(header_kva: KernelVa) -> Result<(), RevokeError> {
                 };
                 if ok.is_err() {
                     first_error = Some(RevokeError::UnmapFailed {
-                        process_paddr,
+                        process_paddr: process_kva_u64,
                         va,
                     });
                     return;
@@ -166,13 +165,12 @@ pub fn revoke_validate(header_kva: KernelVa) -> Result<(), RevokeError> {
 /// The caller may now free the header pages.
 pub fn revoke_apply(header_kva: KernelVa) -> RevokeStats {
     let mut stats = RevokeStats::default();
-    for_each_unique_process(|process_paddr| {
+    for_each_unique_process(|process_kva_u64| {
         stats.processes += 1;
-        let ttbr0 = process_obj::process_ttbr0(PhysAddr::new(process_paddr));
+        let process_kva = KernelVa::new(process_kva_u64);
+        let ttbr0 = process_obj::process_ttbr0(process_kva);
         let ht = unsafe {
-            HandleTableRef::from_paddr(process_obj::process_handle_table(
-                PhysAddr::new(process_paddr),
-            ))
+            HandleTableRef::from_paddr(process_obj::process_handle_table(process_kva))
         };
         // The PageSet revoke walks ignore non-PageSet kinds — pass
         // the typed KernelVa directly.
@@ -242,22 +240,22 @@ fn for_each_unique_process(mut f: impl FnMut(u64)) {
     scheduler::for_each_tcb(|tcb_paddr| {
         // SAFETY: tcb_paddr came from the scheduler's threads array,
         // which holds only registered TCBs in kernel-owned pages.
-        let process_paddr = unsafe {
+        let process_kva = unsafe {
             let tcb = KernelRef::<Tcb>::from_paddr(tcb_paddr);
-            tcb.get().process_paddr
+            tcb.get().process_kva
         };
-        if process_paddr == 0 {
+        if process_kva == 0 {
             return;
         }
         for i in 0..visited_count {
-            if visited[i] == process_paddr {
+            if visited[i] == process_kva {
                 return;
             }
         }
         if visited_count < MAX_VISITED_PROCESSES {
-            visited[visited_count] = process_paddr;
+            visited[visited_count] = process_kva;
             visited_count += 1;
         }
-        f(process_paddr);
+        f(process_kva);
     });
 }

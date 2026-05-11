@@ -95,7 +95,9 @@ impl CreateProcessError {
 /// failure (freeing the pages); on success the orchestrator defuses
 /// each one before handing the addresses off to apply.
 struct ProvisionedResources {
-    proc: PageGuard,
+    /// ProcessObject lives in the KVM pool; the guard frees the KVA
+    /// range (and its backing frame) on drop unless defused.
+    proc: crate::mm::kvm::OwnedKvmRangeGuard,
     ttbr0: Ttbr0Guard,
     handle_table: PageGuard,
     tcb_stack: PageGuard,
@@ -164,9 +166,9 @@ pub fn create_process(
     // Passing it explicitly into validate prevents any possibility
     // of drift between the kernel-owned dedup count and a builder-
     // side mirror.
-    let proc_paddr = resources.proc.addr();
+    let proc_kva = resources.proc.kva();
     let unique_header_count =
-        crate::cap::process_obj::process_consumed_header_count(proc_paddr) as usize;
+        crate::cap::process_obj::process_consumed_header_count(proc_kva) as usize;
     let plan = plan_builder
         .validate(
             resources.scratch_capacity,
@@ -182,7 +184,7 @@ pub fn create_process(
     // them by index. The proc-page storage is a polymorphic u64
     // array — interpret the entries as PageSet header KVAs.
     for idx in 0..plan.unique_header_count() {
-        let hdr = crate::cap::process_obj::process_consumed_header(proc_paddr, idx)
+        let hdr = crate::cap::process_obj::process_consumed_header(proc_kva, idx)
             .expect("header index < unique_header_count by construction");
         crate::cap::pageset_table::consume_pageset_validate(hdr)
             .map_err(|_| CreateProcessError::ConsumeValidateFailed { idx })?;
@@ -196,7 +198,7 @@ pub fn create_process(
     // slot, then unlinks and frees the header. Cannot fail under the
     // validate→apply contract (GKL held throughout).
     for idx in 0..plan.unique_header_count() {
-        let hdr = crate::cap::process_obj::process_consumed_header(proc_paddr, idx)
+        let hdr = crate::cap::process_obj::process_consumed_header(proc_kva, idx)
             .expect("header index < unique_header_count by construction");
         crate::cap::pageset_table::consume_pageset_apply(hdr);
     }
@@ -239,7 +241,9 @@ pub fn create_process(
     let tcb_paddr = resources.tcb.addr();
 
     // Defuse drop guards — child now owns all its resources.
-    resources.proc.defuse();
+    // OwnedKvmRangeGuard transfers ownership via take() (drops the
+    // guard's claim without freeing). Other guards use defuse().
+    let _ = resources.proc.take();
     resources.handle_table.defuse();
     resources.ttbr0.defuse();
     resources.tcb_stack.defuse();
@@ -342,12 +346,19 @@ fn provision_resources(
     let mut mappings = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), MAPPINGS_PER_PAGE) };
     let mut cursor = ScratchCursor::new(scratch_count);
 
-    // Allocate process page early so we can write owned_pages directly
-    // into it during mapping resolution (avoids large stack arrays).
-    let proc_guard = PageGuard::new(
-        page_alloc::alloc_page().ok_or(CreateProcessError::OutOfMemory)?
-    );
-    page_alloc::zero_page(proc_guard.addr());
+    // Allocate process page early (in the KVM pool) so we can write
+    // owned_pages directly into it during mapping resolution. The KVM
+    // alloc returns an OwnedKvmRange whose backing frame is fresh and
+    // zero-initialized via the explicit write_bytes below.
+    let proc_range = crate::mm::kvm::alloc_kernel_pages(1)
+        .map_err(|_| CreateProcessError::OutOfMemory)?;
+    let proc_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(proc_range);
+    let proc_kva = proc_guard.kva();
+    // SAFETY: proc_kva is a freshly-allocated KVM range; we own it.
+    unsafe {
+        let mut p = crate::mm::kernel_ptr::KernelMut::<u8>::from_kva(proc_kva);
+        core::ptr::write_bytes(p.as_mut_ptr(), 0, PAGE_SIZE as usize);
+    }
 
     // Create incremental address space builder — Drop handles cleanup on failure.
     let mut as_builder = unsafe { AddressSpaceBuilder::new() }
@@ -397,12 +408,12 @@ fn provision_resources(
 
         // Record data page directly in ProcessObject (no stack array)
         if !crate::cap::process_obj::process_push_owned_page(
-            proc_guard.addr(), phys.as_u64()
+            proc_kva, phys.as_u64()
         ) {
             return Err(CreateProcessError::TooManyOwnedPages);
         }
         record_mapping_into_plan(
-            plan_builder, proc_guard.addr(), ps_kva,
+            plan_builder, proc_kva, ps_kva,
         )?;
     }
 
@@ -434,13 +445,13 @@ fn provision_resources(
 
         // Record stack pages directly in ProcessObject
         if !crate::cap::process_obj::process_push_owned_page(
-            proc_guard.addr(), phys.as_u64()
+            proc_kva, phys.as_u64()
         ) {
             return Err(CreateProcessError::TooManyOwnedPages);
         }
     }
     record_stack_into_plan(
-        plan_builder, proc_guard.addr(), stack_kva, stack_ps.count(),
+        plan_builder, proc_kva, stack_kva, stack_ps.count(),
     )?;
 
     // Final flush of pending mappings and finalize address space
@@ -468,7 +479,7 @@ fn provision_resources(
 
     // Write ProcessObject header (owned_pages already populated above).
     crate::cap::process_obj::init_process_header(
-        proc_guard.addr(),
+        proc_kva,
         ttbr0_guard.addr().as_u64(),
         ht_guard.addr().as_u64(),
         false, // not immortal
@@ -476,7 +487,7 @@ fn provision_resources(
     );
 
     // First thread — increment via narrow op (count 0 → 1)
-    crate::cap::process_obj::process_inc_thread_count(proc_guard.addr());
+    crate::cap::process_obj::process_inc_thread_count(proc_kva);
 
     // Create TCB — first thread in this process
     let tcb_stack_guard = PageGuard::new(
@@ -492,7 +503,7 @@ fn provision_resources(
             &TcbCreateInfo {
                 entry: process_entry,
                 stack_paddr: tcb_stack_guard.addr(),
-                process_paddr: proc_guard.addr(),
+                process_kva: proc_kva,
                 user_entry_point: entry_point,
                 user_stack_top: stack_va + (stack_ps.count() as u64) * PAGE_SIZE,
                 user_stack_base: stack_va,
@@ -521,10 +532,10 @@ fn provision_resources(
 /// `mapping_count`.
 fn record_mapping_into_plan(
     plan_builder: &mut ProcessCreationPlanBuilder,
-    proc_paddr: PhysAddr,
+    proc_kva: KernelVa,
     header_kva: KernelVa,
 ) -> Result<(), CreateProcessError> {
-    crate::cap::process_obj::process_record_consumed_header(proc_paddr, header_kva)
+    crate::cap::process_obj::process_record_consumed_header(proc_kva, header_kva)
         .map_err(|_| CreateProcessError::PlanError(CreateProcessPlanError::TooManyHeaders))?;
     plan_builder.record_mapping();
     Ok(())
@@ -539,11 +550,11 @@ fn record_mapping_into_plan(
 /// retried).
 fn record_stack_into_plan(
     plan_builder: &mut ProcessCreationPlanBuilder,
-    proc_paddr: PhysAddr,
+    proc_kva: KernelVa,
     header_kva: KernelVa,
     stack_pages: usize,
 ) -> Result<(), CreateProcessError> {
-    crate::cap::process_obj::process_record_consumed_header(proc_paddr, header_kva)
+    crate::cap::process_obj::process_record_consumed_header(proc_kva, header_kva)
         .map_err(|_| CreateProcessError::PlanError(CreateProcessPlanError::TooManyHeaders))?;
     plan_builder.record_stack(stack_pages)
         .map_err(CreateProcessError::PlanError)?;
@@ -563,7 +574,7 @@ pub fn process_entry() -> ! {
         let stack_top = t.user_stack_top;
         let user_arg = t.user_arg;
         let ttbr0 = PhysAddr::new(
-            crate::cap::process_obj::process_ttbr0(PhysAddr::new(t.process_paddr))
+            crate::cap::process_obj::process_ttbr0(KernelVa::new(t.process_kva))
         );
 
         // Release GKL before dropping to EL0. eret restores user

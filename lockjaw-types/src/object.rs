@@ -71,7 +71,7 @@ pub enum HandleKind {
     Endpoint { kva: crate::addr::KernelVa, caller_token: u64 } = 3,
     Notification { kva: crate::addr::KernelVa } = 4,
     Reply { kva: crate::addr::KernelVa } = 5,
-    Process { paddr: crate::addr::PhysAddr } = 6,
+    Process { kva: crate::addr::KernelVa } = 6,
     PageSet { kva: crate::addr::KernelVa, mapped_va_page: u32 } = 7,
 }
 

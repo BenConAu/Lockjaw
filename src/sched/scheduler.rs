@@ -428,7 +428,7 @@ pub fn exit_current() -> ! {
                 let new_paddr = (*SCHEDULER.threads_ptr())[next].unwrap();
                 let new_tcb = KernelMut::<Tcb>::from_paddr(new_paddr);
                 let new_ttbr0 = crate::cap::process_obj::process_ttbr0(
-                    PhysAddr::new(new_tcb.get().process_paddr)
+                    lockjaw_types::addr::KernelVa::new(new_tcb.get().process_kva)
                 );
 
                 // Swap TTBR0 if the new thread has a user address space
@@ -520,7 +520,7 @@ fn finish_exit() {
     // Invariant: stack_base is a direct-map VA of the kernel stack page
     // (stack_base = phys + KERNEL_VA_OFFSET). This is set by create_tcb.
     let stack_paddr = PhysAddr::new(tcb.get().stack_base - KERNEL_VA_OFFSET);
-    let process_paddr = PhysAddr::new(tcb.get().process_paddr);
+    let process_kva = lockjaw_types::addr::KernelVa::new(tcb.get().process_kva);
 
     // Step 2: Remove from scheduler array + model
     unsafe {
@@ -535,7 +535,7 @@ fn finish_exit() {
     page_alloc::dealloc_page(PhysPage::containing(pending.tcb_paddr));
 
     // Step 4: Decrement process thread count via narrow op + pure model
-    let lifecycle = crate::cap::process_obj::process_dec_thread_count(process_paddr);
+    let lifecycle = crate::cap::process_obj::process_dec_thread_count(process_kva);
     let mut pages_freed = 2u32; // stack + TCB
 
     match lifecycle {
@@ -544,8 +544,8 @@ fn finish_exit() {
             use lockjaw_types::process::{TeardownStep, build_teardown_plan};
             use lockjaw_types::object::{CloseHandleResult, decide_close_handle};
 
-            let ttbr0 = crate::cap::process_obj::process_ttbr0(process_paddr);
-            let ht_paddr = crate::cap::process_obj::process_handle_table(process_paddr);
+            let ttbr0 = crate::cap::process_obj::process_ttbr0(process_kva);
+            let ht_paddr = crate::cap::process_obj::process_handle_table(process_kva);
             let ht_page_count = if ht_paddr.as_u64() != 0 {
                 let ht = unsafe { KernelRef::<HandleTableHeader>::from_paddr(ht_paddr) };
                 ht.get().header.page_count as u8
@@ -554,7 +554,7 @@ fn finish_exit() {
             };
 
             let plan = build_teardown_plan(
-                crate::cap::process_obj::process_owned_page_count(process_paddr),
+                crate::cap::process_obj::process_owned_page_count(process_kva),
                 ttbr0 != 0,
                 ht_paddr.as_u64() != 0,
                 ht_page_count,
@@ -564,7 +564,7 @@ fn finish_exit() {
                 match step {
                     TeardownStep::FreeOwnedPages { count } => {
                         for i in 0..*count as usize {
-                            if let Some(paddr) = crate::cap::process_obj::process_owned_page(process_paddr, i) {
+                            if let Some(paddr) = crate::cap::process_obj::process_owned_page(process_kva, i) {
                                 page_alloc::dealloc_page(PhysPage::containing(PhysAddr::new(paddr)));
                                 pages_freed += 1;
                             }
@@ -616,7 +616,17 @@ fn finish_exit() {
                         pages_freed += *page_count as u32;
                     }
                     TeardownStep::FreeProcessPage => {
-                        page_alloc::dealloc_page(PhysPage::containing(process_paddr));
+                        // ProcessObject lives in the KVM pool; tear down
+                        // the KVA range, returning the backing frame to
+                        // page_alloc and the VA to the KVM free list.
+                        // SAFETY: process_kva came from a prior
+                        // kvm::alloc_kernel_pages(1) at process create
+                        // time; no live KernelMut/Ref into the page now.
+                        unsafe {
+                            crate::mm::kvm::free_kernel_pages(
+                                crate::mm::kvm::OwnedKvmRange { kva: process_kva, pages: 1 }
+                            );
+                        }
                         pages_freed += 1;
                     }
                 }
@@ -683,9 +693,9 @@ unsafe fn schedule(reason: SchedReason) {
     // accessed via TTBR1), so swapping before context_switch is safe —
     // when the new thread eventually erets to EL0, TTBR0 is already set.
     // Same-process switches skip the TLB flush (threads share address space).
-    let old_process = old_tcb.get().process_paddr;
-    let new_process = new_tcb.get().process_paddr;
-    let new_ttbr0 = crate::cap::process_obj::process_ttbr0(PhysAddr::new(new_process));
+    let old_process = old_tcb.get().process_kva;
+    let new_process = new_tcb.get().process_kva;
+    let new_ttbr0 = crate::cap::process_obj::process_ttbr0(lockjaw_types::addr::KernelVa::new(new_process));
     if new_ttbr0 != 0 && new_process != old_process {
         TTBR0_WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
         core::arch::asm!(

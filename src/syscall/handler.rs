@@ -757,7 +757,9 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         // The export_kind already carries its typed address (PhysAddr or
         // KernelVa) inside the variant, so insert is the single path.
         let caller_tcb = KernelRef::<Tcb>::from_paddr(PhysAddr::new(caller_tcb_paddr_u64));
-        let caller_ht_paddr = crate::cap::process_obj::process_handle_table(PhysAddr::new(caller_tcb.get().process_paddr));
+        let caller_ht_paddr = crate::cap::process_obj::process_handle_table(
+            lockjaw_types::addr::KernelVa::new(caller_tcb.get().process_kva),
+        );
         let caller_ht = handle_table::HandleTableRef::from_paddr(caller_ht_paddr);
         let idx = caller_ht.insert(export_entry.rights, export_kind)?;
         // Increment refcount for PageSets — a new handle references it.
@@ -860,8 +862,8 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
         return SyscallError::INVALID_PARAMETER; // AArch64 ABI: SP must be 16-byte aligned
     }
 
-    // Get caller's process (returns PhysAddr)
-    let process_paddr = crate::sched::current::CurrentThread::process_paddr();
+    // Get caller's process (returns the KVA of its ProcessObject).
+    let process_kva = crate::sched::current::CurrentThread::process_kva();
 
     // Allocate kernel stack + TCB pages
     let kernel_stack = match crate::mm::page_alloc::alloc_page() {
@@ -883,7 +885,7 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
             &crate::sched::tcb::TcbCreateInfo {
                 entry: crate::process::process_entry,
                 stack_paddr: kernel_stack.start_addr(),
-                process_paddr,
+                process_kva,
                 user_entry_point: entry_point,
                 user_stack_top: stack_top,
                 user_stack_base: stack_base,
@@ -899,7 +901,7 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
     }
 
     // Increment process thread count
-    crate::cap::process_obj::process_inc_thread_count(process_paddr);
+    crate::cap::process_obj::process_inc_thread_count(process_kva);
 
     // Register with scheduler
     if !scheduler::add_thread(tcb_page.start_addr()) {
@@ -907,7 +909,7 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
         // Invariant: caller is still alive, so dec cannot return LastThread.
         crate::mm::page_alloc::dealloc_page(tcb_page);
         crate::mm::page_alloc::dealloc_page(kernel_stack);
-        crate::cap::process_obj::process_dec_thread_count(process_paddr);
+        crate::cap::process_obj::process_dec_thread_count(process_kva);
         return SyscallError::OUT_OF_MEMORY;
     }
 
