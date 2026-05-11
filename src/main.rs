@@ -305,14 +305,18 @@ pub extern "C" fn kmain() -> ! {
     }
 
     // Pivot PC, SP, and FP to higher-half (TTBR1) addresses.
-    // After this call, all PC-relative references resolve to higher-half
-    // VAs — VBAR gets a higher-half address, exception handlers run via
-    // TTBR1, and the kernel no longer depends on TTBR0 identity mapping.
-    // Must happen AFTER secondary CPU boot (PSCI needs physical entry
-    // address) and BEFORE exceptions::init (VBAR must be higher-half).
+    // After this call, all PC-relative references resolve to the L0[1]
+    // kernel-image VA range — VBAR gets an L0[1] address, exception
+    // handlers run via TTBR1's L0[1] mapping, and the kernel no longer
+    // depends on TTBR0 identity. The shift is `LINKER_BASE - load_PA`
+    // (computed by init_kernel_image_map at MMU setup time); pre-relink
+    // this was the constant `KERNEL_VA_OFFSET` because linker_VA == PA +
+    // KERNEL_VA_OFFSET held by accident. Must happen AFTER secondary CPU
+    // boot (PSCI needs physical entry address) and BEFORE exceptions::init
+    // (VBAR must be the post-pivot higher-half address).
     unsafe {
         extern "C" { fn _pivot_to_higher_half(offset: u64); }
-        _pivot_to_higher_half(mm::addr::KERNEL_VA_OFFSET);
+        _pivot_to_higher_half(arch::aarch64::mmu::kernel_image_pivot_shift());
     }
     kprintln!("Pivoted to higher-half (TTBR1).");
 
@@ -940,11 +944,12 @@ pub extern "C" fn secondary_main(cpu_id: u64) -> ! {
     // Enable MMU with the same page tables CPU 0 built
     unsafe { arch::aarch64::mmu::enable_mmu_secondary(); }
 
-    // Pivot to higher-half — same as CPU 0's pivot in kmain.
-    // After this, PC/SP/FP are at TTBR1 addresses.
+    // Pivot to higher-half — same as CPU 0's pivot in kmain. The shift
+    // is the boot-discovered LINKER_BASE - load_PA stored in
+    // KERNEL_PHYS_OFFSET; CPU 0 set it before secondaries booted.
     unsafe {
         extern "C" { fn _pivot_to_higher_half(offset: u64); }
-        _pivot_to_higher_half(mm::addr::KERNEL_VA_OFFSET);
+        _pivot_to_higher_half(arch::aarch64::mmu::kernel_image_pivot_shift());
     }
 
     // Initialize per-CPU data (TPIDR_EL1)

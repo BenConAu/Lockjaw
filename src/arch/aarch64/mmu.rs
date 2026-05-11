@@ -1,6 +1,7 @@
 use crate::mm::addr::PhysAddr;
 use crate::mm::page_table::*;
 use core::arch::asm;
+use lockjaw_types::addr::KernelImageVa;
 
 // ---------------------------------------------------------------------------
 // Boot page tables (static, in BSS)
@@ -31,6 +32,90 @@ static mut KERNEL_L2_RAM: PageTable = PageTable::empty();
 /// L3 table for the 2 MB region containing the guard page.
 /// 512 × 4 KB page entries, with the guard page entry left invalid.
 static mut KERNEL_L3_GUARD: PageTable = PageTable::empty();
+
+// ---------------------------------------------------------------------------
+// L0[1] kernel-image mapping
+// ---------------------------------------------------------------------------
+// The kernel image is linked at KERNEL_IMAGE_LINKER_BASE (a fixed VA in
+// L0[1]) but loaded by firmware at an arbitrary physical address. The
+// boot trampoline:
+//   1. Discovers the runtime PA via PC-relative (`&raw const __sym`).
+//   2. Computes KERNEL_PHYS_OFFSET = load_PA - LINKER_BASE.
+//   3. Walks every kernel image page from __kernel_start through
+//      __per_cpu_stacks_end and writes 4 KB L3 PTEs mapping
+//      load_PA + offset → LINKER_BASE + offset.
+//   4. Installs the L0[1] table descriptor.
+// After the pivot, all kernel-image accesses go through this mapping.
+
+/// Linker.ld ORIGIN. Must equal the value in linker.ld.
+pub const KERNEL_IMAGE_LINKER_BASE: u64 = 0xFFFF_0080_0000_0000;
+
+/// L1 table for L0[1] kernel-image region. Only entry [0] is used —
+/// the kernel image fits well within one 1 GB L1[0] entry.
+static mut KERNEL_IMAGE_L1: PageTable = PageTable::empty();
+
+/// L2 table feeding KERNEL_IMAGE_L1[0]. Each entry covers 2 MB and
+/// points to one of `KERNEL_IMAGE_L3`. Populated by
+/// `init_kernel_image_map` based on the image's actual span.
+static mut KERNEL_IMAGE_L2: PageTable = PageTable::empty();
+
+/// Number of L3 tables reserved for the kernel image. Each L3 covers
+/// 2 MB, so `MAX_KERNEL_IMAGE_L3` × 2 MB = supported image span.
+/// Current kernel image (~256 KB code/data + 2 MB-aligned per-CPU
+/// stacks) fits in ≤ 2 L3 tables; 4 gives headroom up to 8 MB.
+const MAX_KERNEL_IMAGE_L3: usize = 4;
+
+/// L3 tables for KERNEL_IMAGE_L2 entries. Each table contains 512
+/// 4 KB page entries; one table per 2 MB span of kernel image.
+static mut KERNEL_IMAGE_L3: [PageTable; MAX_KERNEL_IMAGE_L3] =
+    [const { PageTable::empty() }; MAX_KERNEL_IMAGE_L3];
+
+/// Runtime PA-VA shift: load_PA - LINKER_BASE. Set once by
+/// `init_kernel_image_map`. Read by `kernel_image_kva_to_pa` and by
+/// callers that need to know the relink delta (e.g., the pivot).
+///
+/// On QEMU virt this is `0x4020_0000 - 0xFFFF_0080_0000_0000`, which
+/// wraps; the wrapping arithmetic in the converter accepts that.
+static mut KERNEL_PHYS_OFFSET: u64 = 0;
+
+/// Recover the physical address of a kernel-image VA. Uses the
+/// boot-discovered offset; valid only for VAs in the kernel image
+/// span ([__kernel_start, __per_cpu_stacks_end)) and only after
+/// `init_kernel_image_map` has run.
+///
+/// All current PA-recovery sites in the boot path run **pre-pivot**,
+/// where `&__sym as u64` returns the runtime PA directly via
+/// PC-relative addressing — they do not need this helper. The
+/// helper exists for post-pivot callers that hold a `KernelImageVa`
+/// and need its PA. None today; kept and exported so future code
+/// can use it without re-deriving the math.
+///
+/// # Safety
+/// Caller must ensure `va` falls inside the kernel image span. Out
+/// of range yields a meaningless paddr.
+#[allow(dead_code)]
+pub unsafe fn kernel_image_kva_to_pa(va: KernelImageVa) -> PhysAddr {
+    PhysAddr::new(va.as_u64().wrapping_add(KERNEL_PHYS_OFFSET))
+}
+
+/// Boot-discovered shift: LINKER_BASE - load_PA. The value the pivot
+/// should add to SP/FP/LR to land them in the L0[1] mapping.
+///
+/// Pre-pivot, PC-relative `&raw const __sym` returns load_PA + offset
+/// (PA). Adding this shift yields LINKER_BASE + offset (the L0[1] VA).
+///
+/// # Safety
+/// Must be called after `init_kernel_image_map`.
+pub unsafe fn kernel_image_pivot_shift() -> u64 {
+    KERNEL_IMAGE_LINKER_BASE.wrapping_sub(load_pa_of_kernel_image())
+}
+
+/// The runtime physical address where the kernel image was loaded.
+/// Recovered from KERNEL_PHYS_OFFSET (the inverse of the per-image
+/// `LINKER_BASE - load_PA` shift).
+unsafe fn load_pa_of_kernel_image() -> u64 {
+    KERNEL_IMAGE_LINKER_BASE.wrapping_add(KERNEL_PHYS_OFFSET)
+}
 
 // ---------------------------------------------------------------------------
 // Identity map setup
@@ -228,6 +313,13 @@ pub unsafe fn enable_higher_half() {
         PhysAddr::new(&raw const KERNEL_L1 as u64),
     );
 
+    // Build the L0[1] kernel-image mapping. Computes KERNEL_PHYS_OFFSET,
+    // walks the kernel image one 4 KB page at a time, and installs L3
+    // PTEs mapping load_PA + offset → LINKER_BASE + offset. Skips guard
+    // pages (left invalid). Must run before the pivot so the new VAs
+    // are reachable when PC moves into them.
+    init_kernel_image_map();
+
     // Install TTBR1
     let ttbr1 = &raw const KERNEL_L0 as u64;
     asm!(
@@ -253,6 +345,95 @@ pub unsafe fn enable_higher_half() {
     // (boot.rs assembly), called separately after this function returns.
     // That stub adds KERNEL_VA_OFFSET to SP, FP, and LR atomically, so
     // the caller resumes at a higher-half address.
+}
+
+/// Build the L0[1] kernel-image mapping. Pre-MMU/pre-pivot, PC-relative
+/// `&raw const __sym` returns the runtime PA of `__sym`; that's how we
+/// discover where firmware loaded the kernel.
+///
+/// Steps:
+/// 1. Compute KERNEL_PHYS_OFFSET from `__kernel_start`'s runtime PA
+///    minus its linker VA (the constant LINKER_BASE).
+/// 2. Walk every kernel image page from `__kernel_start` through
+///    `__per_cpu_stacks_end`, in 4 KB strides.
+/// 3. For each page that is NOT a per-CPU guard page, write a 4 KB L3
+///    page entry mapping `load_PA + offset` → `LINKER_BASE + offset`
+///    in the appropriate `KERNEL_IMAGE_L3` table.
+/// 4. Install `KERNEL_IMAGE_L2` at `KERNEL_IMAGE_L1[0]` and
+///    `KERNEL_IMAGE_L1` at `KERNEL_L0[1]`.
+///
+/// Guard pages are intentionally left as zero L3 entries (invalid),
+/// matching `setup_guard_pages`'s treatment in the linear map.
+///
+/// # Safety
+/// Must be called before the pivot. Mutates statics under the
+/// pre-pivot single-CPU invariant.
+unsafe fn init_kernel_image_map() {
+    extern "C" {
+        static __kernel_start: u8;
+        static __per_cpu_stacks_end: u8;
+        static __guard_page_0: u8;
+        static __guard_page_1: u8;
+        static __guard_page_2: u8;
+        static __guard_page_3: u8;
+    }
+
+    // Step 1: discover the load PA via PC-relative on a kernel symbol,
+    // then derive the boot-wide phys offset.
+    let load_pa = &raw const __kernel_start as u64;
+    let phys_offset = load_pa.wrapping_sub(KERNEL_IMAGE_LINKER_BASE);
+    KERNEL_PHYS_OFFSET = phys_offset;
+
+    // Step 2: walk the image. Per-CPU guard PAs (also via PC-relative).
+    let image_end_pa = &raw const __per_cpu_stacks_end as u64;
+    let image_size = image_end_pa.wrapping_sub(load_pa);
+    let guard_pas: [u64; 4] = [
+        &raw const __guard_page_0 as u64,
+        &raw const __guard_page_1 as u64,
+        &raw const __guard_page_2 as u64,
+        &raw const __guard_page_3 as u64,
+    ];
+    let page_size: u64 = lockjaw_types::addr::PAGE_SIZE;
+    let pages = (image_size + page_size - 1) / page_size;
+    let l3_span: u64 = 512 * page_size; // 2 MB per L3 table
+    let max_pages = (MAX_KERNEL_IMAGE_L3 as u64) * 512;
+    assert!(
+        pages <= max_pages,
+        "kernel image span exceeds MAX_KERNEL_IMAGE_L3 — bump the constant",
+    );
+
+    // Step 3: write L3 PTEs for every non-guard page.
+    for i in 0..pages {
+        let page_pa = load_pa + i * page_size;
+        if guard_pas.iter().any(|&g| g == page_pa) {
+            continue; // leave guard pages invalid
+        }
+        let page_va_offset = i * page_size;
+        let l2_idx = (page_va_offset / l3_span) as usize;
+        let l3_idx = ((page_va_offset / page_size) as usize) & 0x1FF;
+        // SAFETY: l2_idx < MAX_KERNEL_IMAGE_L3 guaranteed by pages cap.
+        KERNEL_IMAGE_L3[l2_idx].entries[l3_idx] = PageTableEntry::new_page(
+            PhysAddr::new(page_pa),
+            MAIR_NORMAL,
+            AP_RW_EL1,
+            SH_INNER,
+        );
+    }
+
+    // Step 4: install table descriptors. KERNEL_IMAGE_L2 entry [i] →
+    // KERNEL_IMAGE_L3[i] for each L3 used (we install all, even unused
+    // tables; their L3 entries are all zero so they're harmless).
+    for i in 0..MAX_KERNEL_IMAGE_L3 {
+        KERNEL_IMAGE_L2.entries[i] = PageTableEntry::new_table(
+            PhysAddr::new(&raw const KERNEL_IMAGE_L3[i] as u64),
+        );
+    }
+    KERNEL_IMAGE_L1.entries[0] = PageTableEntry::new_table(
+        PhysAddr::new(&raw const KERNEL_IMAGE_L2 as u64),
+    );
+    KERNEL_L0.entries[1] = PageTableEntry::new_table(
+        PhysAddr::new(&raw const KERNEL_IMAGE_L1 as u64),
+    );
 }
 
 // ---------------------------------------------------------------------------
