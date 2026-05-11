@@ -20,10 +20,10 @@ pub struct CurrentThread;
 impl CurrentThread {
     // --- Identity ---
 
-    /// Physical address of the current thread's TCB.
-    /// Useful when passing to IPC functions that take a TCB paddr.
-    pub fn tcb_paddr() -> PhysAddr {
-        scheduler::current_tcb_paddr()
+    /// KVA of the current thread's TCB.
+    /// TCBs live in the KVM pool (kernel-vmem-roadmap.md).
+    pub fn tcb_kva() -> lockjaw_types::addr::KernelVa {
+        scheduler::current_tcb_kva()
     }
 
     // --- Read-only field accessors ---
@@ -135,16 +135,16 @@ impl CurrentThread {
     // --- Internal helpers (not pub — prevent external nesting) ---
 
     fn ref_() -> KernelRef<'static, Tcb> {
-        let paddr = scheduler::current_tcb_paddr();
-        // SAFETY: scheduler guarantees current_tcb_paddr is a valid,
-        // live TCB in a kernel-owned page.
-        unsafe { KernelRef::from_paddr(paddr) }
+        let kva = scheduler::current_tcb_kva();
+        // SAFETY: scheduler guarantees current_tcb_kva is a valid,
+        // live TCB in a KVM-mapped page.
+        unsafe { KernelRef::from_kva(kva) }
     }
 
     fn mut_() -> KernelMut<'static, Tcb> {
-        let paddr = scheduler::current_tcb_paddr();
+        let kva = scheduler::current_tcb_kva();
         // SAFETY: same as ref_. Single-core execution ensures no
         // concurrent access.
-        unsafe { KernelMut::from_paddr(paddr) }
+        unsafe { KernelMut::from_kva(kva) }
     }
 }

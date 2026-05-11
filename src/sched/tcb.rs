@@ -1,25 +1,26 @@
 use crate::cap::object::CreateError;
-use crate::mm::addr::{PhysAddr, PAGE_SIZE};
+use crate::mm::addr::PAGE_SIZE;
 use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::context::SavedContext;
 use core::ptr;
+use lockjaw_types::addr::KernelVa;
 
 // Struct definitions and layout assertions live in lockjaw-types
 // (host-testable). Re-export so all existing kernel import sites
 // (`use crate::sched::tcb::Tcb`) work unchanged.
 pub use lockjaw_types::thread::{Tcb, TcbCreateInfo, ThreadBootstrap};
 
-/// Initialize a TCB in donated memory and set up its stack with a
+/// Initialize a TCB in a KVM-mapped page and set up its stack with a
 /// synthetic frame so it can be context-switched into.
 ///
 /// # Safety
-/// `base_paddr` must be a donated page. `info.stack_paddr` must be a
-/// separate page for the thread's stack.
+/// `base_kva` must be a KVM-allocated page. `info.stack_paddr` must
+/// be a separate page for the thread's stack.
 pub unsafe fn create_tcb(
     info: &TcbCreateInfo,
-    base_paddr: PhysAddr,
+    base_kva: KernelVa,
 ) -> Result<(), CreateError> {
-    let mut tcb_km = KernelMut::<Tcb>::from_paddr(base_paddr);
+    let mut tcb_km = KernelMut::<Tcb>::from_kva(base_kva);
     let mut stack_km = KernelMut::<u64>::from_paddr(info.stack_paddr);
     // SAFETY: KernelMut pointer is the kernel VA of the stack page
     let stack_va = stack_km.as_mut_ptr() as usize as u64;
@@ -46,7 +47,11 @@ pub unsafe fn create_tcb(
     // Initialize TCB in place — zero the page first, then write
     // header + non-default fields through the pointer. No by-value
     // Tcb on the kernel stack.
-    crate::mm::page_alloc::zero_page(base_paddr);
+    // SAFETY: base_kva is a freshly-allocated KVM range; we own it.
+    {
+        let mut p = KernelMut::<u8>::from_kva(base_kva);
+        ptr::write_bytes(p.as_mut_ptr(), 0, PAGE_SIZE as usize);
+    }
     let p = tcb_km.as_mut_ptr();
     Tcb::init_in_place(p, info.entry);
     (*p).saved_sp = boot.saved_sp;

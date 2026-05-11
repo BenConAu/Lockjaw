@@ -34,11 +34,13 @@ pub fn print_thread_context(prefix: &str) {
     unsafe {
         let thread_idx = crate::sched::scheduler::current_thread_index();
 
-        if let Some(tcb_paddr) = crate::sched::scheduler::try_current_tcb_paddr() {
+        if let Some(tcb_kva) = crate::sched::scheduler::try_current_tcb_kva() {
             // Read TCB fields via raw pointer arithmetic — no &Tcb reference,
             // no alignment checks that could panic in debug builds.
-            let tcb_va = tcb_paddr.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET;
-            // SAFETY: tcb_paddr is from the scheduler; kernel VA via KERNEL_VA_OFFSET
+            // TCBs live in the KVM pool; the KVA is the dereferenceable
+            // pointer directly (no KERNEL_VA_OFFSET translation).
+            let tcb_va = tcb_kva.as_u64();
+            // SAFETY: tcb_kva is from the scheduler; mapped in KVM.
             let tcb_ptr = tcb_va as *const u8;
 
             // Read the name field (offset = offset_of Tcb::name).

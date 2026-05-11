@@ -589,7 +589,7 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     };
 
     unsafe {
-        let tcb_paddr = CurrentThread::tcb_paddr();
+        let tcb_kva = CurrentThread::tcb_kva();
         let ht = CurrentThread::handle_table();
 
         // Read WaitEntry array from user memory via page table walk (TTBR1).
@@ -639,9 +639,9 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
             let kva = lockjaw_types::addr::KernelVa::new(addrs[i]);
             match types[i] {
                 ObjectType::Endpoint =>
-                    endpoint::set_readiness_waiter(kva, tcb_paddr),
+                    endpoint::set_readiness_waiter(kva, tcb_kva),
                 ObjectType::Notification =>
-                    notification::set_readiness_waiter(kva, tcb_paddr, thresholds[i]),
+                    notification::set_readiness_waiter(kva, tcb_kva, thresholds[i]),
                 _ => {}
             }
         }
@@ -663,9 +663,9 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
             let kva = lockjaw_types::addr::KernelVa::new(a);
             match obj_type_from_u8(type_tag) {
                 ObjectType::Endpoint =>
-                    endpoint::clear_readiness_waiter(kva, tcb_paddr),
+                    endpoint::clear_readiness_waiter(kva, tcb_kva),
                 ObjectType::Notification =>
-                    notification::clear_readiness_waiter(kva, tcb_paddr),
+                    notification::clear_readiness_waiter(kva, tcb_kva),
                 _ => {}
             }
         }
@@ -716,7 +716,7 @@ fn check_readiness(
 /// NO_CALLER if the exporting thread has no bound call.
 ///
 /// The caller is identified via the exporter's own TCB's
-/// `current_reply_kva` → Reply object → `caller_tcb_paddr`.
+/// `current_reply_kva` → Reply object → `caller_tcb_kva`.
 fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let handle_to_export = ctx.gpr[0] as u32;
 
@@ -729,8 +729,8 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         let reply = KernelRef::<crate::ipc::reply::ReplyObject>::from_kva(
             lockjaw_types::addr::KernelVa::new(reply_kva_u64),
         );
-        let caller_tcb_paddr_u64 = reply.get().caller_tcb_paddr;
-        if caller_tcb_paddr_u64 == 0 {
+        let caller_tcb_kva_u64 = reply.get().caller_tcb_kva;
+        if caller_tcb_kva_u64 == 0 {
             return Err(SyscallError::NO_CALLER);
         }
 
@@ -756,7 +756,7 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         // Insert into the caller's handle table (cross-table operation).
         // The export_kind already carries its typed address (PhysAddr or
         // KernelVa) inside the variant, so insert is the single path.
-        let caller_tcb = KernelRef::<Tcb>::from_paddr(PhysAddr::new(caller_tcb_paddr_u64));
+        let caller_tcb = KernelRef::<Tcb>::from_kva(lockjaw_types::addr::KernelVa::new(caller_tcb_kva_u64));
         let caller_ht_kva = crate::cap::process_obj::process_handle_table(
             lockjaw_types::addr::KernelVa::new(caller_tcb.get().process_kva),
         );
@@ -865,18 +865,19 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
     // Get caller's process (returns the KVA of its ProcessObject).
     let process_kva = crate::sched::current::CurrentThread::process_kva();
 
-    // Allocate kernel stack + TCB pages
+    // Allocate kernel stack (physical) + TCB page (KVM).
     let kernel_stack = match crate::mm::page_alloc::alloc_page() {
         Some(p) => p,
         None => return SyscallError::OUT_OF_MEMORY,
     };
-    let tcb_page = match crate::mm::page_alloc::alloc_page() {
-        Some(p) => p,
-        None => {
+    let tcb_range = match crate::mm::kvm::alloc_kernel_pages(1) {
+        Ok(r) => r,
+        Err(_) => {
             crate::mm::page_alloc::dealloc_page(kernel_stack);
             return SyscallError::OUT_OF_MEMORY;
         }
     };
+    let tcb_kva = tcb_range.kva;
 
     // Create TCB — reuses process_entry which reads TTBR0 from the
     // shared ProcessObject and drops to EL0.
@@ -892,9 +893,9 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
                 user_arg,
                 name: *b"thread\0\0\0\0\0\0\0\0\0\0",
             },
-            tcb_page.start_addr(),
+            tcb_kva,
         ).is_err() {
-            crate::mm::page_alloc::dealloc_page(tcb_page);
+            crate::mm::kvm::free_kernel_pages(tcb_range);
             crate::mm::page_alloc::dealloc_page(kernel_stack);
             return SyscallError::UNKNOWN;
         }
@@ -904,10 +905,11 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
     crate::cap::process_obj::process_inc_thread_count(process_kva);
 
     // Register with scheduler
-    if !scheduler::add_thread(tcb_page.start_addr()) {
+    if !scheduler::add_thread(tcb_kva) {
         // Rollback: dealloc pages, then dec thread count.
         // Invariant: caller is still alive, so dec cannot return LastThread.
-        crate::mm::page_alloc::dealloc_page(tcb_page);
+        // SAFETY: tcb_range is the one we just allocated; no live refs.
+        unsafe { crate::mm::kvm::free_kernel_pages(tcb_range); }
         crate::mm::page_alloc::dealloc_page(kernel_stack);
         crate::cap::process_obj::process_dec_thread_count(process_kva);
         return SyscallError::OUT_OF_MEMORY;
@@ -1076,8 +1078,8 @@ fn obj_type_from_u8(v: u8) -> ObjectType {
 /// successful sys_receive or sys_recv_nb. Returns 0 if this thread
 /// has never received.
 fn sys_query_caller_token() -> u64 {
-    let tcb_paddr = scheduler::current_tcb_paddr();
-    // SAFETY: current_tcb_paddr is always valid.
-    let tcb = unsafe { KernelRef::<Tcb>::from_paddr(tcb_paddr) };
+    let tcb_kva = scheduler::current_tcb_kva();
+    // SAFETY: current_tcb_kva is always valid.
+    let tcb = unsafe { KernelRef::<Tcb>::from_kva(tcb_kva) };
     tcb.get().last_caller_token
 }

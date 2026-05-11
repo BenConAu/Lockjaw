@@ -1,5 +1,5 @@
 use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
-use crate::mm::addr::{PhysAddr, kva_of_raw};
+use crate::mm::addr::kva_of_raw;
 use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::scheduler::{self, BlockToken, scoped_mut};
 use crate::sched::tcb::Tcb;
@@ -16,7 +16,7 @@ pub struct NotificationObject {
     /// Timeline semaphore state (value, has_waiter, threshold). Pure logic in lockjaw-types.
     pub state: NotificationState,
     /// TCB paddr of the thread blocked via sys_wait_notification (0 = none).
-    pub blocked_tcb_paddr: u64,
+    pub blocked_tcb_kva: u64,
     /// Thread waiting via sys_wait_any for readiness.
     pub readiness_waiter: lockjaw_types::wait::ReadinessWaiter,
     /// Threshold the readiness waiter is waiting for (value >= this means ready).
@@ -39,7 +39,7 @@ pub fn create_notification(page: crate::mm::addr::ObjectInitPage) -> Result<(), 
                 refcount: 0, // incremented by first handle_insert
             },
             state: NotificationState::new(),
-            blocked_tcb_paddr: 0,
+            blocked_tcb_kva: 0,
             readiness_waiter: lockjaw_types::wait::ReadinessWaiter::empty(),
             readiness_threshold: 0,
         });
@@ -58,8 +58,8 @@ pub fn notification_signal(
     match obj.state.signal(new_value)? {
         SignalResult::Updated => {}
         SignalResult::WakeWaiter => {
-            let waiter = PhysAddr::new(obj.blocked_tcb_paddr);
-            obj.blocked_tcb_paddr = 0;
+            let waiter = KernelVa::new(obj.blocked_tcb_kva);
+            obj.blocked_tcb_kva = 0;
             scheduler::unblock_thread(waiter);
         }
     }
@@ -69,7 +69,8 @@ pub fn notification_signal(
     let should_wake = obj.readiness_waiter.is_registered()
         && lockjaw_types::wait::is_notification_ready(new_value, obj.readiness_threshold);
     if should_wake {
-        let waiter = PhysAddr::new(obj.readiness_waiter.paddr);
+        // ReadinessWaiter.paddr now holds a TCB KVA — TCBs live in KVM.
+        let waiter = KernelVa::new(obj.readiness_waiter.paddr);
         obj.readiness_waiter.paddr = 0;
         obj.readiness_threshold = 0;
         scheduler::unblock_thread(waiter);
@@ -102,14 +103,14 @@ pub fn notification_wait(
         WaitResult::Block => {
             // Block until signaled
             let mut tok = BlockToken::new();
-            let caller_tcb_paddr = scheduler::current_tcb_paddr();
+            let caller_tcb_kva = scheduler::current_tcb_kva();
             {
                 let obj_ref = unsafe { scoped_mut(obj, &mut tok) };
-                obj_ref.blocked_tcb_paddr = caller_tcb_paddr.as_u64();
+                obj_ref.blocked_tcb_kva = caller_tcb_kva.as_u64();
             }
             {
-                // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
-                let caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_tcb_paddr) };
+                // SAFETY: scheduler guarantees current_tcb_kva is a valid, live TCB.
+                let caller_tcb = unsafe { KernelMut::<Tcb>::from_kva(caller_tcb_kva) };
                 // Notification lives in KVM; carry its KVA through TCB.ipc_blocked_on.
                 let notif_kva = kva_of_raw(obj);
                 let t = unsafe { scoped_mut(caller_tcb.raw_ptr(), &mut tok) };
@@ -141,10 +142,11 @@ pub fn read_value(notif_kva: KernelVa) -> u64 {
 ///
 /// # Safety
 /// `notif_kva` must be a live `NotificationObject` mapped in KVM.
-pub unsafe fn set_readiness_waiter(notif_kva: KernelVa, waiter_paddr: PhysAddr, threshold: u64) {
+/// `waiter_kva` must be a live `Tcb` mapped in KVM.
+pub unsafe fn set_readiness_waiter(notif_kva: KernelVa, waiter_kva: KernelVa, threshold: u64) {
     let mut obj = KernelMut::<NotificationObject>::from_kva(notif_kva);
     let o = obj.get_mut();
-    let _ = o.readiness_waiter.register(waiter_paddr.as_u64());
+    let _ = o.readiness_waiter.register(waiter_kva.as_u64());
     o.readiness_threshold = threshold;
 }
 
@@ -152,7 +154,7 @@ pub unsafe fn set_readiness_waiter(notif_kva: KernelVa, waiter_paddr: PhysAddr, 
 ///
 /// # Safety
 /// `notif_kva` must be a live `NotificationObject` mapped in KVM.
-pub unsafe fn clear_readiness_waiter(notif_kva: KernelVa, expected: PhysAddr) {
+pub unsafe fn clear_readiness_waiter(notif_kva: KernelVa, expected: KernelVa) {
     let mut obj = KernelMut::<NotificationObject>::from_kva(notif_kva);
     let o = obj.get_mut();
     if o.readiness_waiter.clear_if_match(expected.as_u64()) {

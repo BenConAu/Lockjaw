@@ -40,7 +40,7 @@ pub fn scheduler_stats() -> (u32, u32) {
 /// next schedule() call from a different thread.
 struct PendingExit {
     thread_idx: usize,
-    tcb_paddr: PhysAddr,
+    tcb_kva: lockjaw_types::addr::KernelVa,
 }
 
 /// Per-CPU cleanup slots for exited threads. Each CPU has its own slot
@@ -71,7 +71,9 @@ static PENDING_EXITS: PendingExitSlots = PendingExitSlots(UnsafeCell::new(
 /// in one place rather than at every call site.
 pub struct Scheduler {
     state: UnsafeCell<SchedState>,
-    threads: UnsafeCell<[Option<PhysAddr>; MAX_THREADS]>,
+    /// TCB addresses for each scheduled thread. TCBs live in the
+    /// KVM pool, addressed through KernelVa. See kernel-vmem-roadmap.md.
+    threads: UnsafeCell<[Option<lockjaw_types::addr::KernelVa>; MAX_THREADS]>,
     active: UnsafeCell<bool>,
 }
 
@@ -98,7 +100,7 @@ impl Scheduler {
         self.state.get()
     }
 
-    fn threads_ptr(&self) -> *mut [Option<PhysAddr>; MAX_THREADS] {
+    fn threads_ptr(&self) -> *mut [Option<lockjaw_types::addr::KernelVa>; MAX_THREADS] {
         self.threads.get()
     }
 }
@@ -118,7 +120,7 @@ pub static SCHEDULER: Scheduler = Scheduler::new();
 /// its state is marked Running (since it's already executing).
 /// Subsequent threads are added as Ready.
 /// Returns `false` if the run queue is full (MAX_THREADS = 8 reached).
-pub fn add_thread(tcb_paddr: PhysAddr) -> bool {
+pub fn add_thread(tcb_kva: lockjaw_types::addr::KernelVa) -> bool {
     // SAFETY: GKL held — exclusive access to state + threads.
     unsafe {
         let state = &mut *SCHEDULER.state_ptr();
@@ -135,7 +137,7 @@ pub fn add_thread(tcb_paddr: PhysAddr) -> bool {
         if idx >= MAX_THREADS {
             return false;
         }
-        (*SCHEDULER.threads_ptr())[idx] = Some(tcb_paddr);
+        (*SCHEDULER.threads_ptr())[idx] = Some(tcb_kva);
         true
     }
 }
@@ -147,7 +149,7 @@ pub fn add_thread(tcb_paddr: PhysAddr) -> bool {
 ///
 /// Must be called from CPU 0 during boot, before the target CPU's
 /// timer is active (so it won't race with tick()).
-pub fn add_thread_for_cpu(tcb_paddr: PhysAddr, cpu_id: usize) -> bool {
+pub fn add_thread_for_cpu(tcb_kva: lockjaw_types::addr::KernelVa, cpu_id: usize) -> bool {
     // SAFETY: GKL held (or boot-time single-core) — exclusive access.
     unsafe {
         let state = &mut *SCHEDULER.state_ptr();
@@ -158,7 +160,7 @@ pub fn add_thread_for_cpu(tcb_paddr: PhysAddr, cpu_id: usize) -> bool {
         if idx >= MAX_THREADS {
             return false;
         }
-        (*SCHEDULER.threads_ptr())[idx] = Some(tcb_paddr);
+        (*SCHEDULER.threads_ptr())[idx] = Some(tcb_kva);
         state.set_initial_current(cpu_id, idx);
         true
     }
@@ -184,18 +186,18 @@ pub fn has_room() -> bool {
 /// to enumerate live processes whose handle tables may hold a handle
 /// to the object being revoked.
 ///
-/// `f` is called once per Some(tcb_paddr) slot in the run queue.
+/// `f` is called once per Some(tcb_kva) slot in the run queue.
 /// Slots may share a process (multiple threads of one process); the
 /// caller is responsible for any deduplication needed. GKL must be
 /// held — the run queue must not change between the walk and any
 /// follow-up action keyed on the visited TCBs.
-pub fn for_each_tcb(mut f: impl FnMut(PhysAddr)) {
+pub fn for_each_tcb(mut f: impl FnMut(lockjaw_types::addr::KernelVa)) {
     // SAFETY: GKL held — read-only access to threads array.
     unsafe {
         let threads = &*SCHEDULER.threads_ptr();
         for i in 0..MAX_THREADS {
-            if let Some(paddr) = threads[i] {
-                f(paddr);
+            if let Some(kva) = threads[i] {
+                f(kva);
             }
         }
     }
@@ -253,15 +255,16 @@ pub fn tick() {
     }
 }
 
-/// Return the physical address of the currently running thread's TCB.
-/// Used by syscall handlers to look up the caller's handle table and TTBR0.
-pub fn current_tcb_paddr() -> PhysAddr {
+/// Return the KVA of the currently running thread's TCB.
+/// TCBs live in the KVM pool (kernel-vmem-roadmap.md). Used by
+/// syscall handlers to look up the caller's handle table and TTBR0.
+pub fn current_tcb_kva() -> lockjaw_types::addr::KernelVa {
     // SAFETY: GKL held — exclusive access to scheduler state.
     unsafe {
         let cpu_id = crate::percpu::cpu_id() as usize;
         let idx = (*SCHEDULER.state_ptr()).current_for(cpu_id);
         (*SCHEDULER.threads_ptr())[idx]
-            .unwrap_or_else(|| panic!("current_tcb_paddr: no TCB for current thread"))
+            .unwrap_or_else(|| panic!("current_tcb_kva: no TCB for current thread"))
     }
 }
 
@@ -280,10 +283,10 @@ pub fn current_thread_index() -> usize {
     }
 }
 
-/// Like current_tcb_paddr but returns None instead of panicking.
+/// Like current_tcb_kva but returns None instead of panicking.
 /// Safe to call from the panic handler without risk of re-entrant panic.
 /// Uses raw pointer reads to avoid bounds-check panics.
-pub fn try_current_tcb_paddr() -> Option<PhysAddr> {
+pub fn try_current_tcb_kva() -> Option<lockjaw_types::addr::KernelVa> {
     // SAFETY: raw pointer reads for crash-robustness (no bounds checks).
     unsafe {
         let cpu_id = crate::percpu::cpu_id() as usize;
@@ -295,9 +298,10 @@ pub fn try_current_tcb_paddr() -> Option<PhysAddr> {
         };
         if idx >= MAX_THREADS { return None; }
         // SAFETY: raw pointer to UnsafeCell interior for crash-safe volatile read
-        let threads_ptr = SCHEDULER.threads.get() as *const [Option<PhysAddr>; MAX_THREADS];
+        let threads_ptr = SCHEDULER.threads.get()
+            as *const [Option<lockjaw_types::addr::KernelVa>; MAX_THREADS];
         // SAFETY: raw pointer to array element — avoids slice bounds check
-        let ptr = (threads_ptr as *const Option<PhysAddr>).add(idx);
+        let ptr = (threads_ptr as *const Option<lockjaw_types::addr::KernelVa>).add(idx);
         core::ptr::read_volatile(ptr)
     }
 }
@@ -387,9 +391,9 @@ pub fn block_current(_token: BlockToken) {
 /// only unblock threads it knows about) or if the thread is not in
 /// the Blocked state (kernel bug — only Blocked threads should be
 /// unblocked, and the IPC state machine shouldn't have them otherwise).
-pub fn unblock_thread(tcb_paddr: PhysAddr) {
-    let idx = thread_index_for(tcb_paddr)
-        .unwrap_or_else(|| panic!("unblock_thread: TCB paddr not registered in scheduler"));
+pub fn unblock_thread(tcb_kva: lockjaw_types::addr::KernelVa) {
+    let idx = thread_index_for(tcb_kva)
+        .unwrap_or_else(|| panic!("unblock_thread: TCB KVA not registered in scheduler"));
     // SAFETY: GKL held — exclusive access to scheduler state.
     unsafe {
         (&mut *SCHEDULER.state_ptr()).unblock(idx)
@@ -422,11 +426,11 @@ pub fn exit_current() -> ! {
 
         match decision {
             SchedDecision::ExitAndSwitch { exited, next } => {
-                let tcb_paddr = (*SCHEDULER.threads_ptr())[exited].unwrap();
-                (*PENDING_EXITS.0.get())[cpu_id] = Some(PendingExit { thread_idx: exited, tcb_paddr });
+                let tcb_kva = (*SCHEDULER.threads_ptr())[exited].unwrap();
+                (*PENDING_EXITS.0.get())[cpu_id] = Some(PendingExit { thread_idx: exited, tcb_kva });
 
                 let new_paddr = (*SCHEDULER.threads_ptr())[next].unwrap();
-                let new_tcb = KernelMut::<Tcb>::from_paddr(new_paddr);
+                let new_tcb = KernelMut::<Tcb>::from_kva(new_paddr);
                 let new_ttbr0 = crate::cap::process_obj::process_ttbr0(
                     lockjaw_types::addr::KernelVa::new(new_tcb.get().process_kva)
                 );
@@ -447,7 +451,7 @@ pub fn exit_current() -> ! {
                 // will never be switched back to. But context_switch
                 // writes it anyway (harmless — the TCB page will be freed).
                 let old_paddr = (*SCHEDULER.threads_ptr())[exited].unwrap();
-                let mut old_tcb = KernelMut::<Tcb>::from_paddr(old_paddr);
+                let mut old_tcb = KernelMut::<Tcb>::from_kva(old_paddr);
                 // SAFETY: old_tcb is live; field reference is unique (exiting thread)
                 let old_sp_ptr = &mut old_tcb.get_mut().saved_sp as *mut u64;
                 // SAFETY: new_tcb is live; shared field reference
@@ -465,8 +469,8 @@ pub fn exit_current() -> ! {
                 // then schedule(Block) picks it up. finish_exit() at the
                 // start of schedule() will clean up this thread's resources
                 // once we switch to the newly-Ready thread.
-                let tcb_paddr = (*SCHEDULER.threads_ptr())[exited].unwrap();
-                (*PENDING_EXITS.0.get())[cpu_id] = Some(PendingExit { thread_idx: exited, tcb_paddr });
+                let tcb_kva = (*SCHEDULER.threads_ptr())[exited].unwrap();
+                (*PENDING_EXITS.0.get())[cpu_id] = Some(PendingExit { thread_idx: exited, tcb_kva });
 
                 loop {
                     schedule(SchedReason::Block);
@@ -516,7 +520,7 @@ fn finish_exit() {
     let pending = unsafe { (*PENDING_EXITS.0.get())[cpu_id].take().unwrap() };
 
     // Step 1: Read everything we need from the exiting TCB
-    let tcb = unsafe { KernelRef::<Tcb>::from_paddr(pending.tcb_paddr) };
+    let tcb = unsafe { KernelRef::<Tcb>::from_kva(pending.tcb_kva) };
     // Invariant: stack_base is a direct-map VA of the kernel stack page
     // (stack_base = phys + KERNEL_VA_OFFSET). This is set by create_tcb.
     let stack_paddr = PhysAddr::new(tcb.get().stack_base - KERNEL_VA_OFFSET);
@@ -532,7 +536,17 @@ fn finish_exit() {
     // Step 3: Free per-thread resources (kernel stack, TCB)
     page_alloc::dealloc_page(PhysPage::containing(stack_paddr));
     // Free TCB page (after reading all fields we need from it)
-    page_alloc::dealloc_page(PhysPage::containing(pending.tcb_paddr));
+    // TCB page lives in the KVM pool — tear down the KVA range,
+    // returning the backing frame to page_alloc and the VA to the
+    // KVM free list.
+    // SAFETY: tcb_kva came from a prior kvm::alloc_kernel_pages(1)
+    // at thread create time; this finish_exit path holds the GKL
+    // and no live references into the TCB page exist by this point.
+    unsafe {
+        crate::mm::kvm::free_kernel_pages(
+            crate::mm::kvm::OwnedKvmRange { kva: pending.tcb_kva, pages: 1 }
+        );
+    }
 
     // Step 4: Decrement process thread count via narrow op + pure model
     let lifecycle = crate::cap::process_obj::process_dec_thread_count(process_kva);
@@ -651,11 +665,11 @@ fn finish_exit() {
 // Internal
 // ---------------------------------------------------------------------------
 
-fn thread_index_for(paddr: PhysAddr) -> Option<usize> {
+fn thread_index_for(kva: lockjaw_types::addr::KernelVa) -> Option<usize> {
     // SAFETY: GKL held — read-only access.
     let threads = unsafe { &*SCHEDULER.threads_ptr() };
     for i in 0..MAX_THREADS {
-        if threads[i] == Some(paddr) {
+        if threads[i] == Some(kva) {
             return Some(i);
         }
     }
@@ -672,7 +686,7 @@ unsafe fn schedule(reason: SchedReason) {
     let state = &mut *SCHEDULER.state_ptr();
     let old_idx = state.current_for(cpu_id);
     let old_paddr = (*SCHEDULER.threads_ptr())[old_idx].unwrap();
-    let mut old_tcb = KernelMut::<Tcb>::from_paddr(old_paddr);
+    let mut old_tcb = KernelMut::<Tcb>::from_kva(old_paddr);
 
     let decision = state.step(cpu_id, reason);
 
@@ -690,7 +704,7 @@ unsafe fn schedule(reason: SchedReason) {
     };
 
     let new_paddr = (*SCHEDULER.threads_ptr())[next_idx].unwrap();
-    let new_tcb = KernelMut::<Tcb>::from_paddr(new_paddr);
+    let new_tcb = KernelMut::<Tcb>::from_kva(new_paddr);
 
     // Check stack canary of the thread we're switching away from
     check_thread_canary(old_tcb.get());

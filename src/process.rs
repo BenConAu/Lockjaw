@@ -102,7 +102,8 @@ struct ProvisionedResources {
     /// HandleTable also lives in the KVM pool.
     handle_table: crate::mm::kvm::OwnedKvmRangeGuard,
     tcb_stack: PageGuard,
-    tcb: PageGuard,
+    /// TCB also lives in the KVM pool.
+    tcb: crate::mm::kvm::OwnedKvmRangeGuard,
     /// Scratch capacity discovered while doing the lookups —
     /// returned because `validate(...)` needs it and the caller
     /// has no other way to learn it without redoing the lookup.
@@ -237,9 +238,9 @@ pub fn create_process(
         }
     }
 
-    // Capture the TCB paddr before defusing — defuse() drops the
-    // guard's ownership, after which addr() would panic.
-    let tcb_paddr = resources.tcb.addr();
+    // Capture the TCB KVA before taking — take() drops the guard's
+    // ownership, after which kva() would panic.
+    let tcb_kva = resources.tcb.kva();
 
     // Defuse drop guards — child now owns all its resources.
     // OwnedKvmRangeGuard transfers ownership via take() (drops the
@@ -248,11 +249,11 @@ pub fn create_process(
     let _ = resources.handle_table.take();
     resources.ttbr0.defuse();
     resources.tcb_stack.defuse();
-    resources.tcb.defuse();
+    let _ = resources.tcb.take();
 
     // Enqueue the thread. Cannot fail because has_room() above
     // returned true and GKL has been held throughout.
-    if !scheduler::add_thread(tcb_paddr) {
+    if !scheduler::add_thread(tcb_kva) {
         panic!("scheduler::add_thread failed after has_room() returned true (kernel-invariant violation)");
     }
 
@@ -491,13 +492,15 @@ fn provision_resources(
     // First thread — increment via narrow op (count 0 → 1)
     crate::cap::process_obj::process_inc_thread_count(proc_kva);
 
-    // Create TCB — first thread in this process
+    // Create TCB — first thread in this process. TCB lives in the
+    // KVM pool. The kernel stack stays in physical memory for now
+    // (commit 6b moves stacks to KVM).
     let tcb_stack_guard = PageGuard::new(
         page_alloc::alloc_page().ok_or(CreateProcessError::OutOfMemory)?
     );
-    let tcb_guard = PageGuard::new(
-        page_alloc::alloc_page().ok_or(CreateProcessError::OutOfMemory)?
-    );
+    let tcb_range = crate::mm::kvm::alloc_kernel_pages(1)
+        .map_err(|_| CreateProcessError::OutOfMemory)?;
+    let tcb_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(tcb_range);
 
     // SAFETY: stack and TCB are freshly allocated kernel pages.
     unsafe {
@@ -512,7 +515,7 @@ fn provision_resources(
                 user_arg: 0,
                 name,
             },
-            tcb_guard.addr(),
+            tcb_guard.kva(),
         ).map_err(|_| CreateProcessError::OutOfMemory)?;
     }
 
@@ -569,8 +572,8 @@ pub fn process_entry() -> ! {
     unsafe {
         // GKL held + IRQs masked (inherited from thread_entry).
         // Read TCB fields under the lock, then release before eret.
-        let tcb_paddr = scheduler::current_tcb_paddr();
-        let tcb = KernelRef::<Tcb>::from_paddr(tcb_paddr);
+        let tcb_paddr = scheduler::current_tcb_kva();
+        let tcb = KernelRef::<Tcb>::from_kva(tcb_paddr);
         let t = tcb.get();
         let entry = t.user_entry_point;
         let stack_top = t.user_stack_top;

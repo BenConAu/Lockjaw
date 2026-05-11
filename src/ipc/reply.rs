@@ -1,5 +1,4 @@
 use crate::cap::object::{ObjectType, ObjectHeader, CreateError};
-use crate::mm::addr::PhysAddr;
 use crate::mm::kernel_ptr::KernelMut;
 use crate::sched::scheduler;
 use crate::sched::tcb::Tcb;
@@ -24,7 +23,7 @@ pub struct ReplyObject {
     /// REPLY_STATE_FRESH or REPLY_STATE_BOUND.
     pub state: u8,
     /// TCB paddr of the caller currently bound to this Reply (0 when Fresh).
-    pub caller_tcb_paddr: u64,
+    pub caller_tcb_kva: u64,
 }
 
 /// Initialize a Reply object in a donated page.
@@ -39,7 +38,7 @@ pub fn create_reply(page: crate::mm::addr::ObjectInitPage) -> Result<(), CreateE
                 refcount: 0, // incremented by first handle_insert
             },
             state: REPLY_STATE_FRESH,
-            caller_tcb_paddr: 0,
+            caller_tcb_kva: 0,
         });
     }
     Ok(())
@@ -57,9 +56,9 @@ pub fn create_reply(page: crate::mm::addr::ObjectInitPage) -> Result<(), CreateE
 pub fn ipc_reply(
     msg: [u64; 4],
 ) -> Result<(), IpcError> {
-    let replier_tcb_paddr = scheduler::current_tcb_paddr();
-    // SAFETY: scheduler guarantees current_tcb_paddr is a valid, live TCB.
-    let replier_tcb = unsafe { KernelMut::<Tcb>::from_paddr(replier_tcb_paddr) };
+    let replier_tcb_kva = scheduler::current_tcb_kva();
+    // SAFETY: scheduler guarantees current_tcb_kva is a valid, live TCB.
+    let replier_tcb = unsafe { KernelMut::<Tcb>::from_kva(replier_tcb_kva) };
     let reply_kva_u64 = replier_tcb.get().current_reply_kva;
 
     let has_reply = reply_kva_u64 != 0;
@@ -76,9 +75,9 @@ pub fn ipc_reply(
     match decide_reply(has_reply, reply_is_bound) {
         ReplyDecision::Deliver => {
             let mut reply = unsafe { KernelMut::<ReplyObject>::from_kva(KernelVa::new(reply_kva_u64)) };
-            let caller_paddr = PhysAddr::new(reply.get().caller_tcb_paddr);
-            // SAFETY: Reply.caller_tcb_paddr was set by ipc_call from a valid TCB.
-            let mut caller_tcb = unsafe { KernelMut::<Tcb>::from_paddr(caller_paddr) };
+            let caller_kva = KernelVa::new(reply.get().caller_tcb_kva);
+            // SAFETY: Reply.caller_tcb_kva was set by ipc_call from a valid TCB.
+            let mut caller_tcb = unsafe { KernelMut::<Tcb>::from_kva(caller_kva) };
 
             // Deliver the reply message straight to the caller's ipc_msg.
             {
@@ -89,15 +88,15 @@ pub fn ipc_reply(
 
             // Unblock BEFORE clearing the Reply (ordering rule: UnblockThread
             // precedes ClearReply, because unblock reads reply.caller).
-            scheduler::unblock_thread(caller_paddr);
+            scheduler::unblock_thread(caller_kva);
 
             // Return the Reply to Fresh and detach this server from the call.
             {
                 let r = reply.get_mut();
                 r.state = REPLY_STATE_FRESH;
-                r.caller_tcb_paddr = 0;
+                r.caller_tcb_kva = 0;
             }
-            let mut replier_tcb = unsafe { KernelMut::<Tcb>::from_paddr(replier_tcb_paddr) };
+            let mut replier_tcb = unsafe { KernelMut::<Tcb>::from_kva(replier_tcb_kva) };
             replier_tcb.get_mut().current_reply_kva = 0;
 
             Ok(())

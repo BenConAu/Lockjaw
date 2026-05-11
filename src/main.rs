@@ -561,18 +561,20 @@ pub extern "C" fn kmain() -> ! {
             lockjaw_types::object::HandleKind::Reply { kva: bench_reply_kva },
         ).unwrap_or_else(|_| panic!("insert reply handle"));
 
-        // Thread A (sender) — kernel thread in the kernel process
+        // Thread A (sender) — kernel thread in the kernel process.
+        // TCB pages live in the KVM pool; per-thread kernel stacks
+        // are still physical (commit 6b moves stacks to KVM).
         cap::process_obj::process_inc_thread_count(kernel_proc_kva);
         let stack_a = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("stack alloc")).start_addr();
-        let tcb_a_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("tcb alloc")).start_addr();
-        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_page)
+        let tcb_a_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("tcb a kvm alloc")).kva;
+        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_kva)
             .unwrap_or_else(|_| panic!("create tcb a"));
 
         // Thread B (receiver) — kernel thread in the kernel process
         cap::process_obj::process_inc_thread_count(kernel_proc_kva);
         let stack_b = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("stack alloc")).start_addr();
-        let tcb_b_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("tcb alloc")).start_addr();
-        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_page)
+        let tcb_b_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("tcb b kvm alloc")).kva;
+        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_kva)
             .unwrap_or_else(|_| panic!("create tcb b"));
 
         // Register idle/init thread (index 0 = this boot thread).
@@ -588,8 +590,8 @@ pub extern "C" fn kmain() -> ! {
         );
 
         sched::scheduler::add_thread(idle_tcb_page);  // index 0: idle/boot (CPU 0)
-        sched::scheduler::add_thread(tcb_a_page);      // index 1: thread A
-        sched::scheduler::add_thread(tcb_b_page);      // index 2: thread B
+        sched::scheduler::add_thread(tcb_a_kva);      // index 1: thread A
+        sched::scheduler::add_thread(tcb_b_kva);      // index 2: thread B
 
         // Per-CPU idle threads for secondary CPUs described by the DTB.
         // Constructed manually (not via create_tcb) because secondary_main
@@ -780,17 +782,17 @@ pub extern "C" fn kmain() -> ! {
 
         // Decrement kernel process thread count (this thread is leaving)
         {
-            let current_tcb_paddr = sched::scheduler::current_tcb_paddr();
+            let current_tcb_kva = sched::scheduler::current_tcb_kva();
             let old_process = lockjaw_types::addr::KernelVa::new(
-                mm::kernel_ptr::KernelRef::<sched::tcb::Tcb>::from_paddr(current_tcb_paddr)
+                mm::kernel_ptr::KernelRef::<sched::tcb::Tcb>::from_kva(current_tcb_kva)
                     .get().process_kva
             );
             cap::process_obj::process_dec_thread_count(old_process);
         }
 
         // Re-point TCB to the init process
-        let current_tcb_paddr = sched::scheduler::current_tcb_paddr();
-        let mut current_tcb = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(current_tcb_paddr);
+        let current_tcb_kva = sched::scheduler::current_tcb_kva();
+        let mut current_tcb = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_kva(current_tcb_kva);
         current_tcb.get_mut().process_kva = init_proc_kva.as_u64();
 
         // Flush I-cache (we copied code into pages)
@@ -885,10 +887,14 @@ unsafe fn create_idle_tcb(
     stack_base: u64,
     process_kva: lockjaw_types::addr::KernelVa,
     name: [u8; 16],
-) -> mm::addr::PhysAddr {
-    let tcb_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("idle tcb alloc")).start_addr();
-    mm::page_alloc::zero_page(tcb_page);
-    let mut tcb_km = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_paddr(tcb_page);
+) -> lockjaw_types::addr::KernelVa {
+    let tcb_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("idle tcb kvm alloc")).kva;
+    // Zero the TCB page (KVM allocator hands back uninitialized backing).
+    {
+        let mut p = mm::kernel_ptr::KernelMut::<u8>::from_kva(tcb_kva);
+        core::ptr::write_bytes(p.as_mut_ptr(), 0, mm::addr::PAGE_SIZE as usize);
+    }
+    let mut tcb_km = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_kva(tcb_kva);
     // Idle TCBs don't use create_tcb() because they start directly
     // (no synthetic SavedContext on a separate stack page). Initialize
     // in place — no by-value Tcb on the kernel stack.
@@ -897,7 +903,7 @@ unsafe fn create_idle_tcb(
     (*p).stack_base = stack_base;
     (*p).process_kva = process_kva.as_u64();
     (*p).name = name;
-    tcb_page
+    tcb_kva
 }
 
 fn idle_thread() -> ! {

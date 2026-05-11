@@ -241,7 +241,7 @@ fn for_each_unique_process(mut f: impl FnMut(u64)) {
         // SAFETY: tcb_paddr came from the scheduler's threads array,
         // which holds only registered TCBs in kernel-owned pages.
         let process_kva = unsafe {
-            let tcb = KernelRef::<Tcb>::from_paddr(tcb_paddr);
+            let tcb = KernelRef::<Tcb>::from_kva(tcb_paddr);
             tcb.get().process_kva
         };
         if process_kva == 0 {
