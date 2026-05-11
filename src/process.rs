@@ -96,10 +96,11 @@ impl CreateProcessError {
 /// each one before handing the addresses off to apply.
 struct ProvisionedResources {
     /// ProcessObject lives in the KVM pool; the guard frees the KVA
-    /// range (and its backing frame) on drop unless defused.
+    /// range (and its backing frame) on drop unless taken.
     proc: crate::mm::kvm::OwnedKvmRangeGuard,
     ttbr0: Ttbr0Guard,
-    handle_table: PageGuard,
+    /// HandleTable also lives in the KVM pool.
+    handle_table: crate::mm::kvm::OwnedKvmRangeGuard,
     tcb_stack: PageGuard,
     tcb: PageGuard,
     /// Scratch capacity discovered while doing the lookups —
@@ -223,9 +224,9 @@ pub fn create_process(
             other => other,
         };
 
-        // SAFETY: handle_table page was initialized as a valid handle
+        // SAFETY: handle_table KVA was initialized as a valid handle
         // table in provision_resources.
-        let child_ht = unsafe { HandleTableRef::from_paddr(resources.handle_table.addr()) };
+        let child_ht = unsafe { HandleTableRef::from_kva(resources.handle_table.kva()) };
         // Cannot fail: the child table was freshly allocated empty
         // with HANDLE_SLOTS_PER_PAGE empty slots, and the post-consume
         // capacity invariant was checked in the pure validate. Avoid
@@ -242,9 +243,9 @@ pub fn create_process(
 
     // Defuse drop guards — child now owns all its resources.
     // OwnedKvmRangeGuard transfers ownership via take() (drops the
-    // guard's claim without freeing). Other guards use defuse().
+    // guard's claim without freeing). PageGuard / Ttbr0Guard use defuse().
     let _ = resources.proc.take();
-    resources.handle_table.defuse();
+    let _ = resources.handle_table.take();
     resources.ttbr0.defuse();
     resources.tcb_stack.defuse();
     resources.tcb.defuse();
@@ -465,15 +466,16 @@ fn provision_resources(
     // Flush I-cache
     unsafe { core::arch::asm!("ic iallu", "dsb ish", "isb") };
 
-    // Create handle table
-    let ht_guard = PageGuard::new(
-        page_alloc::alloc_page().ok_or(CreateProcessError::OutOfMemory)?
-    );
-    // SAFETY: ht_page is a freshly allocated kernel page.
+    // Create handle table in the KVM pool.
+    let ht_range = crate::mm::kvm::alloc_kernel_pages(1)
+        .map_err(|_| CreateProcessError::OutOfMemory)?;
+    let ht_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(ht_range);
+    let ht_kva = ht_guard.kva();
+    // SAFETY: ht_kva is a freshly allocated KVM range.
     unsafe {
         create_handle_table(
             &HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
-            ht_guard.addr(),
+            ht_kva,
         ).map_err(|_| CreateProcessError::OutOfMemory)?;
     }
 
@@ -481,7 +483,7 @@ fn provision_resources(
     crate::cap::process_obj::init_process_header(
         proc_kva,
         ttbr0_guard.addr().as_u64(),
-        ht_guard.addr().as_u64(),
+        ht_kva.as_u64(),
         false, // not immortal
         &name,
     );

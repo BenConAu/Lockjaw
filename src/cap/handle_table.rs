@@ -1,6 +1,5 @@
 use crate::cap::object::ObjectType;
 use crate::cap::rights::Rights;
-use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
 use lockjaw_types::addr::KernelVa;
 use lockjaw_types::object::{HandleTableHeader, HandleEntry, HandleKind};
 use lockjaw_types::handle_ops::{self, HandleError, SlotRevokeAction};
@@ -12,17 +11,18 @@ use lockjaw_types::syscall::SyscallError;
 
 /// A reference to a handle table in kernel memory. Constructed from
 /// `CurrentThread::handle_table()` or by wrapping a known-valid
-/// handle-table PhysAddr. All methods are safe — the PhysAddr validity
-/// is established at construction time.
-pub struct HandleTableRef(PhysAddr);
+/// handle-table KVA. All methods are safe — the KVA validity is
+/// established at construction time. HandleTables live in the KVM
+/// pool (see kernel-vmem-roadmap.md).
+pub struct HandleTableRef(KernelVa);
 
 impl HandleTableRef {
-    /// Wrap a known-valid handle table physical address.
+    /// Wrap a known-valid handle table KVA.
     ///
     /// # Safety
-    /// `paddr` must point to a live HandleTableObject in a kernel-owned page.
-    pub unsafe fn from_paddr(paddr: PhysAddr) -> Self {
-        HandleTableRef(paddr)
+    /// `kva` must point to a live HandleTableObject mapped in the KVM pool.
+    pub unsafe fn from_kva(kva: KernelVa) -> Self {
+        HandleTableRef(kva)
     }
 
     /// Look up a handle by index without type checking (for export/transfer).
@@ -180,11 +180,11 @@ const _: () = assert!(core::mem::size_of::<HandleTableHeader>() % 8 == 0);
 
 /// Insert a new handle into the table. Returns the handle index (slot number).
 pub unsafe fn handle_insert(
-    table_paddr: PhysAddr,
+    table_kva: KernelVa,
     rights: Rights,
     kind: HandleKind,
 ) -> Result<u32, HandleError> {
-    let (_header, slots) = table_slots(table_paddr);
+    let (_header, slots) = table_slots(table_kva);
     handle_ops::slot_insert(slots, rights, kind)
         .map_err(|e| {
             if matches!(e, HandleError::TableFull) {
@@ -196,20 +196,20 @@ pub unsafe fn handle_insert(
 
 /// Look up a handle by index, checking that the required rights are present.
 pub unsafe fn handle_lookup(
-    table_paddr: PhysAddr,
+    table_kva: KernelVa,
     handle: u32,
     required: Rights,
 ) -> Result<HandleEntry, HandleError> {
-    let (_header, slots) = table_slots(table_paddr);
+    let (_header, slots) = table_slots(table_kva);
     handle_ops::slot_lookup(slots, handle, required)
 }
 
 /// Remove a handle, returning what was in the slot.
 pub unsafe fn handle_remove(
-    table_paddr: PhysAddr,
+    table_kva: KernelVa,
     handle: u32,
 ) -> Result<HandleEntry, HandleError> {
-    let (_header, slots) = table_slots(table_paddr);
+    let (_header, slots) = table_slots(table_kva);
     handle_ops::slot_remove(slots, handle)
 }
 
@@ -218,13 +218,15 @@ pub unsafe fn handle_remove(
 // ---------------------------------------------------------------------------
 
 /// Get the header pointer and a mutable slice over the handle slots.
-/// Replaces manual offset arithmetic with Rust slice indexing.
+/// HandleTables live in the KVM pool — the KVA is the base of the
+/// page directly (no `paddr + KERNEL_VA_OFFSET` translation; the KVM
+/// allocator already mapped the frame at this VA).
 ///
 /// # Safety
-/// `table_paddr` must point to a live HandleTableObject in a kernel-owned page.
-unsafe fn table_slots(table_paddr: PhysAddr) -> (*mut HandleTableHeader, &'static mut [HandleEntry]) {
-    let base_va = table_paddr.as_u64() + KERNEL_VA_OFFSET;
-    // SAFETY: kernel object at known VA
+/// `table_kva` must point to a live HandleTableObject mapped in KVM.
+unsafe fn table_slots(table_kva: KernelVa) -> (*mut HandleTableHeader, &'static mut [HandleEntry]) {
+    let base_va = table_kva.as_u64();
+    // SAFETY: kernel object at the KVM-pool VA (mapped by kvm allocator).
     let header = base_va as *mut HandleTableHeader;
     let slot_count = (*header).slot_count as usize;
     // SAFETY: slots immediately follow the header in the donated page(s)

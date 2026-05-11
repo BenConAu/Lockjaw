@@ -35,19 +35,20 @@ impl CurrentThread {
         lockjaw_types::addr::KernelVa::new(tcb.get().process_kva)
     }
 
-    /// Physical address of the current thread's handle table.
+    /// KVA of the current thread's handle table.
     /// Two hops: TCB → process → handle table, via narrow process_ops.
-    pub fn handle_table_paddr() -> PhysAddr {
+    /// HandleTable lives in the KVM pool (kernel-vmem-roadmap.md).
+    pub fn handle_table_kva() -> lockjaw_types::addr::KernelVa {
         crate::cap::process_obj::process_handle_table(Self::process_kva())
     }
 
     /// Safe typed reference to the current thread's handle table.
-    /// Provides lookup/insert/remove without raw PhysAddr or unsafe.
+    /// Provides lookup/insert/remove without raw KernelVa or unsafe.
     pub fn handle_table() -> HandleTableRef {
-        let paddr = Self::handle_table_paddr();
-        // SAFETY: the process's handle_table_paddr was set at process
+        let kva = Self::handle_table_kva();
+        // SAFETY: the process's handle_table_kva was set at process
         // creation and always points to a valid HandleTable.
-        unsafe { HandleTableRef::from_paddr(paddr) }
+        unsafe { HandleTableRef::from_kva(kva) }
     }
 
     /// Physical address of the current thread's TTBR0 (user page table).

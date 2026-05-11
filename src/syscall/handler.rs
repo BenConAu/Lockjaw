@@ -757,10 +757,10 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         // The export_kind already carries its typed address (PhysAddr or
         // KernelVa) inside the variant, so insert is the single path.
         let caller_tcb = KernelRef::<Tcb>::from_paddr(PhysAddr::new(caller_tcb_paddr_u64));
-        let caller_ht_paddr = crate::cap::process_obj::process_handle_table(
+        let caller_ht_kva = crate::cap::process_obj::process_handle_table(
             lockjaw_types::addr::KernelVa::new(caller_tcb.get().process_kva),
         );
-        let caller_ht = handle_table::HandleTableRef::from_paddr(caller_ht_paddr);
+        let caller_ht = handle_table::HandleTableRef::from_kva(caller_ht_kva);
         let idx = caller_ht.insert(export_entry.rights, export_kind)?;
         // Increment refcount for PageSets — a new handle references it.
         if let lockjaw_types::object::HandleKind::PageSet { kva, .. } = export_kind {

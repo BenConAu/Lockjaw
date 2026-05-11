@@ -545,9 +545,9 @@ fn finish_exit() {
             use lockjaw_types::object::{CloseHandleResult, decide_close_handle};
 
             let ttbr0 = crate::cap::process_obj::process_ttbr0(process_kva);
-            let ht_paddr = crate::cap::process_obj::process_handle_table(process_kva);
-            let ht_page_count = if ht_paddr.as_u64() != 0 {
-                let ht = unsafe { KernelRef::<HandleTableHeader>::from_paddr(ht_paddr) };
+            let ht_kva = crate::cap::process_obj::process_handle_table(process_kva);
+            let ht_page_count = if ht_kva.as_u64() != 0 {
+                let ht = unsafe { KernelRef::<HandleTableHeader>::from_kva(ht_kva) };
                 ht.get().header.page_count as u8
             } else {
                 0
@@ -556,7 +556,7 @@ fn finish_exit() {
             let plan = build_teardown_plan(
                 crate::cap::process_obj::process_owned_page_count(process_kva),
                 ttbr0 != 0,
-                ht_paddr.as_u64() != 0,
+                ht_kva.as_u64() != 0,
                 ht_page_count,
             );
 
@@ -577,7 +577,7 @@ fn finish_exit() {
                     TeardownStep::CleanupHandleEntriesPtesGone => {
                         // PTEs already freed by FreeAddressSpace.
                         let ht = unsafe {
-                            crate::cap::handle_table::HandleTableRef::from_paddr(ht_paddr)
+                            crate::cap::handle_table::HandleTableRef::from_kva(ht_kva)
                         };
                         ht.for_each_entry(|entry| {
                             match decide_close_handle(Some(entry)) {
@@ -597,7 +597,7 @@ fn finish_exit() {
                         // no unmap variant exists.
                         use lockjaw_types::object::{TeardownHandleAction, decide_teardown_handle};
                         let ht = unsafe {
-                            crate::cap::handle_table::HandleTableRef::from_paddr(ht_paddr)
+                            crate::cap::handle_table::HandleTableRef::from_kva(ht_kva)
                         };
                         ht.for_each_entry(|entry| {
                             match decide_teardown_handle(entry) {
@@ -609,9 +609,16 @@ fn finish_exit() {
                         });
                     }
                     TeardownStep::FreeHandleTable { page_count } => {
-                        for i in 0..*page_count as usize {
-                            let page = PhysAddr::new(ht_paddr.as_u64() + (i as u64) * crate::mm::addr::PAGE_SIZE);
-                            page_alloc::dealloc_page(PhysPage::containing(page));
+                        // HandleTable lives in the KVM pool; tear down
+                        // the KVA range, returning the backing frames
+                        // to page_alloc and the VA to the KVM free list.
+                        // SAFETY: ht_kva came from a prior
+                        // kvm::alloc_kernel_pages(N) at process create
+                        // time; no live references into the pages now.
+                        unsafe {
+                            crate::mm::kvm::free_kernel_pages(
+                                crate::mm::kvm::OwnedKvmRange { kva: ht_kva, pages: *page_count as usize }
+                            );
                         }
                         pages_freed += *page_count as u32;
                     }

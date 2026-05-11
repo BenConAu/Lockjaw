@@ -1,4 +1,3 @@
-use crate::mm::addr::PhysAddr;
 use crate::mm::kernel_ptr::{KernelMut, KernelRef};
 use lockjaw_types::addr::KernelVa;
 use lockjaw_types::object::{ObjectHeader, ObjectType};
@@ -19,7 +18,7 @@ use lockjaw_types::process::{self, ProcessLifecycle, TransferError, MAX_CONSUMED
 pub struct ProcessObject {
     pub header: ObjectHeader,
     pub ttbr0_paddr: u64,
-    pub handle_table_paddr: u64,
+    pub handle_table_kva: u64,
     pub thread_count: u32,
     pub immortal: bool,
     pub name: [u8; 16],
@@ -54,7 +53,7 @@ const _: () = assert!(core::mem::size_of::<ProcessObject>() <= 4096);
 pub fn create_process_object(
     process_kva: KernelVa,
     ttbr0_paddr: u64,
-    handle_table_paddr: u64,
+    handle_table_kva: u64,
     immortal: bool,
     name: &[u8; 16],
 ) {
@@ -65,7 +64,7 @@ pub fn create_process_object(
         let mut p = KernelMut::<u8>::from_kva(process_kva);
         core::ptr::write_bytes(p.as_mut_ptr(), 0, crate::mm::addr::PAGE_SIZE as usize);
     }
-    init_process_header(process_kva, ttbr0_paddr, handle_table_paddr, immortal, name);
+    init_process_header(process_kva, ttbr0_paddr, handle_table_kva, immortal, name);
 }
 
 /// Write ProcessObject header fields into an already-zeroed KVM page.
@@ -73,7 +72,7 @@ pub fn create_process_object(
 pub fn init_process_header(
     process_kva: KernelVa,
     ttbr0_paddr: u64,
-    handle_table_paddr: u64,
+    handle_table_kva: u64,
     immortal: bool,
     name: &[u8; 16],
 ) {
@@ -89,7 +88,7 @@ pub fn init_process_header(
             refcount: 0, // incremented by first handle_insert
         };
         (*p).ttbr0_paddr = ttbr0_paddr;
-        (*p).handle_table_paddr = handle_table_paddr;
+        (*p).handle_table_kva = handle_table_kva;
         (*p).thread_count = 0;
         (*p).immortal = immortal;
         (*p).name = *name;
@@ -109,11 +108,12 @@ pub fn process_ttbr0(process_kva: KernelVa) -> u64 {
     p.get().ttbr0_paddr
 }
 
-/// Read the handle table physical address for this process.
-pub fn process_handle_table(process_kva: KernelVa) -> PhysAddr {
+/// Read the handle table KVA for this process.
+/// HandleTable lives in the KVM pool (kernel-vmem-roadmap.md).
+pub fn process_handle_table(process_kva: KernelVa) -> KernelVa {
     // SAFETY: process_kva is a valid ProcessObject.
     let p = unsafe { KernelRef::<ProcessObject>::from_kva(process_kva) };
-    PhysAddr::new(p.get().handle_table_paddr)
+    KernelVa::new(p.get().handle_table_kva)
 }
 
 /// Increment the thread count (a new thread was created in this process).

@@ -89,7 +89,7 @@ pub fn revoke_validate(header_kva: KernelVa) -> Result<(), RevokeError> {
         let process_kva = KernelVa::new(process_kva_u64);
         let ttbr0 = process_obj::process_ttbr0(process_kva);
         let ht = unsafe {
-            HandleTableRef::from_paddr(process_obj::process_handle_table(process_kva))
+            HandleTableRef::from_kva(process_obj::process_handle_table(process_kva))
         };
         // The PageSet revoke walks ignore non-PageSet kinds — pass
         // the typed KernelVa directly.
@@ -170,7 +170,7 @@ pub fn revoke_apply(header_kva: KernelVa) -> RevokeStats {
         let process_kva = KernelVa::new(process_kva_u64);
         let ttbr0 = process_obj::process_ttbr0(process_kva);
         let ht = unsafe {
-            HandleTableRef::from_paddr(process_obj::process_handle_table(process_kva))
+            HandleTableRef::from_kva(process_obj::process_handle_table(process_kva))
         };
         // The PageSet revoke walks ignore non-PageSet kinds — pass
         // the typed KernelVa directly.

@@ -1,29 +1,31 @@
 // Re-export pure types from lockjaw-types.
 pub use lockjaw_types::object::*;
 
-use crate::mm::addr::PhysAddr;
 use crate::mm::kernel_ptr::KernelMut;
 use core::ptr;
+use lockjaw_types::addr::KernelVa;
 
 // ---------------------------------------------------------------------------
-// Kernel-only: create_handle_table (unsafe, writes to donated memory)
+// Kernel-only: create_handle_table (unsafe, writes to KVM-mapped memory)
 // ---------------------------------------------------------------------------
 
-/// Initialize a HandleTable in donated physical memory.
+/// Initialize a HandleTable in a KVM-mapped page (or pages, for multi-
+/// page tables).
 ///
 /// # Safety
-/// `base_paddr` must point to donated pages (not mapped by userspace).
-/// The memory must be at least `query_handle_table_size(info).pages` pages.
+/// `base_kva` must point to a kernel-owned KVM range of at least
+/// `query_handle_table_size(info).pages` pages, with no live references
+/// into it.
 pub unsafe fn create_handle_table(
     info: &HandleTableCreateInfo,
-    base_paddr: PhysAddr,
+    base_kva: KernelVa,
 ) -> Result<(), CreateError> {
     if info.slot_count == 0 || info.slot_count > HANDLE_SLOTS_PER_PAGE {
         return Err(CreateError::InvalidParameter);
     }
 
     let required = query_handle_table_size(info);
-    let mut header_km = KernelMut::<HandleTableHeader>::from_paddr(base_paddr);
+    let mut header_km = KernelMut::<HandleTableHeader>::from_kva(base_kva);
 
     // Write the handle table header
     ptr::write(

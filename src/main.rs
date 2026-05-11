@@ -397,39 +397,44 @@ pub extern "C" fn kmain() -> ! {
     let ps = pageset::alloc_pages(ht_size.pages).unwrap_or_else(|_| panic!("alloc_pages failed"));
     kprintln!("  PageSet allocated: ", ps.count, " page(s) at ", Hex(ps.pages[0].as_u64()));
 
+    // Donate the PageSet's data page as the HandleTable backing,
+    // then expose it via KVA so create_handle_table can write through
+    // the new addressing regime. The PageSet itself is leaked on this
+    // boot-test path (one-shot smoke test, no teardown).
     let ht_paddr = pageset::donate(&ps, ht_size.pages).unwrap_or_else(|_| panic!("donate failed"));
-    unsafe { create_handle_table(&ht_info, ht_paddr).unwrap_or_else(|_| panic!("create failed")); }
+    let ht_kva = mm::kvm::map_existing(mm::addr::PhysPage::containing(ht_paddr))
+        .unwrap_or_else(|_| panic!("bench ht kvm map")).kva;
+    unsafe { create_handle_table(&ht_info, ht_kva).unwrap_or_else(|_| panic!("create failed")); }
 
     // Read back the header to verify
-    let header_va = ht_paddr.as_u64() + mm::addr::KERNEL_VA_OFFSET;
-    // SAFETY: kernel object at known VA
-    let header = unsafe { &*(header_va as *const HandleTableHeader) };
+    // SAFETY: kernel object at known KVA (mapped by KVM allocator).
+    let header = unsafe { &*(ht_kva.as_u64() as *const HandleTableHeader) };
     kprintln!("  Created: type=", header.header.obj_type.name(), ", pages=", header.header.page_count, ", slots=", header.slot_count);
 
     // Insert a handle pointing to the table itself (for testing)
     let h0 = unsafe {
         handle_insert(
-            ht_paddr,
+            ht_kva,
             Rights::from_bits(RIGHT_READ | RIGHT_WRITE),
-            HandleKind::HandleTable { paddr: ht_paddr },
+            HandleKind::HandleTable { kva: ht_kva },
         )
     }.unwrap_or_else(|_| panic!("insert failed"));
     kprintln!("  Inserted handle ", h0, " (RW)");
 
     // Look up with matching rights — should succeed
-    let entry = unsafe { handle_lookup(ht_paddr, h0, Rights::from_bits(RIGHT_READ)) }.unwrap_or_else(|_| panic!("lookup failed"));
+    let entry = unsafe { handle_lookup(ht_kva, h0, Rights::from_bits(RIGHT_READ)) }.unwrap_or_else(|_| panic!("lookup failed"));
     kprintln!("  Lookup h", h0, ": kind=", entry.kind.name(), ", rights=", HexByte(entry.rights.bits() as u64));
 
     // Look up with Grant right — should fail (we only gave RW)
-    let bad = unsafe { handle_lookup(ht_paddr, h0, Rights::from_bits(RIGHT_GRANT)) };
+    let bad = unsafe { handle_lookup(ht_kva, h0, Rights::from_bits(RIGHT_GRANT)) };
     kprintln!("  Lookup h", h0, " with Grant: ", bad.err().unwrap().name());
 
     // Remove the handle
-    let removed = unsafe { handle_remove(ht_paddr, h0) }.unwrap_or_else(|_| panic!("remove failed"));
+    let removed = unsafe { handle_remove(ht_kva, h0) }.unwrap_or_else(|_| panic!("remove failed"));
     kprintln!("  Removed h", h0, ": kind=", removed.kind.name());
 
     // Verify slot is now empty
-    let empty = unsafe { handle_lookup(ht_paddr, h0, Rights::none()) };
+    let empty = unsafe { handle_lookup(ht_kva, h0, Rights::none()) };
     kprintln!("  Lookup h", h0, " after remove: ", empty.err().unwrap().name());
 
     // --- Process lifecycle test ---
@@ -438,7 +443,8 @@ pub extern "C" fn kmain() -> ! {
     {
         use lockjaw_types::process::ProcessLifecycle;
 
-        let test_ht = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("test ht")).start_addr();
+        let test_ht_range = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("test ht kvm alloc"));
+        let test_ht = test_ht_range.kva;
         unsafe {
             cap::object::create_handle_table(
                 &cap::object::HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
@@ -476,9 +482,11 @@ pub extern "C" fn kmain() -> ! {
         }
 
         // Clean up test pages (process would normally be freed by finish_exit)
-        mm::page_alloc::dealloc_page(mm::addr::PhysPage::containing(test_ht));
-        // SAFETY: range came from kvm::alloc_kernel_pages above; no live refs.
-        unsafe { mm::kvm::free_kernel_pages(test_proc_range); }
+        // SAFETY: ranges came from kvm::alloc_kernel_pages above; no live refs.
+        unsafe {
+            mm::kvm::free_kernel_pages(test_ht_range);
+            mm::kvm::free_kernel_pages(test_proc_range);
+        }
         kprintln!("Process lifecycle test passed.");
     }
 
@@ -516,10 +524,11 @@ pub extern "C" fn kmain() -> ! {
             .unwrap_or_else(|_| panic!("bench reply kvm map")).kva;
 
         // Create kernel process — immortal, ttbr0=0, owns all kernel threads.
-        let kernel_ht_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("kernel ht alloc")).start_addr();
+        let kernel_ht_kva = mm::kvm::alloc_kernel_pages(1)
+            .unwrap_or_else(|_| panic!("kernel ht kvm alloc")).kva;
         create_handle_table(
             &HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
-            kernel_ht_page,
+            kernel_ht_kva,
         ).unwrap_or_else(|_| panic!("kernel ht create"));
 
         let kernel_proc_kva = mm::kvm::alloc_kernel_pages(1)
@@ -527,7 +536,7 @@ pub extern "C" fn kmain() -> ! {
         cap::process_obj::create_process_object(
             kernel_proc_kva,
             0, // ttbr0 = 0 (kernel process)
-            kernel_ht_page.as_u64(),
+            kernel_ht_kva.as_u64(),
             true, // immortal
             b"kernel\0\0\0\0\0\0\0\0\0\0",
         );
@@ -542,12 +551,12 @@ pub extern "C" fn kmain() -> ! {
             t
         };
         handle_table::handle_insert(
-            kernel_ht_page,
+            kernel_ht_kva,
             cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
             lockjaw_types::object::HandleKind::Endpoint { kva: ep_kva, caller_token: ep_token },
         ).unwrap_or_else(|_| panic!("insert ep handle"));
         handle_table::handle_insert(
-            kernel_ht_page,
+            kernel_ht_kva,
             cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
             lockjaw_types::object::HandleKind::Reply { kva: bench_reply_kva },
         ).unwrap_or_else(|_| panic!("insert reply handle"));
@@ -751,10 +760,11 @@ pub extern "C" fn kmain() -> ! {
         // Create init user process with its own handle table and address
         // space. Init's handle table starts empty — init creates its own
         // handles via syscalls from userspace (sys_create_endpoint, etc.).
-        let init_ht_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("init ht alloc")).start_addr();
+        let init_ht_kva = mm::kvm::alloc_kernel_pages(1)
+            .unwrap_or_else(|_| panic!("init ht kvm alloc")).kva;
         cap::object::create_handle_table(
             &cap::object::HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
-            init_ht_page,
+            init_ht_kva,
         ).unwrap_or_else(|_| panic!("init ht create"));
 
         let init_proc_kva = mm::kvm::alloc_kernel_pages(1)
@@ -762,7 +772,7 @@ pub extern "C" fn kmain() -> ! {
         cap::process_obj::create_process_object(
             init_proc_kva,
             ttbr0.as_u64(),
-            init_ht_page.as_u64(),
+            init_ht_kva.as_u64(),
             false, // not immortal
             b"init\0\0\0\0\0\0\0\0\0\0\0\0",
         );
