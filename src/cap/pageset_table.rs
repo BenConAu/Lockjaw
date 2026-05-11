@@ -129,10 +129,15 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
     let mut backed = unsafe { header_ref.get_mut().backed_mut(count) };
     backed.set_count(count);
 
-    // Allocate data pages one at a time, writing each address directly into the header
+    // Allocate data pages one at a time, writing each address directly into the header.
+    // Zero each page so userspace mmap-backed allocations see the zero-init
+    // contract that POSIX MAP_ANONYMOUS guarantees (mallocng's slot
+    // header validation reads the bytes preceding the user pointer
+    // and crashes on stale non-zero residue from prior kernel use).
     for i in 0..count {
         match page_alloc::alloc_page() {
             Some(page) => {
+                page_alloc::zero_page(page.start_addr());
                 backed.set_page(i, page.start_addr().as_u64());
             }
             None => {
@@ -199,8 +204,12 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
     let mut backed = unsafe { header_ref.get_mut().backed_mut(actual_count) };
     backed.set_count(actual_count);
     let base = first_data.start_addr().as_u64();
+    // Zero pages so userspace mmap-backed allocations see the
+    // POSIX MAP_ANONYMOUS zero-init contract (see alloc_pages above).
     for i in 0..actual_count {
-        backed.set_page(i, base + (i as u64) * PAGE_SIZE);
+        let paddr = PhysAddr::new(base + (i as u64) * PAGE_SIZE);
+        page_alloc::zero_page(paddr);
+        backed.set_page(i, paddr.as_u64());
     }
 
     match insert_into_table(actual_count, header_kva) {
