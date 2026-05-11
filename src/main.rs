@@ -562,19 +562,20 @@ pub extern "C" fn kmain() -> ! {
         ).unwrap_or_else(|_| panic!("insert reply handle"));
 
         // Thread A (sender) — kernel thread in the kernel process.
-        // TCB pages live in the KVM pool; per-thread kernel stacks
-        // are still physical (commit 6b moves stacks to KVM).
+        // TCB pages and per-thread kernel stacks both live in the KVM
+        // pool. Bench threads are immortal; the KVA range and backing
+        // frame leak for the kernel's lifetime (no destroy path).
         cap::process_obj::process_inc_thread_count(kernel_proc_kva);
-        let stack_a = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("stack alloc")).start_addr();
+        let stack_a_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("stack a kvm alloc")).kva;
         let tcb_a_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("tcb a kvm alloc")).kva;
-        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_paddr: stack_a, process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_kva)
+        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack_kva: stack_a_kva, process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_kva)
             .unwrap_or_else(|_| panic!("create tcb a"));
 
         // Thread B (receiver) — kernel thread in the kernel process
         cap::process_obj::process_inc_thread_count(kernel_proc_kva);
-        let stack_b = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("stack alloc")).start_addr();
+        let stack_b_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("stack b kvm alloc")).kva;
         let tcb_b_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("tcb b kvm alloc")).kva;
-        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_paddr: stack_b, process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_kva)
+        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack_kva: stack_b_kva, process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_kva)
             .unwrap_or_else(|_| panic!("create tcb b"));
 
         // Register idle/init thread (index 0 = this boot thread).

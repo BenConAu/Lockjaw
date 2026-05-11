@@ -880,15 +880,17 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
     // Get caller's process (returns the KVA of its ProcessObject).
     let process_kva = crate::sched::current::CurrentThread::process_kva();
 
-    // Allocate kernel stack (physical) + TCB page (KVM).
-    let kernel_stack = match crate::mm::page_alloc::alloc_page() {
-        Some(p) => p,
-        None => return SyscallError::OUT_OF_MEMORY,
+    // Allocate kernel stack + TCB page — both live in the KVM pool.
+    let stack_range = match crate::mm::kvm::alloc_kernel_pages(1) {
+        Ok(r) => r,
+        Err(_) => return SyscallError::OUT_OF_MEMORY,
     };
+    let stack_kva = stack_range.kva;
     let tcb_range = match crate::mm::kvm::alloc_kernel_pages(1) {
         Ok(r) => r,
         Err(_) => {
-            crate::mm::page_alloc::dealloc_page(kernel_stack);
+            // SAFETY: stack_range is the one we just allocated.
+            unsafe { crate::mm::kvm::free_kernel_pages(stack_range); }
             return SyscallError::OUT_OF_MEMORY;
         }
     };
@@ -900,7 +902,7 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
         if crate::sched::tcb::create_tcb(
             &crate::sched::tcb::TcbCreateInfo {
                 entry: crate::process::process_entry,
-                stack_paddr: kernel_stack.start_addr(),
+                stack_kva,
                 process_kva,
                 user_entry_point: entry_point,
                 user_stack_top: stack_top,
@@ -911,7 +913,7 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
             tcb_kva,
         ).is_err() {
             crate::mm::kvm::free_kernel_pages(tcb_range);
-            crate::mm::page_alloc::dealloc_page(kernel_stack);
+            crate::mm::kvm::free_kernel_pages(stack_range);
             return SyscallError::UNKNOWN;
         }
     }
@@ -923,9 +925,12 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
     if !scheduler::add_thread(tcb_kva) {
         // Rollback: dealloc pages, then dec thread count.
         // Invariant: caller is still alive, so dec cannot return LastThread.
-        // SAFETY: tcb_range is the one we just allocated; no live refs.
-        unsafe { crate::mm::kvm::free_kernel_pages(tcb_range); }
-        crate::mm::page_alloc::dealloc_page(kernel_stack);
+        // SAFETY: tcb_range / stack_range are the ones we just allocated;
+        // no live refs.
+        unsafe {
+            crate::mm::kvm::free_kernel_pages(tcb_range);
+            crate::mm::kvm::free_kernel_pages(stack_range);
+        }
         crate::cap::process_obj::process_dec_thread_count(process_kva);
         return SyscallError::OUT_OF_MEMORY;
     }

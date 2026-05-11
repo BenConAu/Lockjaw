@@ -1,4 +1,4 @@
-use crate::mm::addr::{PhysAddr, PhysPage, KERNEL_VA_OFFSET};
+use crate::mm::addr::{PhysAddr, PhysPage};
 use crate::mm::kernel_ptr::{KernelMut, KernelRef};
 use crate::mm::page_alloc;
 use crate::sched::tcb::Tcb;
@@ -521,9 +521,10 @@ fn finish_exit() {
 
     // Step 1: Read everything we need from the exiting TCB
     let tcb = unsafe { KernelRef::<Tcb>::from_kva(pending.tcb_kva) };
-    // Invariant: stack_base is a direct-map VA of the kernel stack page
-    // (stack_base = phys + KERNEL_VA_OFFSET). This is set by create_tcb.
-    let stack_paddr = PhysAddr::new(tcb.get().stack_base - KERNEL_VA_OFFSET);
+    // Invariant (post-Phase-6b): stack_base is the KVA of the kernel
+    // stack page in the KVM pool. set_by create_tcb from
+    // TcbCreateInfo.stack_kva.
+    let stack_kva = lockjaw_types::addr::KernelVa::new(tcb.get().stack_base);
     let process_kva = lockjaw_types::addr::KernelVa::new(tcb.get().process_kva);
 
     // Step 2: Remove from scheduler array + model
@@ -533,16 +534,17 @@ fn finish_exit() {
         (*SCHEDULER.threads_ptr())[pending.thread_idx] = None;
     }
 
-    // Step 3: Free per-thread resources (kernel stack, TCB)
-    page_alloc::dealloc_page(PhysPage::containing(stack_paddr));
-    // Free TCB page (after reading all fields we need from it)
-    // TCB page lives in the KVM pool — tear down the KVA range,
-    // returning the backing frame to page_alloc and the VA to the
-    // KVM free list.
-    // SAFETY: tcb_kva came from a prior kvm::alloc_kernel_pages(1)
-    // at thread create time; this finish_exit path holds the GKL
-    // and no live references into the TCB page exist by this point.
+    // Step 3: Free per-thread resources (kernel stack, TCB) — both
+    // live in the KVM pool. Tear down each KVA range, returning the
+    // backing frame to page_alloc and the VA to the KVM free list.
+    // SAFETY: stack_kva and tcb_kva each came from a prior
+    // kvm::alloc_kernel_pages(1) at thread create time; finish_exit
+    // holds the GKL and no live references into either page exist by
+    // this point.
     unsafe {
+        crate::mm::kvm::free_kernel_pages(
+            crate::mm::kvm::OwnedKvmRange { kva: stack_kva, pages: 1 }
+        );
         crate::mm::kvm::free_kernel_pages(
             crate::mm::kvm::OwnedKvmRange { kva: pending.tcb_kva, pages: 1 }
         );

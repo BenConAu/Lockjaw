@@ -19,21 +19,6 @@ use lockjaw_types::process::{
 };
 use lockjaw_types::vmem::{ScratchAction, ScratchCursor};
 
-/// Drop guard for a kernel page — freed on drop unless defused.
-struct PageGuard(Option<crate::mm::addr::PhysPage>);
-impl PageGuard {
-    fn new(page: crate::mm::addr::PhysPage) -> Self { Self(Some(page)) }
-    fn addr(&self) -> PhysAddr { self.0.unwrap().start_addr() }
-    fn defuse(&mut self) { self.0 = None; }
-}
-impl Drop for PageGuard {
-    fn drop(&mut self) {
-        if let Some(page) = self.0.take() {
-            page_alloc::dealloc_page(page);
-        }
-    }
-}
-
 /// Drop guard for a TTBR0 page table tree — walks and frees all table
 /// pages (L0/L1/L2/L3) on drop unless defused.
 struct Ttbr0Guard(Option<PhysAddr>);
@@ -101,7 +86,8 @@ struct ProvisionedResources {
     ttbr0: Ttbr0Guard,
     /// HandleTable also lives in the KVM pool.
     handle_table: crate::mm::kvm::OwnedKvmRangeGuard,
-    tcb_stack: PageGuard,
+    /// Per-thread kernel stack also lives in the KVM pool.
+    tcb_stack: crate::mm::kvm::OwnedKvmRangeGuard,
     /// TCB also lives in the KVM pool.
     tcb: crate::mm::kvm::OwnedKvmRangeGuard,
     /// Scratch capacity discovered while doing the lookups —
@@ -244,11 +230,11 @@ pub fn create_process(
 
     // Defuse drop guards — child now owns all its resources.
     // OwnedKvmRangeGuard transfers ownership via take() (drops the
-    // guard's claim without freeing). PageGuard / Ttbr0Guard use defuse().
+    // guard's claim without freeing). Ttbr0Guard uses defuse().
     let _ = resources.proc.take();
     let _ = resources.handle_table.take();
     resources.ttbr0.defuse();
-    resources.tcb_stack.defuse();
+    let _ = resources.tcb_stack.take();
     let _ = resources.tcb.take();
 
     // Enqueue the thread. Cannot fail because has_room() above
@@ -492,12 +478,11 @@ fn provision_resources(
     // First thread — increment via narrow op (count 0 → 1)
     crate::cap::process_obj::process_inc_thread_count(proc_kva);
 
-    // Create TCB — first thread in this process. TCB lives in the
-    // KVM pool. The kernel stack stays in physical memory for now
-    // (commit 6b moves stacks to KVM).
-    let tcb_stack_guard = PageGuard::new(
-        page_alloc::alloc_page().ok_or(CreateProcessError::OutOfMemory)?
-    );
+    // Create TCB — first thread in this process. Both the TCB page
+    // and the per-thread kernel stack live in the KVM pool.
+    let tcb_stack_range = crate::mm::kvm::alloc_kernel_pages(1)
+        .map_err(|_| CreateProcessError::OutOfMemory)?;
+    let tcb_stack_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(tcb_stack_range);
     let tcb_range = crate::mm::kvm::alloc_kernel_pages(1)
         .map_err(|_| CreateProcessError::OutOfMemory)?;
     let tcb_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(tcb_range);
@@ -507,7 +492,7 @@ fn provision_resources(
         create_tcb(
             &TcbCreateInfo {
                 entry: process_entry,
-                stack_paddr: tcb_stack_guard.addr(),
+                stack_kva: tcb_stack_guard.kva(),
                 process_kva: proc_kva,
                 user_entry_point: entry_point,
                 user_stack_top: stack_va + (stack_ps.count() as u64) * PAGE_SIZE,

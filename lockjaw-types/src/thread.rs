@@ -193,7 +193,11 @@ impl Tcb {
 /// create_tcb() writes these values into a donated page.
 pub struct TcbCreateInfo {
     pub entry: fn() -> !,
-    pub stack_paddr: crate::addr::PhysAddr,
+    /// KVA of this thread's kernel stack page. Kernel stacks live in
+    /// the KVM pool — see kernel-vmem-roadmap.md. The asm context
+    /// switch loads this VA into SP_EL1; same dereference semantics
+    /// as the prior linear-map VA, different range.
+    pub stack_kva: crate::addr::KernelVa,
     /// KVA of the owning ProcessObject — kernel objects live in the
     /// KVM pool. See kernel-vmem-roadmap.md.
     pub process_kva: crate::addr::KernelVa,

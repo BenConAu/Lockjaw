@@ -14,14 +14,14 @@ pub use lockjaw_types::thread::{Tcb, TcbCreateInfo, ThreadBootstrap};
 /// synthetic frame so it can be context-switched into.
 ///
 /// # Safety
-/// `base_kva` must be a KVM-allocated page. `info.stack_paddr` must
-/// be a separate page for the thread's stack.
+/// `base_kva` must be a KVM-allocated page. `info.stack_kva` must
+/// be a separate KVM-allocated page for the thread's stack.
 pub unsafe fn create_tcb(
     info: &TcbCreateInfo,
     base_kva: KernelVa,
 ) -> Result<(), CreateError> {
     let mut tcb_km = KernelMut::<Tcb>::from_kva(base_kva);
-    let mut stack_km = KernelMut::<u64>::from_paddr(info.stack_paddr);
+    let mut stack_km = KernelMut::<u64>::from_kva(info.stack_kva);
     // SAFETY: KernelMut pointer is the kernel VA of the stack page
     let stack_va = stack_km.as_mut_ptr() as usize as u64;
     let stack_top = stack_va + PAGE_SIZE;
