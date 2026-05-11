@@ -68,46 +68,97 @@ static ALLOCATOR: KvmAllocator = KvmAllocator::new();
 // Public types
 // ---------------------------------------------------------------------------
 
-/// A KVM allocation: a virtually-contiguous range of `pages` 4 KB
-/// pages starting at `kva`. Returned by `alloc_kernel_pages` and
-/// consumed by `free_kernel_pages`.
+/// A KVM allocation whose backing physical frames are owned by the
+/// allocator. Returned by `alloc_kernel_pages` and consumed by
+/// `free_kernel_pages`. Free returns the backing frames to
+/// `page_alloc` and the VA range to the KVM free list.
 #[derive(Clone, Copy, Debug)]
-pub struct KvmRange {
+pub struct OwnedKvmRange {
     pub kva: KernelVa,
     pub pages: usize,
 }
 
-/// RAII guard that frees a `KvmRange` on drop unless explicitly
+/// A KVM mapping over caller-supplied physical frames. Returned by
+/// `map_existing` and consumed by `unmap_existing`. Unmap returns
+/// the VA range to the KVM free list but does NOT free the backing
+/// frames — the caller (typically `consume_pageset_apply`) owns those.
+///
+/// Distinct from `OwnedKvmRange` so the two free paths can never be
+/// crossed: passing an `OwnedKvmRange` to `unmap_existing` (or vice
+/// versa) is a compile error.
+///
+/// `#[allow(dead_code)]` until the per-kind kernel-object migrations
+/// land — first user is `sys_create_reply` in the next commit.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub struct MappedKvmRange {
+    pub kva: KernelVa,
+    pub pages: usize,
+}
+
+/// RAII guard that frees an `OwnedKvmRange` on drop unless explicitly
 /// taken. Mirrors the `HeaderPageGuard` pattern: callers wrap
 /// allocations in a guard, do downstream work that may fail, then
 /// call `take()` on success to claim ownership without freeing.
-pub struct KvmRangeGuard {
-    range: Option<KvmRange>,
+pub struct OwnedKvmRangeGuard {
+    range: Option<OwnedKvmRange>,
 }
 
-impl KvmRangeGuard {
-    pub fn new(range: KvmRange) -> Self {
+impl OwnedKvmRangeGuard {
+    pub fn new(range: OwnedKvmRange) -> Self {
         Self { range: Some(range) }
     }
 
     /// Claim the range, preventing it from being freed on drop.
-    pub fn take(&mut self) -> KvmRange {
-        self.range.take().unwrap_or_else(|| panic!("KvmRangeGuard already taken"))
+    pub fn take(&mut self) -> OwnedKvmRange {
+        self.range.take().unwrap_or_else(|| panic!("OwnedKvmRangeGuard already taken"))
     }
 
     /// The underlying KVA without releasing ownership.
     pub fn kva(&self) -> KernelVa {
-        self.range.expect("KvmRangeGuard already taken").kva
+        self.range.expect("OwnedKvmRangeGuard already taken").kva
     }
 }
 
-impl Drop for KvmRangeGuard {
+impl Drop for OwnedKvmRangeGuard {
     fn drop(&mut self) {
         if let Some(range) = self.range.take() {
             // SAFETY: range came from alloc_kernel_pages and was not
             // taken — no live references into it remain (the caller
             // dropped before claiming ownership).
             unsafe { free_kernel_pages(range); }
+        }
+    }
+}
+
+/// RAII guard for a `MappedKvmRange`. Drop calls `unmap_existing`
+/// (clears PTEs + TLBI; does not touch backing frames). `take()`
+/// transfers ownership to the caller.
+#[allow(dead_code)]
+pub struct MappedKvmRangeGuard {
+    range: Option<MappedKvmRange>,
+}
+
+#[allow(dead_code)]
+impl MappedKvmRangeGuard {
+    pub fn new(range: MappedKvmRange) -> Self {
+        Self { range: Some(range) }
+    }
+
+    pub fn take(&mut self) -> MappedKvmRange {
+        self.range.take().unwrap_or_else(|| panic!("MappedKvmRangeGuard already taken"))
+    }
+
+    pub fn kva(&self) -> KernelVa {
+        self.range.expect("MappedKvmRangeGuard already taken").kva
+    }
+}
+
+impl Drop for MappedKvmRangeGuard {
+    fn drop(&mut self) {
+        if let Some(range) = self.range.take() {
+            // SAFETY: range came from map_existing and was not taken.
+            unsafe { unmap_existing(range); }
         }
     }
 }
@@ -205,7 +256,7 @@ pub unsafe fn kvm_init() {
 /// Allocate `pages` virtually-contiguous pages from the KVM pool,
 /// backed by `pages` independently-allocated physical frames.
 ///
-/// On success the returned `KvmRange` owns:
+/// On success the returned `OwnedKvmRange` owns:
 /// - the VA reservation in the free list
 /// - the per-page backing frames (PTEs in the KVM tree point at them)
 /// - any L2/L3 page-table pages newly allocated to extend the tree
@@ -219,7 +270,7 @@ pub unsafe fn kvm_init() {
 ///   (deferred per the plan; bounded waste, doesn't violate
 ///   correctness — the tree is consistent, just keeps an empty
 ///   sub-tree branch around)
-pub fn alloc_kernel_pages(pages: usize) -> Result<KvmRange, KvmError> {
+pub fn alloc_kernel_pages(pages: usize) -> Result<OwnedKvmRange, KvmError> {
     if !ALLOCATOR.initialized.load(Ordering::Acquire) {
         panic!("alloc_kernel_pages before kvm_init");
     }
@@ -233,20 +284,24 @@ pub fn alloc_kernel_pages(pages: usize) -> Result<KvmRange, KvmError> {
     let kva = list.try_alloc(pages)
         .map_err(|_| KvmError::OutOfVirtualMemory)?;
 
-    // Drive the map walker. On OOM during the walk, roll back via
-    // free_kernel_pages on the partial range we already wrote.
+    // Drive the map walker. The supplier allocates a fresh frame from
+    // page_alloc on every WantBacking step. On OOM during the walk,
+    // roll back via free_kernel_pages on the partial range.
     let mut walk = KvmMapWalk::start(kva, pages, l1_paddr);
     let mut pages_done: usize = 0;
-    let result = drive_map_walk(&mut walk, &mut pages_done);
+    let result = drive_map_walk(&mut walk, &mut pages_done, |_| {
+        let frame = page_alloc::alloc_page().ok_or(KvmError::OutOfPhysicalFrames)?;
+        Ok(lockjaw_types::addr::PhysAddr::new(frame.start_addr().as_u64()))
+    });
 
     if let Err(e) = result {
         // Roll back: free what we already mapped (releases backing
         // frames + clears PTEs + TLBI), then return the VA range.
         if pages_done > 0 {
-            // SAFETY: KvmRangeGuard-style rollback. Free the partial
-            // range. Backing paddrs are recovered by KvmFreeWalk
-            // reading the L3 PTEs we just wrote.
-            unsafe { free_kernel_pages_inner(KvmRange { kva, pages: pages_done }); }
+            // SAFETY: rollback path. Free the partial range. Backing
+            // paddrs are recovered by KvmFreeWalk reading the L3 PTEs
+            // we just wrote.
+            unsafe { tear_down_range(kva, pages_done, /*dealloc_backing=*/ true); }
         } else {
             // No PTEs written — only the VA reservation needs to be
             // returned.
@@ -255,26 +310,80 @@ pub fn alloc_kernel_pages(pages: usize) -> Result<KvmRange, KvmError> {
         return Err(e);
     }
 
-    // Per-page TLBI to invalidate any stale "this VA is unmapped"
-    // cached decisions. Cheap because the pool VAs were never
-    // accessed before allocation.
-    unsafe {
-        asm!("dsb ish", options(nostack, preserves_flags));
-        for i in 0..pages {
-            tlbi_vae1(kva.add_pages(i));
-        }
-        asm!("dsb ish", options(nostack, preserves_flags));
-        asm!("isb", options(nostack, preserves_flags));
-    }
+    tlbi_range(kva, pages);
 
-    Ok(KvmRange { kva, pages })
+    Ok(OwnedKvmRange { kva, pages })
 }
 
-/// Drive the `KvmMapWalk` to completion. Returns `Err` if any
-/// underlying allocation fails; `pages_done` tracks how many pages
-/// have completed `WritePagePte` so the caller can roll back
-/// exactly that many pages.
-fn drive_map_walk(walk: &mut KvmMapWalk, pages_done: &mut usize) -> Result<(), KvmError> {
+/// Map a single caller-supplied physical page into the KVM pool.
+/// The frame's lifecycle stays with the caller — `unmap_existing`
+/// clears the PTE but does NOT return the frame to `page_alloc`.
+///
+/// Takes a `PhysPage` (page-typed) rather than raw `PhysAddr` so the
+/// 4 KB alignment precondition is enforced by the type system.
+/// `PageTableEntry::new_page` masks the low 12 bits of the supplied
+/// paddr; passing an unaligned address would silently mis-map to the
+/// containing page. Requiring `PhysPage` makes the misuse
+/// unrepresentable.
+///
+/// Used by the donated-PageSet → kernel-object path: the user's
+/// donated data page becomes the backing for the new kernel object,
+/// addressed through KVA.
+///
+/// Currently 1-page only. Multi-page `map_existing` would take a
+/// `&[PhysPage]` slice; not yet needed.
+#[allow(dead_code)]
+pub fn map_existing(page: PhysPage) -> Result<MappedKvmRange, KvmError> {
+    if !ALLOCATOR.initialized.load(Ordering::Acquire) {
+        panic!("map_existing before kvm_init");
+    }
+
+    let l1_paddr = unsafe { *ALLOCATOR.l1_paddr.get() };
+    let list = unsafe { &mut *ALLOCATOR.list.get() };
+
+    let kva = list.try_alloc(1).map_err(|_| KvmError::OutOfVirtualMemory)?;
+
+    // Drive the walker; supplier returns the caller's page-aligned
+    // paddr at the single WantBacking step.
+    let backing = lockjaw_types::addr::PhysAddr::new(page.start_addr().as_u64());
+    let mut walk = KvmMapWalk::start(kva, 1, l1_paddr);
+    let mut pages_done: usize = 0;
+    let result = drive_map_walk(&mut walk, &mut pages_done, |_| Ok(backing));
+
+    if let Err(e) = result {
+        // L2/L3 may have failed to allocate. The caller-supplied
+        // backing was never claimed by us, so rollback only needs to
+        // clear any PTE we wrote (none, since pages_done==0 unless
+        // WritePagePte ran) and return the VA range.
+        if pages_done > 0 {
+            // SAFETY: rollback path, but with dealloc_backing=false —
+            // the backing came from the caller and isn't ours to free.
+            unsafe { tear_down_range(kva, pages_done, /*dealloc_backing=*/ false); }
+        } else {
+            let _ = list.free(kva, 1);
+        }
+        return Err(e);
+    }
+
+    tlbi_range(kva, 1);
+
+    Ok(MappedKvmRange { kva, pages: 1 })
+}
+
+/// Drive the `KvmMapWalk` to completion. The `next_backing` closure
+/// is invoked on every `WantBacking` step with the page index (0..N)
+/// and must return the paddr to install at the next L3 PTE.
+///
+/// `pages_done` tracks how many pages have completed `WritePagePte`
+/// so the caller can roll back exactly that many pages.
+fn drive_map_walk<F>(
+    walk: &mut KvmMapWalk,
+    pages_done: &mut usize,
+    mut next_backing: F,
+) -> Result<(), KvmError>
+where
+    F: FnMut(usize) -> Result<lockjaw_types::addr::PhysAddr, KvmError>,
+{
     loop {
         match walk.current_step() {
             KvmMapStep::ReadL1Pte { l1_pte_paddr } => {
@@ -322,13 +431,8 @@ fn drive_map_walk(walk: &mut KvmMapWalk, pages_done: &mut usize) -> Result<(), K
                 walk.step_l3(raw);
             }
             KvmMapStep::WantBacking => {
-                let frame = match page_alloc::alloc_page() {
-                    Some(p) => p,
-                    None => return Err(KvmError::OutOfPhysicalFrames),
-                };
-                walk.supply_backing(
-                    lockjaw_types::addr::PhysAddr::new(frame.start_addr().as_u64()),
-                );
+                let paddr = next_backing(*pages_done)?;
+                walk.supply_backing(paddr);
             }
             KvmMapStep::WritePagePte { pte_paddr, entry } => {
                 unsafe { write_pte(pte_paddr, entry.raw()); }
@@ -341,9 +445,26 @@ fn drive_map_walk(walk: &mut KvmMapWalk, pages_done: &mut usize) -> Result<(), K
                 // where a table is expected, or a live L3 entry for a
                 // VA the freelist said was free). Panic loudly rather
                 // than silently corrupt the page tree.
-                panic!("KvmMapWalk fault during alloc_kernel_pages");
+                panic!("KvmMapWalk fault during map");
             }
         }
+    }
+}
+
+/// Per-page TLB invalidation across `pages` starting at `kva`.
+/// Standard sequence: `dsb ish` to publish PTE writes, surgical
+/// `tlbi vae1is` per VA, `dsb ish` + `isb` to ensure invalidation
+/// completes before any subsequent access.
+#[inline]
+fn tlbi_range(kva: KernelVa, pages: usize) {
+    // SAFETY: pure TLB-management asm; no memory writes.
+    unsafe {
+        asm!("dsb ish", options(nostack, preserves_flags));
+        for i in 0..pages {
+            tlbi_vae1(kva.add_pages(i));
+        }
+        asm!("dsb ish", options(nostack, preserves_flags));
+        asm!("isb", options(nostack, preserves_flags));
     }
 }
 
@@ -360,23 +481,51 @@ fn drive_map_walk(walk: &mut KvmMapWalk, pages_done: &mut usize) -> Result<(), K
 /// `range` must come from a prior `alloc_kernel_pages` and must not
 /// have been freed already. The caller must hold no live references
 /// (`KernelRef`/`KernelMut`) into the range.
-pub unsafe fn free_kernel_pages(range: KvmRange) {
+pub unsafe fn free_kernel_pages(range: OwnedKvmRange) {
     if !ALLOCATOR.initialized.load(Ordering::Acquire) {
         panic!("free_kernel_pages before kvm_init");
     }
-    free_kernel_pages_inner(range);
+    tear_down_range(range.kva, range.pages, /*dealloc_backing=*/ true);
 }
 
-/// Inner implementation shared between the public free entry and
-/// the alloc-path partial rollback.
-unsafe fn free_kernel_pages_inner(range: KvmRange) {
-    if range.pages == 0 {
+/// Unmap a `MappedKvmRange`: clears the PTEs (with TLBI) and returns
+/// the VA range to the free list, but does NOT return the backing
+/// frames to `page_alloc` — the caller-supplied frames belong to
+/// whatever donated them.
+///
+/// # Safety
+/// `range` must come from a prior `map_existing` and must not have
+/// been unmapped already. No live references into the range.
+#[allow(dead_code)]
+pub unsafe fn unmap_existing(range: MappedKvmRange) {
+    if !ALLOCATOR.initialized.load(Ordering::Acquire) {
+        panic!("unmap_existing before kvm_init");
+    }
+    tear_down_range(range.kva, range.pages, /*dealloc_backing=*/ false);
+}
+
+/// Shared tear-down: walk the KVM tree clearing PTEs across `pages`
+/// starting at `kva`, run the canonical TLBI sequence, optionally
+/// dealloc the backing frames, and return the VA range to the free
+/// list.
+///
+/// `dealloc_backing` controls whether the backing physical frames
+/// (recovered from the L3 PTEs as they're cleared) get returned to
+/// `page_alloc`:
+/// - `true` for `free_kernel_pages` (alloc_kernel_pages owned them)
+/// - `false` for `unmap_existing` (caller-supplied frames stay with
+///   their original owner)
+///
+/// Used by both the public free/unmap entries and the alloc/map
+/// rollback paths.
+unsafe fn tear_down_range(kva: KernelVa, pages: usize, dealloc_backing: bool) {
+    if pages == 0 {
         return;
     }
     let l1_paddr = *ALLOCATOR.l1_paddr.get();
     let list = &mut *ALLOCATOR.list.get();
 
-    let mut walk = KvmFreeWalk::start(range.kva, range.pages, l1_paddr);
+    let mut walk = KvmFreeWalk::start(kva, pages, l1_paddr);
     // Capture backing paddrs as the walker yields them; defer the
     // dealloc until after the TLBI sequence so we don't free a frame
     // whose translation might still be cached.
@@ -399,19 +548,23 @@ unsafe fn free_kernel_pages_inner(range: KvmRange) {
             }
             KvmFreeStep::ClearPte { pte_paddr, backing } => {
                 write_pte(pte_paddr, 0);
-                // Record the backing frame for post-TLBI dealloc.
-                let phys = PhysAddr::new(backing.as_u64());
-                if to_free_head < to_free.len() {
-                    to_free[to_free_head] = PhysPage::containing(phys);
-                    to_free_head += 1;
-                } else {
-                    // Should not happen for current MAX_PRACTICAL_PAGES_PER_SET
-                    // (33 backing frames per header alloc), but if a future
-                    // caller exceeds 64 we fall back to in-loop dealloc.
-                    // The TLBI sequence below still runs over every freed VA
-                    // so correctness is preserved; only the "drain after
-                    // TLBI" optimization is lost for the overflowed pages.
-                    page_alloc::dealloc_page(PhysPage::containing(phys));
+                if dealloc_backing {
+                    // Record the backing frame for post-TLBI dealloc.
+                    let phys = PhysAddr::new(backing.as_u64());
+                    if to_free_head < to_free.len() {
+                        to_free[to_free_head] = PhysPage::containing(phys);
+                        to_free_head += 1;
+                    } else {
+                        // Should not happen for current
+                        // MAX_PRACTICAL_PAGES_PER_SET (33 backing
+                        // frames per header alloc), but if a future
+                        // caller exceeds 64 we fall back to in-loop
+                        // dealloc. The TLBI sequence below still
+                        // runs over every freed VA so correctness is
+                        // preserved; only the "drain after TLBI"
+                        // optimization is lost for overflow pages.
+                        page_alloc::dealloc_page(PhysPage::containing(phys));
+                    }
                 }
                 walk.step_pte_cleared();
             }
@@ -421,7 +574,7 @@ unsafe fn free_kernel_pages_inner(range: KvmRange) {
                 // between the free list and the actual page tables.
                 // Panic loudly rather than continue (we'd be freeing
                 // wrong frames).
-                panic!("KvmFreeWalk fault during free_kernel_pages");
+                panic!("KvmFreeWalk fault during tear_down_range");
             }
         }
     }
@@ -431,8 +584,8 @@ unsafe fn free_kernel_pages_inner(range: KvmRange) {
     // VA, dsb ish + isb after to ensure invalidation completes
     // before any subsequent PTE write or instruction fetch.
     asm!("dsb ish", options(nostack, preserves_flags));
-    for i in 0..range.pages {
-        tlbi_vae1(range.kva.add_pages(i));
+    for i in 0..pages {
+        tlbi_vae1(kva.add_pages(i));
     }
     asm!("dsb ish", options(nostack, preserves_flags));
     asm!("isb", options(nostack, preserves_flags));
@@ -443,7 +596,7 @@ unsafe fn free_kernel_pages_inner(range: KvmRange) {
     }
 
     // Return the VA range to the free list.
-    let _ = list.free(range.kva, range.pages);
+    let _ = list.free(kva, pages);
 }
 
 // ---------------------------------------------------------------------------

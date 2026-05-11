@@ -1,6 +1,6 @@
 use crate::mm::addr::{PhysAddr, PhysPage, PAGE_SIZE};
 use crate::mm::kernel_ptr::KernelMut;
-use crate::mm::kvm::{self, KvmRange, KvmRangeGuard};
+use crate::mm::kvm::{self, OwnedKvmRange, OwnedKvmRangeGuard};
 use crate::mm::page_alloc;
 use core::cell::UnsafeCell;
 use lockjaw_types::addr::KernelVa;
@@ -39,7 +39,7 @@ static TABLE: PageSetTableWrapper = PageSetTableWrapper::new();
 
 /// Insert an already-initialized header range into the global table.
 /// Does NOT own the header range — the caller is responsible for
-/// cleanup on failure (typically via KvmRangeGuard).
+/// cleanup on failure (typically via OwnedKvmRangeGuard).
 fn insert_into_table(count: usize, header_kva: KernelVa) -> Option<u64> {
     let entry = PageSetEntry { count, header_kva };
     // SAFETY: single-core, IRQs masked — exclusive table access.
@@ -54,7 +54,7 @@ fn insert_into_table(count: usize, header_kva: KernelVa) -> Option<u64> {
 fn alloc_and_insert_header(page_addrs: &[u64], count: usize) -> Option<u64> {
     let header_pages = header_pages_for(count);
     let range = kvm::alloc_kernel_pages(header_pages).ok()?;
-    let mut guard = KvmRangeGuard::new(range);
+    let mut guard = OwnedKvmRangeGuard::new(range);
     let header_kva = guard.kva();
 
     // Zero the header range. KVM pages are freshly allocated but
@@ -105,7 +105,7 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
 
     let header_pages = header_pages_for(count);
     let range = kvm::alloc_kernel_pages(header_pages).ok()?;
-    let mut guard = KvmRangeGuard::new(range);
+    let mut guard = OwnedKvmRangeGuard::new(range);
     let header_kva = guard.kva();
 
     // Zero the header range so set_page writes happen into known
@@ -175,7 +175,7 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
 
     let header_pages = header_pages_for(actual_count);
     let range = kvm::alloc_kernel_pages(header_pages).ok()?;
-    let mut guard = KvmRangeGuard::new(range);
+    let mut guard = OwnedKvmRangeGuard::new(range);
     let header_kva = guard.kva();
     // SAFETY: header_kva is a freshly-allocated KVM range.
     unsafe {
@@ -259,7 +259,7 @@ pub fn free_header_page(header_kva: KernelVa) {
     // SAFETY: range came from kvm::alloc_kernel_pages and the
     // PageSetTable just released its claim — no live references remain.
     unsafe {
-        kvm::free_kernel_pages(KvmRange { kva: header_kva, pages: header_pages });
+        kvm::free_kernel_pages(OwnedKvmRange { kva: header_kva, pages: header_pages });
     }
 }
 
@@ -359,7 +359,7 @@ pub fn consume_pageset_apply(header_kva: KernelVa) {
     // cleared every cross-process reference; no live KernelMut/Ref
     // can remain.
     unsafe {
-        kvm::free_kernel_pages(KvmRange { kva: header_kva, pages: header_pages });
+        kvm::free_kernel_pages(OwnedKvmRange { kva: header_kva, pages: header_pages });
     }
 }
 
@@ -415,7 +415,7 @@ pub fn free_by_header_kva(header_kva: KernelVa) {
     // SAFETY: range came from kvm::alloc_kernel_pages; refs above
     // have been dropped before this call.
     unsafe {
-        kvm::free_kernel_pages(KvmRange { kva: header_kva, pages: header_pages });
+        kvm::free_kernel_pages(OwnedKvmRange { kva: header_kva, pages: header_pages });
     }
 }
 
