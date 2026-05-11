@@ -38,7 +38,9 @@ pub unsafe fn create_handle_table(
         },
     );
 
-    // Zero all handle slots (empty = object_paddr 0)
+    // Zero all handle slots — `HandleKind::Empty = 0` is the empty
+    // sentinel and its discriminant byte is the first byte of the
+    // kind field, so an all-zeros slot decodes as Empty.
     // SAFETY: slots immediately follow the header in the donated page(s)
     let slots_ptr = (header_km.as_ptr() as u64 + core::mem::size_of::<HandleTableHeader>() as u64)
         as *mut lockjaw_types::object::HandleEntry;

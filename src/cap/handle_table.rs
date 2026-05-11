@@ -1,6 +1,7 @@
 use crate::cap::object::ObjectType;
 use crate::cap::rights::Rights;
 use crate::mm::addr::{PhysAddr, KERNEL_VA_OFFSET};
+use lockjaw_types::addr::KernelVa;
 use lockjaw_types::object::{HandleTableHeader, HandleEntry, HandleKind};
 use lockjaw_types::handle_ops::{self, HandleError, SlotRevokeAction};
 use lockjaw_types::syscall::SyscallError;
@@ -51,11 +52,16 @@ impl HandleTableRef {
 
     /// Insert a new handle into the table. Returns the slot index.
     /// Returns HANDLE_TABLE_FULL if no empty slot is available.
-    pub fn insert(&self, object_paddr: PhysAddr, rights: Rights, kind: HandleKind) -> Result<u32, SyscallError> {
+    ///
+    /// The object's address travels inside `kind` — each non-empty
+    /// `HandleKind` variant carries its own typed address. This is
+    /// the only insert path; there is no separate `object_paddr`
+    /// argument that could drift away from `kind`.
+    pub fn insert(&self, rights: Rights, kind: HandleKind) -> Result<u32, SyscallError> {
         // SAFETY: self.0 was validated at construction.
         unsafe {
             let (_header, slots) = table_slots(self.0);
-            handle_ops::slot_insert(slots, object_paddr.as_u64(), rights, kind)
+            handle_ops::slot_insert(slots, rights, kind)
                 .map_err(|e| {
                     if matches!(e, HandleError::TableFull) {
                         crate::kprintln!("HANDLE TABLE FULL: ", slots.len(), " slots, all occupied");
@@ -75,10 +81,10 @@ impl HandleTableRef {
         }
     }
 
-    /// Phase-1 revoke walk: read-only. For each handle in this table
-    /// referencing `object_paddr`, invoke `on_action(&action)` exactly
-    /// once with the slot's pre-clear snapshot. Returns the number of
-    /// matching slots seen.
+    /// Phase-1 revoke walk: read-only. For each PageSet handle in this
+    /// table referencing `header_kva`, invoke `on_action(&action)`
+    /// exactly once with the slot's pre-clear snapshot. Returns the
+    /// number of matching slots seen.
     ///
     /// **No state mutated.** The caller's callback may read but must
     /// not write the slot. Used by `revoke::validate` to walk every
@@ -87,18 +93,18 @@ impl HandleTableRef {
     /// confirm the apply phase will succeed.
     pub fn revoke_validate(
         &self,
-        object_paddr: u64,
+        header_kva: KernelVa,
         on_action: impl FnMut(&SlotRevokeAction),
     ) -> usize {
         // SAFETY: self.0 was validated at construction.
         unsafe {
             let (_header, slots) = table_slots(self.0);
-            handle_ops::slot_revoke_validate(slots, object_paddr, on_action)
+            handle_ops::slot_revoke_validate(slots, header_kva, on_action)
         }
     }
 
-    /// Phase-2 revoke walk: write. For each handle in this table
-    /// referencing `object_paddr`, invoke `on_action(&action)` with
+    /// Phase-2 revoke walk: write. For each PageSet handle in this
+    /// table referencing `header_kva`, invoke `on_action(&action)` with
     /// the slot's pre-clear snapshot, then zero the slot.
     ///
     /// `on_action` runs BEFORE the slot is cleared so the caller's
@@ -107,17 +113,17 @@ impl HandleTableRef {
     /// `mapped_va_page` and `kind`.
     ///
     /// MUST be called only after a successful matching
-    /// `revoke_validate` against the same `object_paddr` within the
+    /// `revoke_validate` against the same `header_kva` within the
     /// same critical section (GKL held).
     pub fn revoke_apply(
         &self,
-        object_paddr: u64,
+        header_kva: KernelVa,
         on_action: impl FnMut(&SlotRevokeAction),
     ) -> usize {
         // SAFETY: self.0 was validated at construction.
         unsafe {
             let (_header, slots) = table_slots(self.0);
-            handle_ops::slot_revoke_apply(slots, object_paddr, on_action)
+            handle_ops::slot_revoke_apply(slots, header_kva, on_action)
         }
     }
 
@@ -129,7 +135,7 @@ impl HandleTableRef {
         unsafe {
             let (_header, slots) = table_slots(self.0);
             for slot in slots.iter() {
-                if slot.object_paddr != 0 {
+                if !matches!(slot.kind, HandleKind::Empty) {
                     cb(slot);
                 }
             }
@@ -175,12 +181,11 @@ const _: () = assert!(core::mem::size_of::<HandleTableHeader>() % 8 == 0);
 /// Insert a new handle into the table. Returns the handle index (slot number).
 pub unsafe fn handle_insert(
     table_paddr: PhysAddr,
-    object_paddr: PhysAddr,
     rights: Rights,
     kind: HandleKind,
 ) -> Result<u32, HandleError> {
     let (_header, slots) = table_slots(table_paddr);
-    handle_ops::slot_insert(slots, object_paddr.as_u64(), rights, kind)
+    handle_ops::slot_insert(slots, rights, kind)
         .map_err(|e| {
             if matches!(e, HandleError::TableFull) {
                 crate::kprintln!("HANDLE TABLE FULL: ", slots.len(), " slots, all occupied");

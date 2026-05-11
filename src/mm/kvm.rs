@@ -77,6 +77,41 @@ pub struct KvmRange {
     pub pages: usize,
 }
 
+/// RAII guard that frees a `KvmRange` on drop unless explicitly
+/// taken. Mirrors the `HeaderPageGuard` pattern: callers wrap
+/// allocations in a guard, do downstream work that may fail, then
+/// call `take()` on success to claim ownership without freeing.
+pub struct KvmRangeGuard {
+    range: Option<KvmRange>,
+}
+
+impl KvmRangeGuard {
+    pub fn new(range: KvmRange) -> Self {
+        Self { range: Some(range) }
+    }
+
+    /// Claim the range, preventing it from being freed on drop.
+    pub fn take(&mut self) -> KvmRange {
+        self.range.take().unwrap_or_else(|| panic!("KvmRangeGuard already taken"))
+    }
+
+    /// The underlying KVA without releasing ownership.
+    pub fn kva(&self) -> KernelVa {
+        self.range.expect("KvmRangeGuard already taken").kva
+    }
+}
+
+impl Drop for KvmRangeGuard {
+    fn drop(&mut self) {
+        if let Some(range) = self.range.take() {
+            // SAFETY: range came from alloc_kernel_pages and was not
+            // taken — no live references into it remain (the caller
+            // dropped before claiming ownership).
+            unsafe { free_kernel_pages(range); }
+        }
+    }
+}
+
 /// Errors from the KVM allocator.
 #[derive(Debug)]
 pub enum KvmError {

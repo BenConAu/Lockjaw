@@ -115,20 +115,23 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
 /// PageSet is still owned by the caller (no consume happened).
 fn create_kernel_object(
     ps_handle: u32,
-    kind: lockjaw_types::object::HandleKind,
+    make_kind: fn(PhysAddr) -> lockjaw_types::object::HandleKind,
     init_fn: fn(crate::mm::addr::ObjectInitPage) -> Result<(), crate::cap::object::CreateError>,
 ) -> Result<u64, SyscallError> {
     let ht = CurrentThread::handle_table();
     // Require WRITE rights — this is a destructive operation that consumes
     // the PageSet and repurposes its page.
     let entry = ht.lookup(ps_handle, Rights::from_bits(RIGHT_WRITE), ObjectType::PageSet)?;
-    let header_paddr = entry.object_paddr;
+    let header_kva = match entry.kind {
+        lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
+        _ => return Err(SyscallError::INVALID_HANDLE),
+    };
 
     // Read header, validate exactly 1 data page.
-    // SAFETY: entry.object_paddr came from a PageSet handle, which
-    // points to a registered header — read_header_backed enforces that
-    // contract and the wrapper makes get_page safe.
-    let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_paddr) };
+    // SAFETY: entry came from a PageSet handle, which points to a
+    // registered header — read_header_backed enforces that contract
+    // and the wrapper makes get_page safe.
+    let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
     if backed.data_page_count() != 1 {
         return Err(SyscallError::INVALID_PARAMETER);
     }
@@ -138,7 +141,7 @@ fn create_kernel_object(
 
     // Phase 1: validate that revoke would succeed. No state mutated
     // on failure — caller's PageSet handle is still valid.
-    if crate::cap::pageset_table::consume_pageset_validate(header_paddr).is_err() {
+    if crate::cap::pageset_table::consume_pageset_validate(header_kva).is_err() {
         return Err(SyscallError::INVALID_HANDLE);
     }
 
@@ -153,10 +156,12 @@ fn create_kernel_object(
     // Phase 2: revoke every cross-process handle, clear PTEs, dec
     // refcount/map_count, unlink from PageSet table, free the
     // header page. Cannot fail under the validate→apply contract.
-    crate::cap::pageset_table::consume_pageset_apply(header_paddr);
+    crate::cap::pageset_table::consume_pageset_apply(header_kva);
 
-    // Insert a new handle for the created object.
-    ht.insert(PhysAddr::new(page_paddr), Rights::from_bits(RIGHT_READ | RIGHT_WRITE), kind)
+    // Insert a new handle for the created object. The make_kind callback
+    // builds the typed kind variant carrying page_paddr — each kernel
+    // object kind owns its address inside its HandleKind variant.
+    ht.insert(Rights::from_bits(RIGHT_READ | RIGHT_WRITE), make_kind(PhysAddr::new(page_paddr)))
         .map(|h| h as u64)
 }
 
@@ -310,24 +315,24 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     }.ok_or(SyscallError::OUT_OF_MEMORY)?;
 
     // Insert a PageSet handle into the caller's handle table.
-    // The handle points to the header page so sys_export_handle can
+    // The handle points to the header KVA so sys_export_handle can
     // transfer it to other processes.
-    let (_, header_paddr) = crate::cap::pageset_table::get_pageset(id)
+    let (_, header_kva) = crate::cap::pageset_table::get_pageset(id)
         .ok_or(SyscallError::UNKNOWN)?;
     let ht = CurrentThread::handle_table();
-    match ht.insert(PhysAddr::new(header_paddr),
+    match ht.insert(
         Rights::from_bits(RIGHT_READ | RIGHT_WRITE),
-        lockjaw_types::object::HandleKind::PageSet { mapped_va_page: 0 })
-    {
+        lockjaw_types::object::HandleKind::PageSet { kva: header_kva, mapped_va_page: 0 },
+    ) {
         Ok(h) => {
             // Increment refcount — a new handle references this PageSet.
-            unsafe { crate::cap::pageset_table::read_header_mut(header_paddr).inc_refcount(); }
+            unsafe { crate::cap::pageset_table::read_header_mut(header_kva).inc_refcount(); }
             Ok(h as u64)
         }
         Err(e) => {
             // Handle table full — free the pageset (global table slot,
-            // data pages, and header page) to avoid leaking memory.
-            crate::cap::pageset_table::free_by_header_paddr(header_paddr);
+            // data pages, and header range) to avoid leaking memory.
+            crate::cap::pageset_table::free_by_header_kva(header_kva);
             Err(e)
         }
     }
@@ -368,9 +373,12 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
         _ => {}
     }
 
-    // SAFETY: object_paddr came from a PageSet handle — registered header.
-    let header_paddr = entry.object_paddr;
-    let header = unsafe { crate::cap::pageset_table::read_header_backed(header_paddr) };
+    let header_kva = match entry.kind {
+        lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
+        _ => return SyscallError::INVALID_HANDLE,
+    };
+    // SAFETY: kva from a PageSet handle — registered header.
+    let header = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
     unsafe {
         match crate::arch::aarch64::vmem::map_pages_in_existing(addr_space.ttbr0(), virt_addr, &header, flags) {
             Ok(()) => {
@@ -382,7 +390,7 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
                     crate::kprintln!("WARNING: set_mapped_va failed after mapping");
                     return e;
                 }
-                crate::cap::pageset_table::read_header_mut(header_paddr).inc_map_count();
+                crate::cap::pageset_table::read_header_mut(header_kva).inc_map_count();
                 SyscallError::OK
             }
             Err(_) => SyscallError::UNKNOWN,
@@ -423,7 +431,11 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
 /// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_notification(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(ctx.gpr[0] as u32, lockjaw_types::object::HandleKind::Notification, crate::ipc::notification::create_notification)
+    create_kernel_object(
+        ctx.gpr[0] as u32,
+        |paddr| lockjaw_types::object::HandleKind::Notification { paddr },
+        crate::ipc::notification::create_notification,
+    )
 }
 
 /// sys_signal_notification(handle, value) — signal a notification.
@@ -472,7 +484,10 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
         Ok(e) => e,
         Err(e) => return e,
     };
-    let notif_paddr = PhysAddr::new(entry.object_paddr);
+    let notif_paddr = match entry.kind {
+        lockjaw_types::object::HandleKind::Notification { paddr } => paddr,
+        _ => return SyscallError::INVALID_HANDLE,
+    };
     if crate::arch::aarch64::irq_bind::bind(intid, notif_paddr) {
         // Enable SPI in the GIC distributor (PPIs are already enabled in gic::init)
         if intid >= 32 {
@@ -490,14 +505,22 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
 /// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_endpoint(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(ctx.gpr[0] as u32, lockjaw_types::object::HandleKind::Endpoint { caller_token: 0 }, endpoint::create_endpoint)
+    create_kernel_object(
+        ctx.gpr[0] as u32,
+        |paddr| lockjaw_types::object::HandleKind::Endpoint { paddr, caller_token: 0 },
+        endpoint::create_endpoint,
+    )
 }
 
 /// sys_create_reply(handle) — create a Reply object from a donated page.
 /// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_reply(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(ctx.gpr[0] as u32, lockjaw_types::object::HandleKind::Reply, crate::ipc::reply::create_reply)
+    create_kernel_object(
+        ctx.gpr[0] as u32,
+        |paddr| lockjaw_types::object::HandleKind::Reply { paddr },
+        crate::ipc::reply::create_reply,
+    )
 }
 
 /// sys_recv_nb(handle) — non-blocking receive on an endpoint.
@@ -559,11 +582,14 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
                 entry.handle as u32,
                 Rights::from_bits(crate::cap::rights::RIGHT_READ),
             )?;
-            let obj_type = he.kind.obj_type();
-            if obj_type != ObjectType::Endpoint && obj_type != ObjectType::Notification {
-                return Err(SyscallError::INVALID_PARAMETER);
-            }
-            paddrs[i] = PhysAddr::new(he.object_paddr);
+            let (obj_type, paddr) = match he.kind {
+                lockjaw_types::object::HandleKind::Endpoint { paddr, .. } =>
+                    (ObjectType::Endpoint, paddr),
+                lockjaw_types::object::HandleKind::Notification { paddr } =>
+                    (ObjectType::Notification, paddr),
+                _ => return Err(SyscallError::INVALID_PARAMETER),
+            };
+            paddrs[i] = paddr;
             types[i] = obj_type;
             thresholds[i] = entry.threshold;
         }
@@ -673,31 +699,26 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         // - caller_token == 0 (server's own handle): allocate fresh from endpoint.next_token
         // - caller_token != 0 (re-export): copy unchanged (lineage preservation)
         let export_kind = match export_entry.kind {
-            lockjaw_types::object::HandleKind::Endpoint { caller_token } if caller_token == 0 => {
+            lockjaw_types::object::HandleKind::Endpoint { paddr, caller_token } if caller_token == 0 => {
                 // First export: assign fresh token from the endpoint's counter.
-                let mut ep = KernelMut::<crate::ipc::endpoint::EndpointObject>::from_paddr(
-                    PhysAddr::new(export_entry.object_paddr),
-                );
+                let mut ep = KernelMut::<crate::ipc::endpoint::EndpointObject>::from_paddr(paddr);
                 let token = ep.get().next_token;
                 ep.get_mut().next_token = token + 1;
-                lockjaw_types::object::HandleKind::Endpoint { caller_token: token }
+                lockjaw_types::object::HandleKind::Endpoint { paddr, caller_token: token }
             }
             other => other, // non-Endpoint or re-export: pass through
         };
 
         // Insert into the caller's handle table (cross-table operation).
+        // The export_kind already carries its typed address (PhysAddr or
+        // KernelVa) inside the variant, so insert is the single path.
         let caller_tcb = KernelRef::<Tcb>::from_paddr(PhysAddr::new(caller_tcb_paddr_u64));
         let caller_ht_paddr = crate::cap::process_obj::process_handle_table(PhysAddr::new(caller_tcb.get().process_paddr));
         let caller_ht = handle_table::HandleTableRef::from_paddr(caller_ht_paddr);
-        let idx = caller_ht.insert(
-            PhysAddr::new(export_entry.object_paddr),
-            export_entry.rights,
-            export_kind,
-        )?;
+        let idx = caller_ht.insert(export_entry.rights, export_kind)?;
         // Increment refcount for PageSets — a new handle references it.
-        if export_kind.is_pageset() {
-            crate::cap::pageset_table::read_header_mut(export_entry.object_paddr)
-                .inc_refcount();
+        if let lockjaw_types::object::HandleKind::PageSet { kva, .. } = export_kind {
+            crate::cap::pageset_table::read_header_mut(kva).inc_refcount();
         }
         Ok(idx as u64)
     }
@@ -708,15 +729,15 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 /// Returns the handle index in x1.
 fn sys_get_boot_info() -> Result<u64, SyscallError> {
     let dtb_id = crate::dtb_pageset_id();
-    let (_, header_paddr) = crate::cap::pageset_table::get_pageset(dtb_id)
+    let (_, header_kva) = crate::cap::pageset_table::get_pageset(dtb_id)
         .ok_or(SyscallError::UNKNOWN)?;
     let ht = CurrentThread::handle_table();
-    let h = ht.insert(PhysAddr::new(header_paddr),
+    let h = ht.insert(
         Rights::from_bits(RIGHT_READ | RIGHT_WRITE),
-        lockjaw_types::object::HandleKind::PageSet { mapped_va_page: 0 })
-        .map(|h| h as u64)?;
+        lockjaw_types::object::HandleKind::PageSet { kva: header_kva, mapped_va_page: 0 },
+    ).map(|h| h as u64)?;
     // Increment refcount — a new handle references this PageSet.
-    unsafe { crate::cap::pageset_table::read_header_mut(header_paddr).inc_refcount(); }
+    unsafe { crate::cap::pageset_table::read_header_mut(header_kva).inc_refcount(); }
     Ok(h)
 }
 
@@ -728,21 +749,21 @@ fn sys_register_device_page(ctx: &mut ExceptionContext) -> Result<u64, SyscallEr
     let phys_addr = ctx.gpr[0];
     let id = crate::cap::pageset_table::register_device_page(phys_addr)
         .ok_or(SyscallError::OUT_OF_MEMORY)?;
-    let (_, header_paddr) = crate::cap::pageset_table::get_pageset(id)
+    let (_, header_kva) = crate::cap::pageset_table::get_pageset(id)
         .ok_or(SyscallError::UNKNOWN)?;
     let ht = CurrentThread::handle_table();
-    match ht.insert(PhysAddr::new(header_paddr),
+    match ht.insert(
         Rights::from_bits(RIGHT_READ | RIGHT_WRITE),
-        lockjaw_types::object::HandleKind::PageSet { mapped_va_page: 0 })
-    {
+        lockjaw_types::object::HandleKind::PageSet { kva: header_kva, mapped_va_page: 0 },
+    ) {
         Ok(h) => {
-            unsafe { crate::cap::pageset_table::read_header_mut(header_paddr).inc_refcount(); }
+            unsafe { crate::cap::pageset_table::read_header_mut(header_kva).inc_refcount(); }
             Ok(h as u64)
         }
         Err(e) => {
-            // Handle table full — free the tracking entry + header page.
+            // Handle table full — free the tracking entry + header range.
             // The MMIO page itself is not freed (it's device memory).
-            crate::cap::pageset_table::free_header_page(header_paddr);
+            crate::cap::pageset_table::free_header_page(header_kva);
             Err(e)
         }
     }
@@ -758,8 +779,12 @@ fn sys_query_pageset_phys(ctx: &mut ExceptionContext) -> Result<u64, SyscallErro
 
     let ht = CurrentThread::handle_table();
     let entry = ht.lookup(handle, Rights::from_bits(RIGHT_READ), ObjectType::PageSet)?;
-    // SAFETY: object_paddr came from a PageSet handle — registered header.
-    let backed = unsafe { crate::cap::pageset_table::read_header_backed(entry.object_paddr) };
+    let header_kva = match entry.kind {
+        lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
+        _ => return Err(SyscallError::INVALID_HANDLE),
+    };
+    // SAFETY: kva came from a PageSet handle — registered header.
+    let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
     backed.get_page(page_index)
         .ok_or(SyscallError::INVALID_PARAMETER)
 }
@@ -902,9 +927,12 @@ fn sys_unmap_pages(ctx: &mut ExceptionContext) -> SyscallError {
 
     // Read the PageSet header to get expected physical pages.
     // Pass the header's page array directly — no stack copy.
-    let header_paddr = entry.object_paddr;
-    // SAFETY: object_paddr came from a PageSet handle — registered header.
-    let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_paddr) };
+    let header_kva = match entry.kind {
+        lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
+        _ => return SyscallError::INVALID_HANDLE,
+    };
+    // SAFETY: kva came from a PageSet handle — registered header.
+    let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
     let expected = backed.pages_slice();
 
     // Validate PTEs and clear them. TLB flushed inside.
@@ -922,10 +950,10 @@ fn sys_unmap_pages(ctx: &mut ExceptionContext) -> SyscallError {
     // Decrement the PageSet's map count. If both map_count and
     // refcount reach zero, no handles or mappings remain — free it.
     let should_free = unsafe {
-        crate::cap::pageset_table::read_header_mut(header_paddr).dec_map_count()
+        crate::cap::pageset_table::read_header_mut(header_kva).dec_map_count()
     };
     if should_free {
-        crate::cap::pageset_table::free_by_header_paddr(header_paddr);
+        crate::cap::pageset_table::free_by_header_kva(header_kva);
     }
 
     SyscallError::OK
@@ -949,22 +977,22 @@ fn sys_close_handle(ctx: &mut ExceptionContext) -> SyscallError {
             }
         }
 
-        CloseHandleResult::RemoveAndDecRef { header_paddr } => {
+        CloseHandleResult::RemoveAndDecRef { header_kva } => {
             match ht.remove(handle) {
                 Ok(_) => {
-                    crate::cap::pageset_table::dec_refcount_and_maybe_free(header_paddr);
+                    crate::cap::pageset_table::dec_refcount_and_maybe_free(header_kva);
                     SyscallError::OK
                 }
                 Err(e) => e,
             }
         }
 
-        CloseHandleResult::UnmapThenRemove { header_paddr, mapped_va_page } => {
+        CloseHandleResult::UnmapThenRemove { header_kva, mapped_va_page } => {
             // Unmap PTEs first — fallible. If unmap fails, reject close.
-            // SAFETY: header_paddr came from a PageSet handle slot —
+            // SAFETY: header_kva came from a PageSet handle slot —
             // registered header.
             let backed = unsafe {
-                crate::cap::pageset_table::read_header_backed(header_paddr)
+                crate::cap::pageset_table::read_header_backed(header_kva)
             };
             let pages = backed.pages_slice();
             let va = (mapped_va_page as u64) << 12;
@@ -980,7 +1008,7 @@ fn sys_close_handle(ctx: &mut ExceptionContext) -> SyscallError {
             // Unmap succeeded. Remove + dec both counters.
             match ht.remove(handle) {
                 Ok(_) => {
-                    crate::cap::pageset_table::dec_both_and_maybe_free(header_paddr);
+                    crate::cap::pageset_table::dec_both_and_maybe_free(header_kva);
                     SyscallError::OK
                 }
                 Err(e) => e,

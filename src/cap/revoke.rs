@@ -23,6 +23,7 @@ use crate::mm::addr::PhysAddr;
 use crate::mm::kernel_ptr::KernelRef;
 use crate::sched::scheduler;
 use crate::sched::tcb::Tcb;
+use lockjaw_types::addr::KernelVa;
 use lockjaw_types::object::HandleKind;
 
 /// Why revocation could not be validated.
@@ -60,7 +61,7 @@ pub enum RevokeError {
 const MAX_VISITED_PROCESSES: usize = 16;
 
 /// Phase 1: read-only walk. For every live process's handle table,
-/// count handles to `object_paddr` and verify any active PageSet
+/// count handles to `header_kva` and verify any active PageSet
 /// mapping's PTEs match the header's expected pages.
 ///
 /// Returns Ok if accounting reconciles with the header's snapshot
@@ -69,11 +70,11 @@ const MAX_VISITED_PROCESSES: usize = 16;
 /// **with no state mutated** otherwise.
 ///
 /// Caller must hold the GKL.
-pub fn revoke_validate(object_paddr: u64) -> Result<(), RevokeError> {
+pub fn revoke_validate(header_kva: KernelVa) -> Result<(), RevokeError> {
     // Snapshot the header's counters before walking. revoke_validate
     // never writes the header; the snapshot is what we reconcile against.
     let (snapshot_refcount, snapshot_map_count) = unsafe {
-        let h = crate::cap::pageset_table::read_header(object_paddr);
+        let h = crate::cap::pageset_table::read_header(header_kva);
         (h.refcount, h.map_count)
     };
 
@@ -91,7 +92,9 @@ pub fn revoke_validate(object_paddr: u64) -> Result<(), RevokeError> {
                 PhysAddr::new(process_paddr),
             ))
         };
-        ht.revoke_validate(object_paddr, |action| {
+        // The PageSet revoke walks ignore non-PageSet kinds — pass
+        // the typed KernelVa directly.
+        ht.revoke_validate(header_kva, |action| {
             walked_refcount += 1;
             if action.had_mapping {
                 let va = (action.mapped_va_page as u64) << 12;
@@ -99,11 +102,11 @@ pub fn revoke_validate(object_paddr: u64) -> Result<(), RevokeError> {
                 // short-lived and clear_validated_pte (apply phase) may
                 // dec_map_count between iterations, so caching across
                 // iterations would be misleading.
-                // SAFETY: object_paddr is a registered PageSet that
+                // SAFETY: header_kva is a registered PageSet that
                 // reached revoke from an active handle slot; the
                 // wrapper makes pages_slice safe.
                 let backed = unsafe {
-                    crate::cap::pageset_table::read_header_backed(object_paddr)
+                    crate::cap::pageset_table::read_header_backed(header_kva)
                 };
                 let expected = backed.pages_slice();
                 let ok = unsafe {
@@ -153,15 +156,15 @@ pub fn revoke_validate(object_paddr: u64) -> Result<(), RevokeError> {
 /// the snapshot map_count.
 ///
 /// MUST be called only after a matching successful `revoke_validate`
-/// for the same `object_paddr` within the same critical section
+/// for the same `header_kva` within the same critical section
 /// (no GKL release between). Cannot fail under that precondition.
 /// After return:
 /// - `header.refcount == 0 && header.map_count == 0`
-/// - No handle in any process's table references `object_paddr`
+/// - No handle in any process's table references `header_kva`
 /// - No PTE in any process's address space references the data pages
 ///
 /// The caller may now free the header pages.
-pub fn revoke_apply(object_paddr: u64) -> RevokeStats {
+pub fn revoke_apply(header_kva: KernelVa) -> RevokeStats {
     let mut stats = RevokeStats::default();
     for_each_unique_process(|process_paddr| {
         stats.processes += 1;
@@ -171,7 +174,9 @@ pub fn revoke_apply(object_paddr: u64) -> RevokeStats {
                 PhysAddr::new(process_paddr),
             ))
         };
-        ht.revoke_apply(object_paddr, |action| {
+        // The PageSet revoke walks ignore non-PageSet kinds — pass
+        // the typed KernelVa directly.
+        ht.revoke_apply(header_kva, |action| {
             stats.slots += 1;
             if action.had_mapping {
                 stats.mappings += 1;
@@ -180,7 +185,7 @@ pub fn revoke_apply(object_paddr: u64) -> RevokeStats {
                 // corrupted on-disk header.count could otherwise
                 // truncate the unmap and leave stale PTEs behind.
                 let count = unsafe {
-                    crate::cap::pageset_table::read_header_backed(object_paddr)
+                    crate::cap::pageset_table::read_header_backed(header_kva)
                         .data_page_count()
                 };
                 // SAFETY: validate_pte_match succeeded for this exact
@@ -196,13 +201,13 @@ pub fn revoke_apply(object_paddr: u64) -> RevokeStats {
                     );
                 }
                 unsafe {
-                    crate::cap::pageset_table::read_header_mut(object_paddr)
+                    crate::cap::pageset_table::read_header_mut(header_kva)
                         .dec_map_count();
                 }
             }
             if matches!(action.kind, HandleKind::PageSet { .. }) {
                 unsafe {
-                    crate::cap::pageset_table::read_header_mut(object_paddr)
+                    crate::cap::pageset_table::read_header_mut(header_kva)
                         .dec_refcount();
                 }
             }

@@ -6,6 +6,7 @@
 /// PhysAddr, then delegates to these functions. No kernel APIs
 /// (alloc, PTE, scheduler) are needed here.
 
+use crate::addr::KernelVa;
 use crate::object::{HandleEntry, HandleKind};
 use crate::rights::Rights;
 
@@ -37,9 +38,9 @@ impl HandleError {
 // ---------------------------------------------------------------------------
 
 /// Find the first empty slot in a handle table slice.
-/// A slot is empty when `object_paddr == 0`.
+/// A slot is empty when `kind == HandleKind::Empty`.
 pub fn find_empty_slot(slots: &[HandleEntry]) -> Option<usize> {
-    slots.iter().position(|s| s.object_paddr == 0)
+    slots.iter().position(|s| matches!(s.kind, HandleKind::Empty))
 }
 
 /// Look up a handle entry by index with rights checking.
@@ -51,7 +52,7 @@ pub fn slot_lookup(
 ) -> Result<HandleEntry, HandleError> {
     let slot = slots.get(index as usize)
         .ok_or(HandleError::InvalidHandle)?;
-    if slot.object_paddr == 0 {
+    if matches!(slot.kind, HandleKind::Empty) {
         return Err(HandleError::InvalidHandle);
     }
     if !slot.rights.contains(required) {
@@ -63,16 +64,14 @@ pub fn slot_lookup(
 /// Insert a new handle entry into the first empty slot.
 /// Returns the slot index on success.
 ///
-/// Rejects HandleKind::Empty — an occupied slot (object_paddr != 0)
-/// with kind = Empty is an illegal state. Use HandleEntry::EMPTY
-/// assignment for clearing slots instead.
+/// Rejects `HandleKind::Empty` — an inserted handle must carry the
+/// object's typed address inside its kind variant.
 ///
-/// For PageSet handles, mapped_va_page is forced to 0 regardless
+/// For PageSet handles, `mapped_va_page` is forced to 0 regardless
 /// of the input. Mapping state is per-address-space and must not
 /// leak across handle copies (sys_export_handle, create_process).
 pub fn slot_insert(
     slots: &mut [HandleEntry],
-    object_paddr: u64,
     rights: Rights,
     kind: HandleKind,
 ) -> Result<u32, HandleError> {
@@ -82,14 +81,10 @@ pub fn slot_insert(
     let idx = find_empty_slot(slots).ok_or(HandleError::TableFull)?;
     // Clear per-address-space state on PageSet handles.
     let kind = match kind {
-        HandleKind::PageSet { .. } => HandleKind::PageSet { mapped_va_page: 0 },
+        HandleKind::PageSet { kva, .. } => HandleKind::PageSet { kva, mapped_va_page: 0 },
         other => other,
     };
-    slots[idx] = HandleEntry {
-        object_paddr,
-        rights,
-        kind,
-    };
+    slots[idx] = HandleEntry { rights, kind };
     Ok(idx as u32)
 }
 
@@ -104,31 +99,12 @@ pub fn slot_remove(
 ) -> Result<HandleEntry, HandleError> {
     let slot = slots.get_mut(index as usize)
         .ok_or(HandleError::InvalidHandle)?;
-    if slot.object_paddr == 0 {
+    if matches!(slot.kind, HandleKind::Empty) {
         return Err(HandleError::InvalidHandle);
     }
     let removed = *slot;
     *slot = HandleEntry::EMPTY;
     Ok(removed)
-}
-
-/// Remove all handle entries pointing at a given object address.
-/// Returns the number of slots cleared.
-///
-/// Callers don't need the removed entries — cleanup decisions
-/// have already moved to `decide_close_handle` / `decide_teardown_handle`.
-pub fn slot_remove_all_by_object(
-    slots: &mut [HandleEntry],
-    object_paddr: u64,
-) -> usize {
-    let mut count = 0;
-    for slot in slots.iter_mut() {
-        if slot.object_paddr == object_paddr {
-            *slot = HandleEntry::EMPTY;
-            count += 1;
-        }
-    }
-    count
 }
 
 /// Get the `mapped_va_page` for a PageSet handle entry by index.
@@ -139,11 +115,8 @@ pub fn slot_get_mapped_va(
 ) -> Result<u32, HandleError> {
     let slot = slots.get(index as usize)
         .ok_or(HandleError::InvalidHandle)?;
-    if slot.object_paddr == 0 {
-        return Err(HandleError::InvalidHandle);
-    }
     match slot.kind {
-        HandleKind::PageSet { mapped_va_page } => Ok(mapped_va_page),
+        HandleKind::PageSet { mapped_va_page, .. } => Ok(mapped_va_page),
         _ => Err(HandleError::InvalidHandle),
     }
 }
@@ -157,11 +130,8 @@ pub fn slot_set_mapped_va(
 ) -> Result<(), HandleError> {
     let slot = slots.get_mut(index as usize)
         .ok_or(HandleError::InvalidHandle)?;
-    if slot.object_paddr == 0 {
-        return Err(HandleError::InvalidHandle);
-    }
     match &mut slot.kind {
-        HandleKind::PageSet { mapped_va_page } => {
+        HandleKind::PageSet { mapped_va_page, .. } => {
             *mapped_va_page = va_page;
             Ok(())
         }
@@ -194,16 +164,21 @@ pub struct SlotRevokeAction {
     pub kind: HandleKind,
 }
 
-/// Phase 1: read-only walk. For each slot whose `object_paddr ==
-/// target`, build a `SlotRevokeAction` and pass it to `on_action`.
-/// Returns the number of matching slots seen.
+/// Phase 1: read-only walk. For each PageSet slot whose `kva == target`,
+/// build a `SlotRevokeAction` and pass it to `on_action`. Returns the
+/// number of matching slots seen.
+///
+/// PageSet revocation is the only revoke shape today — non-PageSet
+/// kernel objects don't go through cross-process revoke walks. The
+/// target is typed `KernelVa` so callers can't accidentally pass a
+/// `PhysAddr` here.
 ///
 /// **No mutation.** The caller's callback may inspect the action but
 /// must not mutate the slots. Designed for revoke's validate phase
 /// (count slots, validate corresponding PTEs read-only).
 pub fn slot_revoke_validate<F>(
     slots: &[HandleEntry],
-    target: u64,
+    target: KernelVa,
     mut on_action: F,
 ) -> usize
 where
@@ -211,17 +186,22 @@ where
 {
     let mut count = 0;
     for slot in slots.iter() {
-        if slot.object_paddr != target {
+        let HandleKind::PageSet { kva, mapped_va_page } = slot.kind else { continue };
+        if kva != target {
             continue;
         }
-        let action = action_for(slot);
+        let action = SlotRevokeAction {
+            had_mapping: mapped_va_page != 0,
+            mapped_va_page,
+            kind: slot.kind,
+        };
         on_action(&action);
         count += 1;
     }
     count
 }
 
-/// Phase 2: write walk. For each slot whose `object_paddr == target`,
+/// Phase 2: write walk. For each PageSet slot whose `kva == target`,
 /// build a `SlotRevokeAction`, hand it to `on_action`, then clear
 /// the slot. Returns the number of cleared slots.
 ///
@@ -235,7 +215,7 @@ where
 /// passes under that precondition.
 pub fn slot_revoke_apply<F>(
     slots: &mut [HandleEntry],
-    target: u64,
+    target: KernelVa,
     mut on_action: F,
 ) -> usize
 where
@@ -243,30 +223,20 @@ where
 {
     let mut count = 0;
     for slot in slots.iter_mut() {
-        if slot.object_paddr != target {
+        let HandleKind::PageSet { kva, mapped_va_page } = slot.kind else { continue };
+        if kva != target {
             continue;
         }
-        let action = action_for(slot);
+        let action = SlotRevokeAction {
+            had_mapping: mapped_va_page != 0,
+            mapped_va_page,
+            kind: slot.kind,
+        };
         on_action(&action);
         *slot = HandleEntry::EMPTY;
         count += 1;
     }
     count
-}
-
-fn action_for(slot: &HandleEntry) -> SlotRevokeAction {
-    match slot.kind {
-        HandleKind::PageSet { mapped_va_page } => SlotRevokeAction {
-            had_mapping: mapped_va_page != 0,
-            mapped_va_page,
-            kind: slot.kind,
-        },
-        other => SlotRevokeAction {
-            had_mapping: false,
-            mapped_va_page: 0,
-            kind: other,
-        },
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +247,7 @@ fn action_for(slot: &HandleEntry) -> SlotRevokeAction {
 mod tests {
     extern crate alloc;
     use super::*;
+    use crate::addr::{KernelVa, PhysAddr};
     use crate::rights::{RIGHT_READ, RIGHT_WRITE, RIGHT_GRANT};
     use alloc::vec;
 
@@ -284,43 +255,58 @@ mod tests {
         vec![HandleEntry::EMPTY; n]
     }
 
+    fn ep(paddr: u64, token: u64) -> HandleKind {
+        HandleKind::Endpoint { paddr: PhysAddr::new(paddr), caller_token: token }
+    }
+    fn notif(paddr: u64) -> HandleKind {
+        HandleKind::Notification { paddr: PhysAddr::new(paddr) }
+    }
+    fn reply(paddr: u64) -> HandleKind {
+        HandleKind::Reply { paddr: PhysAddr::new(paddr) }
+    }
+    fn ps(kva: u64) -> HandleKind {
+        HandleKind::PageSet { kva: KernelVa::new(kva), mapped_va_page: 0 }
+    }
+    const KVA_A: u64 = 0xFFFF_8000_0000_1000;
+    const KVA_B: u64 = 0xFFFF_8000_0000_2000;
+
     // --- insert ---
 
     #[test]
     fn insert_into_empty_table_returns_index_0() {
         let mut slots = empty_table(4);
-        let idx = slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ), HandleKind::Endpoint { caller_token: 0 });
+        let idx = slot_insert(&mut slots, Rights::from_bits(RIGHT_READ), ep(0x1000, 0));
         assert_eq!(idx, Ok(0));
-        assert_eq!(slots[0].object_paddr, 0x1000);
+        assert_eq!(slots[0].kind, ep(0x1000, 0));
     }
 
     #[test]
     fn insert_fills_sequentially() {
         let mut slots = empty_table(4);
-        assert_eq!(slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }), Ok(0));
-        assert_eq!(slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Notification), Ok(1));
-        assert_eq!(slot_insert(&mut slots, 0x3000, Rights::none(), HandleKind::Reply), Ok(2));
-        assert_eq!(slot_insert(&mut slots, 0x4000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }), Ok(3));
+        assert_eq!(slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)), Ok(0));
+        assert_eq!(slot_insert(&mut slots, Rights::none(), notif(0x2000)), Ok(1));
+        assert_eq!(slot_insert(&mut slots, Rights::none(), reply(0x3000)), Ok(2));
+        assert_eq!(slot_insert(&mut slots, Rights::none(), ps(KVA_A)), Ok(3));
     }
 
     #[test]
     fn insert_reuses_removed_slot() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
-        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(0x2000, 0)).unwrap();
         slot_remove(&mut slots, 0).unwrap();
-        let idx = slot_insert(&mut slots, 0x3000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        let idx = slot_insert(&mut slots, Rights::none(), ep(0x3000, 0)).unwrap();
         assert_eq!(idx, 0);
-        assert_eq!(slots[0].object_paddr, 0x3000);
+        assert_eq!(slots[0].kind, ep(0x3000, 0));
     }
 
     #[test]
     fn insert_full_table_returns_table_full() {
         let mut slots = empty_table(2);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
-        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(0x2000, 0)).unwrap();
         assert_eq!(
-            slot_insert(&mut slots, 0x3000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }),
+            slot_insert(&mut slots, Rights::none(), ep(0x3000, 0)),
             Err(HandleError::TableFull)
         );
     }
@@ -330,10 +316,9 @@ mod tests {
     #[test]
     fn lookup_valid_entry() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), ep(0x1000, 0)).unwrap();
         let entry = slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ)).unwrap();
-        assert_eq!(entry.object_paddr, 0x1000);
-        assert_eq!(entry.kind, HandleKind::Endpoint { caller_token: 0 });
+        assert_eq!(entry.kind, ep(0x1000, 0));
     }
 
     #[test]
@@ -351,7 +336,7 @@ mod tests {
     #[test]
     fn lookup_rights_subset_passes() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), ep(0x1000, 0)).unwrap();
         assert!(slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ)).is_ok());
         assert!(slot_lookup(&slots, 0, Rights::from_bits(RIGHT_READ | RIGHT_WRITE)).is_ok());
     }
@@ -359,7 +344,7 @@ mod tests {
     #[test]
     fn lookup_missing_rights_returns_insufficient() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ), HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::from_bits(RIGHT_READ), ep(0x1000, 0)).unwrap();
         assert_eq!(
             slot_lookup(&slots, 0, Rights::from_bits(RIGHT_GRANT)),
             Err(HandleError::InsufficientRights)
@@ -373,7 +358,7 @@ mod tests {
     #[test]
     fn lookup_no_required_rights_always_passes() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)).unwrap();
         assert!(slot_lookup(&slots, 0, Rights::none()).is_ok());
     }
 
@@ -382,9 +367,8 @@ mod tests {
     #[test]
     fn remove_valid_entry_returns_it() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::from_bits(RIGHT_READ), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::from_bits(RIGHT_READ), ps(KVA_A)).unwrap();
         let removed = slot_remove(&mut slots, 0).unwrap();
-        assert_eq!(removed.object_paddr, 0x1000);
         assert!(removed.kind.is_pageset());
         assert_eq!(removed.rights, Rights::from_bits(RIGHT_READ));
     }
@@ -392,9 +376,9 @@ mod tests {
     #[test]
     fn remove_zeros_slot() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)).unwrap();
         slot_remove(&mut slots, 0).unwrap();
-        assert_eq!(slots[0].object_paddr, 0);
+        assert_eq!(slots[0].kind, HandleKind::Empty);
     }
 
     #[test]
@@ -409,35 +393,12 @@ mod tests {
         assert_eq!(slot_remove(&mut slots, 99), Err(HandleError::InvalidHandle));
     }
 
-    // --- remove_all_by_object ---
-
-    #[test]
-    fn remove_all_by_object_clears_matching() {
-        let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
-        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
-        let count = slot_remove_all_by_object(&mut slots, 0x1000);
-        assert_eq!(count, 2);
-        assert_eq!(slots[0].object_paddr, 0);
-        assert_eq!(slots[2].object_paddr, 0);
-    }
-
-    #[test]
-    fn remove_all_by_object_preserves_others() {
-        let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
-        slot_insert(&mut slots, 0x2000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
-        slot_remove_all_by_object(&mut slots, 0x1000);
-        assert_eq!(slots[1].object_paddr, 0x2000);
-    }
-
     // --- mapped_va ---
 
     #[test]
     fn set_get_mapped_va_round_trip() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
         slot_set_mapped_va(&mut slots, 0, 0x400).unwrap();
         assert_eq!(slot_get_mapped_va(&slots, 0), Ok(0x400));
     }
@@ -452,7 +413,7 @@ mod tests {
     #[test]
     fn mapped_va_on_non_pageset_returns_invalid() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)).unwrap();
         assert_eq!(slot_get_mapped_va(&slots, 0), Err(HandleError::InvalidHandle));
         assert_eq!(slot_set_mapped_va(&mut slots, 0, 0x400), Err(HandleError::InvalidHandle));
     }
@@ -463,7 +424,7 @@ mod tests {
     fn insert_rejects_empty_kind() {
         let mut slots = empty_table(4);
         assert_eq!(
-            slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::Empty),
+            slot_insert(&mut slots, Rights::none(), HandleKind::Empty),
             Err(HandleError::InvalidHandle)
         );
     }
@@ -473,15 +434,15 @@ mod tests {
         // Simulates export/copy: source handle has mapped_va_page = 0x400,
         // but the inserted copy must start at 0 (mapping is per-address-space).
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(), HandleKind::PageSet { mapped_va_page: 0x400 }).unwrap();
+        slot_insert(&mut slots, Rights::none(),
+            HandleKind::PageSet { kva: KernelVa::new(KVA_A), mapped_va_page: 0x400 }).unwrap();
         assert_eq!(slot_get_mapped_va(&slots, 0), Ok(0));
     }
 
     // --- HandleEntry::EMPTY ---
 
     #[test]
-    fn empty_entry_has_zero_paddr() {
-        assert_eq!(HandleEntry::EMPTY.object_paddr, 0);
+    fn empty_entry_kind_is_empty() {
         assert_eq!(HandleEntry::EMPTY.kind, HandleKind::Empty);
     }
 
@@ -492,44 +453,39 @@ mod tests {
         let mut slots = empty_table(4);
         // PageSet inserts zero mapped_va_page (per-address-space rule).
         // Set the mapping VA explicitly to model an active mapping.
-        let h0 = slot_insert(&mut slots, 0x1000, Rights::none(),
-                             HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        let h0 = slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
         slot_set_mapped_va(&mut slots, h0, 0x400).unwrap();
-        slot_insert(&mut slots, 0x2000, Rights::none(),
-                    HandleKind::Endpoint { caller_token: 0 }).unwrap();
-        slot_insert(&mut slots, 0x1000, Rights::none(),
-                    HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(0x2000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
 
         let snapshot = slots.clone();
         let mut actions = vec![];
-        let n = slot_revoke_validate(&slots, 0x1000, |a| actions.push(*a));
+        let n = slot_revoke_validate(&slots, KernelVa::new(KVA_A), |a| actions.push(*a));
         assert_eq!(n, 2);
         assert_eq!(slots, snapshot);
 
         // Action stream reflects pre-clear state.
         assert!(actions[0].had_mapping);
         assert_eq!(actions[0].mapped_va_page, 0x400);
-        assert!(matches!(actions[0].kind, HandleKind::PageSet { mapped_va_page: 0x400 }));
+        assert!(matches!(actions[0].kind, HandleKind::PageSet { mapped_va_page: 0x400, .. }));
         assert!(!actions[1].had_mapping);
-        assert!(matches!(actions[1].kind, HandleKind::PageSet { mapped_va_page: 0 }));
+        assert!(matches!(actions[1].kind, HandleKind::PageSet { mapped_va_page: 0, .. }));
     }
 
     #[test]
     fn revoke_apply_clears_matching_slots() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(),
-                    HandleKind::PageSet { mapped_va_page: 0x400 }).unwrap();
-        slot_insert(&mut slots, 0x2000, Rights::none(),
-                    HandleKind::Endpoint { caller_token: 0 }).unwrap();
-        slot_insert(&mut slots, 0x1000, Rights::none(),
-                    HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::none(),
+            HandleKind::PageSet { kva: KernelVa::new(KVA_A), mapped_va_page: 0x400 }).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(0x2000, 0)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
 
-        let n = slot_revoke_apply(&mut slots, 0x1000, |_| {});
+        let n = slot_revoke_apply(&mut slots, KernelVa::new(KVA_A), |_| {});
         assert_eq!(n, 2);
 
-        // Both 0x1000 slots cleared; the 0x2000 slot survives.
+        // Both KVA_A slots cleared; the 0x2000 slot survives.
         assert_eq!(slots[0], HandleEntry::EMPTY);
-        assert_eq!(slots[1].object_paddr, 0x2000);
+        assert_eq!(slots[1].kind, ep(0x2000, 0));
         assert_eq!(slots[2], HandleEntry::EMPTY);
     }
 
@@ -537,12 +493,11 @@ mod tests {
     fn revoke_apply_yields_action_before_clearing() {
         // Verifies the on_action callback observes pre-clear state.
         let mut slots = empty_table(2);
-        let h = slot_insert(&mut slots, 0x1000, Rights::none(),
-                            HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        let h = slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
         slot_set_mapped_va(&mut slots, h, 0x400).unwrap();
 
         let mut seen = None;
-        slot_revoke_apply(&mut slots, 0x1000, |a| seen = Some(*a));
+        slot_revoke_apply(&mut slots, KernelVa::new(KVA_A), |a| seen = Some(*a));
 
         let action = seen.unwrap();
         assert!(action.had_mapping);
@@ -556,22 +511,18 @@ mod tests {
         // action stream from validate and apply must match exactly so
         // accounting reconciliation in validate predicts apply.
         let mut slots = empty_table(8);
-        let h0 = slot_insert(&mut slots, 0x1000, Rights::none(),
-                             HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        let h0 = slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
         slot_set_mapped_va(&mut slots, h0, 0x100).unwrap();
-        slot_insert(&mut slots, 0x2000, Rights::none(),
-                    HandleKind::Notification).unwrap();
-        slot_insert(&mut slots, 0x1000, Rights::none(),
-                    HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
-        let h2 = slot_insert(&mut slots, 0x1000, Rights::none(),
-                             HandleKind::PageSet { mapped_va_page: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::none(), notif(0x2000)).unwrap();
+        slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
+        let h2 = slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
         slot_set_mapped_va(&mut slots, h2, 0x200).unwrap();
 
         let mut validate_actions = vec![];
-        slot_revoke_validate(&slots, 0x1000, |a| validate_actions.push(*a));
+        slot_revoke_validate(&slots, KernelVa::new(KVA_A), |a| validate_actions.push(*a));
 
         let mut apply_actions = vec![];
-        slot_revoke_apply(&mut slots, 0x1000, |a| apply_actions.push(*a));
+        slot_revoke_apply(&mut slots, KernelVa::new(KVA_A), |a| apply_actions.push(*a));
 
         assert_eq!(validate_actions, apply_actions);
         assert_eq!(validate_actions.len(), 3);
@@ -580,36 +531,29 @@ mod tests {
     #[test]
     fn revoke_no_match_yields_zero() {
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(),
-                    HandleKind::Endpoint { caller_token: 0 }).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)).unwrap();
 
         let mut count = 0;
-        let v = slot_revoke_validate(&slots, 0x9999, |_| count += 1);
+        let v = slot_revoke_validate(&slots, KernelVa::new(KVA_B), |_| count += 1);
         assert_eq!(v, 0);
         assert_eq!(count, 0);
 
         let snapshot = slots.clone();
-        let a = slot_revoke_apply(&mut slots, 0x9999, |_| count += 1);
+        let a = slot_revoke_apply(&mut slots, KernelVa::new(KVA_B), |_| count += 1);
         assert_eq!(a, 0);
         assert_eq!(count, 0);
         assert_eq!(slots, snapshot);
     }
 
     #[test]
-    fn revoke_apply_non_pageset_kind_not_marked_mapped() {
-        // Endpoint / Notification / Reply slots set had_mapping = false
-        // regardless of slot fields — the action's mapped_va_page is
-        // only meaningful for PageSet.
+    fn revoke_skips_non_pageset_slots() {
+        // Endpoint slots are not PageSet — the typed target means revoke
+        // never matches them at all, regardless of the underlying paddr.
         let mut slots = empty_table(4);
-        slot_insert(&mut slots, 0x1000, Rights::none(),
-                    HandleKind::Endpoint { caller_token: 7 }).unwrap();
+        slot_insert(&mut slots, Rights::none(), ep(KVA_A, 7)).unwrap();
 
-        let mut seen = None;
-        slot_revoke_apply(&mut slots, 0x1000, |a| seen = Some(*a));
-
-        let action = seen.unwrap();
-        assert!(!action.had_mapping);
-        assert_eq!(action.mapped_va_page, 0);
-        assert!(matches!(action.kind, HandleKind::Endpoint { caller_token: 7 }));
+        let mut count = 0;
+        slot_revoke_apply(&mut slots, KernelVa::new(KVA_A), |_| count += 1);
+        assert_eq!(count, 0);
     }
 }

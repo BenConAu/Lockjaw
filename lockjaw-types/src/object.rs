@@ -53,19 +53,26 @@ pub struct HandleTableHeader {
 
 /// Object type + per-type metadata for a handle table entry.
 ///
-/// Discriminant values match the legacy ObjectType enum so that
+/// Each non-empty variant carries the address of its underlying kernel
+/// object — `paddr: PhysAddr` for objects allocated from the buddy
+/// allocator (Endpoint, Notification, Reply, etc.) and `kva: KernelVa`
+/// for objects that live in the kernel VA pool (PageSet headers
+/// today; eventually all kernel objects). The address regime is part
+/// of the variant so the type system rules out crossing them.
+///
+/// Discriminant values match the legacy `ObjectType` enum so that
 /// diagnostic code and tests can compare by value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C, u8)]
 pub enum HandleKind {
     Empty = 0,
-    HandleTable = 1,
-    ThreadControlBlock = 2,
-    Endpoint { caller_token: u64 } = 3,
-    Notification = 4,
-    Reply = 5,
-    Process = 6,
-    PageSet { mapped_va_page: u32 } = 7,
+    HandleTable { paddr: crate::addr::PhysAddr } = 1,
+    ThreadControlBlock { paddr: crate::addr::PhysAddr } = 2,
+    Endpoint { paddr: crate::addr::PhysAddr, caller_token: u64 } = 3,
+    Notification { paddr: crate::addr::PhysAddr } = 4,
+    Reply { paddr: crate::addr::PhysAddr } = 5,
+    Process { paddr: crate::addr::PhysAddr } = 6,
+    PageSet { kva: crate::addr::KernelVa, mapped_va_page: u32 } = 7,
 }
 
 impl ObjectType {
@@ -88,12 +95,12 @@ impl HandleKind {
     pub fn name(&self) -> &'static str {
         match self {
             HandleKind::Empty => "Empty",
-            HandleKind::HandleTable => "HandleTable",
-            HandleKind::ThreadControlBlock => "ThreadControlBlock",
+            HandleKind::HandleTable { .. } => "HandleTable",
+            HandleKind::ThreadControlBlock { .. } => "ThreadControlBlock",
             HandleKind::Endpoint { .. } => "Endpoint",
-            HandleKind::Notification => "Notification",
-            HandleKind::Reply => "Reply",
-            HandleKind::Process => "Process",
+            HandleKind::Notification { .. } => "Notification",
+            HandleKind::Reply { .. } => "Reply",
+            HandleKind::Process { .. } => "Process",
             HandleKind::PageSet { .. } => "PageSet",
         }
     }
@@ -108,12 +115,12 @@ impl HandleKind {
     pub fn obj_type(&self) -> ObjectType {
         match self {
             HandleKind::Empty => ObjectType::HandleTable, // inert
-            HandleKind::HandleTable => ObjectType::HandleTable,
-            HandleKind::ThreadControlBlock => ObjectType::ThreadControlBlock,
+            HandleKind::HandleTable { .. } => ObjectType::HandleTable,
+            HandleKind::ThreadControlBlock { .. } => ObjectType::ThreadControlBlock,
             HandleKind::Endpoint { .. } => ObjectType::Endpoint,
-            HandleKind::Notification => ObjectType::Notification,
-            HandleKind::Reply => ObjectType::Reply,
-            HandleKind::Process => ObjectType::Process,
+            HandleKind::Notification { .. } => ObjectType::Notification,
+            HandleKind::Reply { .. } => ObjectType::Reply,
+            HandleKind::Process { .. } => ObjectType::Process,
             HandleKind::PageSet { .. } => ObjectType::PageSet,
         }
     }
@@ -121,29 +128,33 @@ impl HandleKind {
 
 /// A single entry in a handle table. Stored in donated pages immediately
 /// after the HandleTableHeader.
+///
+/// The address of the underlying kernel object lives inside `kind` —
+/// each non-empty `HandleKind` variant carries its own typed address
+/// (`PhysAddr` or `KernelVa`). Emptiness is keyed by
+/// `kind == HandleKind::Empty`; there is no separate `object_paddr`
+/// field whose meaning floats with `kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct HandleEntry {
-    /// Physical address of the kernel object. 0 = empty slot.
-    pub object_paddr: u64,
-    /// Access rights for this handle. Inert filler when kind = Empty
-    /// (emptiness is keyed by object_paddr == 0).
+    /// Access rights for this handle. Inert filler when `kind = Empty`.
     pub rights: crate::rights::Rights,
-    /// Object type + per-type metadata.
+    /// Object type + per-type metadata, including the typed address.
     pub kind: HandleKind,
 }
 
 // Static layout assertions — part of the design contract.
+// HandleKind grew from 16 → 24 bytes when each variant absorbed its
+// typed address (PhysAddr or KernelVa). HandleEntry stays at 32 bytes
+// because the previous u64 `object_paddr` field disappeared.
 const _: () = assert!(core::mem::size_of::<HandleEntry>() == 32);
 const _: () = assert!(core::mem::align_of::<HandleEntry>() == 8);
-const _: () = assert!(core::mem::size_of::<HandleKind>() == 16);
+const _: () = assert!(core::mem::size_of::<HandleKind>() == 24);
 
 impl HandleEntry {
-    /// Empty slot sentinel. `object_paddr == 0` is the sole empty-slot
-    /// test throughout the codebase. Other fields are inert filler —
-    /// not meaningful state when object_paddr is zero.
+    /// Empty slot sentinel. `kind == HandleKind::Empty` is the sole
+    /// empty-slot test throughout the codebase.
     pub const EMPTY: Self = Self {
-        object_paddr: 0,
         rights: crate::rights::Rights::none(),
         kind: HandleKind::Empty,
     };
@@ -164,11 +175,11 @@ pub enum CloseHandleResult {
     /// Occupied non-PageSet handle — just remove, no accounting.
     RemoveOnly,
     /// PageSet, not mapped — remove + dec refcount + maybe free.
-    RemoveAndDecRef { header_paddr: u64 },
+    RemoveAndDecRef { header_kva: crate::addr::KernelVa },
     /// PageSet, mapped — must unmap first, then remove + dec both
     /// counters + maybe free.
     UnmapThenRemove {
-        header_paddr: u64,
+        header_kva: crate::addr::KernelVa,
         mapped_va_page: u32,
     },
     /// Empty slot or absent entry.
@@ -182,19 +193,19 @@ pub enum CloseHandleResult {
 /// None input (failed lookup) returns InvalidHandle.
 pub fn decide_close_handle(entry: Option<&HandleEntry>) -> CloseHandleResult {
     let entry = match entry {
-        Some(e) if e.object_paddr != 0 => e,
+        Some(e) if !matches!(e.kind, HandleKind::Empty) => e,
         _ => return CloseHandleResult::InvalidHandle,
     };
     match entry.kind {
-        HandleKind::PageSet { mapped_va_page } if mapped_va_page != 0 => {
+        HandleKind::PageSet { kva, mapped_va_page } if mapped_va_page != 0 => {
             CloseHandleResult::UnmapThenRemove {
-                header_paddr: entry.object_paddr,
+                header_kva: kva,
                 mapped_va_page,
             }
         }
-        HandleKind::PageSet { .. } => {
+        HandleKind::PageSet { kva, .. } => {
             CloseHandleResult::RemoveAndDecRef {
-                header_paddr: entry.object_paddr,
+                header_kva: kva,
             }
         }
         _ => CloseHandleResult::RemoveOnly,
@@ -207,7 +218,7 @@ pub fn decide_close_handle(entry: Option<&HandleEntry>) -> CloseHandleResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TeardownHandleAction {
     /// PageSet handle — dec refcount, maybe free.
-    DecRef { header_paddr: u64 },
+    DecRef { header_kva: crate::addr::KernelVa },
     /// Non-PageSet or empty — nothing to do.
     Skip,
 }
@@ -215,20 +226,16 @@ pub enum TeardownHandleAction {
 /// Decide cleanup for a handle entry during kernel-process teardown.
 /// Only returns DecRef or Skip — no unmap action exists.
 pub fn decide_teardown_handle(entry: &HandleEntry) -> TeardownHandleAction {
-    if entry.object_paddr == 0 {
-        return TeardownHandleAction::Skip;
-    }
     match entry.kind {
-        HandleKind::PageSet { mapped_va_page } => {
+        HandleKind::Empty => TeardownHandleAction::Skip,
+        HandleKind::PageSet { kva, mapped_va_page } => {
             // Invariant: kernel processes don't have mapped PageSets
             // (they don't call sys_map_pages). A nonzero mapped_va_page
             // here means the invariant is broken at the source — halt
             // rather than silently skip the map_count decrement.
             assert!(mapped_va_page == 0,
                 "mapped PageSet handle in kernel process teardown");
-            TeardownHandleAction::DecRef {
-                header_paddr: entry.object_paddr,
-            }
+            TeardownHandleAction::DecRef { header_kva: kva }
         }
         _ => TeardownHandleAction::Skip,
     }
@@ -359,8 +366,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_kind_size_is_16() {
-        assert_eq!(core::mem::size_of::<HandleKind>(), 16);
+    fn handle_kind_size_is_24() {
+        // Each non-empty variant carries its typed address (PhysAddr or
+        // KernelVa). Endpoint additionally carries caller_token, so its
+        // payload is 16 bytes — that determines the enum's footprint
+        // under #[repr(C, u8)] (1 tag + 7 padding + 16 payload = 24).
+        assert_eq!(core::mem::size_of::<HandleKind>(), 24);
     }
 
     #[test]
@@ -381,12 +392,14 @@ mod tests {
 
     #[test]
     fn handle_kind_discriminants_match_object_type() {
+        let dummy_paddr = crate::addr::PhysAddr::new(0x1000);
+        let dummy_kva = crate::addr::KernelVa::new(0xFFFF_8000_0000_1000);
         // Ensure HandleKind discriminant values match ObjectType for diagnostics.
         assert_eq!(HandleKind::Empty.obj_type(), ObjectType::HandleTable); // inert
-        assert_eq!(HandleKind::HandleTable.obj_type(), ObjectType::HandleTable);
-        assert_eq!(HandleKind::Endpoint { caller_token: 0 }.obj_type(), ObjectType::Endpoint);
-        assert_eq!(HandleKind::PageSet { mapped_va_page: 0 }.obj_type(), ObjectType::PageSet);
-        assert_eq!(HandleKind::Notification.obj_type(), ObjectType::Notification);
+        assert_eq!(HandleKind::HandleTable { paddr: dummy_paddr }.obj_type(), ObjectType::HandleTable);
+        assert_eq!(HandleKind::Endpoint { paddr: dummy_paddr, caller_token: 0 }.obj_type(), ObjectType::Endpoint);
+        assert_eq!(HandleKind::PageSet { kva: dummy_kva, mapped_va_page: 0 }.obj_type(), ObjectType::PageSet);
+        assert_eq!(HandleKind::Notification { paddr: dummy_paddr }.obj_type(), ObjectType::Notification);
     }
 
     #[test]
@@ -399,12 +412,18 @@ mod tests {
 
     // --- decide_close_handle tests ---
 
-    fn make_entry(kind: HandleKind, paddr: u64) -> HandleEntry {
+    fn make_entry(kind: HandleKind) -> HandleEntry {
         HandleEntry {
-            object_paddr: paddr,
             rights: crate::rights::Rights::from_bits(0),
             kind,
         }
+    }
+
+    fn dummy_paddr() -> crate::addr::PhysAddr {
+        crate::addr::PhysAddr::new(0x4000_1000)
+    }
+    fn dummy_kva() -> crate::addr::KernelVa {
+        crate::addr::KernelVa::new(0xFFFF_8000_0000_1000)
     }
 
     #[test]
@@ -414,36 +433,38 @@ mod tests {
 
     #[test]
     fn close_empty_slot_returns_invalid() {
-        let entry = make_entry(HandleKind::PageSet { mapped_va_page: 0 }, 0);
+        let entry = make_entry(HandleKind::Empty);
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::InvalidHandle);
     }
 
     #[test]
     fn close_non_pageset_remove_only() {
-        let entry = make_entry(HandleKind::Endpoint { caller_token: 0 }, 0x1000);
+        let entry = make_entry(HandleKind::Endpoint { paddr: dummy_paddr(), caller_token: 0 });
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::RemoveOnly);
     }
 
     #[test]
     fn close_unmapped_pageset_dec_ref() {
-        let entry = make_entry(HandleKind::PageSet { mapped_va_page: 0 }, 0x1000);
+        let kva = dummy_kva();
+        let entry = make_entry(HandleKind::PageSet { kva, mapped_va_page: 0 });
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::RemoveAndDecRef {
-            header_paddr: 0x1000,
+            header_kva: kva,
         });
     }
 
     #[test]
     fn close_mapped_pageset_unmap_then_remove() {
-        let entry = make_entry(HandleKind::PageSet { mapped_va_page: 0x400 }, 0x1000);
+        let kva = dummy_kva();
+        let entry = make_entry(HandleKind::PageSet { kva, mapped_va_page: 0x400 });
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::UnmapThenRemove {
-            header_paddr: 0x1000,
+            header_kva: kva,
             mapped_va_page: 0x400,
         });
     }
 
     #[test]
     fn close_notification_remove_only() {
-        let entry = make_entry(HandleKind::Notification, 0x2000);
+        let entry = make_entry(HandleKind::Notification { paddr: dummy_paddr() });
         assert_eq!(decide_close_handle(Some(&entry)), CloseHandleResult::RemoveOnly);
     }
 
@@ -451,21 +472,22 @@ mod tests {
 
     #[test]
     fn teardown_handle_unmapped_pageset_dec_ref() {
-        let entry = make_entry(HandleKind::PageSet { mapped_va_page: 0 }, 0x1000);
+        let kva = dummy_kva();
+        let entry = make_entry(HandleKind::PageSet { kva, mapped_va_page: 0 });
         assert_eq!(decide_teardown_handle(&entry), TeardownHandleAction::DecRef {
-            header_paddr: 0x1000,
+            header_kva: kva,
         });
     }
 
     #[test]
     fn teardown_handle_non_pageset_skip() {
-        let entry = make_entry(HandleKind::Endpoint { caller_token: 0 }, 0x1000);
+        let entry = make_entry(HandleKind::Endpoint { paddr: dummy_paddr(), caller_token: 0 });
         assert_eq!(decide_teardown_handle(&entry), TeardownHandleAction::Skip);
     }
 
     #[test]
     fn teardown_handle_empty_slot_skip() {
-        let entry = make_entry(HandleKind::PageSet { mapped_va_page: 0 }, 0);
+        let entry = make_entry(HandleKind::Empty);
         assert_eq!(decide_teardown_handle(&entry), TeardownHandleAction::Skip);
     }
 
@@ -479,13 +501,14 @@ mod tests {
         // that mapped_va_page controls the variant: nonzero produces
         // UnmapThenRemove (which includes map_count dec), zero
         // produces RemoveAndDecRef (which does not).
-        let mapped = make_entry(HandleKind::PageSet { mapped_va_page: 0x400 }, 0x1000);
+        let kva = dummy_kva();
+        let mapped = make_entry(HandleKind::PageSet { kva, mapped_va_page: 0x400 });
         assert!(matches!(decide_close_handle(Some(&mapped)),
             CloseHandleResult::UnmapThenRemove { .. }));
 
         // After the kernel clears mapped_va_page (simulating the slot
         // state after set_mapped_va(handle, 0)):
-        let cleared = make_entry(HandleKind::PageSet { mapped_va_page: 0 }, 0x1000);
+        let cleared = make_entry(HandleKind::PageSet { kva, mapped_va_page: 0 });
         assert!(matches!(decide_close_handle(Some(&cleared)),
             CloseHandleResult::RemoveAndDecRef { .. }));
     }

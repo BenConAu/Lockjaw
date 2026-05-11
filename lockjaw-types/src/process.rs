@@ -155,9 +155,12 @@ use crate::rights::Rights;
 /// Parent-handle copy descriptor: the kernel resolves the parent's
 /// handle, the plan validates the kind policy and carries the
 /// resolved info forward to apply.
+///
+/// The object's address travels inside `kind` (each non-empty
+/// `HandleKind` variant carries its own typed address), so the
+/// descriptor itself doesn't need a separate `object_paddr` field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParentHandleCopy {
-    pub object_paddr: u64,
     pub rights: Rights,
     /// PageSet kind is rejected at `record_parent_copy` time —
     /// transfer routes through `sys_export_handle` instead, which
@@ -197,9 +200,9 @@ pub enum CreateProcessPlanError {
     /// apply, with no signal that the first request was dropped.
     ParentCopyAlreadyRecorded,
     /// `record_parent_copy` was given an empty/inert `HandleEntry`
-    /// (`object_paddr == 0`). Apply would insert the empty sentinel
-    /// into the child table as if it were a live copied handle.
-    /// The pure API rejects rather than trust the caller.
+    /// (`kind == Empty`). Apply would insert the empty sentinel into
+    /// the child table as if it were a live copied handle. The pure
+    /// API rejects rather than trust the caller.
     EmptyParentHandle,
 }
 
@@ -264,10 +267,9 @@ impl ProcessCreationPlanBuilder {
     /// Optional: record the parent handle to copy. At most once per
     /// builder — a second call returns `ParentCopyAlreadyRecorded`.
     /// Rejects PageSet kind here so apply doesn't have to. Also
-    /// rejects `HandleEntry::EMPTY` (`object_paddr == 0`) — the
-    /// empty-slot sentinel is not a live handle and must not reach
-    /// apply, which would otherwise insert it into the child table
-    /// as a real entry.
+    /// rejects `HandleEntry::EMPTY` (kind == Empty) — the empty-slot
+    /// sentinel is not a live handle and must not reach apply, which
+    /// would otherwise insert it into the child table as a real entry.
     pub fn record_parent_copy(
         &mut self,
         entry: HandleEntry,
@@ -275,14 +277,13 @@ impl ProcessCreationPlanBuilder {
         if self.parent_copy.is_some() {
             return Err(CreateProcessPlanError::ParentCopyAlreadyRecorded);
         }
-        if entry.object_paddr == 0 {
+        if matches!(entry.kind, HandleKind::Empty) {
             return Err(CreateProcessPlanError::EmptyParentHandle);
         }
         if entry.kind.is_pageset() {
             return Err(CreateProcessPlanError::PageSetKindParentHandle);
         }
         self.parent_copy = Some(ParentHandleCopy {
-            object_paddr: entry.object_paddr,
             rights: entry.rights,
             kind: entry.kind,
         });
@@ -661,9 +662,11 @@ mod tests {
 
     fn endpoint_entry(paddr: u64) -> HandleEntry {
         HandleEntry {
-            object_paddr: paddr,
             rights: Rights::from_bits(0),
-            kind: HandleKind::Endpoint { caller_token: 0 },
+            kind: HandleKind::Endpoint {
+                paddr: crate::addr::PhysAddr::new(paddr),
+                caller_token: 0,
+            },
         }
     }
 
@@ -689,9 +692,11 @@ mod tests {
     fn record_parent_copy_rejects_pageset_kind() {
         let mut b = ProcessCreationPlanBuilder::new();
         let pageset = HandleEntry {
-            object_paddr: 0x1000,
             rights: Rights::from_bits(0),
-            kind: HandleKind::PageSet { mapped_va_page: 0 },
+            kind: HandleKind::PageSet {
+                kva: crate::addr::KernelVa::new(0xFFFF_8000_0000_1000),
+                mapped_va_page: 0,
+            },
         };
         assert_eq!(
             b.record_parent_copy(pageset),
@@ -701,14 +706,14 @@ mod tests {
 
     #[test]
     fn record_parent_copy_accepts_endpoint_notification_reply() {
+        let dummy = crate::addr::PhysAddr::new(0x4000_2000);
         for kind in [
-            HandleKind::Endpoint { caller_token: 0 },
-            HandleKind::Notification,
-            HandleKind::Reply,
+            HandleKind::Endpoint { paddr: dummy, caller_token: 0 },
+            HandleKind::Notification { paddr: dummy },
+            HandleKind::Reply { paddr: dummy },
         ] {
             let mut b = ProcessCreationPlanBuilder::new();
             let entry = HandleEntry {
-                object_paddr: 0x2000,
                 rights: Rights::from_bits(0),
                 kind,
             };
@@ -788,8 +793,10 @@ mod tests {
 
         assert_eq!(plan.unique_header_count(), 3);
         let parent = plan.parent_copy().unwrap();
-        assert_eq!(parent.object_paddr, 0xDEAD_0000);
-        assert!(matches!(parent.kind, HandleKind::Endpoint { .. }));
+        assert!(matches!(
+            parent.kind,
+            HandleKind::Endpoint { paddr, .. } if paddr.as_u64() == 0xDEAD_0000
+        ));
     }
 
     #[test]
@@ -823,25 +830,14 @@ mod tests {
 
     #[test]
     fn record_parent_copy_rejects_empty_handle() {
-        // Lockdown: HandleEntry::EMPTY has object_paddr == 0 and
-        // HandleKind::Empty. Without this rejection, apply would
-        // insert the empty sentinel into the child table as a real
-        // copied handle. The pure API rejects up front rather than
-        // trust the kernel to filter.
+        // Lockdown: HandleEntry::EMPTY has kind == HandleKind::Empty.
+        // Without this rejection, apply would insert the empty
+        // sentinel into the child table as a real copied handle.
+        // The pure API rejects up front rather than trust the kernel
+        // to filter.
         let mut b = ProcessCreationPlanBuilder::new();
         assert_eq!(
             b.record_parent_copy(HandleEntry::EMPTY).unwrap_err(),
-            CreateProcessPlanError::EmptyParentHandle,
-        );
-        // Also: a real-looking entry with paddr 0 is still rejected
-        // (object_paddr == 0 is the sole emptiness test).
-        let zero_paddr = HandleEntry {
-            object_paddr: 0,
-            rights: Rights::from_bits(0),
-            kind: HandleKind::Endpoint { caller_token: 0 },
-        };
-        assert_eq!(
-            b.record_parent_copy(zero_paddr).unwrap_err(),
             CreateProcessPlanError::EmptyParentHandle,
         );
         // First-call rejection didn't transition the at-most-once
@@ -857,16 +853,21 @@ mod tests {
         let mut b = ProcessCreationPlanBuilder::new();
         b.record_parent_copy(endpoint_entry(0xAAAA_0000)).unwrap();
         let second = HandleEntry {
-            object_paddr: 0xBBBB_0000,
             rights: Rights::from_bits(0),
-            kind: HandleKind::Notification,
+            kind: HandleKind::Notification {
+                paddr: crate::addr::PhysAddr::new(0xBBBB_0000),
+            },
         };
         assert_eq!(
             b.record_parent_copy(second).unwrap_err(),
             CreateProcessPlanError::ParentCopyAlreadyRecorded,
         );
-        // First copy survives.
-        assert_eq!(b.parent_copy.unwrap().object_paddr, 0xAAAA_0000);
+        // First copy survives — confirm by inspecting kind's payload.
+        let parent = b.parent_copy.unwrap();
+        assert!(matches!(
+            parent.kind,
+            HandleKind::Endpoint { paddr, .. } if paddr.as_u64() == 0xAAAA_0000
+        ));
     }
 
     #[test]
@@ -891,9 +892,11 @@ mod tests {
         // to the wrong reply slot — the kind of corruption that
         // surfaces as heap damage in the child's allocator.
         let entry = HandleEntry {
-            object_paddr: 0x1234_5000,
             rights: Rights::from_bits(0),
-            kind: HandleKind::Endpoint { caller_token: 0xDEAD_BEEF_CAFE_BABE },
+            kind: HandleKind::Endpoint {
+                paddr: crate::addr::PhysAddr::new(0x1234_5000),
+                caller_token: 0xDEAD_BEEF_CAFE_BABE,
+            },
         };
         let mut b = ProcessCreationPlanBuilder::new();
         b.record_parent_copy(entry).unwrap();
@@ -902,7 +905,7 @@ mod tests {
         let plan = b.validate(8, true, 2).unwrap();
         let parent = plan.parent_copy().expect("parent copy stored");
         match parent.kind {
-            HandleKind::Endpoint { caller_token } => {
+            HandleKind::Endpoint { caller_token, .. } => {
                 assert_eq!(
                     caller_token, 0xDEAD_BEEF_CAFE_BABE,
                     "Endpoint caller_token must round-trip through record_parent_copy"
@@ -920,9 +923,11 @@ mod tests {
         // Wrong rights reaching the child can drop messages or
         // bypass capability checks downstream.
         let entry = HandleEntry {
-            object_paddr: 0x1234_5000,
             rights: Rights::from_bits(0b1010_1010),
-            kind: HandleKind::Endpoint { caller_token: 0 },
+            kind: HandleKind::Endpoint {
+                paddr: crate::addr::PhysAddr::new(0x1234_5000),
+                caller_token: 0,
+            },
         };
         let mut b = ProcessCreationPlanBuilder::new();
         b.record_parent_copy(entry).unwrap();

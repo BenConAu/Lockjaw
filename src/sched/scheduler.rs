@@ -581,12 +581,12 @@ fn finish_exit() {
                         };
                         ht.for_each_entry(|entry| {
                             match decide_close_handle(Some(entry)) {
-                                CloseHandleResult::RemoveAndDecRef { header_paddr } => {
-                                    crate::cap::pageset_table::dec_refcount_and_maybe_free(header_paddr);
+                                CloseHandleResult::RemoveAndDecRef { header_kva } => {
+                                    crate::cap::pageset_table::dec_refcount_and_maybe_free(header_kva);
                                 }
-                                CloseHandleResult::UnmapThenRemove { header_paddr, .. } => {
+                                CloseHandleResult::UnmapThenRemove { header_kva, .. } => {
                                     // PTEs already gone — skip unmap, dec both.
-                                    crate::cap::pageset_table::dec_both_and_maybe_free(header_paddr);
+                                    crate::cap::pageset_table::dec_both_and_maybe_free(header_kva);
                                 }
                                 _ => {}
                             }
@@ -601,8 +601,8 @@ fn finish_exit() {
                         };
                         ht.for_each_entry(|entry| {
                             match decide_teardown_handle(entry) {
-                                TeardownHandleAction::DecRef { header_paddr } => {
-                                    crate::cap::pageset_table::dec_refcount_and_maybe_free(header_paddr);
+                                TeardownHandleAction::DecRef { header_kva } => {
+                                    crate::cap::pageset_table::dec_refcount_and_maybe_free(header_kva);
                                 }
                                 TeardownHandleAction::Skip => {}
                             }

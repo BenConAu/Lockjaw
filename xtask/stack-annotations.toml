@@ -122,4 +122,5 @@
 # Each new type requires its own entry — keeps the gate narrow.
 "<&lockjaw_types::object::ObjectType as core::fmt::Debug>::fmt" = "assert_eq panic formatting"
 "<&u64 as core::fmt::Debug>::fmt" = "assert_eq panic formatting"
+"<&usize as core::fmt::Debug>::fmt" = "assert_eq panic formatting (kvm boot self-test pages count)"
 "<lockjaw::mm::kvm::KvmError as core::fmt::Debug>::fmt" = "Result::expect on alloc_kernel_pages failures"

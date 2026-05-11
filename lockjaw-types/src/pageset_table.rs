@@ -364,12 +364,19 @@ impl<'a> core::ops::DerefMut for BackedHeaderMut<'a> {
 // PageSetEntry -- thin entry stored in the tracking table
 // ---------------------------------------------------------------------------
 
-/// A tracked PageSet: just the count and the header page's physical address.
-/// The actual page addresses live in the header page, not in the table.
+/// A tracked PageSet: just the count and the header's kernel virtual
+/// address in the KVM pool. The actual data page addresses live in
+/// the header itself, not in the table.
+///
+/// `header_kva` is a `KernelVa`, not a `PhysAddr`: PageSet headers
+/// live in the KVM pool (virtually contiguous, physically scattered
+/// frames stitched into the kernel TTBR1 tree). Code that reads a
+/// PageSet header through this field uses `KernelMut/Ref::from_kva`,
+/// not `from_paddr`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageSetEntry {
     pub count: usize,
-    pub header_paddr: u64,
+    pub header_kva: crate::addr::KernelVa,
 }
 
 /// Errors from PageSet table operations.
@@ -431,13 +438,13 @@ impl PageSetTable {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
 
-    /// Find a PageSet by its header physical address. Returns the slot
-    /// index, or None if no entry has that header_paddr. Used for
-    /// reverse lookup when consuming via a handle.
-    pub fn find_by_header_paddr(&self, header_paddr: u64) -> Option<usize> {
+    /// Find a PageSet by its header kernel virtual address. Returns
+    /// the slot index, or None if no entry has that header_kva.
+    /// Used for reverse lookup when consuming via a handle.
+    pub fn find_by_header_kva(&self, header_kva: crate::addr::KernelVa) -> Option<usize> {
         for i in 0..MAX_PAGESETS {
             if let Some(entry) = &self.slots[i] {
-                if entry.header_paddr == header_paddr {
+                if entry.header_kva == header_kva {
                     return Some(i);
                 }
             }
@@ -457,7 +464,7 @@ mod tests {
     fn make_entry(count: usize) -> PageSetEntry {
         PageSetEntry {
             count,
-            header_paddr: 0x1000 * (count as u64 + 1),
+            header_kva: crate::addr::KernelVa::new(0x1000 * (count as u64 + 1)),
         }
     }
 
@@ -512,7 +519,7 @@ mod tests {
     fn invalid_count_zero() {
         let mut table = PageSetTable::new();
         assert_eq!(
-            table.insert(PageSetEntry { count: 0, header_paddr: 0x1000 }),
+            table.insert(PageSetEntry { count: 0, header_kva: crate::addr::KernelVa::new(0x1000) }),
             Err(PageSetError::InvalidCount)
         );
     }
@@ -521,7 +528,7 @@ mod tests {
     fn invalid_count_too_large() {
         let mut table = PageSetTable::new();
         assert_eq!(
-            table.insert(PageSetEntry { count: MAX_PRACTICAL_PAGES_PER_SET + 1, header_paddr: 0x1000 }),
+            table.insert(PageSetEntry { count: MAX_PRACTICAL_PAGES_PER_SET + 1, header_kva: crate::addr::KernelVa::new(0x1000) }),
             Err(PageSetError::InvalidCount)
         );
     }
@@ -829,33 +836,33 @@ mod tests {
         t.backed_mut().set_count(511);
     }
 
-    // --- find_by_header_paddr ---
+    // --- find_by_header_kva ---
 
     #[test]
-    fn find_by_header_paddr_found() {
+    fn find_by_header_kva_found() {
         let mut table = PageSetTable::new();
-        let e0 = PageSetEntry { count: 1, header_paddr: 0xA000 };
-        let e1 = PageSetEntry { count: 2, header_paddr: 0xB000 };
+        let e0 = PageSetEntry { count: 1, header_kva: crate::addr::KernelVa::new(0xA000) };
+        let e1 = PageSetEntry { count: 2, header_kva: crate::addr::KernelVa::new(0xB000) };
         let id0 = table.insert(e0).unwrap();
         let _id1 = table.insert(e1).unwrap();
 
-        assert_eq!(table.find_by_header_paddr(0xA000), Some(id0));
-        assert_eq!(table.find_by_header_paddr(0xB000), Some(1));
+        assert_eq!(table.find_by_header_kva(crate::addr::KernelVa::new(0xA000)), Some(id0));
+        assert_eq!(table.find_by_header_kva(crate::addr::KernelVa::new(0xB000)), Some(1));
     }
 
     #[test]
-    fn find_by_header_paddr_not_found() {
+    fn find_by_header_kva_not_found() {
         let mut table = PageSetTable::new();
-        table.insert(PageSetEntry { count: 1, header_paddr: 0xA000 }).unwrap();
-        assert_eq!(table.find_by_header_paddr(0xC000), None);
+        table.insert(PageSetEntry { count: 1, header_kva: crate::addr::KernelVa::new(0xA000) }).unwrap();
+        assert_eq!(table.find_by_header_kva(crate::addr::KernelVa::new(0xC000)), None);
     }
 
     #[test]
-    fn find_by_header_paddr_after_remove() {
+    fn find_by_header_kva_after_remove() {
         let mut table = PageSetTable::new();
-        let id = table.insert(PageSetEntry { count: 1, header_paddr: 0xA000 }).unwrap();
+        let id = table.insert(PageSetEntry { count: 1, header_kva: crate::addr::KernelVa::new(0xA000) }).unwrap();
         table.remove(id).unwrap();
-        assert_eq!(table.find_by_header_paddr(0xA000), None);
+        assert_eq!(table.find_by_header_kva(crate::addr::KernelVa::new(0xA000)), None);
     }
 
     // --- map_count lifecycle ---

@@ -1,5 +1,6 @@
 use crate::mm::addr::PhysAddr;
 use crate::mm::kernel_ptr::{KernelMut, KernelRef};
+use lockjaw_types::addr::KernelVa;
 use lockjaw_types::object::{ObjectHeader, ObjectType};
 use lockjaw_types::process::{self, ProcessLifecycle, TransferError, MAX_CONSUMED_HEADERS};
 
@@ -159,15 +160,19 @@ pub fn process_owned_page(process_paddr: PhysAddr, index: usize) -> Option<u64> 
     }
 }
 
-/// Append a PageSet header to this process's `consumed_headers`
+/// Append a PageSet header KVA to this process's `consumed_headers`
 /// list, deduplicating. Used by `create_process` while building
 /// the new process — keeps the deduplicated list off the kernel
 /// stack. Returns `Ok(true)` if the header was new (added),
 /// `Ok(false)` if it was already present, `Err(TooManyHeaders)`
 /// if the array is full.
+///
+/// The proc-page storage is a u64 array (the dedup helper is generic
+/// over u64); we cast to/from `KernelVa` at the boundary so callers
+/// see typed values.
 pub fn process_record_consumed_header(
     process_paddr: PhysAddr,
-    header_paddr: u64,
+    header_kva: KernelVa,
 ) -> Result<bool, TransferError> {
     // SAFETY: process_paddr is a valid ProcessObject (page already zeroed
     // by create_process). The dedup helper takes the array slice + count
@@ -175,7 +180,7 @@ pub fn process_record_consumed_header(
     let mut p = unsafe { KernelMut::<ProcessObject>::from_paddr(process_paddr) };
     let proc = p.get_mut();
     let mut count = proc.consumed_header_count as usize;
-    let result = process::dedup_add_header(header_paddr, &mut proc.consumed_headers, &mut count);
+    let result = process::dedup_add_header(header_kva.as_u64(), &mut proc.consumed_headers, &mut count);
     proc.consumed_header_count = count as u32;
     result
 }
@@ -190,14 +195,14 @@ pub fn process_consumed_header_count(process_paddr: PhysAddr) -> u32 {
     p.get().consumed_header_count
 }
 
-/// Read one consumed PageSet header by index. Returns None if out
-/// of range.
-pub fn process_consumed_header(process_paddr: PhysAddr, index: usize) -> Option<u64> {
+/// Read one consumed PageSet header KVA by index. Returns None if
+/// out of range.
+pub fn process_consumed_header(process_paddr: PhysAddr, index: usize) -> Option<KernelVa> {
     // SAFETY: process_paddr is a valid ProcessObject.
     let p = unsafe { KernelRef::<ProcessObject>::from_paddr(process_paddr) };
     let proc = p.get();
     if index < proc.consumed_header_count as usize {
-        Some(proc.consumed_headers[index])
+        Some(KernelVa::new(proc.consumed_headers[index]))
     } else {
         None
     }

@@ -408,7 +408,11 @@ pub extern "C" fn kmain() -> ! {
 
     // Insert a handle pointing to the table itself (for testing)
     let h0 = unsafe {
-        handle_insert(ht_paddr, ht_paddr, Rights::from_bits(RIGHT_READ | RIGHT_WRITE), HandleKind::HandleTable)
+        handle_insert(
+            ht_paddr,
+            Rights::from_bits(RIGHT_READ | RIGHT_WRITE),
+            HandleKind::HandleTable { paddr: ht_paddr },
+        )
     }.unwrap_or_else(|_| panic!("insert failed"));
     kprintln!("  Inserted handle ", h0, " (RW)");
 
@@ -522,12 +526,16 @@ pub extern "C" fn kmain() -> ! {
             ep_km.get_mut().next_token = t + 1;
             t
         };
-        handle_table::handle_insert(kernel_ht_page, ep_page,
+        handle_table::handle_insert(
+            kernel_ht_page,
             cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
-            lockjaw_types::object::HandleKind::Endpoint { caller_token: ep_token }).unwrap_or_else(|_| panic!("insert ep handle"));
-        handle_table::handle_insert(kernel_ht_page, bench_reply_page,
+            lockjaw_types::object::HandleKind::Endpoint { paddr: ep_page, caller_token: ep_token },
+        ).unwrap_or_else(|_| panic!("insert ep handle"));
+        handle_table::handle_insert(
+            kernel_ht_page,
             cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
-            lockjaw_types::object::HandleKind::Reply).unwrap_or_else(|_| panic!("insert reply handle"));
+            lockjaw_types::object::HandleKind::Reply { paddr: bench_reply_page },
+        ).unwrap_or_else(|_| panic!("insert reply handle"));
 
         // Thread A (sender) — kernel thread in the kernel process
         cap::process_obj::process_inc_thread_count(kernel_proc_page);

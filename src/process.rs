@@ -9,6 +9,7 @@ use crate::mm::user_access::UserAddressSpace;
 use crate::sched::current::CurrentThread;
 use crate::sched::tcb::{Tcb, TcbCreateInfo, create_tcb};
 use crate::sched::scheduler;
+use lockjaw_types::addr::KernelVa;
 use lockjaw_types::syscall::SyscallError;
 
 // Re-export from lockjaw-types — single source of truth.
@@ -178,7 +179,8 @@ pub fn create_process(
     // succeed. consume_pageset_validate is read-only — Err here
     // leaves every parent's handle table and page table untouched.
     // Headers live in the proc page (off the kernel stack); read
-    // them by index.
+    // them by index. The proc-page storage is a polymorphic u64
+    // array — interpret the entries as PageSet header KVAs.
     for idx in 0..plan.unique_header_count() {
         let hdr = crate::cap::process_obj::process_consumed_header(proc_paddr, idx)
             .expect("header index < unique_header_count by construction");
@@ -208,15 +210,13 @@ pub fn create_process(
         // send/call on this handle. Same logic as sys_export_handle:
         // token==0 → fresh from endpoint counter, nonzero → copy (lineage).
         let child_kind = match parent.kind {
-            lockjaw_types::object::HandleKind::Endpoint { caller_token } if caller_token == 0 => {
+            lockjaw_types::object::HandleKind::Endpoint { paddr, caller_token } if caller_token == 0 => {
                 let mut ep = unsafe {
-                    KernelMut::<crate::ipc::endpoint::EndpointObject>::from_paddr(
-                        PhysAddr::new(parent.object_paddr),
-                    )
+                    KernelMut::<crate::ipc::endpoint::EndpointObject>::from_paddr(paddr)
                 };
                 let token = ep.get().next_token;
                 ep.get_mut().next_token = token + 1;
-                lockjaw_types::object::HandleKind::Endpoint { caller_token: token }
+                lockjaw_types::object::HandleKind::Endpoint { paddr, caller_token: token }
             }
             other => other,
         };
@@ -229,11 +229,7 @@ pub fn create_process(
         // capacity invariant was checked in the pure validate. Avoid
         // Result::expect so the panic path doesn't pull in Debug
         // formatting for SyscallError (would inflate exception stack).
-        if child_ht.insert(
-            PhysAddr::new(parent.object_paddr),
-            parent.rights,
-            child_kind,
-        ).is_err() {
+        if child_ht.insert(parent.rights, child_kind).is_err() {
             panic!("child handle insert into fresh empty table failed (kernel-invariant violation)");
         }
     }
@@ -290,8 +286,12 @@ fn provision_resources(
         crate::cap::rights::Rights::from_bits(crate::cap::rights::RIGHT_READ),
         crate::cap::object::ObjectType::PageSet)
         .map_err(|_| CreateProcessError::BadHandle)?;
-    // SAFETY: object_paddr from a PageSet handle — valid header page.
-    let stack_ps = unsafe { PageSetRef::from_header_paddr(stack_entry.object_paddr) };
+    let stack_kva = match stack_entry.kind {
+        lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
+        _ => return Err(CreateProcessError::BadHandle),
+    };
+    // SAFETY: kva from a PageSet handle — registered header KVA.
+    let stack_ps = unsafe { PageSetRef::from_header_kva(stack_kva) };
 
     // Resolve parent_handle_to_copy in validate phase. The actual
     // child-table insertion runs in apply (step 6) so the
@@ -317,7 +317,11 @@ fn provision_resources(
         crate::cap::rights::Rights::from_bits(crate::cap::rights::RIGHT_READ),
         crate::cap::object::ObjectType::PageSet)
         .map_err(|_| CreateProcessError::BadHandle)?;
-    let scratch_ps = unsafe { PageSetRef::from_header_paddr(scratch_entry.object_paddr) };
+    let scratch_kva = match scratch_entry.kind {
+        lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
+        _ => return Err(CreateProcessError::BadHandle),
+    };
+    let scratch_ps = unsafe { PageSetRef::from_header_kva(scratch_kva) };
     let scratch_count = scratch_ps.count();
     if scratch_count == 0 {
         return Err(CreateProcessError::InvalidUserMemory);
@@ -360,8 +364,12 @@ fn provision_resources(
             crate::cap::rights::Rights::from_bits(crate::cap::rights::RIGHT_READ),
             crate::cap::object::ObjectType::PageSet)
             .map_err(|_| CreateProcessError::BadHandle)?;
-        // SAFETY: object_paddr from a PageSet handle — valid header page.
-        let ps = unsafe { PageSetRef::from_header_paddr(ps_entry.object_paddr) };
+        let ps_kva = match ps_entry.kind {
+            lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
+            _ => return Err(CreateProcessError::BadHandle),
+        };
+        // SAFETY: kva from a PageSet handle — registered header KVA.
+        let ps = unsafe { PageSetRef::from_header_kva(ps_kva) };
         let page_idx = user_mapping.page_index as usize;
         let phys = ps.page(page_idx).ok_or(CreateProcessError::InvalidUserMemory)?;
 
@@ -394,7 +402,7 @@ fn provision_resources(
             return Err(CreateProcessError::TooManyOwnedPages);
         }
         record_mapping_into_plan(
-            plan_builder, proc_guard.addr(), ps_entry.object_paddr,
+            plan_builder, proc_guard.addr(), ps_kva,
         )?;
     }
 
@@ -432,7 +440,7 @@ fn provision_resources(
         }
     }
     record_stack_into_plan(
-        plan_builder, proc_guard.addr(), stack_entry.object_paddr, stack_ps.count(),
+        plan_builder, proc_guard.addr(), stack_kva, stack_ps.count(),
     )?;
 
     // Final flush of pending mappings and finalize address space
@@ -514,9 +522,9 @@ fn provision_resources(
 fn record_mapping_into_plan(
     plan_builder: &mut ProcessCreationPlanBuilder,
     proc_paddr: PhysAddr,
-    header_paddr: u64,
+    header_kva: KernelVa,
 ) -> Result<(), CreateProcessError> {
-    crate::cap::process_obj::process_record_consumed_header(proc_paddr, header_paddr)
+    crate::cap::process_obj::process_record_consumed_header(proc_paddr, header_kva)
         .map_err(|_| CreateProcessError::PlanError(CreateProcessPlanError::TooManyHeaders))?;
     plan_builder.record_mapping();
     Ok(())
@@ -532,10 +540,10 @@ fn record_mapping_into_plan(
 fn record_stack_into_plan(
     plan_builder: &mut ProcessCreationPlanBuilder,
     proc_paddr: PhysAddr,
-    header_paddr: u64,
+    header_kva: KernelVa,
     stack_pages: usize,
 ) -> Result<(), CreateProcessError> {
-    crate::cap::process_obj::process_record_consumed_header(proc_paddr, header_paddr)
+    crate::cap::process_obj::process_record_consumed_header(proc_paddr, header_kva)
         .map_err(|_| CreateProcessError::PlanError(CreateProcessPlanError::TooManyHeaders))?;
     plan_builder.record_stack(stack_pages)
         .map_err(CreateProcessError::PlanError)?;
