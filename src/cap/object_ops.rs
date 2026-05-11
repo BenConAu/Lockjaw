@@ -104,11 +104,11 @@ pub fn signal_notification(
         Rights::from_bits(crate::cap::rights::RIGHT_WRITE),
         ObjectType::Notification,
     )?;
-    let HandleKind::Notification { paddr } = entry.kind else {
+    let HandleKind::Notification { kva } = entry.kind else {
         return Err(SyscallError::INVALID_PARAMETER);
     };
     // SAFETY: type verified as Notification; KernelMut scoped to this call.
-    let mut km = unsafe { KernelMut::<notification::NotificationObject>::from_paddr(paddr) };
+    let mut km = unsafe { KernelMut::<notification::NotificationObject>::from_kva(kva) };
     Ok(notification::notification_signal(km.get_mut(), new_value))
 }
 
@@ -123,10 +123,10 @@ pub fn wait_notification(
         Rights::from_bits(crate::cap::rights::RIGHT_READ),
         ObjectType::Notification,
     )?;
-    let HandleKind::Notification { paddr } = entry.kind else {
+    let HandleKind::Notification { kva } = entry.kind else {
         return Err(SyscallError::INVALID_PARAMETER);
     };
     // Blocking — pass raw pointer so no &mut T survives across block_current().
-    let km = unsafe { KernelMut::<notification::NotificationObject>::from_paddr(paddr) };
+    let km = unsafe { KernelMut::<notification::NotificationObject>::from_kva(kva) };
     Ok(notification::notification_wait(km.raw_ptr(), threshold))
 }

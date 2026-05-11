@@ -710,7 +710,7 @@ mod tests {
         let dummy_kva = crate::addr::KernelVa::new(0xFFFF_8000_0000_2000);
         for kind in [
             HandleKind::Endpoint { paddr: dummy, caller_token: 0 },
-            HandleKind::Notification { paddr: dummy },
+            HandleKind::Notification { kva: dummy_kva },
             HandleKind::Reply { kva: dummy_kva },
         ] {
             let mut b = ProcessCreationPlanBuilder::new();
@@ -856,7 +856,7 @@ mod tests {
         let second = HandleEntry {
             rights: Rights::from_bits(0),
             kind: HandleKind::Notification {
-                paddr: crate::addr::PhysAddr::new(0xBBBB_0000),
+                kva: crate::addr::KernelVa::new(0xFFFF_8000_BBBB_0000),
             },
         };
         assert_eq!(

@@ -258,8 +258,8 @@ mod tests {
     fn ep(paddr: u64, token: u64) -> HandleKind {
         HandleKind::Endpoint { paddr: PhysAddr::new(paddr), caller_token: token }
     }
-    fn notif(paddr: u64) -> HandleKind {
-        HandleKind::Notification { paddr: PhysAddr::new(paddr) }
+    fn notif(kva: u64) -> HandleKind {
+        HandleKind::Notification { kva: KernelVa::new(kva) }
     }
     fn reply(kva: u64) -> HandleKind {
         HandleKind::Reply { kva: KernelVa::new(kva) }
@@ -284,7 +284,7 @@ mod tests {
     fn insert_fills_sequentially() {
         let mut slots = empty_table(4);
         assert_eq!(slot_insert(&mut slots, Rights::none(), ep(0x1000, 0)), Ok(0));
-        assert_eq!(slot_insert(&mut slots, Rights::none(), notif(0x2000)), Ok(1));
+        assert_eq!(slot_insert(&mut slots, Rights::none(), notif(KVA_B)), Ok(1));
         assert_eq!(slot_insert(&mut slots, Rights::none(), reply(KVA_A)), Ok(2));
         assert_eq!(slot_insert(&mut slots, Rights::none(), ps(KVA_A)), Ok(3));
     }
@@ -513,7 +513,7 @@ mod tests {
         let mut slots = empty_table(8);
         let h0 = slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
         slot_set_mapped_va(&mut slots, h0, 0x100).unwrap();
-        slot_insert(&mut slots, Rights::none(), notif(0x2000)).unwrap();
+        slot_insert(&mut slots, Rights::none(), notif(KVA_B)).unwrap();
         slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
         let h2 = slot_insert(&mut slots, Rights::none(), ps(KVA_A)).unwrap();
         slot_set_mapped_va(&mut slots, h2, 0x200).unwrap();

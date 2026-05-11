@@ -1,5 +1,5 @@
-use crate::mm::addr::PhysAddr;
 use core::cell::UnsafeCell;
+use lockjaw_types::addr::KernelVa;
 
 /// Maximum number of IRQ-to-Notification bindings.
 /// Must cover UART (INTID 33-40) and virtio-mmio (INTID 48-79).
@@ -10,10 +10,13 @@ const MAX_BINDINGS: usize = 96;
 // IrqBindings singleton
 // ---------------------------------------------------------------------------
 
-/// Static IRQ binding table. Maps hardware INTID → Notification paddr.
-/// Wraps the mutable array in `UnsafeCell` so the `unsafe impl Sync`
-/// safety argument lives in one place rather than at every call site.
-struct IrqBindings(UnsafeCell<[Option<PhysAddr>; MAX_BINDINGS]>);
+/// Static IRQ binding table. Maps hardware INTID → Notification KVA.
+/// Notification objects live in the KVM pool (see kernel-vmem-roadmap.md),
+/// so the table stores `KernelVa` and the IRQ handler reaches the
+/// NotificationObject via `from_kva`. Wraps the mutable array in
+/// `UnsafeCell` so the `unsafe impl Sync` safety argument lives in one
+/// place rather than at every call site.
+struct IrqBindings(UnsafeCell<[Option<KernelVa>; MAX_BINDINGS]>);
 
 /// SAFETY: single-core kernel. IRQ handler reads this table; syscall
 /// handler writes it. Both run with IRQs masked at EL1, so no concurrent
@@ -33,7 +36,7 @@ static BINDINGS: IrqBindings = IrqBindings(UnsafeCell::new([None; MAX_BINDINGS])
 /// INTID 0 = kernel reschedule SGI (cross-core wakeup).
 const RESERVED_INTID_SGI_RESCHED: u32 = 0;
 
-pub fn bind(intid: u32, notification_paddr: PhysAddr) -> bool {
+pub fn bind(intid: u32, notification_kva: KernelVa) -> bool {
     let idx = intid as usize;
     if idx >= MAX_BINDINGS || intid == RESERVED_INTID_SGI_RESCHED {
         return false;
@@ -44,14 +47,14 @@ pub fn bind(intid: u32, notification_paddr: PhysAddr) -> bool {
         if table[idx].is_some() {
             return false; // already bound
         }
-        table[idx] = Some(notification_paddr);
+        table[idx] = Some(notification_kva);
     }
     true
 }
 
-/// Look up the Notification bound to a given INTID.
+/// Look up the Notification KVA bound to a given INTID.
 /// Returns None if the INTID is unbound or out of range.
-pub fn lookup(intid: u32) -> Option<PhysAddr> {
+pub fn lookup(intid: u32) -> Option<KernelVa> {
     let idx = intid as usize;
     if idx >= MAX_BINDINGS {
         return None;

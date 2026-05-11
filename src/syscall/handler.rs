@@ -514,9 +514,11 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
 /// x0 = PageSet handle (must be a 1-page PageSet).
 /// Returns the new handle index in x1 on success.
 fn sys_create_notification(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
-    create_kernel_object(
+    // Notification lives in the KVM pool — use the _kvm orchestrator
+    // so map_existing runs in the validate phase before consume_apply.
+    create_kernel_object_kvm(
         ctx.gpr[0] as u32,
-        |paddr| lockjaw_types::object::HandleKind::Notification { paddr },
+        |kva| lockjaw_types::object::HandleKind::Notification { kva },
         crate::ipc::notification::create_notification,
     )
 }
@@ -567,11 +569,11 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
         Ok(e) => e,
         Err(e) => return e,
     };
-    let notif_paddr = match entry.kind {
-        lockjaw_types::object::HandleKind::Notification { paddr } => paddr,
+    let notif_kva = match entry.kind {
+        lockjaw_types::object::HandleKind::Notification { kva } => kva,
         _ => return SyscallError::INVALID_HANDLE,
     };
-    if crate::arch::aarch64::irq_bind::bind(intid, notif_paddr) {
+    if crate::arch::aarch64::irq_bind::bind(intid, notif_kva) {
         // Enable SPI in the GIC distributor (PPIs are already enabled in gic::init)
         if intid >= 32 {
             // SAFETY: intid validated by irq_bind::bind; enable_spi is a GIC
@@ -655,7 +657,13 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 
         // Read WaitEntry array from user memory via page table walk (TTBR1).
         // Never touches TTBR0 — immune to context switches.
-        let mut paddrs = [PhysAddr::new(0); MAX_WAIT_OBJECTS];
+        //
+        // `addrs` is a polymorphic u64 storage: an Endpoint entry holds
+        // a `PhysAddr.as_u64()`; a Notification entry (now in KVM) holds
+        // a `KernelVa.as_u64()`. The matching `types[i]` says which
+        // regime to use when decoding. TCB's `wait_objects` field is
+        // already u64-typed for exactly this reason.
+        let mut addrs = [0u64; MAX_WAIT_OBJECTS];
         let mut types = [ObjectType::HandleTable; MAX_WAIT_OBJECTS];
         let mut thresholds = [0u64; MAX_WAIT_OBJECTS];
 
@@ -669,29 +677,35 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
                 entry.handle as u32,
                 Rights::from_bits(crate::cap::rights::RIGHT_READ),
             )?;
-            let (obj_type, paddr) = match he.kind {
+            let (obj_type, addr) = match he.kind {
                 lockjaw_types::object::HandleKind::Endpoint { paddr, .. } =>
-                    (ObjectType::Endpoint, paddr),
-                lockjaw_types::object::HandleKind::Notification { paddr } =>
-                    (ObjectType::Notification, paddr),
+                    (ObjectType::Endpoint, paddr.as_u64()),
+                lockjaw_types::object::HandleKind::Notification { kva } =>
+                    (ObjectType::Notification, kva.as_u64()),
                 _ => return Err(SyscallError::INVALID_PARAMETER),
             };
-            paddrs[i] = paddr;
+            addrs[i] = addr;
             types[i] = obj_type;
             thresholds[i] = entry.threshold;
         }
 
         // Fast path: check if any object is already ready
-        let mask = check_readiness(&paddrs, &types, &thresholds, count);
+        let mask = check_readiness(&addrs, &types, &thresholds, count);
         if mask != 0 {
             return Ok(mask);
         }
 
-        // Slow path: register as readiness waiter on each object, then block
+        // Slow path: register as readiness waiter on each object, then block.
+        // Each kind decodes its own address regime from the polymorphic u64.
         for i in 0..count {
             match types[i] {
-                ObjectType::Endpoint => endpoint::set_readiness_waiter(paddrs[i], tcb_paddr),
-                ObjectType::Notification => notification::set_readiness_waiter(paddrs[i], tcb_paddr, thresholds[i]),
+                ObjectType::Endpoint =>
+                    endpoint::set_readiness_waiter(PhysAddr::new(addrs[i]), tcb_paddr),
+                ObjectType::Notification => notification::set_readiness_waiter(
+                    lockjaw_types::addr::KernelVa::new(addrs[i]),
+                    tcb_paddr,
+                    thresholds[i],
+                ),
                 _ => {}
             }
         }
@@ -701,7 +715,7 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
             let type_bytes: [u8; MAX_WAIT_OBJECTS] = core::array::from_fn(|i| {
                 if i < count { types[i] as u8 } else { 0 }
             });
-            CurrentThread::store_wait_state(&paddrs, &thresholds, &type_bytes, count);
+            CurrentThread::store_wait_state(&addrs, &thresholds, &type_bytes, count);
         }
 
         scheduler::block_current(scheduler::BlockToken::new());
@@ -709,24 +723,32 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         // Woke up — unregister from all objects (only clear our own registration)
         let wc = CurrentThread::wait_count();
         for i in 0..wc {
-            let (p, type_tag) = CurrentThread::wait_entry(i);
+            let (a, type_tag) = CurrentThread::wait_entry(i);
             match obj_type_from_u8(type_tag) {
-                ObjectType::Endpoint => endpoint::clear_readiness_waiter(p, tcb_paddr),
-                ObjectType::Notification => notification::clear_readiness_waiter(p, tcb_paddr),
+                ObjectType::Endpoint =>
+                    endpoint::clear_readiness_waiter(PhysAddr::new(a), tcb_paddr),
+                ObjectType::Notification => notification::clear_readiness_waiter(
+                    lockjaw_types::addr::KernelVa::new(a), tcb_paddr,
+                ),
                 _ => {}
             }
         }
         CurrentThread::clear_wait_count();
 
         // Re-check all objects (others may have become ready while blocked)
-        Ok(check_readiness(&paddrs, &types, &thresholds, wc))
+        Ok(check_readiness(&addrs, &types, &thresholds, wc))
     }
 }
 
 /// Build ObjectReadiness snapshots from live objects and compute the ready bitmask.
 /// The readiness logic is in lockjaw_types::wait::compute_ready_mask (tested on host).
+///
+/// `addrs` is polymorphic u64 storage: each entry's regime is determined
+/// by the matching `types[i]`. Endpoint entries decode as `PhysAddr`;
+/// Notification entries decode as `KernelVa` (Notification objects live
+/// in the KVM pool).
 fn check_readiness(
-    paddrs: &[PhysAddr],
+    addrs: &[u64],
     types: &[ObjectType],
     thresholds: &[u64],
     count: usize,
@@ -738,11 +760,13 @@ fn check_readiness(
     for i in 0..count {
         objects[i] = match types[i] {
             ObjectType::Endpoint => {
-                let state = endpoint::read_state(paddrs[i]);
+                let state = endpoint::read_state(PhysAddr::new(addrs[i]));
                 ObjectReadiness::Endpoint(state)
             }
             ObjectType::Notification => {
-                let value = crate::ipc::notification::read_value(paddrs[i]);
+                let value = crate::ipc::notification::read_value(
+                    lockjaw_types::addr::KernelVa::new(addrs[i]),
+                );
                 ObjectReadiness::Notification { value, threshold: thresholds[i] }
             }
             _ => ObjectReadiness::Endpoint(EpState::Idle), // not waitable, never ready

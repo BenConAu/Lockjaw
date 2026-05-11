@@ -80,12 +80,14 @@ impl CurrentThread {
         Self::ref_().get().wait_count as usize
     }
 
-    /// Read a single wait entry by index (paddr + object type tag).
+    /// Read a single wait entry by index (polymorphic u64 address +
+    /// object type tag). Caller decodes the address based on the type:
+    /// Endpoint → `PhysAddr`; Notification → `KernelVa`.
     /// Caller must ensure `i < wait_count()`.
-    pub fn wait_entry(i: usize) -> (PhysAddr, u8) {
+    pub fn wait_entry(i: usize) -> (u64, u8) {
         let tcb = Self::ref_();
         let t = tcb.get();
-        (PhysAddr::new(t.wait_objects[i]), t.wait_types[i])
+        (t.wait_objects[i], t.wait_types[i])
     }
 
     // --- Write operations ---
@@ -104,8 +106,11 @@ impl CurrentThread {
     }
 
     /// Store the sys_wait_any state into the TCB before blocking.
+    /// `addrs` holds polymorphic u64 values — Endpoint paddrs and
+    /// Notification KVAs — decoded by readers based on the matching
+    /// `types[i]`.
     pub fn store_wait_state(
-        paddrs: &[PhysAddr],
+        addrs: &[u64],
         thresholds: &[u64],
         types: &[u8],
         count: usize,
@@ -113,7 +118,7 @@ impl CurrentThread {
         let mut tcb = Self::mut_();
         let t = tcb.get_mut();
         for i in 0..count {
-            t.wait_objects[i] = paddrs[i].as_u64();
+            t.wait_objects[i] = addrs[i];
             t.wait_thresholds[i] = thresholds[i];
             t.wait_types[i] = types[i];
         }
