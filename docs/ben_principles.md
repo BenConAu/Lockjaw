@@ -60,46 +60,64 @@ How tier 1 manifests in the kernel's shape.
 5. **The kernel has to be strict and hardcore about construction
    so that user mode does not have to be as much so.**
 
-6. **Don't allow state machines or non-trivial logic in kernel
+6. **Reach for userspace before reaching for the kernel.**
+   Every kernel feature must be justified by what it enables
+   that userspace can't do alone. New `HandleKind` variants,
+   new syscalls, new kernel-side dispatch paths, new kernel
+   state — all last-resort. The kernel is for hardware (MMU,
+   GIC, TTBRn registers), substrate (PageSets, KVM allocator,
+   scheduler), capability creation, and IPC routing.
+   Everything else is userspace.
+
+   When this fights Tier 3's "use strong typing" idiom: let
+   this principle win. Typed kernel cap variants enforcing
+   what is really a userspace-driver protocol pushes policy
+   into the kernel. Type the protocol where it lives — in
+   `lockjaw-types` message shapes and `lockjaw-userlib`
+   client wrappers — not in the cap layer. The existing
+   `BlockEngine` / `DisplayEngine` pattern (typed traits +
+   generic Endpoint handles) is the model.
+
+7. **Don't allow state machines or non-trivial logic in kernel
    code — build pull mechanisms or plans in types.**
 
-7. **Unsafe should be strictly used for doing asm, and for
+8. **Unsafe should be strictly used for doing asm, and for
    casting pages to Rust objects, and everything downstream
    should be safe.**
 
-8. **Don't use unsafe types — make wrappers that force the
+9. **Don't use unsafe types — make wrappers that force the
    unsafety to only be exposed at creation.**
 
 ## Tier 3 — Type-System Idioms
 
 Specific Rust patterns that implement tiers 1 and 2.
 
-9. **Use Rust per-enum values where you can to be correct by
-   construction.**
+10. **Use Rust per-enum values where you can to be correct by
+    construction.**
 
-10. **In general use strong typing wherever possible** — even if
-    it does not survive the syscall boundary, it still enforces
-    correctness.
+11. **In general use strong typing wherever possible** — even
+    if it does not survive the syscall boundary, it still
+    enforces correctness.
 
-11. **Use RAII wherever possible rather than rely on manual
+12. **Use RAII wherever possible rather than rely on manual
     cleanup.**
 
 ## Tier 4 — Project & Process
 
 Working rules that aren't directly about correctness.
 
-12. **Drivers should be split between bit bangers and protocol
+13. **Drivers should be split between bit bangers and protocol
     drivers.** UART buffering should not be repeated everywhere,
     block management should not be repeated everywhere; think of
     KMD vs UMD in Windows.
 
-13. **Prefer clean code and abstractions over feature richness.**
+14. **Prefer clean code and abstractions over feature richness.**
 
-14. **Back compatibility is not a concern until much later** — we
-    should feel free to refactor anything and change any
+15. **Back compatibility is not a concern until much later** —
+    we should feel free to refactor anything and change any
     protocol.
 
-15. **YAGNI is for things you can build now but don't need; debt
+16. **YAGNI is for things you can build now but don't need; debt
     is stuff we need but can't build yet.** The Tier 1 #3
     counterpoint: substrate debt is need-but-can't-build-yet
     debt that *also* keeps the surface working — the surface
