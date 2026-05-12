@@ -1,6 +1,6 @@
 # Lockjaw
 
-A capability-based microkernel written in Rust, targeting AArch64 (ARMv8-A). Runs on QEMU `virt` machine and builds a kernel image suitable for Raspberry Pi 4B (DTB-driven platform discovery, GICv2 + spin-table SMP, position-independent boot). Inspired by seL4 and Zircon, but with its own object model.
+A capability-based microkernel written in Rust, targeting AArch64 (ARMv8-A). Runs on QEMU `virt` machine **and** boots end-to-end on a real Raspberry Pi 4B from the same binary — DTB-driven platform discovery, GICv2 + spin-table SMP, kernel image linked at a fixed higher-half VA with the load physical address discovered at runtime. Inspired by seL4 and Zircon, but with its own object model.
 
 ## What is this?
 
@@ -17,6 +17,8 @@ The design follows a few core principles:
 - **Pull over push.** Kernel code is organized by integration shape: pull (types drives sequencing), plan/apply (types returns a decision, kernel executes), or push (kernel calls helpers). Push is treated as highest review-risk; the extraction rubric converts push to pull wherever possible.
 - **All MMIO through the device manager.** Drivers cannot map arbitrary physical addresses. The device manager discovers hardware from the DTB and issues tracked PageSets for MMIO pages. Only processes that receive an MMIO PageSet can map device memory.
 - **Unforgeable caller identity.** IPC endpoints carry kernel-assigned opaque caller tokens. When a handle is exported, the kernel assigns a monotonic per-endpoint token stored in the handle entry. Servers query the token after receive to scope resources per-client. Tokens identify handle lineage, not processes — delegates inherit the original token. Token 0 is receive-only; send/call with token 0 is rejected by the kernel.
+- **Decoupled link VA from load PA.** The kernel image is linked at a fixed higher-half VA in its own L0[1] region (`0xFFFF_0080_0000_0000`), independent of the physical address firmware loads it at. The boot trampoline discovers the actual load PA via PC-relative (`adr _start`), computes a per-boot phys offset, and maps the runtime PA range at the linker VA via 4 KB L3 PTEs. Same binary boots on QEMU (load PA `0x40200000`) and Pi 4B (load PA `0x80000`); neither linker ORIGIN nor any code path needs adjustment. Userspace TTBR0 carries no kernel entries — no kernel identity, no device MMIO. The only PA-aware input is the DTB.
+- **Typed VA regimes.** Three sibling newtypes — `PhysAddr` for physical memory, `KernelVa` for the KVM allocator pool (`0xFFFF_8000_0000_0000`, where typed kernel objects live), `KernelImageVa` for the kernel image region (`0xFFFF_0080_0000_0000`). `compile_fail` doctests prove they cannot be assigned across regimes. Per-thread kernel stack base is a typed `KernelStackBase::{Image(KernelImageVa), Pool(KernelVa)}` enum so `finish_exit`'s free-path choice is `match`-driven and the wrong path is unrepresentable.
 
 ## What works today
 
@@ -98,6 +100,12 @@ posix-server: child exit
 - **Phase 2** (mmap + stdio): musl's `malloc` above the brk threshold goes through `mmap(NULL, len, RW, MAP_PRIVATE|MAP_ANONYMOUS)`. Personality server's per-client mmap_table allocates a PageSet, picks a base_va from a bump VA allocator, exports the handle to the client. Shim's failure-ordered handshake (`NR_MMAP` IPC -> `sys_map_pages` -> tracker insert) with explicit `NR_MMAP_ROLLBACK` if any post-export step fails. Variable-size PageSet header (Phase 2.K, see Phase 12) lets one PageSet back up to 64 MiB. Multi-L2 page-table mapping (Phase 2.M) lets a single mapping span multiple L2 regions transactionally (classify, pre-allocate, apply — same shape as consume_pageset_validate/apply). 8 MiB malloc gate verified end-to-end. `fopen + fread + fclose` exercises Phase 1 through musl stdio (which mallocs the FILE struct via mmap), proving Phase 2's mmap-backed malloc supports stdio.
 - Phase 3+ (filesystem write, threads via futex, processes via posix_spawn, pipes, signals) still aspirational.
 
+**Phase 17 -- Handle Revocation.** Two-phase consume_pageset (validate + apply) walks every live process's handle table, clears stale exported handles, replaces tombstone-leak pattern. sys_create_process restructured to push every fallible step into the validate phase.
+
+**Phase 18 -- Kernel Objects to KVA.** Every typed kernel object (Endpoint, Notification, Reply, ProcessObject, HandleTable, TCB, per-thread kernel stack) migrated from `page_alloc::alloc_page() + KernelMut::<T>::from_paddr(...)` (the linear higher-half map) to `kvm::alloc_kernel_pages(N) + KernelMut::<T>::from_kva(...)` (a dedicated KVM pool at L0[256]). Each `HandleKind::Foo { paddr }` variant flipped to `HandleKind::Foo { kva }`. Distinct `OwnedKvmRange` / `MappedKvmRange` types make the wrong free path a compile error. Surfaced and fixed a latent POSIX MAP_ANONYMOUS contract bug — `pageset_table::alloc_pages` was returning user-mmap'd frames non-zero, which mallocng's slot-header validation crashed on once the migration shifted which physical frames the buddy hands out at user-mmap time. After the migration, no typed kernel struct is addressed through `+KERNEL_VA_OFFSET` arithmetic; the type system enforces it.
+
+**Phase 19 -- Kernel Image Relink + Pi 4B Bring-Up Validation.** Kernel image relinked at a fixed higher-half VA in a dedicated L0[1] region (`0xFFFF_0080_0000_0000`), decoupled from the physical load address. Boot trampoline discovers actual load PA via PC-relative (`adr _start`) and computes `KERNEL_PHYS_OFFSET = load_PA - LINKER_BASE`. `init_kernel_image_map` walks every kernel image page and writes 4 KB L3 PTEs mapping `load_PA + offset` → `LINKER_BASE + offset` (4 KB granule chosen specifically so any load-PA alignment works, including Pi 4B's `0x80000`). Pivot uses the boot-discovered shift instead of a constant `KERNEL_VA_OFFSET`. New `KernelImageVa` newtype keeps the kernel-image VA regime distinct from the KVM pool's `KernelVa`. New `KernelStackBase` enum (`Image` / `Pool` variants) makes the kernel-stack regime explicit at the type level so `finish_exit`'s free-path choice cannot regress. New `xtask check-linker-symbols` enforces an audit doc listing every linker-symbol-to-integer site with classification. Userspace TTBR0 no longer carries the kernel identity map (L1[1] kernel RAM block + L2[4] device MMIO are gone — userspace device drivers still get MMIO via the normal `sys_map_pages` + `MAP_FLAG_DEVICE` path). Same binary boots end-to-end on QEMU virt and a real Pi 4B (firmware relocates to PA `0x80000`); the only PA-aware input is the DTB.
+
 ### Unsafe reduction
 
 The kernel's unsafe usage has been systematically hardened through a multi-round review process with a second AI reviewer (Codex):
@@ -114,7 +122,7 @@ Three layers of automated testing run on every build:
 
 | Layer | Count | What it tests |
 |-------|-------|---------------|
-| Unit tests (host) | 708 | Scheduler model, IPC state machine (exhaustive) + decision functions, process lifecycle + transfer plan + teardown plan, buddy allocator, page tables (PageTableWalk + MapWalk + validate_pte_match + clear_validated_pte + L2RegionIter), ExceptionContext ABI, ESR decode, HandleKind + handle ops + slot_revoke_validate/apply, BackedHeader/BackedHeaderMut wrapper bounds, VirtIO types + layout, block protocol, FDT parser, FAT32 BPB + cluster chains + dirent parser + 8.3 path matching, FS-IPC protocol, POSIX dispatch arms (mmap/munmap/mprotect/madvise + 21 rejection paths) + VA layout + Linux stack writer, device probe protocol, notifications, wait readiness, ticket lock (multi-threaded), feature negotiation, L3 region tracker, ScratchCursor pagination, build_process_page permission policy |
+| Unit tests (host) | 747 | Scheduler model, IPC state machine (exhaustive) + decision functions, process lifecycle + transfer plan + teardown plan, buddy allocator, page tables (PageTableWalk + MapWalk + validate_pte_match + clear_validated_pte + L2RegionIter), ExceptionContext ABI, ESR decode, HandleKind + handle ops + slot_revoke_validate/apply, BackedHeader/BackedHeaderMut wrapper bounds, VirtIO types + layout, block protocol, FDT parser, FAT32 BPB + cluster chains + dirent parser + 8.3 path matching, FS-IPC protocol, POSIX dispatch arms (mmap/munmap/mprotect/madvise + 21 rejection paths) + VA layout + Linux stack writer, device probe protocol, notifications, wait readiness, ticket lock (multi-threaded), feature negotiation, L3 region tracker, ScratchCursor pagination, build_process_page permission policy, KVM allocator + KvmFreeList + KvmMapWalk + KvmFreeWalk, address-regime separation (PhysAddr / KernelVa / KernelImageVa compile_fail doctests) |
 | Integration tests (QEMU) | 87 (per GIC variant) | Full boot through 17 phases, scheduler/MMU integration, IPC bootstrap, caller token delivery (positive + negative assertions), thread exit cleanup, thread creation, virtio-blk disk read, FAT32 mount + open + read end-to-end, POSIX Phase 0 puts, Phase 1 file read via fopen, Phase 2.3 malloc(1 MiB) gate, Phase 2.4 malloc(8 MiB) gate, handle revocation diagnostic with multi-process walk assertion |
 | Stack analysis | 4 entry points | No recursion, depth within 8KB budget, per-function 1600B cap, all indirect calls annotated, both debug and release profiles |
 | Pointer cast lint | 80+ | Every `as *const` / `as *mut` in kernel code has a SAFETY comment |
@@ -160,10 +168,11 @@ make pi4              # Build a kernel8.img for Raspberry Pi 4B SD card boot
 make test             # Run all tests (unit + integration + stack)
 make test-unit        # Host-side unit tests only
 make test-qemu        # QEMU integration tests only
-make check-stack      # Stack depth and call graph analysis
-make check-pointers   # Pointer cast SAFETY annotation check
-make check-vtables    # Scan .rodata/.data for unauthorized code pointers
-make objdump          # Disassemble the kernel
+make check-stack            # Stack depth and call graph analysis
+make check-pointers         # Pointer cast SAFETY annotation check
+make check-vtables          # Scan .rodata/.data for unauthorized code pointers
+make check-linker-symbols   # Enforce docs/linker-symbol-audit.md allowlist
+make objdump                # Disassemble the kernel
 ```
 
 QEMU is invoked with two UARTs (UART0 for kernel debug, UART1 for userspace driver), GICv3, and a serial mux. Press Ctrl-A then X to exit. `make run-display` adds `-device ramfb -display cocoa` for the framebuffer window. `make run-blk` adds a 1MB virtio-blk device with modern MMIO transport. See `Makefile` for the full command.
@@ -280,7 +289,11 @@ docs/                        # Book of Lockjaw -- design documentation
   tech-debt.md               # Known limitations and planned fixes
   extraction-roadmap.md      # Push-shaped code remaining to extract, ranked
   yagni-parking-lot.md       # Removed code tracked for future phases
-  development-journal.md     # Journal entries from the AI collaborator (1-9)
+  development-journal.md     # Journal entries from the AI collaborator (1-10)
+  kernel-vmem-roadmap.md     # Kernel VA allocator + relink roadmap
+  linker-symbol-audit.md     # Every linker-symbol-to-integer site classified
+  relink-notes.md            # Phase 0 diagnostic: what depended on the user-TTBR0 kernel identity
+  ben_principles.md          # Personal engineering principles (Tier 1-4)
   handle-revocation-plan.md  # Plan for two-phase consume_pageset + sys_create_process restructure
   posix-musl-plan.md         # Multi-phase plan for the musl personality (Phase 0/1/2 done)
   posix-phase2-mmap-plan.md  # Phase 2 mmap design + sub-phase breakdown
@@ -316,9 +329,10 @@ tests/
 | 16a. POSIX Phase 1 | Done | FAT32 server (mounts virtio-blk disk), FsClient + FdTable in posix-server, openat/read/close end-to-end; musl direct syscalls read `/HELLO.TXT` |
 | 16b. POSIX Phase 2 | Done | Variable-size PageSet header, multi-L2 page-table mapping, posix-server mmap_table + VA allocator, shim mmap/munmap/mprotect/madvise + readv translation; `malloc(8 MiB)` and `fopen + fread + fclose` work end-to-end |
 | 17. Handle Revocation | Done | Two-phase consume_pageset (validate + apply) walks every live process's handle table, clears stale exported handles, replaces tombstone-leak pattern. sys_create_process restructured to push every fallible step into the validate phase. |
-| 18. Architecture Hardening | Ongoing | Extracting pure logic to lockjaw-types (push→pull), making illegal states unrepresentable |
-| 19. Pi 4B Bring-Up Validation | Planned | Confirm `kernel8.img` boots on a real Pi 4B; fix whatever real-hardware quirks surface |
-| 20. POSIX Phase 3+ | Planned | Filesystem write, threads (futex), processes (posix_spawn/wait), pipes, signals |
+| 18. Kernel Objects to KVA | Done | Endpoint, Notification, Reply, ProcessObject, HandleTable, TCB, kernel stack all migrated from page_alloc/linear-map to dedicated KVM pool. Distinct OwnedKvmRange / MappedKvmRange types make wrong free path a compile error. Surfaced and fixed latent POSIX MAP_ANONYMOUS zero-init contract bug. |
+| 19. Kernel Image Relink + Pi 4B Validation | Done | Linker ORIGIN at L0[1] base (`0xFFFF_0080_0000_0000`), independent of load PA. Boot trampoline maps kernel image PA→VA via 4 KB L3 PTEs (handles any load-PA alignment, including Pi 4B's `0x80000`). User TTBR0 has no kernel entries. Same binary boots on QEMU virt and Pi 4B end-to-end. |
+| 20. Architecture Hardening | Ongoing | Extracting pure logic to lockjaw-types (push→pull), making illegal states unrepresentable |
+| 21. POSIX Phase 3+ | Planned | Filesystem write, threads (futex), processes (posix_spawn/wait), pipes, signals |
 
 ## License
 
