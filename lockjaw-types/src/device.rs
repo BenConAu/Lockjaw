@@ -30,8 +30,32 @@ pub const FW_CFG_HASH: u64 = compatible_hash(b"qemu,fw-cfg-mmio");
 pub const MAX_COMPAT: usize = 4;
 
 /// Maximum number of devices the device manager can track.
-/// QEMU virt has 32 virtio-mmio devices alone, plus UARTs, GIC, etc.
-pub const MAX_DEVICES: usize = 64;
+/// QEMU virt has ~50 nodes-with-compatible (32 virtio-mmio +
+/// UARTs + GIC + etc.); Pi 4B DTB has ~119 (every SoC peripheral
+/// node carries a compatible string). 192 is generous headroom
+/// for both platforms.
+pub const MAX_DEVICES: usize = 192;
+
+/// Maximum number of clock references per device. The DTB
+/// `clocks = <&phandle id ...>` property carries multiple
+/// (controller_phandle, clock_id) tuples; this caps how many we
+/// resolve per node. emmc2 has 1 clock; nothing in the current
+/// Pi 4B / QEMU virt set comes close to 4.
+pub const MAX_CLOCK_REFS: usize = 4;
+
+/// A resolved clock reference: which controller, which clock on it.
+/// Output of FDT parsing — lifted from `clocks = <&phandle N>` after
+/// looking up `#clock-cells` on the controller node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClockRef {
+    /// Phandle of the clock controller (e.g., CPRMAN's phandle).
+    pub controller_phandle: u32,
+    /// Per-controller clock identifier (the cell that follows
+    /// the phandle in the `clocks` property; meaning is defined
+    /// by the controller's binding — e.g., for CPRMAN, this is
+    /// the clock leaf index).
+    pub clock_id: u32,
+}
 
 /// A device entry parsed from the DTB.
 #[derive(Clone, Copy)]
@@ -50,6 +74,12 @@ pub struct DeviceInfo {
     pub intid: u32,
     /// Whether this device has been claimed by a driver.
     pub claimed: bool,
+    /// Resolved `clocks = <&phandle id ...>` references, in DTB
+    /// declaration order. Empty if the node had no `clocks` property
+    /// or the controller's `#clock-cells` was unresolvable.
+    pub clocks: [ClockRef; MAX_CLOCK_REFS],
+    /// Number of valid entries in `clocks`.
+    pub clock_count: u8,
 }
 
 impl DeviceInfo {
@@ -157,10 +187,18 @@ mod tests {
 
     #[test]
     fn device_info_size() {
-        // Ensure it's a reasonable size for array storage
-        // 4 compat hashes (32) + count (1) + padding + mmio_addr (8) +
-        // mmio_size (8) + intid (4) + claimed (1) + padding = 64
-        assert!(core::mem::size_of::<DeviceInfo>() <= 64);
+        // Cap at 128 bytes per entry. MAX_DEVICES (64) entries fits
+        // in 8 KB, well within the userspace device-manager's 16 KB
+        // page-array budget. Layout: 4 compat hashes (32) + counts +
+        // padding + mmio_addr (8) + mmio_size (8) + intid (4) +
+        // claimed (1) + padding + clocks (4 × 8 = 32) + clock_count
+        // (1) + padding = ~96.
+        assert!(core::mem::size_of::<DeviceInfo>() <= 128);
+    }
+
+    #[test]
+    fn clock_ref_packs_to_8_bytes() {
+        assert_eq!(core::mem::size_of::<ClockRef>(), 8);
     }
 
     #[test]

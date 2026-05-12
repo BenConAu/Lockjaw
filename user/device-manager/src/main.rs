@@ -7,10 +7,23 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
+use core::cell::UnsafeCell;
 use core::ptr;
 use lockjaw_userlib::*;
-use lockjaw_types::fdt::parse_fdt;
+use lockjaw_types::fdt::{parse_fdt_into, FdtDevices};
 use lockjaw_types::device::{CMD_PROBE_DEVICE, CMD_CLAIM_BY_ADDR, CLAIM_OK, CLAIM_ERR};
+
+// FdtDevices is ~18 KB at MAX_DEVICES = 192. Holding it on the stack
+// (return-by-value from parse_fdt) would need >36 KB of stack to
+// account for the call-site copy. Live in BSS instead so the only
+// stack cost is the &mut FdtDevices reference.
+//
+// SAFETY: device-manager is a single-threaded userspace process; the
+// only writer is the bootstrap path before the main IPC loop, the
+// only readers are the IPC handler functions running serially after.
+struct DevTableCell(UnsafeCell<FdtDevices>);
+unsafe impl Sync for DevTableCell {}
+static DEVICE_TABLE: DevTableCell = DevTableCell(UnsafeCell::new(FdtDevices::empty()));
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -76,13 +89,13 @@ pub extern "C" fn _start() -> ! {
     let dtb_slice = unsafe {
         core::slice::from_raw_parts(dtb_va as *const u8, dtb_content_end)
     };
-    let mut devices = match parse_fdt(dtb_slice) {
-        Ok(d) => d,
-        Err(_) => {
-            puts("devmgr: DTB parse FAILED\n");
-            halt();
-        }
-    };
+    // SAFETY: single-threaded process; this is the only writer to
+    // DEVICE_TABLE and runs before any IPC handler can read it.
+    let mut devices: &mut FdtDevices = unsafe { &mut *DEVICE_TABLE.0.get() };
+    if let Err(_) = parse_fdt_into(dtb_slice, &mut *devices) {
+        puts("devmgr: DTB parse FAILED\n");
+        halt();
+    }
     puts("devmgr: parsed DTB, ");
     put_decimal(devices.count as u64);
     puts(" devices\n");

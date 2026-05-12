@@ -1,13 +1,14 @@
 /// Minimal Flattened Device Tree (FDT) parser.
 ///
 /// Parses the binary DTB format to extract device information: compatible
-/// strings, MMIO addresses (reg property), and interrupt numbers.
+/// strings, MMIO addresses (reg property), interrupt numbers, and
+/// `clocks` references (resolved against per-controller `#clock-cells`).
 /// Pure, no_std, testable on host with a real DTB blob.
 ///
-/// Limitations (sufficient for QEMU virt flat layout):
-/// - No address translation (#address-cells inheritance)
-/// - No phandle resolution
-/// - Assumes root #address-cells=2, #size-cells=2
+/// Limitations (sufficient for QEMU virt + Pi 4B):
+/// - Phandle resolution scoped to clocks (no general phandle table
+///   exposed to callers; sufficient for the providers we have today).
+/// - Assumes root #address-cells=2, #size-cells=2.
 ///
 /// Two public parsers:
 /// - `parse_fdt()`: full device enumeration for the userspace device
@@ -16,9 +17,11 @@
 ///   UART, GIC, and memory into a fixed PlatformHw struct. Safe for the
 ///   kernel's 8KB stack budget.
 ///
-/// Both share the same FDT walk and property extraction helpers.
+/// Both share the same FDT walk and property extraction helpers. Only
+/// `parse_fdt` resolves `clocks` references; `scan_platform` doesn't
+/// need them.
 
-use crate::device::{DeviceInfo, MAX_DEVICES, compatible_hash};
+use crate::device::{ClockRef, DeviceInfo, MAX_CLOCK_REFS, MAX_DEVICES, compatible_hash};
 
 // ---------------------------------------------------------------------------
 // SMP boot method types (discovered from DTB)
@@ -262,6 +265,18 @@ struct NodeState {
     cpu_release_addr: u64,
     /// /psci node's "method" property conduit.
     psci_conduit: PsciConduit,
+    /// `phandle` (or `linux,phandle`) of this node, if present.
+    /// 0 = no phandle (DTB convention; phandle 0 is reserved).
+    phandle: u32,
+    /// `#clock-cells` value for nodes that act as clock controllers.
+    /// `u32::MAX` = property absent (we use sentinel rather than 0
+    /// because 0 is a valid value for fixed-rate clocks with no id).
+    clock_cells: u32,
+    /// Raw bytes of the `clocks` property (deferred resolution —
+    /// each referenced controller's `#clock-cells` may not have been
+    /// seen yet during the walk). 0 = no clocks property.
+    clocks_start: usize,
+    clocks_len: usize,
 }
 
 impl NodeState {
@@ -273,6 +288,10 @@ impl NodeState {
         enable_method: EnableMethod::None,
         cpu_release_addr: 0,
         psci_conduit: PsciConduit::Unknown,
+        phandle: 0,
+        clock_cells: u32::MAX,
+        clocks_start: 0,
+        clocks_len: 0,
     };
 
     /// Check if any compatible hash matches the given hash.
@@ -525,6 +544,26 @@ fn walk_fdt(
                             state[d].psci_conduit = PsciConduit::Smc;
                         }
                         // Unrecognized values stay PsciConduit::Unknown
+                    } else if (str_eq(prop_name, b"phandle")
+                              || str_eq(prop_name, b"linux,phandle"))
+                              && prop_len >= 4 {
+                        // Some toolchains emit `linux,phandle` (deprecated)
+                        // alongside or instead of `phandle`. Either form
+                        // serves as this node's phandle for cross-references.
+                        state[d].phandle = read_u32_be(data, prop_data_start);
+                    } else if str_eq(prop_name, b"#clock-cells") && prop_len >= 4 {
+                        // This node is a clock controller. Records how
+                        // many cells per clock-reference its consumers
+                        // must supply. 0 cells = single anonymous clock
+                        // (e.g., fixed-clock); 1+ cells = id + extras.
+                        state[d].clock_cells = read_u32_be(data, prop_data_start);
+                    } else if str_eq(prop_name, b"clocks") {
+                        // Defer parsing — the referenced controller's
+                        // #clock-cells may not have been walked yet.
+                        // Resolution happens after the full walk
+                        // completes (see resolve_clocks).
+                        state[d].clocks_start = prop_data_start;
+                        state[d].clocks_len = prop_len;
                     }
                 }
 
@@ -541,48 +580,214 @@ fn walk_fdt(
 // Full device enumeration (for userspace device manager)
 // ---------------------------------------------------------------------------
 
+/// Maximum number of clock-controller nodes the resolver tracks.
+/// One entry per phandle that declared `#clock-cells`. Pi 4B has CPRMAN
+/// + a few fixed-clock nodes; QEMU virt has none. 16 is plenty.
+const MAX_CLOCK_PROVIDERS: usize = 16;
+
+/// Per-controller record: maps a phandle to its `#clock-cells` value.
+/// Built during `parse_fdt`, consumed by `resolve_clocks` after the
+/// full walk finishes.
+#[derive(Clone, Copy)]
+struct ClockProvider {
+    phandle: u32,
+    clock_cells: u32,
+}
+
+/// Captured raw `clocks` property bytes for one device, awaiting
+/// resolution against the phandle → #clock-cells table.
+#[derive(Clone, Copy)]
+struct PendingClocks {
+    /// Index into FdtDevices.devices for the consumer.
+    device_idx: u16,
+    /// File offset + length of the raw clocks property bytes.
+    bytes_start: u32,
+    bytes_len: u32,
+}
+
 /// Result of parsing an FDT: a list of discovered devices.
 pub struct FdtDevices {
     pub devices: [DeviceInfo; MAX_DEVICES],
     pub count: usize,
 }
 
-/// Parse an FDT blob and extract device information.
-/// Returns a list of devices with their compatible hashes, MMIO addresses,
-/// and interrupt IDs.
-pub fn parse_fdt(data: &[u8]) -> Result<FdtDevices, FdtError> {
+/// Empty `FdtDevices` builder for callers that pre-allocate the
+/// device array (typically in a static or page-backed buffer to avoid
+/// the ~18 KB stack copy a by-value return would produce).
+impl FdtDevices {
+    pub const fn empty() -> Self {
+        Self {
+            devices: [DeviceInfo {
+                compat_hashes: [0; MAX_COMPAT],
+                compat_count: 0,
+                mmio_addr: 0,
+                mmio_size: 0,
+                intid: 0,
+                claimed: false,
+                clocks: [ClockRef { controller_phandle: 0, clock_id: 0 }; MAX_CLOCK_REFS],
+                clock_count: 0,
+            }; MAX_DEVICES],
+            count: 0,
+        }
+    }
+}
+
+/// Parse an FDT blob into a caller-provided `FdtDevices` buffer.
+/// Resets the buffer's `count` to 0 and fills in devices with
+/// compatible strings, MMIO addresses, interrupt IDs, and resolved
+/// clock references.
+///
+/// Takes the output by `&mut` rather than returning by value because
+/// `FdtDevices` is large (~18 KB at MAX_DEVICES = 192) — a by-value
+/// return materializes the struct on both the callee's and caller's
+/// stack momentarily, blowing past typical userspace stack budgets.
+pub fn parse_fdt_into(data: &[u8], result: &mut FdtDevices) -> Result<(), FdtError> {
     let (off_dt_struct, off_dt_strings) = validate_header(data)?;
 
-    let mut result = FdtDevices {
-        devices: [DeviceInfo {
-            compat_hashes: [0; MAX_COMPAT],
-            compat_count: 0,
-            mmio_addr: 0,
-            mmio_size: 0,
-            intid: 0,
-            claimed: false,
-        }; MAX_DEVICES],
-        count: 0,
-    };
+    result.count = 0;
+
+    // Phandle → #clock-cells table, populated as we encounter clock-
+    // controller nodes during the walk. Used after the walk to resolve
+    // each device's deferred `clocks` property bytes.
+    let mut providers: [ClockProvider; MAX_CLOCK_PROVIDERS] =
+        [ClockProvider { phandle: 0, clock_cells: 0 }; MAX_CLOCK_PROVIDERS];
+    let mut provider_count: usize = 0;
+
+    // Devices with `clocks` properties to resolve after the walk.
+    let mut pending: [PendingClocks; MAX_DEVICES] =
+        [PendingClocks { device_idx: 0, bytes_start: 0, bytes_len: 0 }; MAX_DEVICES];
+    let mut pending_count: usize = 0;
 
     walk_fdt(data, off_dt_struct, off_dt_strings, |_name, node| {
+        // Record clock providers regardless of whether they have a
+        // compatible string (clocks-controller nodes sometimes don't,
+        // e.g., bare "fixed-clock" nodes).
+        if node.clock_cells != u32::MAX
+            && node.phandle != 0
+            && provider_count < MAX_CLOCK_PROVIDERS
+        {
+            providers[provider_count] = ClockProvider {
+                phandle: node.phandle,
+                clock_cells: node.clock_cells,
+            };
+            provider_count += 1;
+        }
+
         // Save every node that had a compatible string.
         // Store all compat hashes so consumers can match any of them
         // (e.g., Pi 4B UART has "arm,pl011-axi" first, "arm,pl011" second).
         if node.has_compat && result.count < MAX_DEVICES {
-            result.devices[result.count] = DeviceInfo {
+            let idx = result.count;
+            result.devices[idx] = DeviceInfo {
                 compat_hashes: node.compat_hashes,
                 compat_count: node.compat_count,
                 mmio_addr: node.reg_addr,
                 mmio_size: node.reg_size,
                 intid: node.intid,
                 claimed: false,
+                clocks: [ClockRef { controller_phandle: 0, clock_id: 0 }; MAX_CLOCK_REFS],
+                clock_count: 0,
             };
+
+            // Defer clocks resolution — controller's #clock-cells may
+            // not have been seen yet. Capture the raw property bytes.
+            if node.clocks_len > 0 && pending_count < MAX_DEVICES {
+                pending[pending_count] = PendingClocks {
+                    device_idx: idx as u16,
+                    bytes_start: node.clocks_start as u32,
+                    bytes_len: node.clocks_len as u32,
+                };
+                pending_count += 1;
+            }
+
             result.count += 1;
         }
     })?;
 
-    Ok(result)
+    // Walk complete: every clock controller has been recorded.
+    // Resolve each pending device's `clocks` property bytes against
+    // the provider table.
+    let providers_slice = &providers[..provider_count];
+    let mut i = 0;
+    while i < pending_count {
+        let p = pending[i];
+        resolve_clocks_for(
+            &mut result.devices[p.device_idx as usize],
+            data,
+            p.bytes_start as usize,
+            p.bytes_len as usize,
+            providers_slice,
+        );
+        i += 1;
+    }
+
+    Ok(())
+}
+
+/// Convenience wrapper around `parse_fdt_into` that allocates the
+/// `FdtDevices` buffer on the caller's stack and returns it by value.
+/// Suitable for host tests where stack space is plentiful; production
+/// userspace (device-manager) should use `parse_fdt_into` with a
+/// pre-allocated static or page-backed buffer to avoid the ~18 KB
+/// per-call-frame stack hit at MAX_DEVICES = 192.
+pub fn parse_fdt(data: &[u8]) -> Result<FdtDevices, FdtError> {
+    let mut devs = FdtDevices::empty();
+    parse_fdt_into(data, &mut devs)?;
+    Ok(devs)
+}
+
+/// Resolve one device's `clocks = <&phandle id ...>` property bytes
+/// into typed `ClockRef` entries. Walks the bytes one reference at a
+/// time, looking up the controller's `#clock-cells` to know how many
+/// cells follow each phandle. Unknown controllers (phandle not in the
+/// table) are silently skipped — they correspond to controllers we
+/// don't model, and the consumer's view should reflect what it can
+/// actually use.
+fn resolve_clocks_for(
+    device: &mut DeviceInfo,
+    data: &[u8],
+    bytes_start: usize,
+    bytes_len: usize,
+    providers: &[ClockProvider],
+) {
+    let end = bytes_start + bytes_len;
+    let mut off = bytes_start;
+    while off + 4 <= end && (device.clock_count as usize) < MAX_CLOCK_REFS {
+        let phandle = read_u32_be(data, off);
+        off += 4;
+        // Look up #clock-cells for this phandle.
+        let cells = match providers.iter().find(|p| p.phandle == phandle) {
+            Some(p) => p.clock_cells,
+            None => {
+                // Unknown controller — we can't decode further bytes
+                // because we don't know how many cells to skip.
+                // Stop processing this property to avoid mis-aligned
+                // decode of later (phandle, id) tuples.
+                break;
+            }
+        };
+        // Per binding spec: #clock-cells = N means N u32 cells follow
+        // the phandle. By convention the first cell is the clock_id;
+        // any further cells are controller-specific (we ignore them
+        // for now — emmc2/CPRMAN uses #clock-cells = 1).
+        let cells_bytes = (cells as usize) * 4;
+        if off + cells_bytes > end {
+            break;
+        }
+        let clock_id = if cells >= 1 {
+            read_u32_be(data, off)
+        } else {
+            0 // fixed-clock with no id
+        };
+        off += cells_bytes;
+
+        let idx = device.clock_count as usize;
+        device.clocks[idx] = ClockRef {
+            controller_phandle: phandle,
+            clock_id,
+        };
+        device.clock_count += 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +1109,141 @@ mod tests {
             Err(FdtError::TooSmall) => {}
             _ => panic!("expected TooSmall"),
         }
+    }
+
+    // --- clocks-reference resolution tests ---
+
+    // PI4B_DTB is declared further down (in the scan_platform tests
+    // section). Reuse that constant here.
+
+    /// CM_EMMC2 clock id from the upstream BCM2711 DT binding
+    /// (`include/dt-bindings/clock/bcm2835.h::BCM2835_CLOCK_EMMC2`).
+    /// Stable enum value; used by Linux, U-Boot, Circle, and now us.
+    const BCM2711_CLOCK_EMMC2: u32 = 51;
+
+    #[test]
+    fn pi4b_dtb_parses() {
+        assert!(parse_fdt(PI4B_DTB).is_ok());
+    }
+
+    #[test]
+    fn pi4b_emmc2_has_clocks_resolved() {
+        let devs = parse_fdt(PI4B_DTB).unwrap();
+        let emmc2_hash = compatible_hash(b"brcm,bcm2711-emmc2");
+        let emmc2 = devs.devices[..devs.count]
+            .iter()
+            .find(|d| d.has_compat(emmc2_hash))
+            .expect("Pi 4B DTB should have brcm,bcm2711-emmc2");
+        assert_eq!(emmc2.clock_count, 1, "emmc2 has exactly one clock");
+        let cref = emmc2.clocks[0];
+        assert_ne!(cref.controller_phandle, 0,
+                   "controller phandle should be resolved (CPRMAN)");
+        assert_eq!(cref.clock_id, BCM2711_CLOCK_EMMC2,
+                   "clock_id should be CM_EMMC2 (51) per BCM2711 binding");
+    }
+
+    #[test]
+    fn qemu_clocks_resolve_to_apb_pclk() {
+        // QEMU virt's PL011 UARTs reference an apb-pclk fixed-clock
+        // (#clock-cells = 0). The resolver should record the
+        // controller's phandle with clock_id = 0 (no id cells).
+        let devs = parse_fdt(QEMU_DTB).unwrap();
+        let pl011_hash = compatible_hash(b"arm,pl011");
+        let uart = devs.devices[..devs.count]
+            .iter()
+            .find(|d| d.has_compat(pl011_hash))
+            .expect("QEMU virt has PL011 UARTs");
+        assert!(uart.clock_count >= 1,
+                "PL011 should resolve at least one clock reference");
+        // apb-pclk has #clock-cells = 0, so clock_id is 0.
+        assert_eq!(uart.clocks[0].clock_id, 0);
+        assert_ne!(uart.clocks[0].controller_phandle, 0,
+                   "apb-pclk's phandle is non-zero");
+    }
+
+    #[test]
+    fn resolve_clocks_skips_unknown_phandle() {
+        // Synthetic check: a clocks property whose first phandle is
+        // not in the providers table must stop processing (we can't
+        // know how many cells to skip). The device's clock_count
+        // should remain 0.
+        let mut device = DeviceInfo {
+            compat_hashes: [0; MAX_COMPAT],
+            compat_count: 0,
+            mmio_addr: 0,
+            mmio_size: 0,
+            intid: 0,
+            claimed: false,
+            clocks: [ClockRef { controller_phandle: 0, clock_id: 0 }; MAX_CLOCK_REFS],
+            clock_count: 0,
+        };
+        let bytes: [u8; 8] = [
+            0, 0, 0, 0xCC,  // phandle 0xCC (not in providers)
+            0, 0, 0, 0x07,  // would-be clock_id
+        ];
+        let providers: [ClockProvider; 1] = [
+            ClockProvider { phandle: 0xAA, clock_cells: 1 },
+        ];
+        resolve_clocks_for(&mut device, &bytes, 0, bytes.len(), &providers);
+        assert_eq!(device.clock_count, 0,
+                   "unknown phandle yields no resolved entries");
+    }
+
+    #[test]
+    fn resolve_clocks_decodes_one_ref() {
+        let mut device = DeviceInfo {
+            compat_hashes: [0; MAX_COMPAT],
+            compat_count: 0,
+            mmio_addr: 0,
+            mmio_size: 0,
+            intid: 0,
+            claimed: false,
+            clocks: [ClockRef { controller_phandle: 0, clock_id: 0 }; MAX_CLOCK_REFS],
+            clock_count: 0,
+        };
+        let bytes: [u8; 8] = [
+            0, 0, 0, 0xAA,  // phandle 0xAA (in providers, #clock-cells = 1)
+            0, 0, 0, 0x33,  // clock_id 0x33
+        ];
+        let providers: [ClockProvider; 1] = [
+            ClockProvider { phandle: 0xAA, clock_cells: 1 },
+        ];
+        resolve_clocks_for(&mut device, &bytes, 0, bytes.len(), &providers);
+        assert_eq!(device.clock_count, 1);
+        assert_eq!(device.clocks[0].controller_phandle, 0xAA);
+        assert_eq!(device.clocks[0].clock_id, 0x33);
+    }
+
+    #[test]
+    fn resolve_clocks_decodes_multiple_refs() {
+        let mut device = DeviceInfo {
+            compat_hashes: [0; MAX_COMPAT],
+            compat_count: 0,
+            mmio_addr: 0,
+            mmio_size: 0,
+            intid: 0,
+            claimed: false,
+            clocks: [ClockRef { controller_phandle: 0, clock_id: 0 }; MAX_CLOCK_REFS],
+            clock_count: 0,
+        };
+        let bytes: [u8; 16] = [
+            0, 0, 0, 0xAA,  // phandle AA (1 cell)
+            0, 0, 0, 0x10,  // clock_id 0x10
+            0, 0, 0, 0xBB,  // phandle BB (2 cells)
+            0, 0, 0, 0x20,  // clock_id 0x20
+            // Note: BB has 2 cells per ref, but only 1 cell of data
+            // remains; we'd stop early. Adjust if needed.
+        ];
+        let providers: [ClockProvider; 2] = [
+            ClockProvider { phandle: 0xAA, clock_cells: 1 },
+            ClockProvider { phandle: 0xBB, clock_cells: 1 }, // simplify
+        ];
+        resolve_clocks_for(&mut device, &bytes, 0, bytes.len(), &providers);
+        assert_eq!(device.clock_count, 2);
+        assert_eq!(device.clocks[0].controller_phandle, 0xAA);
+        assert_eq!(device.clocks[0].clock_id, 0x10);
+        assert_eq!(device.clocks[1].controller_phandle, 0xBB);
+        assert_eq!(device.clocks[1].clock_id, 0x20);
     }
 
     #[test]
