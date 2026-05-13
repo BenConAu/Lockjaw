@@ -100,6 +100,10 @@ impl DeviceInfo {
 /// Pre-computed hash for "virtio,mmio" — used by virtio drivers.
 pub const VIRTIO_MMIO_HASH: u64 = compatible_hash(b"virtio,mmio");
 
+/// Pre-computed hash for "brcm,bcm2711-cprman" — Pi 4B clock manager.
+/// CPRMAN driver claims this in M0b.
+pub const BCM2711_CPRMAN_HASH: u64 = compatible_hash(b"brcm,bcm2711-cprman");
+
 // ---------------------------------------------------------------------------
 // Device manager IPC protocol commands
 // ---------------------------------------------------------------------------

@@ -29,5 +29,6 @@ pub mod thread;
 pub mod display;
 pub mod virtio;
 pub mod block;
+pub mod clock;
 pub mod fat32;
 pub mod fs;

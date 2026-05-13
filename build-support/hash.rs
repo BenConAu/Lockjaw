@@ -11,24 +11,41 @@ use std::path::{Path, PathBuf};
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
-/// Source directories to hash, relative to the project root.
-const SOURCE_DIRS: &[&str] = &[
-    "src",
-    "lockjaw-types/src",
-    "user/init/src",
-    "user/hello/src",
-    "user/uart-driver/src",
-    "user/device-manager/src",
-    "user/ramfb-driver/src",
-    "user/lockjaw-userlib/src",
-];
+/// Top-level source directories to hash, relative to the project
+/// root. Crate-specific directories under `user/` are auto-discovered
+/// (see `collect_source_dirs`) — adding a new user crate must not
+/// require editing this file, because forgetting to do so silently
+/// weakens the stale-binary mismatch invariant for that binary.
+const ROOT_SOURCE_DIRS: &[&str] = &["src", "lockjaw-types/src"];
+
+/// Discover every directory whose .rs files contribute to the source
+/// hash. Mirrors the Makefile `build-hash` target's `find user/*/src/`
+/// glob: every `user/<crate>/src` automatically participates so that
+/// new user crates can never silently drift out of the hash input.
+fn collect_source_dirs(project_root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = ROOT_SOURCE_DIRS
+        .iter()
+        .map(|d| project_root.join(d))
+        .collect();
+    let user_dir = project_root.join("user");
+    if let Ok(entries) = fs::read_dir(&user_dir) {
+        for entry in entries.flatten() {
+            let src = entry.path().join("src");
+            if src.is_dir() {
+                dirs.push(src);
+            }
+        }
+    }
+    // Sort for determinism — fs::read_dir order is OS-defined.
+    dirs.sort();
+    dirs
+}
 
 /// Compute FNV-1a hash of all .rs files under the Lockjaw project.
 /// Files are sorted by path for determinism across platforms and runs.
 fn compute_source_hash(project_root: &Path) -> u64 {
     let mut files = BTreeSet::new();
-    for dir in SOURCE_DIRS {
-        let full = project_root.join(dir);
+    for full in collect_source_dirs(project_root) {
         if full.exists() {
             collect_rs_files(&full, &mut files);
         }
