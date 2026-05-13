@@ -244,10 +244,43 @@ fn spawn_elf(
         puts(" spawned OK\n");
         true
     } else {
+        // Surface the SyscallError code so we can tell *why* the
+        // spawn failed without re-instrumenting on each Pi run. The
+        // codes match SyscallError constants in
+        // lockjaw-types/src/syscall.rs (1=INVALID_HANDLE,
+        // 3=OUT_OF_MEMORY, 4=INVALID_PARAMETER, 7=QUEUE_FULL,
+        // 12=HANDLE_TABLE_FULL, etc.).
         puts("init: ");
         puts(name);
-        puts(" spawn FAILED\n");
+        puts(" spawn FAILED, sys_create_process err=");
+        put_decimal(result.0);
+        puts(" (");
+        puts(syscall_err_name(result));
+        puts(")\n");
         false
+    }
+}
+
+/// Map a SyscallError to a short human-readable label so the boot
+/// log doesn't require cross-referencing constants. Reads as a
+/// single line in the failure message.
+fn syscall_err_name(e: SyscallError) -> &'static str {
+    match e {
+        SyscallError::OK                  => "OK",
+        SyscallError::INVALID_HANDLE      => "INVALID_HANDLE",
+        SyscallError::INSUFFICIENT_RIGHTS => "INSUFFICIENT_RIGHTS",
+        SyscallError::OUT_OF_MEMORY       => "OUT_OF_MEMORY",
+        SyscallError::INVALID_PARAMETER   => "INVALID_PARAMETER",
+        SyscallError::ENDPOINT_BUSY       => "ENDPOINT_BUSY",
+        SyscallError::NO_CALLER           => "NO_CALLER",
+        SyscallError::QUEUE_FULL          => "QUEUE_FULL",
+        SyscallError::NOT_MONOTONIC       => "NOT_MONOTONIC",
+        SyscallError::ALREADY_WAITING     => "ALREADY_WAITING",
+        SyscallError::WOULD_BLOCK         => "WOULD_BLOCK",
+        SyscallError::REPLY_BOUND         => "REPLY_BOUND",
+        SyscallError::HANDLE_TABLE_FULL   => "HANDLE_TABLE_FULL",
+        SyscallError::UNKNOWN             => "UNKNOWN",
+        _                                 => "?",
     }
 }
 
