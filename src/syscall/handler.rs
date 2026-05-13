@@ -544,7 +544,11 @@ fn sys_create_endpoint(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> 
     // map_existing runs in the validate phase before consume_apply.
     create_kernel_object_kvm(
         ctx.gpr[0] as u32,
-        |kva| lockjaw_types::object::HandleKind::Endpoint { kva, caller_token: 0 },
+        // Creator's handle is the master (no minted identity yet).
+        // Send/call on caller_token=None is rejected; only sender
+        // handles minted via sys_export_handle / create_process can
+        // initiate IPC. The creator can receive on this handle.
+        |kva| lockjaw_types::object::HandleKind::Endpoint { kva, caller_token: None },
         endpoint::create_endpoint,
     )
 }
@@ -754,18 +758,25 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         let exporter_ht = CurrentThread::handle_table();
         let export_entry = exporter_ht.lookup_any(handle_to_export, Rights::none())?;
 
-        // For Endpoint handles: assign a caller token.
-        // - caller_token == 0 (server's own handle): allocate fresh from endpoint.next_token
-        // - caller_token != 0 (re-export): copy unchanged (lineage preservation)
+        // For Endpoint handles: always mint a fresh caller token from
+        // the endpoint's monotonic counter, regardless of whether the
+        // exporter holds the master (caller_token=None) or a previously-
+        // exported sender handle. The identity inheres in the handle,
+        // not the lineage chain — every export is a distinct gift event,
+        // so each recipient gets a distinct identity the server can
+        // distinguish via sys_query_caller_token.
+        //
+        // See docs/book-of-lockjaw/02-handle-identity-tokens.md for the
+        // requirement → implementation mapping.
         let export_kind = match export_entry.kind {
-            lockjaw_types::object::HandleKind::Endpoint { kva, caller_token } if caller_token == 0 => {
-                // First export: assign fresh token from the endpoint's counter.
-                let mut ep = KernelMut::<crate::ipc::endpoint::EndpointObject>::from_kva(kva);
-                let token = ep.get().next_token;
-                ep.get_mut().next_token = token + 1;
-                lockjaw_types::object::HandleKind::Endpoint { kva, caller_token: token }
+            lockjaw_types::object::HandleKind::Endpoint { kva, .. } => {
+                let token = {
+                    let mut ep = KernelMut::<crate::ipc::endpoint::EndpointObject>::from_kva(kva);
+                    crate::ipc::endpoint::mint_caller_token(ep.get_mut())
+                };
+                lockjaw_types::object::HandleKind::Endpoint { kva, caller_token: Some(token) }
             }
-            other => other, // non-Endpoint or re-export: pass through
+            other => other, // non-Endpoint: pass through unchanged
         };
 
         // Insert into the caller's handle table (cross-table operation).

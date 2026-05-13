@@ -25,9 +25,13 @@ pub fn send(handle: u32, msg: [u64; 4]) -> Result<Result<(), endpoint::IpcError>
         Rights::from_bits(crate::cap::rights::RIGHT_WRITE),
         ObjectType::Endpoint,
     )?;
+    // Sender handles are HandleKind::Endpoint with caller_token=Some(t);
+    // master handles (caller_token=None) cannot send/call. The type
+    // makes the "is master?" question pattern-match instead of a magic-
+    // value check.
     let (kva, caller_token) = match entry.kind {
-        HandleKind::Endpoint { kva, caller_token } if caller_token != 0 => (kva, caller_token),
-        HandleKind::Endpoint { .. } => return Err(SyscallError::INVALID_PARAMETER),
+        HandleKind::Endpoint { kva, caller_token: Some(t) } => (kva, t.get()),
+        HandleKind::Endpoint { caller_token: None, .. } => return Err(SyscallError::INVALID_PARAMETER),
         _ => return Err(SyscallError::INVALID_PARAMETER),
     };
     // SAFETY: handle_lookup verified type == Endpoint; object lives in
@@ -63,9 +67,11 @@ pub fn call(
     let rw = Rights::from_bits(crate::cap::rights::RIGHT_READ | crate::cap::rights::RIGHT_WRITE);
     let ep_entry = ht.lookup(ep_handle, rw, ObjectType::Endpoint)?;
     let reply_entry = ht.lookup(reply_handle, rw, ObjectType::Reply)?;
+    // Same pattern as `send`: only sender handles (Some) can call;
+    // master handles (None) are receive-only.
     let (ep_kva, caller_token) = match ep_entry.kind {
-        HandleKind::Endpoint { kva, caller_token } if caller_token != 0 => (kva, caller_token),
-        HandleKind::Endpoint { .. } => return Err(SyscallError::INVALID_PARAMETER),
+        HandleKind::Endpoint { kva, caller_token: Some(t) } => (kva, t.get()),
+        HandleKind::Endpoint { caller_token: None, .. } => return Err(SyscallError::INVALID_PARAMETER),
         _ => return Err(SyscallError::INVALID_PARAMETER),
     };
     let HandleKind::Reply { kva: reply_kva } = reply_entry.kind else {

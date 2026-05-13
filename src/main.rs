@@ -566,18 +566,18 @@ pub extern "C" fn kmain() -> ! {
         );
 
         // Insert endpoint + reply handles into kernel handle table.
-        // Assign a caller token from the endpoint's counter so the kernel
-        // sender thread can use it (token 0 = receive-only).
+        // Mint a sender token via the same path sys_export_handle uses
+        // (the master/receive-only handle would have caller_token=None
+        // and reject sends; the kernel sender thread needs a sender
+        // handle just like any userspace client would).
         let ep_token = {
             let mut ep_km = mm::kernel_ptr::KernelMut::<ipc::endpoint::EndpointObject>::from_kva(ep_kva);
-            let t = ep_km.get().next_token;
-            ep_km.get_mut().next_token = t + 1;
-            t
+            ipc::endpoint::mint_caller_token(ep_km.get_mut())
         };
         handle_table::handle_insert(
             kernel_ht_kva,
             cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
-            lockjaw_types::object::HandleKind::Endpoint { kva: ep_kva, caller_token: ep_token },
+            lockjaw_types::object::HandleKind::Endpoint { kva: ep_kva, caller_token: Some(ep_token) },
         ).unwrap_or_else(|_| panic!("insert ep handle"));
         handle_table::handle_insert(
             kernel_ht_kva,

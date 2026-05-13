@@ -196,17 +196,23 @@ pub fn create_process(
     // not appear in the revoke walks above. Cannot fail: the table
     // was freshly allocated empty above and has zero entries.
     if let Some(parent) = plan.parent_copy() {
-        // For Endpoint handles: assign a caller token so the child can
-        // send/call on this handle. Same logic as sys_export_handle:
-        // token==0 → fresh from endpoint counter, nonzero → copy (lineage).
+        // For Endpoint handles: always mint a fresh caller token from
+        // the endpoint's monotonic counter. Same rule as
+        // sys_export_handle: every gift event creates a distinct
+        // identity, regardless of whether the parent's handle was the
+        // master or a previously-minted sender. The child gets its own
+        // identity that the server can distinguish from the parent's.
+        //
+        // See docs/book-of-lockjaw/02-handle-identity-tokens.md.
         let child_kind = match parent.kind {
-            lockjaw_types::object::HandleKind::Endpoint { kva, caller_token } if caller_token == 0 => {
-                let mut ep = unsafe {
-                    KernelMut::<crate::ipc::endpoint::EndpointObject>::from_kva(kva)
+            lockjaw_types::object::HandleKind::Endpoint { kva, .. } => {
+                let token = {
+                    let mut ep = unsafe {
+                        KernelMut::<crate::ipc::endpoint::EndpointObject>::from_kva(kva)
+                    };
+                    crate::ipc::endpoint::mint_caller_token(ep.get_mut())
                 };
-                let token = ep.get().next_token;
-                ep.get_mut().next_token = token + 1;
-                lockjaw_types::object::HandleKind::Endpoint { kva, caller_token: token }
+                lockjaw_types::object::HandleKind::Endpoint { kva, caller_token: Some(token) }
             }
             other => other,
         };

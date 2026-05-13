@@ -512,9 +512,14 @@ pub fn create_process(...) -> Result<(), &'static str> {
     //    the parent's table along with everyone else's and
     //    clears the PTEs as part of its work.
     // 6. Insert parent_handle_to_copy into the child's table:
-    //      - If kind is Endpoint with caller_token == 0: bump
-    //        endpoint.next_token (mutation in apply phase, fully
-    //        transactional).
+    //      - If kind is Endpoint: always mint a fresh caller_token
+    //        from endpoint.next_token regardless of whether the
+    //        parent's handle is the master (None) or a previously-
+    //        minted sender (Some). The child gets its own identity
+    //        the server can distinguish from the parent's. Mutation
+    //        happens in apply, fully transactional. See
+    //        docs/book-of-lockjaw/02-handle-identity-tokens.md for
+    //        the requirement-to-implementation mapping.
     //      - child_ht.insert(object_paddr, rights, child_kind)
     //        Cannot fail: child table was freshly allocated in
     //        step 2 and has zero entries.

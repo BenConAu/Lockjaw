@@ -48,6 +48,21 @@ pub struct EndpointObject {
     pub queue_tail: u64,
 }
 
+/// Allocate the next caller-identity token from this endpoint's
+/// monotonic counter and advance the counter. Returns the minted
+/// (nonzero) token; the caller pairs it with the `kva` to construct
+/// `HandleKind::Endpoint { kva, caller_token: Some(token) }`.
+///
+/// Single source of truth for the mint arithmetic — both
+/// `sys_export_handle` and `create_process` handle copy go through
+/// this. The pure logic + invariant tests live in
+/// `lockjaw_types::ipc_token`.
+pub fn mint_caller_token(ep: &mut EndpointObject) -> core::num::NonZeroU64 {
+    let (token, next) = lockjaw_types::ipc_token::mint_caller_token(ep.next_token);
+    ep.next_token = next;
+    token
+}
+
 /// Initialize an endpoint object in a donated page. The `ObjectInitPage`
 /// newtype guarantees the page is kernel-owned and not mapped elsewhere.
 pub fn create_endpoint(page: crate::mm::addr::ObjectInitPage) -> Result<(), CreateError> {

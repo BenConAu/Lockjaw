@@ -256,7 +256,12 @@ mod tests {
     }
 
     fn ep(kva: u64, token: u64) -> HandleKind {
-        HandleKind::Endpoint { kva: KernelVa::new(kva), caller_token: token }
+        // Test convenience: take a u64 and map 0 → master (None), nonzero
+        // → Some(NonZeroU64). Keeps the per-test call sites short.
+        HandleKind::Endpoint {
+            kva: KernelVa::new(kva),
+            caller_token: core::num::NonZeroU64::new(token),
+        }
     }
     fn notif(kva: u64) -> HandleKind {
         HandleKind::Notification { kva: KernelVa::new(kva) }

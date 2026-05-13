@@ -665,7 +665,10 @@ mod tests {
             rights: Rights::from_bits(0),
             kind: HandleKind::Endpoint {
                 kva: crate::addr::KernelVa::new(0xFFFF_8000_0000_0000 | kva_lo),
-                caller_token: 0,
+                // Master handle (no minted identity yet) — fits the
+                // "parent_handle_to_copy" inputs these tests exercise,
+                // and create_process now mints fresh on copy regardless.
+                caller_token: None,
             },
         }
     }
@@ -709,7 +712,7 @@ mod tests {
         let dummy = crate::addr::PhysAddr::new(0x4000_2000);
         let dummy_kva = crate::addr::KernelVa::new(0xFFFF_8000_0000_2000);
         for kind in [
-            HandleKind::Endpoint { kva: dummy_kva, caller_token: 0 },
+            HandleKind::Endpoint { kva: dummy_kva, caller_token: None },
             HandleKind::Notification { kva: dummy_kva },
             HandleKind::Reply { kva: dummy_kva },
         ] {
@@ -885,18 +888,18 @@ mod tests {
     #[test]
     fn record_parent_copy_preserves_endpoint_caller_token() {
         // Lockdown: ParentHandleCopy must preserve the full
-        // HandleKind::Endpoint payload, including the inner u64
-        // caller_token. Other tests use caller_token == 0 (the
-        // identity value) and pattern-match with `..`, which would
-        // miss a bug that drops or zeros the field. A wrong
-        // caller_token reaching the child means IPC replies route
-        // to the wrong reply slot — the kind of corruption that
-        // surfaces as heap damage in the child's allocator.
+        // HandleKind::Endpoint payload, including the inner caller_token
+        // identity. The builder stores and returns the entry verbatim;
+        // the kernel may later mint a fresh token at apply time, but
+        // pure-side preservation through the builder must not drop or
+        // alter the field. A wrong caller_token reaching the child
+        // could route IPC replies to the wrong slot.
+        let nonzero = core::num::NonZeroU64::new(0xDEAD_BEEF_CAFE_BABE).unwrap();
         let entry = HandleEntry {
             rights: Rights::from_bits(0),
             kind: HandleKind::Endpoint {
                 kva: crate::addr::KernelVa::new(0xFFFF_8000_1234_5000),
-                caller_token: 0xDEAD_BEEF_CAFE_BABE,
+                caller_token: Some(nonzero),
             },
         };
         let mut b = ProcessCreationPlanBuilder::new();
@@ -908,7 +911,7 @@ mod tests {
         match parent.kind {
             HandleKind::Endpoint { caller_token, .. } => {
                 assert_eq!(
-                    caller_token, 0xDEAD_BEEF_CAFE_BABE,
+                    caller_token, Some(nonzero),
                     "Endpoint caller_token must round-trip through record_parent_copy"
                 );
             }
@@ -927,7 +930,7 @@ mod tests {
             rights: Rights::from_bits(0b1010_1010),
             kind: HandleKind::Endpoint {
                 kva: crate::addr::KernelVa::new(0xFFFF_8000_1234_5000),
-                caller_token: 0,
+                caller_token: None,
             },
         };
         let mut b = ProcessCreationPlanBuilder::new();
