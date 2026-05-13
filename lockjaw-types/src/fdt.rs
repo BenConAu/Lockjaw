@@ -626,6 +626,7 @@ impl FdtDevices {
                 claimed: false,
                 clocks: [ClockRef { controller_phandle: 0, clock_id: 0 }; MAX_CLOCK_REFS],
                 clock_count: 0,
+                phandle: 0,
             }; MAX_DEVICES],
             count: 0,
         }
@@ -687,6 +688,7 @@ pub fn parse_fdt_into(data: &[u8], result: &mut FdtDevices) -> Result<(), FdtErr
                 claimed: false,
                 clocks: [ClockRef { controller_phandle: 0, clock_id: 0 }; MAX_CLOCK_REFS],
                 clock_count: 0,
+                phandle: node.phandle,
             };
 
             // Defer clocks resolution — controller's #clock-cells may
@@ -1127,6 +1129,33 @@ mod tests {
     }
 
     #[test]
+    fn pi4b_cprman_phandle_populated_in_device_info() {
+        // device-manager's clock-provider registry validates incoming
+        // CMD_GET_CLOCK_HANDLE requests against this phandle. If the
+        // FDT parser stops plumbing it into DeviceInfo, the registry
+        // would silently fail (no provider would ever match) — lock
+        // it down here.
+        let devs = parse_fdt(PI4B_DTB).unwrap();
+        let cprman_hash = compatible_hash(b"brcm,bcm2711-cprman");
+        let cprman = devs.devices[..devs.count]
+            .iter()
+            .find(|d| d.has_compat(cprman_hash))
+            .expect("Pi 4B DTB should have brcm,bcm2711-cprman");
+        assert_ne!(cprman.phandle, 0,
+                   "cprman node declares a phandle in the Pi 4B DTB");
+
+        // And the consumer's clocks-reference must point to that
+        // exact phandle — both sides of the binding agree.
+        let emmc2_hash = compatible_hash(b"brcm,bcm2711-emmc2");
+        let emmc2 = devs.devices[..devs.count]
+            .iter()
+            .find(|d| d.has_compat(emmc2_hash))
+            .expect("Pi 4B DTB should have brcm,bcm2711-emmc2");
+        assert_eq!(emmc2.clocks[0].controller_phandle, cprman.phandle,
+                   "emmc2's clocks ref must point at cprman's phandle");
+    }
+
+    #[test]
     fn pi4b_emmc2_has_clocks_resolved() {
         let devs = parse_fdt(PI4B_DTB).unwrap();
         let emmc2_hash = compatible_hash(b"brcm,bcm2711-emmc2");
@@ -1176,6 +1205,7 @@ mod tests {
             claimed: false,
             clocks: [ClockRef { controller_phandle: 0, clock_id: 0 }; MAX_CLOCK_REFS],
             clock_count: 0,
+            phandle: 0,
         };
         let bytes: [u8; 8] = [
             0, 0, 0, 0xCC,  // phandle 0xCC (not in providers)
@@ -1200,6 +1230,7 @@ mod tests {
             claimed: false,
             clocks: [ClockRef { controller_phandle: 0, clock_id: 0 }; MAX_CLOCK_REFS],
             clock_count: 0,
+            phandle: 0,
         };
         let bytes: [u8; 8] = [
             0, 0, 0, 0xAA,  // phandle 0xAA (in providers, #clock-cells = 1)
@@ -1225,6 +1256,7 @@ mod tests {
             claimed: false,
             clocks: [ClockRef { controller_phandle: 0, clock_id: 0 }; MAX_CLOCK_REFS],
             clock_count: 0,
+            phandle: 0,
         };
         let bytes: [u8; 16] = [
             0, 0, 0, 0xAA,  // phandle AA (1 cell)

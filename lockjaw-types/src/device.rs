@@ -80,6 +80,13 @@ pub struct DeviceInfo {
     pub clocks: [ClockRef; MAX_CLOCK_REFS],
     /// Number of valid entries in `clocks`.
     pub clock_count: u8,
+    /// This node's own DTB phandle (the value other nodes use to
+    /// reference it via `<&phandle ...>`). 0 = no phandle declared.
+    /// Phandle 0 is reserved by the DTB spec, so 0 is a safe
+    /// "absent" sentinel. Used by device-manager's clock-provider
+    /// registry to validate `controller_phandle` arguments to
+    /// CMD_GET_CLOCK_HANDLE.
+    pub phandle: u32,
 }
 
 impl DeviceInfo {
@@ -191,12 +198,12 @@ mod tests {
 
     #[test]
     fn device_info_size() {
-        // Cap at 128 bytes per entry. MAX_DEVICES (64) entries fits
-        // in 8 KB, well within the userspace device-manager's 16 KB
-        // page-array budget. Layout: 4 compat hashes (32) + counts +
-        // padding + mmio_addr (8) + mmio_size (8) + intid (4) +
-        // claimed (1) + padding + clocks (4 × 8 = 32) + clock_count
-        // (1) + padding = ~96.
+        // Cap at 128 bytes per entry. MAX_DEVICES (192) entries fits
+        // in ~24 KB, well within the userspace device-manager's
+        // page-array budget. Layout: 4 compat hashes (32) +
+        // compat_count (1) + padding + mmio_addr (8) + mmio_size (8)
+        // + intid (4) + claimed (1) + padding + clocks (4 × 8 = 32)
+        // + clock_count (1) + phandle (4) + padding ~ 104.
         assert!(core::mem::size_of::<DeviceInfo>() <= 128);
     }
 

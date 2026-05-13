@@ -10,7 +10,12 @@ static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
 use core::ptr;
 use lockjaw_userlib::*;
-use lockjaw_types::clock::{ClockError, cprman::*};
+use lockjaw_types::clock::{
+    ClockError,
+    CLOCK_OK, CLOCK_ERR_NOT_SUPPORTED,
+    CLOCK_OP_SET_RATE, CLOCK_OP_GET_RATE, CLOCK_OP_ENABLE, CLOCK_OP_DISABLE,
+    cprman::*,
+};
 use lockjaw_types::device::BCM2711_CPRMAN_HASH;
 
 // ---------------------------------------------------------------------------
@@ -86,9 +91,7 @@ unsafe fn emmc2_set_rate(base: u64, target_hz: u64) -> Result<u64, ClockError> {
 }
 
 /// Read the current EMMC2 output rate from the divider register.
-/// `#[allow(dead_code)]` because the M0b self-test exercises only
-/// `set_rate`. M0c's IPC dispatch table will route GET_RATE here.
-#[allow(dead_code)]
+/// Called from the M0c IPC dispatch path (`dispatch_emmc2`).
 unsafe fn emmc2_get_rate(base: u64) -> Result<u64, ClockError> {
     let divider = cm_read(base, CM_EMMC2DIV) & 0xFF_FFFF;
     if divider == 0 {
@@ -150,53 +153,116 @@ pub extern "C" fn _start() -> ! {
         Ok(r) => r,
         Err(_) => { puts("cprman: bootstrap FAILED\n"); halt(); }
     };
-    // Reply layout: [server_ep, devmgr_client, _, _]. We don't serve
-    // an IPC endpoint yet (M0c will add the cap path), so server_ep
-    // is stashed but not used this milestone.
-    let _server_ep = EndpointHandle(reply[0]);
+    // Reply layout: [server_ep, devmgr_client, _, _]. server_ep is
+    // the endpoint we receive clock-op IPCs on; the only legitimate
+    // caller is device-manager (the proxy / arbiter — see
+    // docs/book-of-lockjaw/03-non-virtualizable-hardware.md).
+    let server_ep = EndpointHandle(reply[0]);
     let devmgr_client = EndpointHandle(reply[1]);
     puts("cprman: bootstrapped\n");
 
     // Claim the CPRMAN device. On QEMU virt this fails (no
-    // brcm,bcm2711-cprman); we exit cleanly with a message so the
-    // process doesn't hang. On Pi 4B the claim returns the MMIO
-    // PageSet handle.
+    // brcm,bcm2711-cprman); we keep the process alive serving
+    // NotSupported for everything so the broker IPC path is still
+    // exercised end-to-end on QEMU. On Pi 4B the claim returns the
+    // MMIO PageSet handle.
     let claim = match sys_call_ret4(
         devmgr_client, reply_obj, CMD_CLAIM_DEVICE, BCM2711_CPRMAN_HASH, 0, 0,
     ) {
         Ok(r) => r,
         Err(_) => { puts("cprman: claim call FAILED\n"); halt(); }
     };
-    if claim[0] != CLAIM_OK {
-        puts("cprman: no BCM2711 CPRMAN on this platform (expected on QEMU)\n");
-        halt();
-    }
-    let mmio_pageset = PageSetHandle(claim[1]);
-
-    // Map the first page of the CPRMAN register region. The DTB
-    // declares the full region as 0x2000 (8 KB / 2 pages), but the
-    // device-manager claim path returns a single-page PageSet today
-    // (`sys_register_device_page` in src/cap/pageset_table.rs is
-    // explicitly one-page). Both M0b registers we touch
-    // (CM_EMMC2CTL = 0x1d0, CM_EMMC2DIV = 0x1d4) are inside the
-    // first 4 KB, so 1 page is sufficient. When a future clock
-    // leaf needs registers in the second page, the
-    // claim-multi-page path will need to land first.
-    let mmio_va = match VMEM.alloc(1) {
-        Some(va) => va,
-        None => { puts("cprman: VA exhausted for MMIO\n"); halt(); }
+    let mmio_va = if claim[0] == CLAIM_OK {
+        let mmio_pageset = PageSetHandle(claim[1]);
+        // Map the first page of the CPRMAN register region. The DTB
+        // declares the full region as 0x2000 (8 KB / 2 pages), but
+        // the device-manager claim path returns a single-page
+        // PageSet today (`sys_register_device_page` in
+        // src/cap/pageset_table.rs is explicitly one-page). Both
+        // M0b registers we touch (CM_EMMC2CTL = 0x1d0,
+        // CM_EMMC2DIV = 0x1d4) are inside the first 4 KB, so 1 page
+        // is sufficient. When a future clock leaf needs registers
+        // in the second page, the claim-multi-page path will need
+        // to land first.
+        let va = match VMEM.alloc(1) {
+            Some(va) => va,
+            None => { puts("cprman: VA exhausted for MMIO\n"); halt(); }
+        };
+        if !sys_map_pages(mmio_pageset, va, MAP_FLAG_DEVICE).is_ok() {
+            puts("cprman: map MMIO FAILED\n");
+            halt();
+        }
+        // Run the self-test (prints the three M0b success lines).
+        unsafe { self_test(va); }
+        Some(va)
+    } else {
+        puts("[CPRMAN] no BCM2711 CPRMAN on this platform (QEMU); serving NotSupported for all clock ops\n");
+        None
     };
-    if !sys_map_pages(mmio_pageset, mmio_va, MAP_FLAG_DEVICE).is_ok() {
-        puts("cprman: map MMIO FAILED\n");
-        halt();
+
+    serve(server_ep, mmio_va);
+}
+
+/// Server loop. The only legitimate caller is device-manager, which
+/// has already validated the binding (caller_token → clock_id) on
+/// behalf of the actual driver client. cprman trusts the message
+/// body's `clock_id` and dispatches accordingly.
+///
+/// On platforms where the CPRMAN device wasn't present (QEMU virt),
+/// `mmio_va` is `None` and every op replies NotSupported with the
+/// requested id echoed back. The IPC plumbing is exercised either
+/// way; only the side-effecting MMIO path is conditional.
+fn serve(server_ep: EndpointHandle, mmio_va: Option<u64>) -> ! {
+    loop {
+        let msg = match sys_receive_ret4(server_ep) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let op = msg[0];
+        let clock_id_raw = msg[1] as u32;
+        let arg = msg[2];
+
+        // Translate the raw id into the typed enum. Unknown ids
+        // surface as NotSupported with the offending id echoed —
+        // the caller's log message stays meaningful.
+        let typed = ClockId::try_from_u32(clock_id_raw);
+
+        // If the device wasn't claimed (QEMU), every leaf is
+        // NotSupported regardless of the id. Same wire shape as a
+        // real provider that doesn't model this leaf.
+        let result = match (mmio_va, typed) {
+            (None, _) => Err(ClockError::NotSupported(clock_id_raw)),
+            (_, Err(e)) => Err(e),
+            (Some(base), Ok(ClockId::Emmc2)) => unsafe { dispatch_emmc2(base, op, arg) },
+        };
+
+        // sys_reply returns SyscallError; discard so the match
+        // produces the loop-body unit type.
+        let _ = match result {
+            Ok(value) => sys_reply(CLOCK_OK, value, 0, 0),
+            Err(ClockError::NotSupported(id)) =>
+                sys_reply(CLOCK_ERR_NOT_SUPPORTED, id as u64, 0, 0),
+            Err(e) => sys_reply(e.status_code(), 0, 0, 0),
+        };
     }
+}
 
-    // Run the self-test (prints the three M0b success lines).
-    unsafe { self_test(mmio_va); }
-
-    // M0b ends here. M0c will replace this halt with the IPC server
-    // loop that receives ClockOp messages from cap-holding clients.
-    halt();
+/// Dispatch a clock op to the EMMC2 leaf. SET_RATE / GET_RATE return
+/// the actual rate; ENABLE / DISABLE return 0 on success. Unknown
+/// opcodes surface as `BadOp`.
+unsafe fn dispatch_emmc2(base: u64, op: u64, arg: u64) -> Result<u64, ClockError> {
+    match op {
+        CLOCK_OP_SET_RATE => emmc2_set_rate(base, arg),
+        CLOCK_OP_GET_RATE => emmc2_get_rate(base),
+        // ENABLE / DISABLE are no-ops at this milestone:
+        // emmc2_set_rate already programs ENABLE as part of the
+        // mandatory disable→divider→enable sequence (per
+        // bcm2835_clock_on). Standalone gating is M2+ work; for
+        // now, accept the op so the IPC contract is complete and
+        // return success.
+        CLOCK_OP_ENABLE | CLOCK_OP_DISABLE => Ok(0),
+        _ => Err(ClockError::BadOp),
+    }
 }
 
 fn halt() -> ! {

@@ -69,6 +69,14 @@ static FAT32_ELF: &[u8] = include_bytes!("../../fat32-server/target/aarch64-unkn
 /// Built by: cd user/fat32-test && cargo build --release
 static FAT32_TEST_ELF: &[u8] = include_bytes!("../../fat32-test/target/aarch64-unknown-none/release/lockjaw-fat32-test");
 
+/// The CPRMAN clock-controller driver ELF binary, embedded at compile time.
+/// Built by: cd user/cprman-driver && cargo build --release
+static CPRMAN_ELF: &[u8] = include_bytes!("../../cprman-driver/target/aarch64-unknown-none/release/lockjaw-cprman-driver");
+
+/// The clock-cap proxy verification client, embedded at compile time.
+/// Built by: cd user/clock-test && cargo build --release
+static CLOCK_TEST_ELF: &[u8] = include_bytes!("../../clock-test/target/aarch64-unknown-none/release/lockjaw-clock-test");
+
 // ---------------------------------------------------------------------------
 // ELF spawn helper
 // ---------------------------------------------------------------------------
@@ -348,6 +356,11 @@ pub extern "C" fn _start() -> ! {
     let ep_handle = alloc_endpoint("uart srv");
     let devmgr_ep = alloc_endpoint("devmgr srv");
     let display_ep = alloc_endpoint("display srv");
+    // CPRMAN clock-provider endpoint. The only legitimate caller is
+    // device-manager (the arbiter for non-virtualizable hardware —
+    // see docs/book-of-lockjaw/03-non-virtualizable-hardware.md);
+    // drivers never receive a handle to this.
+    let cprman_srv_ep = alloc_endpoint("cprman srv");
     let hello_boot_ep = alloc_endpoint("hello boot");
     let devmgr_boot_ep = alloc_endpoint("devmgr boot");
     let uart_boot_ep = alloc_endpoint("uart boot");
@@ -359,6 +372,8 @@ pub extern "C" fn _start() -> ! {
     let fat32_boot_ep = alloc_endpoint("fat32 boot");
     let fat32_test_boot_ep = alloc_endpoint("fat32-test boot");
     let posix_boot_ep = alloc_endpoint("posix boot");
+    let cprman_boot_ep = alloc_endpoint("cprman boot");
+    let clock_test_boot_ep = alloc_endpoint("clock-test boot");
 
     // Spawn child processes.
     // Allocate VAs for ELF loading. These are reused across spawns
@@ -389,6 +404,11 @@ pub extern "C" fn _start() -> ! {
 
     spawn_elf(HELLO_ELF, "hello", map_array_va, temp_base_va, plan_buf_va, scratch_ps, hello_boot_ep, 1);
     spawn_elf(DEVMGR_ELF, "device-manager", map_array_va, temp_base_va, plan_buf_va, scratch_ps, devmgr_boot_ep, 8);
+    // cprman-driver early so the clock provider is up before any
+    // future driver that depends on a clock cap (M1+ emmc2-driver
+    // will). On QEMU the CPRMAN device claim fails gracefully and
+    // cprman serves NotSupported for every clock op.
+    spawn_elf(CPRMAN_ELF, "cprman-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, cprman_boot_ep, 4);
     spawn_elf(UART_ELF, "uart-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, uart_boot_ep, 4);
     spawn_elf(RAMFB_ELF, "ramfb-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, ramfb_boot_ep, 4);
     spawn_elf(BLK_ELF, "blk-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, blk_boot_ep, 4);
@@ -396,6 +416,7 @@ pub extern "C" fn _start() -> ! {
     spawn_elf(FAT32_TEST_ELF, "fat32-test", map_array_va, temp_base_va, plan_buf_va, scratch_ps, fat32_test_boot_ep, 4);
     spawn_elf(POSIX_SERVER_ELF, "posix-server", map_array_va, temp_base_va, plan_buf_va, scratch_ps, posix_boot_ep, 8);
     spawn_elf(DISPLAY_TEST_ELF, "display-test", map_array_va, temp_base_va, plan_buf_va, scratch_ps, display_test_boot_ep, 1);
+    spawn_elf(CLOCK_TEST_ELF, "clock-test", map_array_va, temp_base_va, plan_buf_va, scratch_ps, clock_test_boot_ep, 1);
 
     // Bootstrap hello: export a test notification into its handle table.
     puts("init: waiting for hello bootstrap...\n");
@@ -429,15 +450,41 @@ pub extern "C" fn _start() -> ! {
     sys_reply(exported_idx, 0, 0, 0);
     puts("[BOOTSTRAP] hello\n");
 
-    // Bootstrap device-manager: export devmgr_ep so it can serve device claims.
+    // Bootstrap device-manager: export devmgr_ep (its server) plus
+    // cprman_srv_ep (its only path to forward clock ops to the
+    // clock provider — see
+    // docs/book-of-lockjaw/03-non-virtualizable-hardware.md). cprman
+    // hasn't bootstrapped yet at this point; that's fine, the
+    // sys_call inside devmgr's clock-op forwarding will block until
+    // cprman is alive and receiving.
     puts("init: waiting for devmgr bootstrap...\n");
     let _ = sys_receive(devmgr_boot_ep);
     let devmgr_ep_idx = match sys_export_handle(devmgr_ep) {
         Ok(idx) => idx,
         Err(_) => { puts("init: export devmgr_ep FAILED\n"); loop { sys_yield(); } }
     };
-    sys_reply(devmgr_ep_idx, 0, 0, 0);
+    let devmgr_cprman_idx = match sys_export_handle(cprman_srv_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export cprman_srv_ep to devmgr FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(devmgr_ep_idx, devmgr_cprman_idx, 0, 0);
     puts("[BOOTSTRAP] devmgr\n");
+
+    // Bootstrap cprman-driver: export cprman_srv_ep (the endpoint
+    // it serves clock ops on) plus devmgr_ep (so it can claim its
+    // CPRMAN MMIO device). Same shape as uart-driver bootstrap.
+    puts("init: waiting for cprman bootstrap...\n");
+    let _ = sys_receive(cprman_boot_ep);
+    let cprman_srv_idx = match sys_export_handle(cprman_srv_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export cprman_srv_ep to cprman FAILED\n"); loop { sys_yield(); } }
+    };
+    let cprman_devmgr_idx = match sys_export_handle(devmgr_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export devmgr to cprman FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(cprman_srv_idx, cprman_devmgr_idx, 0, 0);
+    puts("[BOOTSTRAP] cprman\n");
 
     // Bootstrap UART driver: export ep_handle (its IPC server) and devmgr_ep (its client).
     puts("init: waiting for uart bootstrap...\n");
@@ -530,6 +577,20 @@ pub extern "C" fn _start() -> ! {
     };
     sys_reply(posix_fs_idx, 0, 0, 0);
     puts("[BOOTSTRAP] posix-server\n");
+
+    // Bootstrap clock-test: export devmgr_ep so the test client can
+    // exercise CMD_GET_CLOCK_HANDLE + CLOCK_OP_SET_RATE through the
+    // proxy. On QEMU the SET_RATE will return NotSupported (no
+    // CPRMAN device); the test asserts the proxy plumbing works
+    // end-to-end either way.
+    puts("init: waiting for clock-test bootstrap...\n");
+    let _ = sys_receive(clock_test_boot_ep);
+    let clock_test_devmgr_idx = match sys_export_handle(devmgr_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export devmgr_ep to clock-test FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(clock_test_devmgr_idx, 0, 0, 0);
+    puts("[BOOTSTRAP] clock-test\n");
 
     // Allocate a Reply object for init's own outbound calls (ipc_puts to
     // the uart server). Each client that issues sys_call needs one.

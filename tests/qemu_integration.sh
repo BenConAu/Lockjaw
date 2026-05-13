@@ -113,6 +113,22 @@ assert_contains "\[BOOTSTRAP\] display-test" "Init-display-test bootstrap IPC co
 assert_contains "\[BOOTSTRAP\] fat32" "Init-fat32 bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] fat32-test" "Init-fat32-test bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] posix-server" "Init-posix-server bootstrap IPC completed"
+assert_contains "\[BOOTSTRAP\] cprman" "Init-cprman bootstrap IPC completed"
+assert_contains "\[BOOTSTRAP\] clock-test" "Init-clock-test bootstrap IPC completed"
+# M0c clock-provider arbitration: device-manager validates incoming
+# CMD_GET_CLOCK_HANDLE requests against its registry of clock providers
+# (built from the DTB scan at startup; today only bcm2711-cprman is
+# recognised). On QEMU virt the cprman device is absent, so any request
+# -- including the deliberately-bogus placeholder phandle the test client
+# sends -- must come back as NoProvider. This locks down the validation
+# gate; the SET_RATE forwarding path through the proxy is exercised on
+# Pi 4B from M1 onward when emmc2-driver acquires a real handle.
+assert_contains "devmgr: no cprman in DTB; clock requests will return NoProvider" \
+    "M0c device-manager has no cprman provider on QEMU virt"
+assert_contains "\[CLOCK-TEST\] CMD_GET_CLOCK_HANDLE refused unregistered phandle (expected on QEMU)" \
+    "M0c device-manager refuses CMD_GET_CLOCK_HANDLE for unregistered controller_phandle"
+assert_not_contains "\[CLOCK-TEST\] BUG:" \
+    "M0c device-manager did not silently accept the bogus controller_phandle"
 
 echo "Phase 9 — Thread Exit:"
 assert_contains "\[EXIT\] Thread" "Thread cleanup ran (finish_exit)"
