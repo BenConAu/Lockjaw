@@ -68,9 +68,24 @@ static mut BOOT_DTB_PADDR: u64 = 0;
 /// DTB PageSet ID, set once at boot. Returned by sys_get_boot_info.
 static DTB_PAGESET_ID: BootOnce = BootOnce::new();
 
+/// In-page offset of the DTB header within the first physical page
+/// of `DTB_PAGESET_ID`'s page set. Nonzero on platforms whose
+/// firmware places the DTB at an unaligned address (notably Pi 4B,
+/// which typically uses 0xe00). Userspace adds this offset to the
+/// mapped VA before reading DTB bytes. See
+/// `lockjaw_types::dtb_layout` for the requirement-to-implementation
+/// mapping; the host tests there pin down the recovery flow without
+/// requiring a real boot.
+static DTB_IN_PAGE_OFFSET: BootOnce = BootOnce::new();
+
 /// Get the DTB PageSet ID (called by sys_get_boot_info handler).
 pub fn dtb_pageset_id() -> u64 {
     DTB_PAGESET_ID.get()
+}
+
+/// Get the DTB in-page offset (called by sys_get_boot_info handler).
+pub fn dtb_in_page_offset() -> u64 {
+    DTB_IN_PAGE_OFFSET.get()
 }
 
 #[no_mangle]
@@ -189,31 +204,52 @@ pub extern "C" fn kmain() -> ! {
             if magic == 0xd00dfeed { "valid" } else { "INVALID" }, ")");
     }
 
-    // Register DTB pages as a PageSet so userspace can map them normally.
-    // This avoids the MAIR_DEVICE aliasing problem (DTB is normal RAM, not MMIO).
-    // Compute page count from the DTB header's totalsize field instead of
-    // hardcoding — the DTB size varies with -smp and -device flags.
+    // Register DTB pages as a PageSet so userspace can map them
+    // normally (avoids the MAIR_DEVICE aliasing problem — DTB is
+    // normal RAM, not MMIO). Compute page count from the DTB
+    // header's totalsize field rather than hardcoding — the DTB
+    // size varies with `-smp` and `-device` flags on QEMU and
+    // differs across boards.
+    //
+    // The firmware-supplied `dtb_paddr` is *not* guaranteed to be
+    // page-aligned: Pi 4B's VC firmware typically uses 0xe00 in the
+    // low 12 bits. `lockjaw_types::dtb_layout::compute_layout`
+    // returns the page-aligned first page, the in-page offset, and
+    // the (offset-aware) page count. The host tests in that module
+    // exercise the recovery flow against the QEMU virt DTB blob at
+    // multiple offsets — pin down the layout math without needing
+    // a real Pi.
     {
-        let dtb_content_end = unsafe {
+        let dtb_content_size = unsafe {
             // SAFETY: kernel VA, DTB header validated above
             let h = (dtb_paddr + mm::addr::KERNEL_VA_OFFSET) as *const u8;
             let header = core::slice::from_raw_parts(h, 40);
             lockjaw_types::fdt::dtb_content_size(header)
-                .unwrap_or_else(|_| panic!("DTB header invalid")) as u64
+                .unwrap_or_else(|_| panic!("DTB header invalid"))
         };
-        let dtb_page_count = ((dtb_content_end + mm::addr::PAGE_SIZE - 1) / mm::addr::PAGE_SIZE) as usize;
-        if dtb_page_count > 16 {
-            kprintln!("DTB content too large: ", dtb_page_count, " pages");
+        let layout = lockjaw_types::dtb_layout::compute_layout(
+            mm::addr::PhysAddr::new(dtb_paddr),
+            dtb_content_size,
+        );
+        if layout.page_count > 16 {
+            kprintln!("DTB content too large: ", layout.page_count, " pages");
             panic!("DTB content too large");
         }
-        let mut dtb_pages = [mm::addr::PhysAddr::new(0); 16];
-        for i in 0..dtb_page_count {
-            dtb_pages[i] = mm::addr::PhysAddr::new(dtb_paddr + (i as u64) * mm::addr::PAGE_SIZE);
+        let mut dtb_pages = [layout.first_page; 16];
+        for i in 0..layout.page_count {
+            dtb_pages[i] = layout.first_page.add_pages(i);
         }
-        let dtb_ps_id = cap::pageset_table::register_existing(dtb_page_count, &dtb_pages[..dtb_page_count])
+        let dtb_ps_id = cap::pageset_table::register_existing(
+            layout.page_count, &dtb_pages[..layout.page_count])
             .unwrap_or_else(|| panic!("DTB PageSet registration failed"));
         DTB_PAGESET_ID.set(dtb_ps_id);
-        kprintln!("DTB PageSet registered: id=", dtb_ps_id, ", ", dtb_page_count, " pages (", dtb_content_end, " bytes content)");
+        DTB_IN_PAGE_OFFSET.set(layout.in_page_offset as u64);
+        kprintln!(
+            "DTB PageSet registered: id=", dtb_ps_id,
+            ", ", layout.page_count, " pages (",
+            dtb_content_size, " bytes content, in-page offset ",
+            crate::print::Hex(layout.in_page_offset as u64), ")",
+        );
     }
 
     // Set up guard pages (unmapped) for all per-CPU stacks and init canary

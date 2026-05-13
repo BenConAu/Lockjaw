@@ -355,15 +355,21 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // Test sys_get_boot_info — map the DTB PageSet and verify the magic.
-    let dtb_ps = match sys_get_boot_info() {
-        Ok(id) => id,
+    // Test sys_get_boot_info — map the DTB PageSet and verify the
+    // magic. The DTB header may not start at the first byte of the
+    // mapping if the firmware placed the DTB at an unaligned
+    // physical address (Pi 4B's VC firmware typically uses 0xe00 in
+    // the low 12 bits); apply `dtb_in_page_offset` from the kernel
+    // before reading.
+    let boot_info = match sys_get_boot_info() {
+        Ok(b) => b,
         Err(_) => { puts("init: get_boot_info FAILED\n"); loop { sys_yield(); } }
     };
     let dtb_va = VMEM.alloc(16).expect("VA exhausted for DTB"); // 16 pages max
-    if sys_map_pages(dtb_ps, dtb_va, 0).is_ok() {
+    if sys_map_pages(boot_info.dtb_pageset, dtb_va, 0).is_ok() {
+        let dtb_header_va = dtb_va + boot_info.dtb_in_page_offset as u64;
         let magic = unsafe {
-            let p = dtb_va as *const u8;
+            let p = dtb_header_va as *const u8;
             u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
         };
         if magic == 0xd00dfeed {

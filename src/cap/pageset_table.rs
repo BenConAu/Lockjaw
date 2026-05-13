@@ -225,25 +225,50 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
     }
 }
 
-/// Register a PageSet for existing physical pages (not from the allocator).
-/// Used at boot to wrap the DTB pages placed by QEMU firmware.
-/// Allocates header_pages_for(count) extra contiguous pages for the header.
-pub fn register_existing(count: usize, pages: &[PhysAddr]) -> Option<u64> {
-    if count == 0 || count > MAX_PRACTICAL_PAGES_PER_SET {
+/// Maximum pages for a single `register_existing` call. The only
+/// caller today is the DTB boot path, which caps itself at 16
+/// (`dtb_page_count > 16` panics in `src/main.rs`). 64 is generous
+/// headroom for any future firmware-placed region we might want to
+/// wrap. Constrained to keep the per-call stack temporary small.
+pub const MAX_REGISTER_EXISTING_PAGES: usize = 64;
+
+/// Register a PageSet for existing physical pages (not from the
+/// allocator). Used at boot to wrap firmware-placed regions like the
+/// DTB. Allocates `header_pages_for(count)` extra contiguous pages
+/// for the header.
+///
+/// **Type-level alignment guarantee:** the slice element is
+/// `PhysPage`, not `PhysAddr`. This is the load-bearing distinction
+/// that prevents the Pi DTB class of bug — `PhysPage` literally
+/// cannot represent an unaligned address (its inner u64 is the page
+/// number; `start_addr()` shifts left by `PAGE_SHIFT` so the low 12
+/// bits are always zero by construction). Callers wanting to wrap
+/// an arbitrary firmware-supplied address must explicitly choose
+/// between `PhysPage::aligned(addr)?` (fail loudly when the address
+/// should already be aligned) and `PhysPage::containing(addr)`
+/// (round down and own the in-page offset themselves — see
+/// `lockjaw_types::dtb_layout` for the canonical pattern).
+///
+/// Capped at `MAX_REGISTER_EXISTING_PAGES` so the per-call stack
+/// temporary stays small. Returns `None` if `count` is zero, exceeds
+/// the cap, or is larger than the supplied slice.
+pub fn register_existing(count: usize, pages: &[PhysPage]) -> Option<u64> {
+    if count == 0 || count > MAX_REGISTER_EXISTING_PAGES || pages.len() < count {
         return None;
     }
 
-    // SAFETY: PhysAddr is repr(transparent) over u64, same layout.
-    let addrs: &[u64] = unsafe {
-        core::slice::from_raw_parts(
-            // SAFETY: PhysAddr → u64 transmute via repr(transparent)
-            pages.as_ptr() as *const u64,
-            count,
-        )
-    };
+    // Materialise page-base PhysAddrs for the header. PhysPage stores
+    // the page number; the header stores page-base byte addresses.
+    // The two differ by a PAGE_SHIFT shift, so a transmute would
+    // silently store wrong values — emit through start_addr().
+    let mut addrs = [0u64; MAX_REGISTER_EXISTING_PAGES];
+    for i in 0..count {
+        addrs[i] = pages[i].start_addr().as_u64();
+    }
+
     // Header pages freed by guard on insert failure.
     // Data pages are firmware-placed — not ours to free.
-    alloc_and_insert_header(addrs, count)
+    alloc_and_insert_header(&addrs[..count], count)
 }
 
 /// Wrap a physical MMIO address as a 1-page PageSet (no allocation from pool, just tracking).

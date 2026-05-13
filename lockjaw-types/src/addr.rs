@@ -51,15 +51,54 @@ pub struct PhysPage(u64);
 
 impl PhysPage {
     /// Return the page containing the given physical address.
+    /// Lossy: silently rounds down. Use [`aligned`] when the
+    /// caller's intent is "this address must already be page-
+    /// aligned" — that variant fails loudly on misuse.
+    ///
+    /// [`aligned`]: PhysPage::aligned
     pub const fn containing(addr: PhysAddr) -> Self {
         addr.containing_page()
+    }
+
+    /// Promote a known-aligned `PhysAddr` to a `PhysPage`. Returns
+    /// `Err(NotPageAligned)` if the address has nonzero low 12 bits.
+    ///
+    /// Use this in code paths where treating an unaligned address
+    /// as a page would be a bug — the alternative `containing`
+    /// silently rounds down, which is the right operation when the
+    /// caller is explicitly normalising an arbitrary address but
+    /// the wrong operation when the contract is "this is already a
+    /// page base." Pinning that distinction at the type level is
+    /// what blocks the Pi DTB class of bug from recurring (see
+    /// `lockjaw_types::dtb_layout`).
+    pub const fn aligned(addr: PhysAddr) -> Result<Self, NotPageAligned> {
+        let raw = addr.as_u64();
+        if raw & (PAGE_SIZE - 1) != 0 {
+            Err(NotPageAligned(raw))
+        } else {
+            Ok(PhysPage(raw >> PAGE_SHIFT))
+        }
     }
 
     /// Physical address of the first byte in this page.
     pub const fn start_addr(self) -> PhysAddr {
         PhysAddr(self.0 << PAGE_SHIFT)
     }
+
+    /// Page `n` after this one. Wraps via `wrapping_add`; out-of-
+    /// range arithmetic is the caller's responsibility (the bounds
+    /// of physical memory live elsewhere). Used by the boot path to
+    /// walk the contiguous physical span containing the DTB.
+    pub const fn add_pages(self, n: usize) -> Self {
+        PhysPage(self.0.wrapping_add(n as u64))
+    }
 }
+
+/// Error returned by `PhysPage::aligned` when the input `PhysAddr`
+/// has nonzero low 12 bits. Carries the raw u64 so the caller can
+/// log "expected page-aligned, got 0x...".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotPageAligned(pub u64);
 
 impl fmt::Debug for PhysPage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -240,6 +279,41 @@ mod tests {
         let addr = PhysAddr::new(0x4000_0000);
         let page = PhysPage::containing(addr);
         assert_eq!(page.start_addr(), addr);
+    }
+
+    #[test]
+    fn phys_page_aligned_accepts_page_aligned() {
+        let p = PhysPage::aligned(PhysAddr::new(0x4000_0000)).unwrap();
+        assert_eq!(p.start_addr().as_u64(), 0x4000_0000);
+        let p = PhysPage::aligned(PhysAddr::new(0)).unwrap();
+        assert_eq!(p.start_addr().as_u64(), 0);
+    }
+
+    #[test]
+    fn phys_page_aligned_rejects_unaligned() {
+        // Pi 4B's typical DTB address — the original bug.
+        assert_eq!(
+            PhysPage::aligned(PhysAddr::new(0x2eff_1e00)),
+            Err(NotPageAligned(0x2eff_1e00)),
+        );
+        // Off by 1.
+        assert_eq!(
+            PhysPage::aligned(PhysAddr::new(0x4000_0001)),
+            Err(NotPageAligned(0x4000_0001)),
+        );
+        // Off by PAGE_SIZE - 1.
+        assert_eq!(
+            PhysPage::aligned(PhysAddr::new(0x4000_0FFF)),
+            Err(NotPageAligned(0x4000_0FFF)),
+        );
+    }
+
+    #[test]
+    fn phys_page_add_pages_walks_contiguously() {
+        let base = PhysPage::aligned(PhysAddr::new(0x4000_0000)).unwrap();
+        assert_eq!(base.add_pages(0).start_addr().as_u64(), 0x4000_0000);
+        assert_eq!(base.add_pages(1).start_addr().as_u64(), 0x4000_1000);
+        assert_eq!(base.add_pages(15).start_addr().as_u64(), 0x4000_F000);
     }
 
     #[test]

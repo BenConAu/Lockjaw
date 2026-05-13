@@ -367,20 +367,42 @@ pub fn sys_unmap_pages(ps: PageSetHandle, va: u64) -> SyscallError {
     SyscallError(err)
 }
 
+/// Boot info returned by the kernel: the DTB PageSet handle plus the
+/// in-page offset of the DTB header within the first page of that
+/// PageSet. The offset is nonzero on platforms whose firmware places
+/// the DTB at an unaligned physical address (notably Pi 4B). To read
+/// DTB bytes, map the PageSet at some VA and start reading at
+/// `va + dtb_in_page_offset`.
+///
+/// See `lockjaw_types::dtb_layout` for the layout model.
+#[derive(Clone, Copy, Debug)]
+pub struct BootInfo {
+    pub dtb_pageset: PageSetHandle,
+    pub dtb_in_page_offset: u32,
+}
+
 /// Get boot information from the kernel.
-/// Returns a PageSet handle for the DTB.
-pub fn sys_get_boot_info() -> Result<PageSetHandle, SyscallError> {
+pub fn sys_get_boot_info() -> Result<BootInfo, SyscallError> {
     let err: u64;
-    let val: u64;
+    let dtb_handle: u64;
+    let dtb_offset: u64;
     unsafe {
         asm!(
             "svc #0",
             in("x8") SYS_GET_BOOT_INFO,
             lateout("x0") err,
-            lateout("x1") val,
+            lateout("x1") dtb_handle,
+            lateout("x2") dtb_offset,
         );
     }
-    if err == 0 { Ok(PageSetHandle(val)) } else { Err(SyscallError(err)) }
+    if err == 0 {
+        Ok(BootInfo {
+            dtb_pageset: PageSetHandle(dtb_handle),
+            dtb_in_page_offset: dtb_offset as u32,
+        })
+    } else {
+        Err(SyscallError(err))
+    }
 }
 
 /// Register a physical MMIO address as a tracked PageSet.

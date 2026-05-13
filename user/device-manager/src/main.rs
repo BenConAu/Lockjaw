@@ -92,33 +92,39 @@ pub extern "C" fn _start() -> ! {
     puts("\n");
 
     // Step 1: Get the DTB PageSet from the kernel and map it.
-    // sys_get_boot_info returns the PageSet ID for the DTB physical pages.
-    // sys_map_pages without MAP_FLAG_DEVICE maps with normal memory attributes,
-    // avoiding the MAIR aliasing problem with the kernel identity map.
-    let dtb_ps = match sys_get_boot_info() {
-        Ok(id) => id,
+    // `sys_get_boot_info` returns both the PageSet handle and the
+    // in-page offset of the DTB header within the first page —
+    // nonzero on platforms whose firmware places the DTB at an
+    // unaligned physical address (Pi 4B's VC firmware typically uses
+    // 0xe00). We add the offset to the mapped VA before reading.
+    // sys_map_pages without MAP_FLAG_DEVICE maps with normal memory
+    // attributes, avoiding the MAIR aliasing problem.
+    let boot_info = match sys_get_boot_info() {
+        Ok(b) => b,
         Err(_) => { puts("devmgr: get_boot_info FAILED\n"); halt(); }
     };
     let dtb_va = VMEM.alloc(DTB_MAX_PAGES).expect("VA exhausted for DTB");
-    if !sys_map_pages(dtb_ps, dtb_va, 0).is_ok() {
+    if !sys_map_pages(boot_info.dtb_pageset, dtb_va, 0).is_ok() {
         puts("devmgr: DTB map FAILED\n");
         halt();
     }
+    let dtb_header_va = dtb_va + boot_info.dtb_in_page_offset as u64;
     puts("devmgr: DTB mapped\n");
 
-    // Step 2: Parse the DTB to discover devices.
-    // Read only the 40-byte FDT header first to compute the actual content
-    // size (off_dt_strings + size_dt_strings). The kernel mapped exactly
-    // this many pages worth of content via dtb_content_size().
+    // Step 2: Parse the DTB to discover devices. Read the 40-byte
+    // FDT header first to compute the actual content size, then
+    // wrap the full content slice. Both reads start at the
+    // offset-applied address `dtb_header_va`, not the raw mapping
+    // base.
     let dtb_content_end = {
-        let header = unsafe { core::slice::from_raw_parts(dtb_va as *const u8, 40) };
+        let header = unsafe { core::slice::from_raw_parts(dtb_header_va as *const u8, 40) };
         match lockjaw_types::fdt::dtb_content_size(header) {
             Ok(size) => size,
             Err(_) => { puts("devmgr: DTB header invalid\n"); halt(); }
         }
     };
     let dtb_slice = unsafe {
-        core::slice::from_raw_parts(dtb_va as *const u8, dtb_content_end)
+        core::slice::from_raw_parts(dtb_header_va as *const u8, dtb_content_end)
     };
     // SAFETY: single-threaded process; this is the only writer to
     // DEVICE_TABLE and runs before any IPC handler can read it.

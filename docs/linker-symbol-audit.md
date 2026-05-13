@@ -49,26 +49,26 @@ and any unclassified addition fails CI.
 
 | Line | Classification | Symbol | Consumer / notes |
 |------|---|---|---|
-| 113  | DISPLAY        | `__bss_start` | local for kprintln of BSS range |
-| 115  | DISPLAY        | `__bss_end`   | local for kprintln of BSS range |
-| 117  | DISPLAY        | `__kernel_end`| local for kprintln of kernel-end addr |
-| 119  | DISPLAY        | `__stack_bottom` | local for kprintln of stack range |
-| 121  | DISPLAY        | `__stack_top` | local for kprintln of stack range |
-| 125  | DISPLAY        | `__kernel_start` | kprintln "kernel load" — relabel post-relink |
-| 140  | PA-prepivot    | `__kernel_start` | `PhysAddr::new(...)` → `page_alloc::init_with_gap` |
-| 142  | PA-prepivot    | `__kernel_end`   | same |
-| 144  | PA-prepivot    | `__per_cpu_stacks` | same |
-| 146  | PA-prepivot    | `__per_cpu_stacks_end` | same |
-| 224  | PA-prepivot    | `__guard_page_0` | `setup_guard_pages` (expects PA) |
-| 226  | PA-prepivot    | `__guard_page_1` | same |
-| 228  | PA-prepivot    | `__guard_page_2` | same |
-| 230  | PA-prepivot    | `__guard_page_3` | same |
-| 266  | PA-prepivot    | `_secondary_start` (`fn` cast) | PSCI cpu_on entry — needs PA |
-| 611  | VA-image       | `__stack_bottom` | wrapped as `KernelImageVa::new(...)` → `create_idle_tcb` |
-| 637  | VA-image       | `__guard_page_0` (+4096) | wrapped as `KernelImageVa::new(...)` → secondary idle |
-| 639  | VA-image       | `__guard_page_1` (+4096) | same |
-| 641  | VA-image       | `__guard_page_2` (+4096) | same |
-| 643  | VA-image       | `__guard_page_3` (+4096) | same |
+| 128  | DISPLAY        | `__bss_start` | local for kprintln of BSS range |
+| 130  | DISPLAY        | `__bss_end`   | local for kprintln of BSS range |
+| 132  | DISPLAY        | `__kernel_end`| local for kprintln of kernel-end addr |
+| 134  | DISPLAY        | `__stack_bottom` | local for kprintln of stack range |
+| 136  | DISPLAY        | `__stack_top` | local for kprintln of stack range |
+| 140  | DISPLAY        | `__kernel_start` | kprintln "kernel load" — relabel post-relink |
+| 155  | PA-prepivot    | `__kernel_start` | `PhysAddr::new(...)` → `page_alloc::init_with_gap` |
+| 157  | PA-prepivot    | `__kernel_end`   | same |
+| 159  | PA-prepivot    | `__per_cpu_stacks` | same |
+| 161  | PA-prepivot    | `__per_cpu_stacks_end` | same |
+| 260  | PA-prepivot    | `__guard_page_0` | `setup_guard_pages` (expects PA) |
+| 262  | PA-prepivot    | `__guard_page_1` | same |
+| 264  | PA-prepivot    | `__guard_page_2` | same |
+| 266  | PA-prepivot    | `__guard_page_3` | same |
+| 302  | PA-prepivot    | `_secondary_start` (`fn` cast) | PSCI cpu_on entry — needs PA |
+| 647  | VA-image       | `__stack_bottom` | wrapped as `KernelImageVa::new(...)` → `create_idle_tcb` |
+| 673  | VA-image       | `__guard_page_0` (+4096) | wrapped as `KernelImageVa::new(...)` → secondary idle |
+| 675  | VA-image       | `__guard_page_1` (+4096) | same |
+| 677  | VA-image       | `__guard_page_2` (+4096) | same |
+| 679  | VA-image       | `__guard_page_3` (+4096) | same |
 
 ### `src/mm/stack.rs` — stack canary helpers
 

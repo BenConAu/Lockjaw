@@ -61,7 +61,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_RECV_NB => sys_recv_nb(ctx),
         SYS_WAIT_ANY => SyscallReturn::Value(sys_wait_any(ctx)),
         SYS_EXPORT_HANDLE => SyscallReturn::Value(sys_export_handle(ctx)),
-        SYS_GET_BOOT_INFO => SyscallReturn::Value(sys_get_boot_info()),
+        SYS_GET_BOOT_INFO => sys_get_boot_info(ctx),
         SYS_REGISTER_DEVICE_PAGE => SyscallReturn::Value(sys_register_device_page(ctx)),
         SYS_QUERY_PAGESET_PHYS => SyscallReturn::Value(sys_query_pageset_phys(ctx)),
         SYS_CREATE_REPLY => SyscallReturn::Value(sys_create_reply(ctx)),
@@ -796,21 +796,36 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     }
 }
 
-/// sys_get_boot_info() — returns boot information.
-/// Inserts a PageSet handle for the DTB into the caller's handle table.
-/// Returns the handle index in x1.
-fn sys_get_boot_info() -> Result<u64, SyscallError> {
+/// sys_get_boot_info() — returns boot information about the DTB.
+///
+/// Inserts a PageSet handle for the DTB pages into the caller's
+/// handle table. Returns the handle index in x1 and the in-page
+/// offset of the DTB header in x2 (zero on platforms whose firmware
+/// page-aligned the DTB; nonzero on Pi 4B etc.). Userspace adds the
+/// offset to the mapped VA before reading DTB bytes — see
+/// `lockjaw_types::dtb_layout` for the layout model.
+///
+/// Uses `SyscallReturn::Message` so we can write both return slots;
+/// the dispatch only writes x0 = error.
+fn sys_get_boot_info(ctx: &mut ExceptionContext) -> SyscallReturn {
     let dtb_id = crate::dtb_pageset_id();
-    let (_, header_kva) = crate::cap::pageset_table::get_pageset(dtb_id)
-        .ok_or(SyscallError::UNKNOWN)?;
+    let (_, header_kva) = match crate::cap::pageset_table::get_pageset(dtb_id) {
+        Some(t) => t,
+        None => return SyscallReturn::Void(SyscallError::UNKNOWN),
+    };
     let ht = CurrentThread::handle_table();
-    let h = ht.insert(
+    let h = match ht.insert(
         Rights::from_bits(RIGHT_READ | RIGHT_WRITE),
         lockjaw_types::object::HandleKind::PageSet { kva: header_kva, mapped_va_page: 0 },
-    ).map(|h| h as u64)?;
+    ) {
+        Ok(h) => h as u64,
+        Err(e) => return SyscallReturn::Void(e),
+    };
     // Increment refcount — a new handle references this PageSet.
     unsafe { crate::cap::pageset_table::read_header_mut(header_kva).inc_refcount(); }
-    Ok(h)
+    ctx.gpr[1] = h;
+    ctx.gpr[2] = crate::dtb_in_page_offset();
+    SyscallReturn::Message(SyscallError::OK)
 }
 
 /// sys_register_device_page(phys_addr) — wrap a physical address as a tracked PageSet.
