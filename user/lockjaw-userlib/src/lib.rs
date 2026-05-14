@@ -9,6 +9,7 @@ pub mod clock;
 pub mod display;
 pub mod fs;
 pub mod handle;
+pub mod time;
 pub mod virtqueue;
 
 // Re-export the ELF parser and load planner from lockjaw-types

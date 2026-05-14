@@ -81,6 +81,14 @@ static CLOCK_TEST_ELF: &[u8] = include_bytes!("../../clock-test/target/aarch64-u
 /// Built by: cd user/emmc2-driver && cargo build --release
 static EMMC2_ELF: &[u8] = include_bytes!("../../emmc2-driver/target/aarch64-unknown-none/release/lockjaw-emmc2-driver");
 
+/// The sleep-primitive verification client, embedded at compile time.
+/// Built by: cd user/sleep-test && cargo build --release
+/// Exercises lockjaw-userlib::time::sleep_for + monotonic_now and
+/// prints `[SLEEP-TEST] elapsed within tolerance` (asserted by the
+/// QEMU integration tests) — locks down the kernel's deadline scan
+/// against regressions.
+static SLEEP_TEST_ELF: &[u8] = include_bytes!("../../sleep-test/target/aarch64-unknown-none/release/lockjaw-sleep-test");
+
 // ---------------------------------------------------------------------------
 // ELF spawn helper
 // ---------------------------------------------------------------------------
@@ -441,6 +449,7 @@ pub extern "C" fn _start() -> ! {
     let cprman_boot_ep = alloc_endpoint("cprman boot");
     let clock_test_boot_ep = alloc_endpoint("clock-test boot");
     let emmc2_boot_ep = alloc_endpoint("emmc2 boot");
+    let sleep_test_boot_ep = alloc_endpoint("sleep-test boot");
 
     // Spawn child processes.
     // Allocate VAs for ELF loading. These are reused across spawns
@@ -488,6 +497,10 @@ pub extern "C" fn _start() -> ! {
     // driver calls CMD_GET_CLOCK_HANDLE. On QEMU the claim fails immediately
     // (no bcm2711-emmc2 in the virt DTB) and the driver exits cleanly.
     spawn_elf(EMMC2_ELF, "emmc2-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, emmc2_boot_ep, 2);
+    // sleep-test verifies the kernel's deadline/sleep primitive
+    // (sys_wait_any with absolute monotonic deadline). It needs no
+    // device handles — bootstrap is a synchronization handshake only.
+    spawn_elf(SLEEP_TEST_ELF, "sleep-test", map_array_va, temp_base_va, plan_buf_va, scratch_ps, sleep_test_boot_ep, 1);
 
     // Bootstrap hello: export a test notification into its handle table.
     puts("init: waiting for hello bootstrap...\n");
@@ -675,6 +688,14 @@ pub extern "C" fn _start() -> ! {
     };
     sys_reply(emmc2_devmgr_idx, 0, 0, 0);
     puts("[BOOTSTRAP] emmc2\n");
+
+    // Bootstrap sleep-test: no handles to export, just a sync reply
+    // so the client knows init has acknowledged its startup. The
+    // client then drives sleep_for + monotonic_now under its own steam.
+    puts("init: waiting for sleep-test bootstrap...\n");
+    let _ = sys_receive(sleep_test_boot_ep);
+    sys_reply(0, 0, 0, 0);
+    puts("[BOOTSTRAP] sleep-test\n");
 
     // Allocate a Reply object for init's own outbound calls (ipc_puts to
     // the uart server). Each client that issues sys_call needs one.

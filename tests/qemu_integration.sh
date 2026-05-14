@@ -145,6 +145,20 @@ assert_not_contains "\[CLOCK-TEST\] BUG:" \
 assert_contains "\[EMMC2:INIT\] no bcm2711-emmc2 device on this platform (QEMU)" \
     "M1 emmc2-driver exits cleanly when bcm2711-emmc2 absent (QEMU)"
 
+# S4 sleep primitive: sleep-test asks the kernel for a 50ms sleep via
+# sys_wait_any(deadline) and prints elapsed measured by monotonic_now()
+# (mrs CNTVCT_EL0 from EL0 — gated by S1's CNTKCTL_EL1 setup).
+# Tolerance window [50ms, 70ms]: lower bound = the deadline floor;
+# upper bound covers up to ~two scheduler-tick periods of slack
+# (request alignment + post-deadline scan with S3's wake-before-
+# schedule ordering). Out-of-tolerance flags a kernel regression
+# in the deadline machinery, not a userspace bug.
+assert_contains "\[BOOTSTRAP\] sleep-test" "Init-sleep-test bootstrap IPC completed"
+assert_contains "\[SLEEP-TEST\] elapsed within tolerance" \
+    "S4 sleep_for(50ms) elapsed in [50ms, 70ms]"
+assert_not_contains "\[SLEEP-TEST\] elapsed OUT OF TOLERANCE" \
+    "S4 sleep deadline did not over-shoot or under-shoot"
+
 echo "Phase 9 — Thread Exit:"
 assert_contains "\[EXIT\] Thread" "Thread cleanup ran (finish_exit)"
 assert_contains "pages freed" "Thread exit freed resources"

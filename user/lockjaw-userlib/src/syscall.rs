@@ -357,6 +357,29 @@ pub fn sys_wait_any(entries: &[crate::WaitEntry]) -> Result<u64, SyscallError> {
     if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
 }
 
+/// Wait until any of the given objects is ready or the absolute
+/// monotonic deadline expires. `entries` may be empty — that is the
+/// "pure sleep" form (only the deadline can wake us). Returns the
+/// readiness bitmask: bit N set = entry N became ready; mask == 0
+/// = deadline expired before any object fired (timeout encoding).
+pub fn sys_wait_any_until(
+    entries: &[crate::WaitEntry],
+    deadline: lockjaw_types::time::MonoTicks,
+) -> Result<u64, SyscallError> {
+    let err: u64;
+    let val: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") entries.as_ptr() => err,
+            inlateout("x1") entries.len() => val,
+            in("x2") deadline.0,                // Absolute CNTVCT_EL0 deadline (NO_DEADLINE = u64::MAX)
+            in("x8") SYS_WAIT_ANY,
+        );
+    }
+    if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
+}
+
 /// Unmap a PageSet from the caller's address space.
 /// VA must match the address used in sys_map_pages. Validates that
 /// every PTE maps to the expected physical page before clearing.
