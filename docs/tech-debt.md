@@ -28,15 +28,37 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ---
 
-## MAX_THREADS = 16 static scheduler array
+## MAX_THREADS = 1024 static scheduler array
 
-**Where:** `src/sched/scheduler.rs:15`
+**Where:** `lockjaw-types/src/scheduler.rs::MAX_THREADS` (canonical const; imported by `src/sched/scheduler.rs`).
 
-**What:** The run queue is a fixed-size array of 16 slots (raised from 8). Cannot grow. `add_thread` returns false when full. Sufficient for today's ~11 active processes plus kernel threads, but a hard ceiling.
+**What:** The run queue is a fixed-size array of 1024 slots (raised from 16, originally 8). Cannot grow. `add_thread` returns false when full → `SyscallError::QUEUE_FULL`. 1024 covers any realistic thread count for the platforms Lockjaw targets; modern aarch64 hardware comfortably runs thousands of Linux threads, so this is comparable to what userspace sees on a typical OS.
 
-**Why bootstrap:** A dynamic run queue requires either kernel allocation (violates our principle) or a user-donated page for the queue.
+**Why bootstrap:** A dynamic run queue requires either kernel allocation (violates our no-kernel-alloc principle) or a user-donated page for the queue.
 
-**Fix:** User-donated page for the run queue, similar to how handle tables work. The scheduler would be initialized with a donated page that holds the thread array.
+**Fix:** User-donated page for the run queue, similar to how endpoint/notification/reply pages work today. The scheduler would be initialized with a donated page that holds the thread array, and add_thread would fail with QUEUE_FULL only when the donated page itself is full. Until then, 1024 is generous enough that the cap is not a practical limit.
+
+---
+
+## Kernel-side allocation in process creation (violates microkernel principle)
+
+**Where:** `src/process.rs::provision_resources` (4 sites: `proc_range`, `ht_range`, `tcb_stack_range`, `tcb_range`); `src/syscall/handler.rs::sys_create_thread` (2 sites: `stack_range`, `tcb_range`); `src/arch/aarch64/vmem.rs::AddressSpaceBuilder::new` + `map_batch` (page-table internal nodes).
+
+**What:** `sys_create_process` and `sys_create_thread` allocate kernel-side pages internally via `kvm::alloc_kernel_pages` and `page_alloc::alloc_page`. Every alloc point is a potential `OUT_OF_MEMORY` syscall return that complicates error paths and weakens the type-level "kernel cannot fail from memory" invariant.
+
+The endpoint/notification/reply syscalls already follow the seL4-style "user donates a page, kernel transmutes it in place" pattern (`kvm::map_existing` rather than `kvm::alloc_kernel_pages`). Process creation deviates: ProcessObject, HandleTable, TCB, and the per-thread kernel stack are all kernel-allocated rather than user-donated.
+
+**Why bootstrap:** Adding more PageSet arguments to `sys_create_process` was deferred — userspace would need to allocate 4 additional pages and donate them before each spawn, which the early-bootstrap init code wasn't yet ready to do.
+
+**Categories with their fix paths:**
+
+- *ProcessObject / HandleTable storage / TCB / kernel stack* — all donate-able. Should follow the endpoint pattern: spawn syscall takes additional PageSet handles, kernel calls `kvm::map_existing` per donated page. Removes 4–6 OOM sites with no architectural cost beyond a wider syscall signature.
+- *Page-table internal nodes (L1/L2/L3 inside `AddressSpaceBuilder`)* — genuinely harder. seL4's strict model has userspace explicitly insert each page-table level via separate caps (verbose). The pragmatic compromise everyone takes is kernel-on-demand allocation. Could move to a per-process pre-allocated "page-table pool" (user donates N pages at spawn, kernel carves from them) — same shape as the run-queue fix above.
+- *PageSet header (`src/cap/pageset_table.rs::alloc_and_insert_header`)* — kernel-side allocation of the metadata page that tracks user-donated pages. Self-referential (can't be donated as part of the same PageSet it would track). Could take an extra PageSet for the header, or carve the header out of the donated data range.
+
+**Fix order:** ProcessObject and TCB first (lowest friction, removes the most-frequently-hit OOM sites). Then HandleTable and kernel stack. Then page-table pools. The donate-pattern syscalls are easier to add than the page-table case because the user already allocates the per-thread user stack PageSet — adding 4 more PageSet args is mechanical.
+
+**Why this is a real violation, not just style:** every kernel alloc site is a runtime failure that needs error handling, type-level OOM in syscall returns, and rollback code on the failure path. The endpoint/notification/reply syscalls have zero of these because they don't allocate. Closing the remaining sites would shrink the kernel's failure surface meaningfully and make `OUT_OF_MEMORY` rare enough to treat as a hard invariant rather than a routine return.
 
 ---
 

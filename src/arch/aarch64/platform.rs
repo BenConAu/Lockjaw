@@ -20,8 +20,12 @@ pub const QEMU_DTB_SEARCH_ADDR: u64 = 0x4000_0000;
 /// Virtual timer PPI interrupt ID (generic ARMv8, platform-independent).
 pub const VIRTUAL_TIMER_INTID: u32 = 27;
 
-/// Maximum number of CPUs supported.
-pub const MAX_CPUS: usize = 4;
+/// Maximum number of CPUs supported. Re-exported from
+/// `lockjaw_types::scheduler::MAX_CPUS` (single source of truth,
+/// shared with the pure scheduler model in lockjaw-types). The
+/// re-export keeps existing `platform::MAX_CPUS` call sites
+/// working without churn.
+pub use lockjaw_types::scheduler::MAX_CPUS;
 
 // ---------------------------------------------------------------------------
 // Runtime platform info (populated from DTB)

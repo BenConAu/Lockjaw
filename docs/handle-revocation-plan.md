@@ -72,9 +72,12 @@ mappings — then it's safe to free the header normally.
 - `arch::aarch64::vmem::unmap_validated` —
   `src/arch/aarch64/vmem.rs`. Validates and clears PTEs in any
   TTBR0; TLB-invalidates.
-- Scheduler's `threads: [Option<PhysAddr>; MAX_THREADS = 16]` —
-  `src/sched/scheduler.rs`. Each entry is a TCB paddr. TCBs carry
-  `process_paddr`.
+- Scheduler's `threads: [Option<KernelVa>; MAX_THREADS]` —
+  `src/sched/scheduler.rs`, sized from
+  `lockjaw_types::scheduler::MAX_THREADS` (single source of truth,
+  currently 1024). Each entry is a TCB KVA. TCBs carry
+  `process_kva`. The revoke walker's dedup buffer in
+  `src/cap/revoke.rs` is sized from the same const.
 
 ### New infrastructure
 

@@ -52,10 +52,19 @@ pub enum CreateProcessError {
 impl CreateProcessError {
     pub fn to_syscall_error(&self) -> SyscallError {
         match self {
+            // Genuine kernel-internal physical/virtual page exhaustion
+            // (KVM pool, page allocator, page-table tree growth).
             CreateProcessError::OutOfMemory
-            | CreateProcessError::PlanError(CreateProcessPlanError::SchedulerFull)
             | CreateProcessError::AddressSpaceMappingFailed =>
                 SyscallError::OUT_OF_MEMORY,
+            // Scheduler slot table is full — distinct failure class
+            // from memory OOM. Previously collapsed into OUT_OF_MEMORY,
+            // which conflated "ran out of pages" with "ran out of
+            // thread slots" and made the userspace failure class
+            // unguessable without a kernel boot log. The QUEUE_FULL
+            // variant already exists for exactly this case.
+            CreateProcessError::PlanError(CreateProcessPlanError::SchedulerFull) =>
+                SyscallError::QUEUE_FULL,
             CreateProcessError::PlanError(CreateProcessPlanError::HandleTableTooSmall) =>
                 SyscallError::HANDLE_TABLE_FULL,
             CreateProcessError::PlanError(CreateProcessPlanError::PageSetKindParentHandle)
@@ -73,6 +82,24 @@ impl CreateProcessError {
                 SyscallError::UNKNOWN,
         }
     }
+}
+
+/// Diagnostic — name the failing allocation step plus the
+/// page-allocator free count, so a single boot log identifies
+/// which sub-pool actually exhausted. Process creation fans out
+/// across ~7 distinct allocation sites that all collapse to
+/// `CreateProcessError::OutOfMemory`; without a label the syscall
+/// only tells the caller "OOM" and leaves the kernel-internal
+/// resource a guess.
+///
+/// Cheap by design: only fires on a failing path, doesn't change
+/// hot-path control flow, and removes cleanly when the OOM trigger
+/// is fixed.
+fn log_create_process_oom(step: &'static str) {
+    crate::kprintln!(
+        "[create_process OOM] step=", step,
+        " page_alloc_free=", crate::mm::page_alloc::free_count(),
+    );
 }
 
 /// Bundle returned by `provision_resources`: every kernel page the
@@ -345,7 +372,7 @@ fn provision_resources(
     // alloc returns an OwnedKvmRange whose backing frame is fresh and
     // zero-initialized via the explicit write_bytes below.
     let proc_range = crate::mm::kvm::alloc_kernel_pages(1)
-        .map_err(|_| CreateProcessError::OutOfMemory)?;
+        .map_err(|_| { log_create_process_oom("proc_range"); CreateProcessError::OutOfMemory })?;
     let proc_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(proc_range);
     let proc_kva = proc_guard.kva();
     // SAFETY: proc_kva is a freshly-allocated KVM range; we own it.
@@ -356,7 +383,7 @@ fn provision_resources(
 
     // Create incremental address space builder — Drop handles cleanup on failure.
     let mut as_builder = unsafe { AddressSpaceBuilder::new() }
-        .map_err(|_| CreateProcessError::OutOfMemory)?;
+        .map_err(|_| { log_create_process_oom("AddressSpaceBuilder::new"); CreateProcessError::OutOfMemory })?;
 
     for i in 0..mapping_count {
         // Read ProcessMapping from user memory via page table walk (TTBR1).
@@ -389,7 +416,7 @@ fn provision_resources(
             ScratchAction::Continue => {}
             ScratchAction::FlushAndAdvance { next_page_idx } => {
                 unsafe { as_builder.map_batch(&mappings[..MAPPINGS_PER_PAGE]) }
-                    .map_err(|_| CreateProcessError::AddressSpaceMappingFailed)?;
+                    .map_err(|_| { log_create_process_oom("map_batch flush"); CreateProcessError::AddressSpaceMappingFailed })?;
                 let next = scratch_ps.page(next_page_idx).ok_or(CreateProcessError::InvalidUserMemory)?;
                 page_alloc::zero_page(next);
                 buf = unsafe { KernelMut::<Mapping>::from_paddr(next) };
@@ -426,7 +453,7 @@ fn provision_resources(
             ScratchAction::Continue => {}
             ScratchAction::FlushAndAdvance { next_page_idx } => {
                 unsafe { as_builder.map_batch(&mappings[..MAPPINGS_PER_PAGE]) }
-                    .map_err(|_| CreateProcessError::AddressSpaceMappingFailed)?;
+                    .map_err(|_| { log_create_process_oom("map_batch flush"); CreateProcessError::AddressSpaceMappingFailed })?;
                 let next = scratch_ps.page(next_page_idx).ok_or(CreateProcessError::InvalidUserMemory)?;
                 page_alloc::zero_page(next);
                 buf = unsafe { KernelMut::<Mapping>::from_paddr(next) };
@@ -451,7 +478,7 @@ fn provision_resources(
     // Final flush of pending mappings and finalize address space
     if cursor.has_pending() {
         unsafe { as_builder.map_batch(&mappings[..cursor.pending_count()]) }
-            .map_err(|_| CreateProcessError::AddressSpaceMappingFailed)?;
+            .map_err(|_| { log_create_process_oom("map_batch final"); CreateProcessError::AddressSpaceMappingFailed })?;
     }
     let ttbr0 = as_builder.finish();
     let ttbr0_guard = Ttbr0Guard::new(ttbr0);
@@ -461,7 +488,7 @@ fn provision_resources(
 
     // Create handle table in the KVM pool.
     let ht_range = crate::mm::kvm::alloc_kernel_pages(1)
-        .map_err(|_| CreateProcessError::OutOfMemory)?;
+        .map_err(|_| { log_create_process_oom("ht_range"); CreateProcessError::OutOfMemory })?;
     let ht_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(ht_range);
     let ht_kva = ht_guard.kva();
     // SAFETY: ht_kva is a freshly allocated KVM range.
@@ -469,7 +496,7 @@ fn provision_resources(
         create_handle_table(
             &HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
             ht_kva,
-        ).map_err(|_| CreateProcessError::OutOfMemory)?;
+        ).map_err(|_| { log_create_process_oom("create_handle_table"); CreateProcessError::OutOfMemory })?;
     }
 
     // Write ProcessObject header (owned_pages already populated above).
@@ -487,10 +514,10 @@ fn provision_resources(
     // Create TCB — first thread in this process. Both the TCB page
     // and the per-thread kernel stack live in the KVM pool.
     let tcb_stack_range = crate::mm::kvm::alloc_kernel_pages(1)
-        .map_err(|_| CreateProcessError::OutOfMemory)?;
+        .map_err(|_| { log_create_process_oom("tcb_stack_range"); CreateProcessError::OutOfMemory })?;
     let tcb_stack_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(tcb_stack_range);
     let tcb_range = crate::mm::kvm::alloc_kernel_pages(1)
-        .map_err(|_| CreateProcessError::OutOfMemory)?;
+        .map_err(|_| { log_create_process_oom("tcb_range"); CreateProcessError::OutOfMemory })?;
     let tcb_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(tcb_range);
 
     // SAFETY: stack and TCB are freshly allocated kernel pages.
@@ -507,7 +534,7 @@ fn provision_resources(
                 name,
             },
             tcb_guard.kva(),
-        ).map_err(|_| CreateProcessError::OutOfMemory)?;
+        ).map_err(|_| { log_create_process_oom("create_tcb"); CreateProcessError::OutOfMemory })?;
     }
 
     Ok(ProvisionedResources {

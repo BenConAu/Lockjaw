@@ -84,7 +84,11 @@ server creates a notification per POSIX process. Kernel's
 - **Page allocation + mapping**: `sys_alloc_pages` + `sys_map_pages`
 - **ELF loader**: `lockjaw-userlib` ET_EXEC loader
 - **VA allocator**: `VirtualMemory` bitmap allocator in userlib
-- **MAX_THREADS = 16**: sufficient for initial phases
+- **MAX_THREADS = 1024** (`lockjaw_types::scheduler::MAX_THREADS`):
+  far more than POSIX phases will ever push against; sized to match
+  what aarch64 hardware can comfortably schedule. Was 16 originally
+  but the cap collapsed `SchedulerFull` and `OutOfMemory` into one
+  syscall return — see `docs/tech-debt.md` for the full story.
 
 ## The Shared Buffer
 

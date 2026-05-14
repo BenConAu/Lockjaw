@@ -79,6 +79,15 @@
 # LLVM code de-duplication artifact. Small outlined sequences.
 "OUTLINED_FUNCTION_0" = 0
 
+# Cortex-A53 erratum 843419 linker-inserted trampoline. The linker
+# emits these stubs (named `__CortexA53843419_<patched_va_hex>`) to
+# work around a CPU prefetch bug near specific page boundaries. The
+# stub is a 4-instruction veneer: load + branch, no stack frame.
+# The hex suffix is the patched address and changes whenever the
+# kernel image layout shifts, so we match by prefix via the `*`
+# wildcard support in xtask's check-stack lookup.
+"__CortexA53843419_*" = 0
+
 # Core library functions from the precompiled sysroot (no
 # emit-stack-sizes). Conservative upper bounds. The proper long-term
 # fix is -Zbuild-std so core is rebuilt with our rustflags.

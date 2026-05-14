@@ -958,7 +958,9 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
             crate::mm::kvm::free_kernel_pages(stack_range);
         }
         crate::cap::process_obj::process_dec_thread_count(process_kva);
-        return SyscallError::OUT_OF_MEMORY;
+        // Scheduler slot table exhausted — distinct from physical
+        // OOM. Same fix as sys_create_process's SchedulerFull path.
+        return SyscallError::QUEUE_FULL;
     }
 
     SyscallError::OK

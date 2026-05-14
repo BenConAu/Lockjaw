@@ -58,10 +58,34 @@ pub enum RevokeError {
     },
 }
 
-/// Bounded dedup buffer for the per-process walk. The scheduler's
-/// run queue holds at most `MAX_THREADS = 16` TCBs; multiple TCBs
-/// may share a process, so the unique-process count is at most 16.
-const MAX_VISITED_PROCESSES: usize = 16;
+/// Static dedup buffer for the per-process revoke walk. Sized at
+/// `lockjaw_types::scheduler::MAX_THREADS` because the scheduler's
+/// run queue holds at most that many TCBs; multiple TCBs may share
+/// a process, so the unique-process count never exceeds the slot
+/// count. Imported directly (no local alias) so the size cannot
+/// drift from the scheduler's actual capacity — the prior
+/// hardcoded `16` here was the scheduler's value at the time it
+/// was written and silently became a correctness bug when the
+/// scheduler grew.
+///
+/// At MAX_THREADS=1024 the array is 8 KB — exactly the kernel
+/// stack size, so it cannot live on the stack. GKL serializes every
+/// kernel path; `for_each_unique_process` runs to completion before
+/// another caller can enter, and resets `visited_count = 0` at
+/// entry. Single-static is safe under that invariant. SMP work
+/// would shift to a per-CPU buffer (same pattern as `PENDING_EXITS`
+/// in `src/sched/scheduler.rs`).
+struct VisitedBuffer {
+    processes: core::cell::UnsafeCell<[u64; lockjaw_types::scheduler::MAX_THREADS]>,
+}
+/// SAFETY: GKL is held by every caller of `for_each_unique_process`;
+/// no two threads access the buffer concurrently.
+unsafe impl Sync for VisitedBuffer {}
+static VISITED: VisitedBuffer = VisitedBuffer {
+    processes: core::cell::UnsafeCell::new(
+        [0u64; lockjaw_types::scheduler::MAX_THREADS],
+    ),
+};
 
 /// Phase 1: read-only walk. For every live process's handle table,
 /// count handles to `header_kva` and verify any active PageSet
@@ -237,7 +261,11 @@ pub struct RevokeStats {
 /// (process_kva == 0) are skipped — they do not own a handle
 /// table that could hold user-visible PageSet handles.
 fn for_each_unique_process(mut f: impl FnMut(u64)) {
-    let mut visited = [0u64; MAX_VISITED_PROCESSES];
+    // SAFETY: GKL held — exclusive access to the static dedup buffer.
+    // for_each_unique_process is not recursive (revoke walks call
+    // user-supplied closures that never re-enter the walker), so a
+    // single static buffer is sufficient.
+    let visited = unsafe { &mut *VISITED.processes.get() };
     let mut visited_count: usize = 0;
 
     scheduler::for_each_tcb(|tcb_paddr| {
@@ -255,10 +283,17 @@ fn for_each_unique_process(mut f: impl FnMut(u64)) {
                 return;
             }
         }
-        if visited_count < MAX_VISITED_PROCESSES {
-            visited[visited_count] = process_kva;
-            visited_count += 1;
+        // Buffer is sized at MAX_THREADS, and we're iterating over
+        // slots in the scheduler's run queue (capped at MAX_THREADS).
+        // Unique processes <= total TCBs <= MAX_THREADS, so this can
+        // never overflow. Panic if it does — silently re-calling f
+        // for an unrecorded process would double-count revocation
+        // work (the bug this assert guards against).
+        if visited_count >= lockjaw_types::scheduler::MAX_THREADS {
+            panic!("revoke dedup buffer overflow: more unique processes than MAX_THREADS — invariant violation");
         }
+        visited[visited_count] = process_kva;
+        visited_count += 1;
         f(process_kva);
     });
 }

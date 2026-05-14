@@ -103,10 +103,22 @@ fn check_stack_for_profile(profile: &str, elf_path: &str) {
     // Validate known_assembly symbols exist in disassembly.
     // For generic functions (e.g. assert_failed), accept a match
     // if any monomorphized instance (assert_failed::<u64, u64>) exists.
+    // For wildcard entries (key ends with '*'), accept any
+    // function whose name starts with the prefix (used for linker-
+    // generated stubs with build-dependent address suffixes — see
+    // `__CortexA53843419_*`).
     // External symbols (core::, mem*) may be absent in release builds
     // (optimized away) — only warn, don't fail.
     for sym in annotations.known_assembly.keys() {
         if functions.contains(sym.as_str()) {
+            continue;
+        }
+        if let Some(prefix) = sym.strip_suffix('*') {
+            if functions.iter().any(|f| f.starts_with(prefix)) {
+                continue;
+            }
+            // Wildcard entry with no matching function — soft skip
+            // (the stub may simply not have been generated this build).
             continue;
         }
         let has_generic_instance = functions
@@ -808,6 +820,9 @@ fn strip_llvm_suffix(name: &str) -> &str {
 /// 1. Exact match
 /// 2. With .llvm.NNNN suffix stripped
 /// 3. Generic prefix match (name::<T> matches base name)
+/// 4. Wildcard match (key ending with `*` matches any name starting
+///    with the prefix — used for linker-generated stubs whose
+///    address suffix shifts between builds)
 fn lookup_stack_size(name: &str, sizes: &HashMap<String, u64>) -> Option<u64> {
     if let Some(&s) = sizes.get(name) {
         return Some(s);
@@ -819,14 +834,25 @@ fn lookup_stack_size(name: &str, sizes: &HashMap<String, u64>) -> Option<u64> {
         }
     }
     // Generic monomorphization: "foo::bar::<u64, u64>" matches "foo::bar"
-    sizes
+    if let Some((_, &s)) = sizes
         .iter()
         .find(|(key, _)| {
             name.starts_with(key.as_str())
                 && name.len() > key.len()
                 && name[key.len()..].starts_with("::<")
         })
-        .map(|(_, &s)| s)
+    {
+        return Some(s);
+    }
+    // Wildcard: "__CortexA53843419_*" matches any
+    // "__CortexA53843419_FFFF008000010004" etc.
+    sizes
+        .iter()
+        .find_map(|(key, &s)| {
+            key.strip_suffix('*')
+                .filter(|prefix| name.starts_with(prefix))
+                .map(|_| s)
+        })
 }
 
 fn parse_hex_or_dec(s: &str) -> Result<u64, std::num::ParseIntError> {

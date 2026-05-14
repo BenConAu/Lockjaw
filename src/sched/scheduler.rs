@@ -12,7 +12,11 @@ use lockjaw_types::scheduler::{
 use lockjaw_types::object::HandleTableHeader;
 use lockjaw_types::process::ProcessLifecycle;
 
-const MAX_THREADS: usize = 16;
+/// Slot capacity for the scheduler's TCB-pointer table. Imported
+/// from `lockjaw_types::scheduler::MAX_THREADS` so the pure
+/// scheduler model and the kernel's concrete storage stay in sync
+/// by construction — single source of truth, no drift.
+use lockjaw_types::scheduler::MAX_THREADS;
 
 // ---------------------------------------------------------------------------
 // Scheduler observability counters
@@ -54,7 +58,7 @@ struct PendingExitSlots(UnsafeCell<[Option<PendingExit>; MAX_CPUS]>);
 /// cross-CPU slot corruption even without the lock.
 unsafe impl Sync for PendingExitSlots {}
 
-const MAX_CPUS: usize = crate::arch::aarch64::platform::MAX_CPUS;
+use lockjaw_types::scheduler::MAX_CPUS;
 
 static PENDING_EXITS: PendingExitSlots = PendingExitSlots(UnsafeCell::new(
     [None, None, None, None]
@@ -119,7 +123,10 @@ pub static SCHEDULER: Scheduler = Scheduler::new();
 /// saved_sp will be filled on the first context switch away from it, and
 /// its state is marked Running (since it's already executing).
 /// Subsequent threads are added as Ready.
-/// Returns `false` if the run queue is full (MAX_THREADS = 8 reached).
+/// Returns `false` if the run queue is full (every `MAX_THREADS`
+/// slot occupied). Caller maps to `SyscallError::QUEUE_FULL`, not
+/// OUT_OF_MEMORY — exhaustion of the scheduler's slot table is a
+/// distinct failure class from physical-memory OOM.
 pub fn add_thread(tcb_kva: lockjaw_types::addr::KernelVa) -> bool {
     // SAFETY: GKL held — exclusive access to state + threads.
     unsafe {

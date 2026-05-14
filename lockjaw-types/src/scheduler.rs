@@ -128,24 +128,36 @@ where
 pub struct SchedState {
     /// Per-CPU current thread index. `Some(idx)` means this CPU is running
     /// thread `idx`. `None` means the CPU has no thread assigned yet.
-    pub current_per_cpu: [Option<usize>; MAX_CPUS_MODEL],
-    pub states: [Option<SchedThreadState>; MAX_THREADS_MODEL],
+    pub current_per_cpu: [Option<usize>; MAX_CPUS],
+    pub states: [Option<SchedThreadState>; MAX_THREADS],
 }
 
-/// Maximum threads tracked by the model. The kernel's MAX_THREADS (8)
-/// should be <= this. Fixed-size array for no_std compatibility.
-pub const MAX_THREADS_MODEL: usize = 16;
+/// Maximum number of threads the kernel can track simultaneously.
+/// Single source of truth for both the pure scheduler model in this
+/// module and the kernel's concrete `Scheduler.threads` slot table
+/// (`src/sched/scheduler.rs`). The two used to be MAX_THREADS_MODEL
+/// (here) and MAX_THREADS (kernel) with the same value — split was
+/// historical, not architectural.
+///
+/// Sized at 1024: matches what aarch64 hardware can comfortably
+/// schedule. Fixed-array storage cost: 1024 * 16 bytes ≈ 16 KB BSS
+/// in the slot table + 1-2 KB BSS in the model's states array. TCB
+/// content pages are allocated dynamically (1 page each via the KVM
+/// pool); empty slots cost nothing.
+pub const MAX_THREADS: usize = 1024;
 
-/// Maximum CPUs tracked by the model. Must match platform::MAX_CPUS.
-pub const MAX_CPUS_MODEL: usize = 4;
+/// Maximum number of CPUs the platform can have. Single source of
+/// truth: kernel-side platform.rs and the pure scheduler model both
+/// import from here.
+pub const MAX_CPUS: usize = 4;
 
 impl SchedState {
     /// Create an empty state with no threads registered. Const-fn so it
     /// can be used for static initialization in the kernel.
     pub const fn new_const() -> Self {
         Self {
-            current_per_cpu: [None; MAX_CPUS_MODEL],
-            states: [None; MAX_THREADS_MODEL],
+            current_per_cpu: [None; MAX_CPUS],
+            states: [None; MAX_THREADS],
         }
     }
 
@@ -393,7 +405,7 @@ impl SchedState {
 
     /// Invariants of a valid scheduler state:
     /// - For each active CPU (current_per_cpu[c] = Some(idx)):
-    ///   - idx < MAX_THREADS_MODEL (in bounds)
+    ///   - idx < MAX_THREADS (in bounds)
     ///   - states[idx] is registered (Some)
     /// - No two CPUs have the same current thread
     /// - Every Running thread is current on exactly one CPU
@@ -402,7 +414,7 @@ impl SchedState {
         // Check each active CPU's current is valid
         for (c, cpu_current) in self.current_per_cpu.iter().enumerate() {
             if let Some(idx) = cpu_current {
-                if *idx >= MAX_THREADS_MODEL {
+                if *idx >= MAX_THREADS {
                     return false;
                 }
                 if self.states[*idx].is_none() {
@@ -436,7 +448,7 @@ impl SchedState {
     /// Private — callers use `step` instead, which computes + applies atomically.
     fn decide(&self, cpu_id: usize, reason: SchedReason) -> SchedDecision {
         let current = self.current_for(cpu_id);
-        select_next(current, MAX_THREADS_MODEL, reason, |i| {
+        select_next(current, MAX_THREADS, reason, |i| {
             let state = self.get(i).unwrap_or(SchedThreadState::Blocked);
             // A Ready thread that is Running on another CPU must be
             // skipped — it cannot be selected by this CPU.
