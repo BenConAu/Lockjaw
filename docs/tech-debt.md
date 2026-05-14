@@ -225,3 +225,49 @@ The endpoint/notification/reply syscalls already follow the seL4-style "user don
 - Revocation walks (~260 LOC) — recently added; could likely have parts extracted
 
 **Fix:** Continue the push→pull conversion per `docs/extraction-roadmap.md`. Each new feature should land its decision logic in lockjaw-types first; the kernel mechanically executes.
+
+---
+
+## emmc2: CAPABILITIES.base_clock_mhz == 0 fallback not implemented
+
+**Where:** `user/emmc2-driver/src/main.rs` (M2 entry point: the explicit `caps.base_clock_mhz == 0` guard).
+
+**What:** Per `lockjaw_types::sdhci`, `base_clock_mhz == 0` is the SDHCI capability hole that means "controller did not advertise its base clock; driver must source the value elsewhere." The driver currently logs a clear diagnostic and `sys_exit()`s, which is safe but doesn't unblock any controller that hides this field. On Pi 4B and QEMU virt this never triggers — the BCM2711 emmc2 advertises 100 MHz — so the gap is latent.
+
+The Pi log also showed a separate but related fact: `[CPRMAN] EMMC2 set_rate(...) -> actual=...` reported 200 MHz from cprman's *self-test*, while the emmc2 driver later asked for and got 100 MHz back from CPRMAN. CAPABILITIES (100 MHz) and what CPRMAN can deliver (200 MHz) aren't necessarily the same number, and assuming they are baked the M2-v1 bug into a "matched" state by accident.
+
+**Why bootstrap:** Every controller we've tested advertises a non-zero `base_clock_mhz`, so the immediate-exit path was the cheapest correct behavior for M2.
+
+**Fix:** Two clean options — either is fine, both are bigger than M2's scope:
+1. **DTB-sourced rate.** The bcm2711-emmc2 DTB node has a `clock-frequency` (or assigned-clock-rates) property. Read it via the existing devmgr DTB pass and pass into the driver alongside the MMIO claim.
+2. **CPRMAN-as-source-of-truth.** Treat `clk.get_rate()` as authoritative — ask CPRMAN what it's actually delivering, ignore CAPABILITIES, derive the SD divisor from CPRMAN's number. Means cprman needs a `get_rate` syscall path (today only `set_rate` exists for EMMC2).
+
+Pick (2) when CPRMAN gets `get_rate` for EMMC2; (1) is a working fallback meanwhile.
+
+---
+
+## uart-driver bind_irq fails on Pi 4B
+
+**Where:** `user/uart-driver/src/main.rs` IRQ-bind step. Surfaces in Pi log as `uart-driver: bind IRQ FAILED` after `uart-driver: notification created`. QEMU virt path works fine.
+
+**What:** PL011 IRQ binding succeeds on QEMU virt (GICv3, INTID assigned by virt platform code) but fails on Pi 4B (GICv2, INTIDs come from the BCM2711 DTB). The Pi log shows devmgr decoding INTID 153 for `0xfe201000` — but `153` is in the kernel-reserved range as labeled in the same log line (`intid=153 (kernel, reserved)`), so the bind syscall refuses. Either the DTB decode is wrong (PL011 IRQ is somewhere else on BCM2711) or the kernel-reserved range is too aggressive on Pi.
+
+The user-facing symptom is no UART input from the Pi — output works (kernel UART path) but typed characters don't make it to userspace.
+
+**Why bootstrap:** Pi 4B was added late and the GICv2 + BCM2711 IRQ map differs from QEMU virt enough that the M0/M1 milestones got the platform booting on hardware but didn't gate the userspace UART path on Pi.
+
+**Fix:** Audit the BCM2711 DTB IRQ encoding for PL011 (probably `interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL_HIGH>` per the BCM2711 binding, not 153). If the decode is right and 153 is just out of the kernel's whitelist on Pi, narrow the reserved range. Out of the emmc2 critical path; lands when someone needs Pi UART input.
+
+---
+
+## Per-process UART output not serialized on Pi
+
+**Where:** Kernel UART writer in `src/io/uart.rs` (or wherever `puts` lands per platform). QEMU virt path holds the GKL across the whole emit so output never interleaves; Pi 4B path doesn't.
+
+**What:** On Pi log captures, lines from concurrent userspace processes regularly interleave mid-string (e.g. `devmgr: PL011 at 0xfe201000[EXIT] Thread 6 cleaned up...`). On QEMU output is character-by-character clean because GKL ordering happens to serialize the writes. On Pi the same code path is racier — possibly because BCM2711 PL011 init differs, or because the puts loop on Pi releases and reacquires something the QEMU path doesn't.
+
+The functional correctness isn't affected, but every Pi log read is harder than it should be — grepping for a specific message can miss it because the prefix and suffix landed on different "lines" of stdout.
+
+**Why bootstrap:** The QEMU path looks clean, so the bug-class hid until we started capturing Pi logs in earnest during the sleep-primitive plan.
+
+**Fix:** Make the UART writer atomic w.r.t. other CPUs/processes — a simple mutex around the per-byte loop, or a proper kernel print buffer. The right shape is probably a ticket-locked per-CPU print buffer flushed on either newline or timer tick, but a coarse spinlock around the existing path would fix the readability problem immediately.
