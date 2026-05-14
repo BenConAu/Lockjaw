@@ -29,6 +29,40 @@ unsafe fn arm_timer(duration_ms: u64) {
     );
 }
 
+/// Allow EL0 to read CNTVCT_EL0 and CNTPCT_EL0 directly via `mrs`.
+///
+/// CNTKCTL_EL1.EL0VCTEN (bit 1) and EL0PCTEN (bit 0): 0 = the
+/// counter read traps to EL1, 1 = EL0 reads succeed. The reset
+/// value of CNTKCTL_EL1 is architecturally UNKNOWN and on QEMU /
+/// most implementations boots zero, so without this write a
+/// userspace `mrs CNTVCT_EL0` would synchronously fault.
+///
+/// We expose both VCTEN and PCTEN even though Lockjaw uses only
+/// the virtual counter: granting CNTPCT_EL0 read costs nothing
+/// (it's already side-effect-free hardware) and avoids surprising
+/// any future userspace that prefers the physical counter.
+///
+/// Read-modify-write: CNTKCTL_EL1 also carries EVNTEN/EVNTDIR/
+/// EVNTI (event-stream config) and EL0PTEN/EL0VTEN (EL0 access to
+/// the timer compare/control regs). We only intend to grant
+/// counter-read access here; clobbering the rest with a bare write
+/// would silently change unrelated policy. So OR our two bits in.
+///
+/// CNTKCTL_EL1 is per-CPU, so this runs on the boot CPU here and
+/// on each secondary in `init_secondary` below.
+unsafe fn enable_el0_counter_reads() {
+    let mut val: u64;
+    asm!(
+        "mrs {val}, CNTKCTL_EL1",   // Read current control bits (event-stream, EL0PTEN, EL0VTEN, …)
+        val = out(reg) val,
+    );
+    val |= 0x3;                       // Set bit 0 (EL0PCTEN) and bit 1 (EL0VCTEN); leave others intact
+    asm!(
+        "msr CNTKCTL_EL1, {val}",   // Write back: EL0 counter reads now succeed, other policy unchanged
+        val = in(reg) val,
+    );
+}
+
 /// Initialize the virtual timer for periodic 10ms ticks.
 ///
 /// # Safety
@@ -37,6 +71,8 @@ unsafe fn arm_timer(duration_ms: u64) {
 pub unsafe fn init() {
     let freq = timer_freq();
     crate::kprintln!("  Timer frequency: ", freq, " Hz");
+    enable_el0_counter_reads();
+    crate::kprintln!("  CNTKCTL_EL1: EL0 counter reads enabled");
     arm_timer(lockjaw_types::constants::TIMER_TICK_MS);
     crate::kprintln!("  Timer armed (10ms interval)");
 }
@@ -44,6 +80,7 @@ pub unsafe fn init() {
 /// Arm the timer on a secondary CPU. No printing — UART is not
 /// serialized during secondary bring-up (GKL not yet held).
 pub unsafe fn init_secondary() {
+    enable_el0_counter_reads();
     arm_timer(lockjaw_types::constants::TIMER_TICK_MS);
 }
 

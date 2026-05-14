@@ -93,6 +93,14 @@ assert_contains "Loading init process" "Init ELF loading started"
 assert_contains "Entry point: 0x400000" "ELF entry point parsed"
 assert_contains "Address space created" "Per-process page tables allocated"
 assert_contains "Hello from userspace init" "Init process running from ELF"
+# S1 EL0-time gate: CNTKCTL_EL1.EL0VCTEN+EL0PCTEN allow EL0 to read
+# CNTVCT_EL0 / CNTFRQ_EL0 with bare `mrs`. The trap that would fire
+# if the kernel hadn't set those bits is synchronous, so the boot
+# would die before printing this line. QEMU virt with cortex-a53
+# reports CNTFRQ_EL0 = 62.5 MHz; pin the value so a future build
+# that loses CNTKCTL wiring (or that QEMU silently changes the
+# default frequency) fails loudly here, not by symptom downstream.
+assert_contains "init: EL0 CNTFRQ=62500000 CNTVCT=" "EL0 mrs of CNTVCT_EL0/CNTFRQ_EL0 succeeds (no trap)"
 assert_contains "alloc_pages(1) OK" "sys_alloc_pages works from userspace"
 assert_contains "map_pages OK" "sys_map_pages works from userspace"
 assert_contains "mapped memory read/write OK" "Mapped memory accessible from userspace"

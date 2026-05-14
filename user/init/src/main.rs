@@ -311,6 +311,29 @@ fn alloc_endpoint(label: &str) -> EndpointHandle {
 pub extern "C" fn _start() -> ! {
     puts("Hello from userspace init!\n");
 
+    // EL0 monotonic-time probe. ARMv8 lets EL0 read CNTVCT_EL0 +
+    // CNTFRQ_EL0 with `mrs` once CNTKCTL_EL1.EL0VCTEN/EL0PCTEN are
+    // set in the kernel timer init. If the trap were still in
+    // place these `mrs` instructions would synchronously fault and
+    // boot would die here. Reading and printing both proves the
+    // gate is open — the substrate the upcoming sleep / deadline
+    // primitive depends on.
+    let cntfrq: u64;
+    let cntvct: u64;
+    unsafe {
+        asm!(
+            "mrs {f}, CNTFRQ_EL0",   // counter frequency in Hz (constant per boot)
+            "mrs {v}, CNTVCT_EL0",   // monotonic counter (ticks since boot, virtualised)
+            f = out(reg) cntfrq,
+            v = out(reg) cntvct,
+        );
+    }
+    puts("init: EL0 CNTFRQ=");
+    put_decimal(cntfrq);
+    puts(" CNTVCT=");
+    put_decimal(cntvct);
+    puts("\n");
+
     // Test sys_alloc_pages
     match sys_alloc_pages(1) {
         Ok(test_ps) => {
