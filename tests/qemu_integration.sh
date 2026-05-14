@@ -115,6 +115,7 @@ assert_contains "\[BOOTSTRAP\] fat32-test" "Init-fat32-test bootstrap IPC comple
 assert_contains "\[BOOTSTRAP\] posix-server" "Init-posix-server bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] cprman" "Init-cprman bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] clock-test" "Init-clock-test bootstrap IPC completed"
+assert_contains "\[BOOTSTRAP\] emmc2" "Init-emmc2 bootstrap IPC completed"
 # M0c clock-provider arbitration: device-manager validates incoming
 # CMD_GET_CLOCK_HANDLE requests against its registry of clock providers
 # (built from the DTB scan at startup; today only bcm2711-cprman is
@@ -129,6 +130,12 @@ assert_contains "\[CLOCK-TEST\] CMD_GET_CLOCK_HANDLE refused unregistered phandl
     "M0c device-manager refuses CMD_GET_CLOCK_HANDLE for unregistered controller_phandle"
 assert_not_contains "\[CLOCK-TEST\] BUG:" \
     "M0c device-manager did not silently accept the bogus controller_phandle"
+# M1: emmc2-driver claims bcm2711-emmc2 on Pi 4B; on QEMU virt the
+# device is absent so it exits cleanly with a log line. We assert the
+# clean-exit line rather than the Pi success line (which would never
+# appear in QEMU output).
+assert_contains "\[EMMC2:INIT\] no bcm2711-emmc2 device on this platform (QEMU)" \
+    "M1 emmc2-driver exits cleanly when bcm2711-emmc2 absent (QEMU)"
 
 echo "Phase 9 — Thread Exit:"
 assert_contains "\[EXIT\] Thread" "Thread cleanup ran (finish_exit)"

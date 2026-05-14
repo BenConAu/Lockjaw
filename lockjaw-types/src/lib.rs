@@ -30,6 +30,7 @@ pub mod thread;
 pub mod display;
 pub mod virtio;
 pub mod block;
+pub mod sdhci;
 pub mod clock;
 pub mod clock_handle_table;
 pub mod dtb_layout;

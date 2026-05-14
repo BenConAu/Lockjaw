@@ -13,7 +13,7 @@ use lockjaw_userlib::*;
 use lockjaw_types::fdt::{parse_fdt_into, FdtDevices};
 use lockjaw_types::device::{
     CMD_PROBE_DEVICE, CMD_CLAIM_BY_ADDR, CLAIM_OK, CLAIM_ERR,
-    BCM2711_CPRMAN_HASH,
+    BCM2711_CPRMAN_HASH, pack_clock_ref,
 };
 use lockjaw_types::clock::{
     CMD_GET_CLOCK_HANDLE,
@@ -228,7 +228,19 @@ pub extern "C" fn _start() -> ! {
                     puts("devmgr: claimed device at ");
                     put_hex(dev.mmio_addr);
                     puts("\n");
-                    sys_reply(CLAIM_OK, exported, dev.intid as u64, 0);
+                    // Pack the device's first clocks reference into the
+                    // claim reply so the driver can immediately call
+                    // CMD_GET_CLOCK_HANDLE without a separate query.
+                    // 0 means the node had no clocks property.
+                    let clock_ref = if dev.clock_count > 0 {
+                        pack_clock_ref(
+                            dev.clocks[0].controller_phandle,
+                            dev.clocks[0].clock_id,
+                        )
+                    } else {
+                        0
+                    };
+                    sys_reply(CLAIM_OK, exported, dev.intid as u64, clock_ref);
                     found = true;
                     break;
                 }
@@ -539,7 +551,18 @@ fn handle_claim_by_addr(devices: &mut lockjaw_types::fdt::FdtDevices, mmio_addr:
     puts("devmgr: claimed device at ");
     put_hex(dev.mmio_addr);
     puts("\n");
-    sys_reply(CLAIM_OK, exported, dev.intid as u64, 0);
+    // Same shape as CMD_CLAIM_DEVICE — pack the device's first
+    // clocks reference into the reply so the driver can call
+    // CMD_GET_CLOCK_HANDLE without a separate query.
+    let clock_ref = if dev.clock_count > 0 {
+        pack_clock_ref(
+            dev.clocks[0].controller_phandle,
+            dev.clocks[0].clock_id,
+        )
+    } else {
+        0
+    };
+    sys_reply(CLAIM_OK, exported, dev.intid as u64, clock_ref);
 }
 
 // ---------------------------------------------------------------------------

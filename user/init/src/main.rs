@@ -77,6 +77,10 @@ static CPRMAN_ELF: &[u8] = include_bytes!("../../cprman-driver/target/aarch64-un
 /// Built by: cd user/clock-test && cargo build --release
 static CLOCK_TEST_ELF: &[u8] = include_bytes!("../../clock-test/target/aarch64-unknown-none/release/lockjaw-clock-test");
 
+/// The BCM2711 emmc2 (SDHCI) driver ELF binary, embedded at compile time.
+/// Built by: cd user/emmc2-driver && cargo build --release
+static EMMC2_ELF: &[u8] = include_bytes!("../../emmc2-driver/target/aarch64-unknown-none/release/lockjaw-emmc2-driver");
+
 // ---------------------------------------------------------------------------
 // ELF spawn helper
 // ---------------------------------------------------------------------------
@@ -413,6 +417,7 @@ pub extern "C" fn _start() -> ! {
     let posix_boot_ep = alloc_endpoint("posix boot");
     let cprman_boot_ep = alloc_endpoint("cprman boot");
     let clock_test_boot_ep = alloc_endpoint("clock-test boot");
+    let emmc2_boot_ep = alloc_endpoint("emmc2 boot");
 
     // Spawn child processes.
     // Allocate VAs for ELF loading. These are reused across spawns
@@ -456,6 +461,10 @@ pub extern "C" fn _start() -> ! {
     spawn_elf(POSIX_SERVER_ELF, "posix-server", map_array_va, temp_base_va, plan_buf_va, scratch_ps, posix_boot_ep, 8);
     spawn_elf(DISPLAY_TEST_ELF, "display-test", map_array_va, temp_base_va, plan_buf_va, scratch_ps, display_test_boot_ep, 1);
     spawn_elf(CLOCK_TEST_ELF, "clock-test", map_array_va, temp_base_va, plan_buf_va, scratch_ps, clock_test_boot_ep, 1);
+    // emmc2-driver spawns after cprman so the clock provider is alive when the
+    // driver calls CMD_GET_CLOCK_HANDLE. On QEMU the claim fails immediately
+    // (no bcm2711-emmc2 in the virt DTB) and the driver exits cleanly.
+    spawn_elf(EMMC2_ELF, "emmc2-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, emmc2_boot_ep, 2);
 
     // Bootstrap hello: export a test notification into its handle table.
     puts("init: waiting for hello bootstrap...\n");
@@ -630,6 +639,19 @@ pub extern "C" fn _start() -> ! {
     };
     sys_reply(clock_test_devmgr_idx, 0, 0, 0);
     puts("[BOOTSTRAP] clock-test\n");
+
+    // Bootstrap emmc2-driver: export devmgr_ep so it can call
+    // CMD_CLAIM_DEVICE + CMD_GET_CLOCK_HANDLE through the proxy.
+    // On QEMU the claim returns CLAIM_ERR immediately; the driver
+    // exits cleanly without touching the clock path.
+    puts("init: waiting for emmc2 bootstrap...\n");
+    let _ = sys_receive(emmc2_boot_ep);
+    let emmc2_devmgr_idx = match sys_export_handle(devmgr_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export devmgr_ep to emmc2 FAILED\n"); loop { sys_yield(); } }
+    };
+    sys_reply(emmc2_devmgr_idx, 0, 0, 0);
+    puts("[BOOTSTRAP] emmc2\n");
 
     // Allocate a Reply object for init's own outbound calls (ipc_puts to
     // the uart server). Each client that issues sys_call needs one.

@@ -111,15 +111,24 @@ pub const VIRTIO_MMIO_HASH: u64 = compatible_hash(b"virtio,mmio");
 /// CPRMAN driver claims this in M0b.
 pub const BCM2711_CPRMAN_HASH: u64 = compatible_hash(b"brcm,bcm2711-cprman");
 
+/// Pre-computed hash for "brcm,bcm2711-emmc2" — Pi 4B SDHCI v3 controller
+/// behind the microSD slot. emmc2-driver claims this in M1.
+pub const BCM2711_EMMC2_HASH: u64 = compatible_hash(b"brcm,bcm2711-emmc2");
+
 // ---------------------------------------------------------------------------
 // Device manager IPC protocol commands
 // ---------------------------------------------------------------------------
 
 /// Claim the first unclaimed device matching a compatible hash.
 /// Request:  msg = [CMD_CLAIM_DEVICE, compatible_hash, 0, 0]
-/// Response: msg = [status, exported_handle, intid, 0]
+/// Response: msg = [status, exported_handle, intid, packed_clock_ref]
 ///   status: CLAIM_OK on success, CLAIM_ERR on failure.
 ///   Handle 0 is a valid handle-table index — check status, not handle.
+///   packed_clock_ref: the device's first DTB clocks reference (if
+///     any), packed via `pack_clock_ref(controller_phandle,
+///     clock_id)`. Lets drivers immediately call
+///     `CMD_GET_CLOCK_HANDLE` without a separate query. 0 means the
+///     node had no `clocks` property.
 pub const CMD_CLAIM_DEVICE: u64 = 1;
 
 /// Probe a device by absolute index among ALL devices matching a hash.
@@ -148,13 +157,43 @@ pub const PROBE_ERR:     u64 = 3; // internal failure (register/map/bad magic)
 /// The driver first uses CMD_PROBE_DEVICE to discover the mmio_addr,
 /// then claims by stable identity — no skip_count, no race.
 /// Request:  msg = [CMD_CLAIM_BY_ADDR, mmio_addr, 0, 0]
-/// Response: msg = [status, exported_handle, intid, 0]
+/// Response: msg = [status, exported_handle, intid, packed_clock_ref]
 ///   status: CLAIM_OK on success, CLAIM_ERR on failure.
+///   packed_clock_ref: same shape as CMD_CLAIM_DEVICE.
 pub const CMD_CLAIM_BY_ADDR: u64 = 3;
 
 /// Claim response status codes.
 pub const CLAIM_OK:  u64 = 0;
 pub const CLAIM_ERR: u64 = 1;
+
+// ---------------------------------------------------------------------------
+// Packed clock-reference encoding for claim replies
+// ---------------------------------------------------------------------------
+//
+// `CMD_CLAIM_DEVICE` and `CMD_CLAIM_BY_ADDR` reply with the device's
+// first DTB `clocks = <&phandle id>` reference (if any) in the last
+// message word. Both halves are u32; packing them into one u64
+// avoids growing the IPC reply layout. 0 means the node had no
+// clocks property.
+
+/// Pack a `(controller_phandle, clock_id)` pair into one u64 for
+/// the claim-reply word. controller_phandle in the high 32 bits,
+/// clock_id in the low 32 bits — order chosen so that 0 unpacks
+/// cleanly into "no provider, no clock id."
+pub const fn pack_clock_ref(controller_phandle: u32, clock_id: u32) -> u64 {
+    ((controller_phandle as u64) << 32) | (clock_id as u64)
+}
+
+/// Inverse of `pack_clock_ref`. Returns `None` if the packed value
+/// is 0 (no clocks reference); `Some((controller_phandle,
+/// clock_id))` otherwise.
+pub const fn unpack_clock_ref(packed: u64) -> Option<(u32, u32)> {
+    if packed == 0 {
+        None
+    } else {
+        Some(((packed >> 32) as u32, packed as u32))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -197,6 +236,27 @@ mod tests {
     }
 
     #[test]
+    fn pack_clock_ref_round_trip() {
+        // Realistic Pi 4B emmc2 case: cprman phandle = 8,
+        // BCM2835_CLOCK_EMMC2 = 51.
+        let packed = pack_clock_ref(8, 51);
+        assert_eq!(unpack_clock_ref(packed), Some((8, 51)));
+        // Boundaries: phandle and clock_id can each take any u32.
+        let packed = pack_clock_ref(u32::MAX, u32::MAX);
+        assert_eq!(unpack_clock_ref(packed), Some((u32::MAX, u32::MAX)));
+        let packed = pack_clock_ref(0, 1);
+        assert_eq!(unpack_clock_ref(packed), Some((0, 1)));
+    }
+
+    #[test]
+    fn pack_clock_ref_zero_is_none() {
+        // 0 means "no clocks reference present" — the only
+        // round-trip that yields None on unpack.
+        assert_eq!(pack_clock_ref(0, 0), 0);
+        assert_eq!(unpack_clock_ref(0), None);
+    }
+
+    #[test]
     fn device_info_size() {
         // Cap at 128 bytes per entry. MAX_DEVICES (192) entries fits
         // in ~24 KB, well within the userspace device-manager's
@@ -221,6 +281,19 @@ mod tests {
     fn virtio_mmio_hash_differs_from_others() {
         assert_ne!(VIRTIO_MMIO_HASH, PL011_HASH);
         assert_ne!(VIRTIO_MMIO_HASH, FW_CFG_HASH);
+    }
+
+    #[test]
+    fn bcm2711_emmc2_hash_distinct_from_other_devices() {
+        // CPRMAN and EMMC2 must each have a unique compatible hash;
+        // device-manager dispatches claims by hash, so a collision
+        // would silently route a clock claim to the storage driver
+        // (or vice-versa).
+        assert_eq!(compatible_hash(b"brcm,bcm2711-emmc2"), BCM2711_EMMC2_HASH);
+        assert_ne!(BCM2711_EMMC2_HASH, BCM2711_CPRMAN_HASH);
+        assert_ne!(BCM2711_EMMC2_HASH, PL011_HASH);
+        assert_ne!(BCM2711_EMMC2_HASH, FW_CFG_HASH);
+        assert_ne!(BCM2711_EMMC2_HASH, VIRTIO_MMIO_HASH);
     }
 
     #[test]
