@@ -114,6 +114,12 @@ pub const SDHCI_INT_ERROR: u16 = 0x8000;
 pub const SDHCI_INT_CMD_TIMEOUT: u16 = 0x0001;
 /// Command CRC Error (bit 1). CRC mismatch detected in the response.
 pub const SDHCI_INT_CMD_CRC: u16 = 0x0002;
+/// Command End Bit Error (bit 2). End bit of the response was wrong.
+pub const SDHCI_INT_CMD_END_BIT: u16 = 0x0004;
+/// Command Index Error (bit 3). Response's command-index field
+/// didn't match the issued command (only checked when CMD_INDEX
+/// flag is set in the COMMAND register).
+pub const SDHCI_INT_CMD_INDEX: u16 = 0x0008;
 
 // ---------------------------------------------------------------------------
 // PRESENT_STATE bits (offset 0x024, read-only)

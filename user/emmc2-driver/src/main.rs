@@ -31,7 +31,10 @@ use lockjaw_types::sdhci::{
     SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT,
     SDHCI_ARGUMENT, SDHCI_COMMAND,
     SDHCI_NORMAL_INT_STATUS, SDHCI_ERROR_INT_STATUS,
+    SDHCI_NORMAL_INT_STATUS_ENABLE, SDHCI_ERROR_INT_STATUS_ENABLE,
     SDHCI_INT_CMD_COMPLETE, SDHCI_INT_ERROR,
+    SDHCI_INT_CMD_TIMEOUT, SDHCI_INT_CMD_CRC,
+    SDHCI_INT_CMD_END_BIT, SDHCI_INT_CMD_INDEX,
     SDHCI_RESPONSE_0,
     SDHCI_CMD_CRC, SDHCI_CMD_INDEX, SDHCI_CMD_RESP_NONE, SDHCI_CMD_RESP_SHORT,
     SdCommand, compute_clock_divisor, sd_command_word,
@@ -206,6 +209,21 @@ unsafe fn configure_clock_id_mode(base: u64, base_hz: u64) -> Result<(), ()> {
 // Command issue
 // ---------------------------------------------------------------------------
 
+/// Outcomes from `issue_command`. Each failure shape is its own
+/// variant so the caller can emit a precise diagnostic instead of
+/// a generic timeout. `ControllerError` carries the raw
+/// `ERROR_INT_STATUS` bits captured before clearing.
+#[derive(Clone, Copy)]
+enum CmdResult {
+    Ok(u32),
+    /// CMD_INHIBIT didn't clear before the deadline. No bus transaction issued.
+    InhibitStuck,
+    /// NORMAL_INT_STATUS.ERROR fired; bits == ERROR_INT_STATUS at the moment of detection.
+    ControllerError(u16),
+    /// Neither CMD_COMPLETE nor ERROR fired before the 1s deadline.
+    NoResponse,
+}
+
 /// Issue one SD command and return `RESPONSE_0` (the low 32 bits of the
 /// response register).
 ///
@@ -216,12 +234,12 @@ unsafe fn configure_clock_id_mode(base: u64, base_hz: u64) -> Result<(), ()> {
 ///   4. Poll NORMAL_INT_STATUS for CMD_COMPLETE or ERROR.
 ///   5. Clear CMD_COMPLETE (write-1-to-clear).
 ///   6. Return RESPONSE_0.
-///
-/// Returns `Err(())` on timeout, CMD_INHIBIT stuck, or controller error.
-unsafe fn issue_command(base: u64, arg: u32, cmd_word: u16) -> Result<u32, ()> {
+unsafe fn issue_command(base: u64, arg: u32, cmd_word: u16) -> CmdResult {
     // Wait for CMD line to be free. Should clear within microseconds
     // on a healthy controller; 100 ms is generous bound.
-    poll_until_clear_32(base, SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, Nanos::from_millis(100))?;
+    if poll_until_clear_32(base, SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, Nanos::from_millis(100)).is_err() {
+        return CmdResult::InhibitStuck;
+    }
     sdhci_write32(base, SDHCI_ARGUMENT, arg);
     // Writing COMMAND triggers the command on the bus.
     sdhci_write16(base, SDHCI_COMMAND, cmd_word);
@@ -238,23 +256,38 @@ unsafe fn issue_command(base: u64, arg: u32, cmd_word: u16) -> Result<u32, ()> {
     loop {
         let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
         if status & SDHCI_INT_ERROR != 0 {
-            // Clear underlying error bits first (w1c), then the summary.
-            // Leaving ERROR_INT_STATUS set causes the controller to re-assert
-            // the NORMAL_INT_STATUS ERROR summary bit on the next command.
+            // Capture which error bit fired *before* clearing, so the
+            // caller can decode the cause. Then clear underlying bits
+            // (w1c) followed by the summary bit — leaving
+            // ERROR_INT_STATUS set causes the controller to re-assert
+            // the NORMAL_INT_STATUS ERROR summary on the next command.
+            let err_bits = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
             sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
             sdhci_write16(base, SDHCI_NORMAL_INT_STATUS,
                 SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
-            return Err(());
+            return CmdResult::ControllerError(err_bits);
         }
         if status & SDHCI_INT_CMD_COMPLETE != 0 {
             sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
-            return Ok(sdhci_read32(base, SDHCI_RESPONSE_0));
+            return CmdResult::Ok(sdhci_read32(base, SDHCI_RESPONSE_0));
         }
         if monotonic_now() >= deadline {
-            return Err(()); // timeout
+            return CmdResult::NoResponse;
         }
         core::hint::spin_loop();
     }
+}
+
+/// Pretty-print ERROR_INT_STATUS bits to the kernel UART. Names match
+/// the SDHCI spec § 2.2.18 / Linux's headers so the output line can
+/// be grep'd against a reference.
+fn put_error_int_status(bits: u16) {
+    puts("ERROR_INT_STATUS=0x");
+    put_hex(bits as u64);
+    if bits & SDHCI_INT_CMD_TIMEOUT != 0 { puts(" CMD_TIMEOUT"); }
+    if bits & SDHCI_INT_CMD_CRC      != 0 { puts(" CMD_CRC"); }
+    if bits & SDHCI_INT_CMD_END_BIT  != 0 { puts(" CMD_END_BIT"); }
+    if bits & SDHCI_INT_CMD_INDEX    != 0 { puts(" CMD_INDEX"); }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +387,25 @@ pub extern "C" fn _start() -> ! {
         halt();
     }
 
+    // Enable status reporting in NORMAL_INT_STATUS / ERROR_INT_STATUS.
+    // SDHCI spec § 2.2.21: each bit in NORMAL_INT_STATUS_ENABLE
+    // (0x034) gates whether the controller updates the corresponding
+    // bit in NORMAL_INT_STATUS (0x030). After SW_RST_ALL the enable
+    // registers are zero, so polling NORMAL_INT_STATUS for
+    // CMD_COMPLETE / ERROR yields nothing forever — every command
+    // appears to time out even when the bus runs perfectly. This
+    // is the bug the M2 v1 instrumentation surfaced: SD_CLK was
+    // 400 kHz, neither CMD_COMPLETE nor ERROR ever fired.
+    //
+    // We don't enable IRQ *signals* (NORMAL_INT_SIGNAL_ENABLE 0x038
+    // / ERROR_INT_SIGNAL_ENABLE 0x03A) — the driver polls today,
+    // and signal-enable controls whether the GIC line asserts.
+    // M3+ will flip those bits when we wire the IRQ path.
+    unsafe {
+        sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS_ENABLE, 0xFFFF);
+        sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS_ENABLE,  0xFFFF);
+    }
+
     // Read CAPABILITIES (low 32 bits at 0x040) and CAPABILITIES_HI
     // (high 32 bits at 0x044). Decoded view lives in lockjaw-types
     // so the bit layout has host tests; the driver just dispatches
@@ -402,11 +454,14 @@ pub extern "C" fn _start() -> ! {
     // Program CPRMAN to produce the SDHCI base clock. The CAPABILITIES
     // register reports what the controller expects; ask CPRMAN to match it.
     let base_hz = caps.base_clock_mhz as u64 * 1_000_000;
-    match clk.set_rate(base_hz) {
+    let actual_base_hz = match clk.set_rate(base_hz) {
         Ok(actual) => {
             puts("emmc2: CPRMAN set_rate=");
             put_decimal(actual / 1_000_000);
-            puts("MHz\n");
+            puts("MHz (requested ");
+            put_decimal(base_hz / 1_000_000);
+            puts("MHz)\n");
+            actual
         }
         Err(e) => {
             puts("emmc2: set_rate FAILED: ");
@@ -414,7 +469,21 @@ pub extern "C" fn _start() -> ! {
             puts("\n");
             halt();
         }
-    }
+    };
+    // Diagnostic: the divisor we'll program into CLOCK_CONTROL and
+    // the resulting SD bus clock. SD ID-mode requires SD_CLK ≤ 400 kHz;
+    // anything outside [100kHz, 400kHz] explains a CMD8 failure
+    // immediately (CRC mismatch / no response).
+    let (lo, hi) = compute_clock_divisor(actual_base_hz, 400_000);
+    let n = ((hi as u64) << 8) | (lo as u64);
+    let derived_sd_clk = if n == 0 { actual_base_hz } else { actual_base_hz / (2 * n) };
+    puts("[EMMC2:CLK] base_actual=");
+    put_decimal(actual_base_hz);
+    puts(" divisor_N=");
+    put_decimal(n);
+    puts(" SD_CLK=");
+    put_decimal(derived_sd_clk);
+    puts("Hz\n");
     if let Err(e) = clk.enable() {
         puts("emmc2: clk enable FAILED: ");
         put_clock_error(e);
@@ -449,11 +518,22 @@ pub extern "C" fn _start() -> ! {
     // satisfies the "≥ 185 µs" minimum.
     let _ = sleep_for(Nanos::from_micros(200));
 
-    // CMD0 — GO_IDLE_STATE. No response. Resets all cards on the bus to
-    // idle state. We issue and ignore the result: no response means no
-    // success indicator, and it's safe for the card to miss CMD0.
+    // CMD0 — GO_IDLE_STATE. No response (RESP_NONE). Resets all cards
+    // on the bus to idle state. We log the outcome but don't bail on
+    // failure: it's safe for the card to miss CMD0 if it was already
+    // idle. A controller-level error here (e.g. CMD line wedged) is
+    // still useful diagnostic context for what follows.
     let cmd0 = sd_command_word(SdCommand::GoIdleState.index(), SDHCI_CMD_RESP_NONE);
-    let _ = unsafe { issue_command(mmio_va, 0, cmd0) };
+    match unsafe { issue_command(mmio_va, 0, cmd0) } {
+        CmdResult::Ok(_) => puts("[EMMC2:IDPHASE] CMD0 acknowledged\n"),
+        CmdResult::InhibitStuck => puts("[EMMC2:IDPHASE] CMD0: CMD_INHIBIT stuck (controller not responding)\n"),
+        CmdResult::ControllerError(bits) => {
+            puts("[EMMC2:IDPHASE] CMD0 controller error: ");
+            put_error_int_status(bits);
+            puts("\n");
+        }
+        CmdResult::NoResponse => puts("[EMMC2:IDPHASE] CMD0: no CMD_COMPLETE within 1s (suspicious)\n"),
+    }
 
     // CMD8 — SEND_IF_COND. Arg: VHS=1 (2.7–3.6 V) + check pattern 0xAA.
     // R7 response echoes VHS and the check pattern back. A correct echo
@@ -462,9 +542,28 @@ pub extern "C" fn _start() -> ! {
     let cmd8_flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX;
     let cmd8 = sd_command_word(SdCommand::SendIfCond.index(), cmd8_flags);
     let resp = match unsafe { issue_command(mmio_va, 0x0000_01AA, cmd8) } {
-        Ok(r) => r,
-        Err(()) => {
-            puts("emmc2: CMD8 FAILED — no card or card not SDv2+\n");
+        CmdResult::Ok(r) => r,
+        CmdResult::InhibitStuck => {
+            puts("[EMMC2:IDPHASE] CMD8 FAILED: CMD_INHIBIT did not clear before deadline\n");
+            sys_exit();
+        }
+        CmdResult::ControllerError(bits) => {
+            // Decoded error bits tell us whether the bus rate, the
+            // voltage, or the card itself is the problem:
+            //   CMD_TIMEOUT alone → card didn't respond (pre-SDv2,
+            //                       no card, or SD_CLK out of spec)
+            //   CMD_CRC          → response present but bus-rate /
+            //                       signal-integrity issue
+            //   CMD_END_BIT      → bus framing wrong
+            //   CMD_INDEX        → response received but for a
+            //                       different command (controller bug?)
+            puts("[EMMC2:IDPHASE] CMD8 FAILED: ");
+            put_error_int_status(bits);
+            puts("\n");
+            sys_exit();
+        }
+        CmdResult::NoResponse => {
+            puts("[EMMC2:IDPHASE] CMD8 FAILED: no CMD_COMPLETE/ERROR within 1s\n");
             sys_exit();
         }
     };
