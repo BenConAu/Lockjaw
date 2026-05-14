@@ -132,6 +132,18 @@ impl CurrentThread {
         Self::mut_().get_mut().wait_count = 0;
     }
 
+    /// Absolute monotonic deadline (CNTVCT_EL0 ticks) for the current
+    /// `sys_wait_any`. `MonoTicks::NO_DEADLINE` means "no timeout".
+    pub fn wait_deadline() -> lockjaw_types::time::MonoTicks {
+        lockjaw_types::time::MonoTicks(Self::ref_().get().wait_deadline)
+    }
+
+    /// Store the absolute monotonic deadline for the current
+    /// `sys_wait_any`. Pass `MonoTicks::NO_DEADLINE` to clear.
+    pub fn set_wait_deadline(deadline: lockjaw_types::time::MonoTicks) {
+        Self::mut_().get_mut().wait_deadline = deadline.0;
+    }
+
     // --- Internal helpers (not pub — prevent external nesting) ---
 
     fn ref_() -> KernelRef<'static, Tcb> {

@@ -15,6 +15,7 @@
 
 use crate::addr::{KernelImageVa, KernelVa};
 use crate::object::ObjectHeader;
+use crate::time::MonoTicks;
 use crate::wait::MAX_WAIT_OBJECTS;
 
 // ---------------------------------------------------------------------------
@@ -190,8 +191,18 @@ pub struct Tcb {
     pub wait_thresholds: [u64; MAX_WAIT_OBJECTS],
     /// Object types for each wait entry (ObjectType as u8).
     pub wait_types: [u8; MAX_WAIT_OBJECTS],
-    /// Number of valid entries in wait_objects (0 = not in a sys_wait_any).
+    /// Number of valid entries in wait_objects (0 = not in a sys_wait_any
+    /// — but a future S3 will allow `count == 0` as a pure-sleep variant
+    /// driven by `wait_deadline` alone).
     pub wait_count: u8,
+    /// Absolute monotonic deadline (CNTVCT_EL0 ticks) for the current
+    /// `sys_wait_any`. `MonoTicks::NO_DEADLINE` (= u64::MAX) means
+    /// "no timeout — wait indefinitely on object readiness". Set on
+    /// syscall entry, scanned by the per-tick deadline walker, cleared
+    /// on syscall return. Stored as raw u64 because `Tcb` is `repr(C)`
+    /// and crossed by raw-pointer accessors; the `MonoTicks` newtype
+    /// is reconstructed at the use sites.
+    pub wait_deadline: u64,
     /// Currently executing syscall number (u64::MAX = not in a syscall).
     /// Set at syscall entry, cleared at exit. Printed on crash.
     pub current_syscall: u64,
@@ -223,6 +234,7 @@ impl Tcb {
         };
         (*ptr).entry = entry;
         (*ptr).current_syscall = u64::MAX;
+        (*ptr).wait_deadline = MonoTicks::NO_DEADLINE.0; // No outstanding sleep on a fresh TCB.
     }
 }
 
@@ -312,5 +324,21 @@ mod tests {
     #[test]
     fn tcb_fits_in_page() {
         assert!(core::mem::size_of::<Tcb>() <= 4096);
+    }
+
+    #[test]
+    fn tcb_init_in_place_sets_wait_deadline_to_no_deadline() {
+        // WHY: a freshly-created thread has no outstanding sleep. The
+        // per-tick deadline scan must see NO_DEADLINE and skip it,
+        // otherwise a thread could appear "expired" at t=0 because
+        // the page-zeroed default (0) is in the past for any nonzero
+        // CNTVCT_EL0 reading.
+        let mut storage = [0u8; core::mem::size_of::<Tcb>()];
+        let ptr = storage.as_mut_ptr() as *mut Tcb;
+        fn dummy() -> ! { loop {} }
+        unsafe { Tcb::init_in_place(ptr, dummy); }
+        let tcb = unsafe { &*ptr };
+        assert_eq!(tcb.wait_deadline, MonoTicks::NO_DEADLINE.0);
+        assert_eq!(tcb.wait_deadline, u64::MAX);
     }
 }
