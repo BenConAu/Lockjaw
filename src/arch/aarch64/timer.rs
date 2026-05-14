@@ -16,6 +16,23 @@ fn timer_freq() -> u64 {
     freq
 }
 
+/// Kernel-side read of the monotonic counter (CNTVCT_EL0).
+///
+/// Used by the per-tick deadline scan in `handle_tick` and by
+/// `sys_wait_any`'s deadline-already-past fast path. EL1 always
+/// has access to the counter regardless of CNTKCTL_EL1 — that
+/// register only gates EL0 reads (see `enable_el0_counter_reads`).
+pub fn kernel_now() -> lockjaw_types::time::MonoTicks {
+    let ticks: u64;
+    unsafe {
+        asm!(
+            "mrs {val}, CNTVCT_EL0",            // Read virtual counter (EL1 access never traps)
+            val = out(reg) ticks,
+        );
+    }
+    lockjaw_types::time::MonoTicks(ticks)
+}
+
 /// Arm the virtual timer to fire after `duration_ms` milliseconds.
 unsafe fn arm_timer(duration_ms: u64) {
     let ticks = timer_freq() / 1000 * duration_ms;
@@ -85,11 +102,23 @@ pub unsafe fn init_secondary() {
 }
 
 /// Called from the IRQ handler when INTID 27 fires.
-/// Increments the tick counter, rearms the timer, and triggers the scheduler.
+/// Increments the tick counter, rearms the timer, wakes any
+/// deadline-expired sleepers, and triggers the scheduler.
+///
+/// Wake-before-schedule ordering matters: a TCB whose deadline
+/// just expired must transition Blocked→Ready *before*
+/// `scheduler::tick()` so it can be a candidate for *this* tick's
+/// scheduling decision. Calling `unblock_thread` after `tick()`
+/// would leave the just-expired sleeper Blocked through the
+/// current scheduling pass — the woken thread wouldn't actually
+/// run until the *next* tick, doubling the worst-case wakeup
+/// latency for no reason and breaking the [50ms, 70ms] tolerance
+/// the integration test pins.
 pub fn handle_tick() {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     unsafe {
         arm_timer(lockjaw_types::constants::TIMER_TICK_MS);
+        crate::sched::scheduler::wake_expired_deadlines(kernel_now());
         crate::sched::scheduler::tick();
     }
 }

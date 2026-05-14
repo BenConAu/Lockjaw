@@ -44,8 +44,16 @@ pub fn validate_user_buffer(ptr: u64, byte_count: u64) -> bool {
 }
 
 /// Validate that a wait entry count is within bounds.
+///
+/// `count == 0` is intentionally accepted: it is the "pure sleep"
+/// form of `sys_wait_any`, where the only wake source is the
+/// caller's deadline. The two roles (wait-on-objects-with-optional-
+/// timeout and pure-sleep) deliberately collapse onto the same
+/// syscall so the kernel substrate stays small. A future reader who
+/// tightens this back to `count >= 1` would silently break
+/// `sleep_until` / `sleep_for` in lockjaw-userlib::time.
 pub fn validate_wait_count(count: usize) -> bool {
-    count >= 1 && count <= MAX_WAIT_OBJECTS
+    count <= MAX_WAIT_OBJECTS
 }
 
 // ---------------------------------------------------------------------------
@@ -235,8 +243,11 @@ mod tests {
     }
 
     #[test]
-    fn wait_count_invalid_zero() {
-        assert!(!validate_wait_count(0));
+    fn wait_count_zero_is_pure_sleep() {
+        // WHY: count == 0 is the "pure sleep" form of sys_wait_any —
+        // the caller waits only on its deadline, no objects. Tightening
+        // this back to >= 1 would silently break sleep_for / sleep_until.
+        assert!(validate_wait_count(0));
     }
 
     #[test]

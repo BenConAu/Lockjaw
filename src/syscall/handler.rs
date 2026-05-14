@@ -587,29 +587,52 @@ fn sys_recv_nb(ctx: &mut ExceptionContext) -> SyscallReturn {
     }
 }
 
-/// sys_wait_any(entries_ptr, count) — wait until any of N objects is ready.
+/// sys_wait_any(entries_ptr, count, deadline) — wait until any of N
+/// objects is ready or `deadline` (absolute monotonic CNTVCT_EL0
+/// ticks) expires, whichever comes first.
+///
 /// x0 = pointer to WaitEntry array in caller memory.
-/// x1 = count (1..MAX_WAIT_OBJECTS).
-/// Returns bitmask of ready objects in x1 (bit N = entry N is ready).
+/// x1 = count (0..=MAX_WAIT_OBJECTS).
+/// x2 = absolute monotonic deadline; `MonoTicks::NO_DEADLINE`
+///      (= u64::MAX) means "no timeout".
+///
+/// Returns: standard 2-register syscall convention — x0 = SyscallError
+/// code (0 on success), x1 = bitmask. Bit N set = entry N became ready;
+/// mask == 0 = deadline expired before any object fired (timeout
+/// encoding — see docs/syscalls.md S6 for the eternal-truth caveat).
+///
+/// Two roles deliberately collapse onto this one syscall:
+/// - `count > 0`: wait on objects, optionally with a timeout.
+/// - `count == 0`: pure sleep — no objects, only the deadline can
+///   wake you. Used by lockjaw-userlib `sleep_until` / `sleep_for`.
 fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     use lockjaw_types::wait::{WaitEntry, MAX_WAIT_OBJECTS, validate_wait_count};
+    use lockjaw_types::time::MonoTicks;
     use crate::ipc::notification;
 
     let entries_va = ctx.gpr[0];
     let count = ctx.gpr[1] as usize;
+    let deadline = MonoTicks(ctx.gpr[2]);
 
     if !validate_wait_count(count) {
         return Err(SyscallError::INVALID_PARAMETER);
     }
 
-    let addr_space = match CurrentThread::address_space() {
-        Some(a) => a,
-        None => return Err(SyscallError::INVALID_PARAMETER),
+    // Pure-sleep form (count == 0) doesn't read a WaitEntry array, so
+    // it doesn't need an address space lookup. Only require it when
+    // count > 0; this also leaves the door open to kernel threads
+    // pure-sleeping (none currently do).
+    let addr_space = if count > 0 {
+        match CurrentThread::address_space() {
+            Some(a) => Some(a),
+            None => return Err(SyscallError::INVALID_PARAMETER),
+        }
+    } else {
+        None
     };
 
     unsafe {
         let tcb_kva = CurrentThread::tcb_kva();
-        let ht = CurrentThread::handle_table();
 
         // Read WaitEntry array from user memory via page table walk (TTBR1).
         // Never touches TTBR0 — immune to context switches.
@@ -623,35 +646,51 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         let mut types = [ObjectType::HandleTable; MAX_WAIT_OBJECTS];
         let mut thresholds = [0u64; MAX_WAIT_OBJECTS];
 
-        for i in 0..count {
-            let user_va = entries_va + (i as u64) * core::mem::size_of::<WaitEntry>() as u64;
-            let entry: WaitEntry = match addr_space.read(user_va) {
-                Some(e) => e,
-                None => return Err(SyscallError::INVALID_PARAMETER),
-            };
-            let he = ht.lookup_any(
-                entry.handle as u32,
-                Rights::from_bits(crate::cap::rights::RIGHT_READ),
-            )?;
-            let (obj_type, addr) = match he.kind {
-                lockjaw_types::object::HandleKind::Endpoint { kva, .. } =>
-                    (ObjectType::Endpoint, kva.as_u64()),
-                lockjaw_types::object::HandleKind::Notification { kva } =>
-                    (ObjectType::Notification, kva.as_u64()),
-                _ => return Err(SyscallError::INVALID_PARAMETER),
-            };
-            addrs[i] = addr;
-            types[i] = obj_type;
-            thresholds[i] = entry.threshold;
+        if count > 0 {
+            let addr_space = addr_space.as_ref().unwrap(); // checked above
+            let ht = CurrentThread::handle_table();
+            for i in 0..count {
+                let user_va = entries_va + (i as u64) * core::mem::size_of::<WaitEntry>() as u64;
+                let entry: WaitEntry = match addr_space.read(user_va) {
+                    Some(e) => e,
+                    None => return Err(SyscallError::INVALID_PARAMETER),
+                };
+                let he = ht.lookup_any(
+                    entry.handle as u32,
+                    Rights::from_bits(crate::cap::rights::RIGHT_READ),
+                )?;
+                let (obj_type, addr) = match he.kind {
+                    lockjaw_types::object::HandleKind::Endpoint { kva, .. } =>
+                        (ObjectType::Endpoint, kva.as_u64()),
+                    lockjaw_types::object::HandleKind::Notification { kva } =>
+                        (ObjectType::Notification, kva.as_u64()),
+                    _ => return Err(SyscallError::INVALID_PARAMETER),
+                };
+                addrs[i] = addr;
+                types[i] = obj_type;
+                thresholds[i] = entry.threshold;
+            }
+
+            // Fast path: object already ready
+            let mask = check_readiness(&addrs, &types, &thresholds, count);
+            if mask != 0 {
+                return Ok(mask);
+            }
         }
 
-        // Fast path: check if any object is already ready
-        let mask = check_readiness(&addrs, &types, &thresholds, count);
-        if mask != 0 {
-            return Ok(mask);
+        // Deadline-already-past fast path. Applies to both:
+        //   - count > 0: the timeout already fired before we got here.
+        //   - count == 0: sleep_until called with a past deadline.
+        // Returns the timeout-encoding mask (0) without registering
+        // waiters or blocking — symmetric with the count > 0 case.
+        if !deadline.is_no_deadline() {
+            if deadline.has_expired(crate::arch::aarch64::timer::kernel_now()) {
+                return Ok(0);
+            }
         }
 
         // Slow path: register as readiness waiter on each object, then block.
+        // For count == 0 this loop is a no-op; only the deadline can wake us.
         // Both Endpoint and Notification live in the KVM pool now —
         // decode the polymorphic u64 as KernelVa for both.
         for i in 0..count {
@@ -665,17 +704,29 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
             }
         }
 
-        // Store wait state in TCB for post-wake cleanup
+        // Store wait state in TCB for post-wake cleanup. For count == 0
+        // this records an empty wait set so the post-wake unregister
+        // loop is also a no-op.
         {
             let type_bytes: [u8; MAX_WAIT_OBJECTS] = core::array::from_fn(|i| {
                 if i < count { types[i] as u8 } else { 0 }
             });
             CurrentThread::store_wait_state(&addrs, &thresholds, &type_bytes, count);
         }
+        // Store deadline so the per-tick scan in handle_tick can find us.
+        // NO_DEADLINE means the scan will skip this TCB — only IPC
+        // unblock can wake us (current behavior for count > 0 callers
+        // that don't pass a deadline).
+        CurrentThread::set_wait_deadline(deadline);
 
         scheduler::block_current(scheduler::BlockToken::new());
 
-        // Woke up — unregister from all objects (only clear our own registration)
+        // Woke up — could be readiness fired, deadline expired, or both.
+        // Clear the deadline so a stale value can't accidentally apply
+        // to a future sys_wait_any (the per-tick scan also clears it
+        // when it does the unblocking, but be defensive).
+        CurrentThread::set_wait_deadline(MonoTicks::NO_DEADLINE);
+
         let wc = CurrentThread::wait_count();
         for i in 0..wc {
             let (a, type_tag) = CurrentThread::wait_entry(i);
@@ -690,7 +741,9 @@ fn sys_wait_any(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         }
         CurrentThread::clear_wait_count();
 
-        // Re-check all objects (others may have become ready while blocked)
+        // Re-check all objects (others may have become ready while
+        // blocked). For count == 0 this returns 0 — pure sleep always
+        // returns the timeout-encoding mask, by construction.
         Ok(check_readiness(&addrs, &types, &thresholds, wc))
     }
 }

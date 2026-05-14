@@ -408,6 +408,66 @@ pub fn unblock_thread(tcb_kva: lockjaw_types::addr::KernelVa) {
     }
 }
 
+/// Wake every Blocked thread whose `wait_deadline` has expired
+/// relative to `now` (a CNTVCT_EL0 reading).
+///
+/// Called from the timer tick handler before `scheduler::tick()`
+/// so that a just-expired sleeper participates in the same tick's
+/// scheduling decision (see `handle_tick` for the ordering
+/// rationale).
+///
+/// O(N) walk over the run queue under the GKL. N is bounded by
+/// `MAX_THREADS` (currently 1024). Each visited TCB is two loads
+/// (deadline + scheduler state) and a compare; if a future workload
+/// pushes wake latency or contention, switch to a sorted per-CPU
+/// deadline heap (out of scope today).
+///
+/// Three guards each block a class of bug:
+/// - `is_no_deadline` skips TCBs with no outstanding sleep, so the
+///   page-zeroed default for never-slept threads (NO_DEADLINE) is
+///   correctly ignored.
+/// - `has_expired` skips not-yet-due deadlines.
+/// - `state.get(idx) == Blocked` skips threads that have already
+///   been woken by an IPC unblock but whose syscall return path
+///   hasn't yet cleared `wait_deadline` (a brief Running window
+///   with a stale deadline). Without this guard, calling
+///   `unblock` on a Ready/Running thread would panic.
+///
+/// We clear `wait_deadline` to NO_DEADLINE before unblocking so a
+/// repeat scan on a later tick (before the woken thread's syscall
+/// return path runs) cannot try to unblock it again.
+pub fn wake_expired_deadlines(now: lockjaw_types::time::MonoTicks) {
+    use lockjaw_types::scheduler::SchedThreadState;
+    use lockjaw_types::time::MonoTicks;
+    use lockjaw_types::thread::Tcb;
+
+    // SAFETY: GKL held during timer tick — exclusive access to scheduler
+    // state and to every live TCB (single-core mutation per CPU; the
+    // tick walk on this CPU does not race other CPUs' tick walks because
+    // each holds the GKL while running).
+    unsafe {
+        let threads = &*SCHEDULER.threads_ptr();
+        let state = &mut *SCHEDULER.state_ptr();
+        for idx in 0..MAX_THREADS {
+            let Some(kva) = threads[idx] else { continue };
+            // SAFETY: live KVM-mapped TCB; GKL held — no concurrent mutation. (See module doc above.)
+            let tcb_ptr = kva.as_u64() as *mut Tcb;
+            let deadline = MonoTicks((*tcb_ptr).wait_deadline);
+            if deadline.is_no_deadline() { continue; }
+            if !deadline.has_expired(now) { continue; }
+            // Only Blocked threads can be unblocked. A Ready/Running
+            // thread with a stale deadline got woken by IPC and is
+            // racing the syscall return path; let it clear itself.
+            if state.get(idx) != Some(SchedThreadState::Blocked) { continue; }
+            // Clear deadline first so a re-scan can't double-unblock.
+            (*tcb_ptr).wait_deadline = MonoTicks::NO_DEADLINE.0;
+            state.unblock(idx).unwrap_or_else(|_| {
+                panic!("wake_expired_deadlines: unblock failed for idx {}", idx)
+            });
+        }
+    }
+}
+
 /// Exit the current thread permanently. Never returns.
 ///
 /// 1. Asserts no pending exit (cleanup slot empty)

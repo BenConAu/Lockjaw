@@ -337,6 +337,11 @@ pub fn sys_export_handle(h: impl Exportable) -> Result<u64, SyscallError> {
 /// Wait until any of the given objects is ready.
 /// entries = array of WaitEntry (handle + threshold pairs).
 /// Returns a bitmask: bit N set = entry N is ready.
+///
+/// Internally passes `NO_DEADLINE` (= u64::MAX) in x2 to the kernel's
+/// 3-arg `sys_wait_any` ABI — this wrapper is the no-timeout form.
+/// For the deadline-aware form, use `lockjaw_userlib::time::sleep_until`
+/// or call the syscall directly with x2 = absolute CNTVCT_EL0 ticks.
 pub fn sys_wait_any(entries: &[crate::WaitEntry]) -> Result<u64, SyscallError> {
     let err: u64;
     let val: u64;
@@ -345,6 +350,7 @@ pub fn sys_wait_any(entries: &[crate::WaitEntry]) -> Result<u64, SyscallError> {
             "svc #0",
             inlateout("x0") entries.as_ptr() => err,
             inlateout("x1") entries.len() => val,
+            in("x2") u64::MAX,                  // NO_DEADLINE — no timeout
             in("x8") SYS_WAIT_ANY,
         );
     }
