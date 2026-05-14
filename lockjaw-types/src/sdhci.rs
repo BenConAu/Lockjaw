@@ -17,8 +17,7 @@
 //
 // All offsets are byte offsets from the controller's MMIO base.
 // Names match the SD Host Controller spec / Linux kernel headers
-// for cross-reference. Only the registers M1 actually touches are
-// listed today; M2+ adds the rest as it grows the protocol surface.
+// for cross-reference.
 
 /// `SDMA_SYS_ADDR_REG` (0x000) — also serves as the 32-bit ADMA
 /// system address argument register. Read here only as part of
@@ -76,6 +75,68 @@ pub const SDHCI_CAPABILITIES_HI: usize = 0x044;
 /// `SLOT_INT_STATUS_VERSION` (0x0fc) — slot status (low 16) +
 /// host controller version (high 16).
 pub const SDHCI_HOST_VERSION: usize = 0x0fe;
+
+// ---------------------------------------------------------------------------
+// CLOCK_CONTROL bits (offset 0x02c)
+// ---------------------------------------------------------------------------
+
+/// Internal Clock Enable — start the host oscillator.
+pub const SDHCI_CLOCK_INT_EN: u16 = 0x0001;
+/// Internal Clock Stable — set by hardware when the oscillator is stable.
+pub const SDHCI_CLOCK_INT_STABLE: u16 = 0x0002;
+/// SD Clock Enable — gates the oscillator through to the card slot.
+pub const SDHCI_CLOCK_CARD_EN: u16 = 0x0004;
+
+// ---------------------------------------------------------------------------
+// POWER_CONTROL bits (offset 0x029)
+// ---------------------------------------------------------------------------
+
+/// Bus Power On. OR this with a voltage-select constant to enable the bus.
+pub const SDHCI_POWER_ON: u8 = 0x01;
+/// Bus Voltage Select = 3.3 V. bits[3:1] = 0b111 = 7, so 0x0E.
+pub const SDHCI_POWER_330: u8 = 0x0E;
+
+// ---------------------------------------------------------------------------
+// NORMAL_INT_STATUS bits (offset 0x030, write-1-to-clear)
+// ---------------------------------------------------------------------------
+
+/// Command Complete (bit 0). Set when the CMD/response phase finishes.
+pub const SDHCI_INT_CMD_COMPLETE: u16 = 0x0001;
+/// Error Interrupt (bit 15). Summary bit — consult ERROR_INT_STATUS for
+/// which error fired.
+pub const SDHCI_INT_ERROR: u16 = 0x8000;
+
+// ---------------------------------------------------------------------------
+// ERROR_INT_STATUS bits (offset 0x032, write-1-to-clear)
+// ---------------------------------------------------------------------------
+
+/// Command Timeout (bit 0). Card did not respond within the timeout window.
+pub const SDHCI_INT_CMD_TIMEOUT: u16 = 0x0001;
+/// Command CRC Error (bit 1). CRC mismatch detected in the response.
+pub const SDHCI_INT_CMD_CRC: u16 = 0x0002;
+
+// ---------------------------------------------------------------------------
+// PRESENT_STATE bits (offset 0x024, read-only)
+// ---------------------------------------------------------------------------
+
+/// CMD Line Inhibit (bit 0). Set while a command transfer is in progress.
+pub const SDHCI_CMD_INHIBIT: u32 = 0x0000_0001;
+
+// ---------------------------------------------------------------------------
+// COMMAND_REG flag constants (offset 0x00e, low byte)
+// ---------------------------------------------------------------------------
+//
+// Assemble with `sd_command_word(index, flags)`. Bits[13:8] = command
+// index, bits[7:0] = flags. See SDHCI Spec § 2.2.5.
+
+/// CRC check enable for the response field.
+pub const SDHCI_CMD_CRC: u8 = 0x08;
+/// Index check enable for the response field.
+pub const SDHCI_CMD_INDEX: u8 = 0x10;
+/// No response type (CMD0, broadcast commands with no reply).
+pub const SDHCI_CMD_RESP_NONE: u8 = 0x00;
+/// Short response — 48-bit (R1, R3, R4, R5, R6, R7).
+pub const SDHCI_CMD_RESP_SHORT: u8 = 0x02;
 
 // ---------------------------------------------------------------------------
 // SOFTWARE_RESET bits (offset 0x02f)
@@ -166,16 +227,60 @@ impl Capabilities {
 }
 
 // ---------------------------------------------------------------------------
+// Clock divisor math (SDHCI v3 10-bit divisor mode)
+// ---------------------------------------------------------------------------
+//
+// SDHCI v3 uses a 10-bit programmable divisor N where the SD clock output
+// is: SD_CLK = base_clock / (2 × N).  N = 0 is pass-through (bypass).
+//
+// N is packed into CLOCK_CONTROL as:
+//   bits[15:8] = lower 8 bits of N
+//   bits[7:6]  = upper 2 bits of N  (SDHCI v3 only; v1/v2 ignore these)
+//
+// Example: 200 MHz base → 400 kHz target
+//   N = 200_000_000 / (2 × 400_000) = 250 = 0xFA
+//   lo = 0xFA  (CLOCK_CONTROL[15:8])
+//   hi = 0x00  (CLOCK_CONTROL[7:6])
+//
+// The caller assembles CLOCK_CONTROL as:
+//   (lo as u16) << 8 | (hi as u16) << 6 | enable_bits
+
+/// Compute the `(lo, hi)` CLOCK_CONTROL divisor pair for SDHCI v3.
+/// Produces the closest output ≤ `target_hz` from `base_hz`.
+/// `lo` → CLOCK_CONTROL\[15:8\], `hi` (2-bit) → CLOCK_CONTROL\[7:6\].
+pub const fn compute_clock_divisor(base_hz: u64, target_hz: u64) -> (u8, u8) {
+    if target_hz == 0 || base_hz <= target_hz {
+        return (0, 0); // N = 0 → bypass
+    }
+    // N = ceil(base_hz / (2 × target_hz)), clamped to [1, 1023].
+    let double_target = 2 * target_hz;
+    let n_raw = (base_hz + double_target - 1) / double_target;
+    let n = if n_raw > 1023 { 1023 } else { n_raw };
+    ((n & 0xFF) as u8, ((n >> 8) & 0x3) as u8)
+}
+
+// ---------------------------------------------------------------------------
+// Command register word builder
+// ---------------------------------------------------------------------------
+
+/// Build the 16-bit value for `COMMAND_REG` (offset 0x00e).
+///
+/// `index` is the SD command number (0–63); `flags` is the OR of
+/// `SDHCI_CMD_*` flag constants. bits\[13:8\] = index, bits\[7:0\] = flags.
+pub const fn sd_command_word(index: u8, flags: u8) -> u16 {
+    ((index as u16) << 8) | (flags as u16)
+}
+
+// ---------------------------------------------------------------------------
 // SD command opcodes (SD Physical Layer Spec § 4.7.4)
 // ---------------------------------------------------------------------------
 //
-// Typed for M2+ to dispatch on. Numbering matches the spec; the
-// SDHCI controller takes `cmd_index` in bits[13:8] of
-// COMMAND_REG, so `as u16` produces the value to OR in.
+// Numbered to match the spec; the SDHCI controller takes `cmd_index` in
+// bits[13:8] of COMMAND_REG. Use `sd_command_word(cmd.index(), flags)` to
+// build the register value.
 
-/// Standard SD commands. M1 doesn't issue any of these; the enum
-/// is in place so M2+ can match exhaustively rather than passing
-/// raw integers.
+/// Standard SD commands. Exhaustive match forces a compile error when
+/// new commands are added without handling them in the dispatch site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SdCommand {
@@ -332,5 +437,63 @@ mod tests {
         assert_eq!(SdCommand::SetBlockCount.index(), 23);
         assert_eq!(SdCommand::WriteBlock.index(), 24);
         assert_eq!(SdCommand::AppCmd.index(), 55);
+    }
+
+    // ----- Clock divisor math -----
+
+    #[test]
+    fn clock_divisor_400khz_from_200mhz() {
+        // Pi 4B emmc2 base clock = 200 MHz; ID-mode = 400 kHz.
+        // N = 200_000_000 / (2 × 400_000) = 250 = 0xFA.
+        let (lo, hi) = compute_clock_divisor(200_000_000, 400_000);
+        assert_eq!(lo, 0xFA, "lower 8 bits of N should be 0xFA (=250)");
+        assert_eq!(hi, 0x00, "upper 2 bits of N should be 0 (250 fits in 8 bits)");
+    }
+
+    #[test]
+    fn clock_divisor_bypass_when_base_lte_target() {
+        // If base ≤ target the divisor is 0 (bypass).
+        let (lo, hi) = compute_clock_divisor(400_000, 400_000);
+        assert_eq!((lo, hi), (0, 0));
+        let (lo2, hi2) = compute_clock_divisor(1, 400_000);
+        assert_eq!((lo2, hi2), (0, 0));
+    }
+
+    #[test]
+    fn clock_divisor_target_zero_returns_bypass() {
+        let (lo, hi) = compute_clock_divisor(200_000_000, 0);
+        assert_eq!((lo, hi), (0, 0));
+    }
+
+    #[test]
+    fn clock_divisor_assembled_clock_control_word() {
+        // Verify the assembled CLOCK_CONTROL value for 200 MHz → 400 kHz.
+        // (lo=0xFA, hi=0x00) → (0xFA << 8) | (0x00 << 6) = 0xFA00.
+        let (lo, hi) = compute_clock_divisor(200_000_000, 400_000);
+        let ctrl = (lo as u16) << 8 | (hi as u16) << 6;
+        assert_eq!(ctrl, 0xFA00);
+        // With INT_EN set:
+        assert_eq!(ctrl | SDHCI_CLOCK_INT_EN, 0xFA01);
+        // With INT_EN + CARD_EN set:
+        assert_eq!(ctrl | SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_CARD_EN, 0xFA05);
+    }
+
+    // ----- Command word builder -----
+
+    #[test]
+    fn cmd0_word_is_zero() {
+        // CMD0: index=0, no response, no CRC/index check → all zeros.
+        let w = sd_command_word(SdCommand::GoIdleState.index(), SDHCI_CMD_RESP_NONE);
+        assert_eq!(w, 0x0000);
+    }
+
+    #[test]
+    fn cmd8_word_is_081a() {
+        // CMD8 (SendIfCond): index=8, short response (0x02), CRC (0x08),
+        // index check (0x10). flags = 0x02 | 0x08 | 0x10 = 0x1A.
+        // word = (8 << 8) | 0x1A = 0x081A.
+        let flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX;
+        let w = sd_command_word(SdCommand::SendIfCond.index(), flags);
+        assert_eq!(w, 0x081A);
     }
 }
