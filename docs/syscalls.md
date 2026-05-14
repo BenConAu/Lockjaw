@@ -19,11 +19,25 @@ x8     = syscall number
 x0-x5  = arguments (up to 6)
 SVC #0 = trap instruction
 
-After return:
-x0     = return value (0 = success, u64::MAX = error)
+After return (2-register convention):
+x0     = SyscallError (0 = success, nonzero = error code)
+x1     = return value (for syscalls that produce one)
+x2-x4  = additional return values (for multi-value returns,
+         e.g. ret4-flavored receive/call carrying a 4-word msg)
 ```
 
-This is similar to Linux's AArch64 syscall convention (which also uses x8 for the number and x0-x5 for arguments). The choice of x8 keeps x0 free for both the first argument and the return value.
+This is similar to Linux's AArch64 syscall convention (which also
+uses x8 for the number and x0-x5 for arguments) but splits the
+error and value across two registers instead of overloading x0.
+The split removes the "value happens to look like an error code"
+ambiguity that single-register conventions live with — every
+syscall that returns a value reads x0 for the OK/error decision
+and x1 for the payload.
+
+Wrappers in `lockjaw-userlib` follow the same shape: an
+`inlateout("x0") arg => err, inlateout("x1") arg => val` asm block
+and `if err == 0 { Ok(val) } else { Err(SyscallError(err)) }`. See
+`user/lockjaw-userlib/src/syscall.rs` for canonical examples.
 
 ## How the trap works
 
@@ -35,7 +49,7 @@ When userspace executes `SVC #0`, the CPU:
 
 The vector stub saves all 31 general-purpose registers plus ELR/SPSR/ESR onto the kernel stack (272 bytes), then calls the Rust handler with a pointer to this saved context.
 
-The handler reads x8 from the saved context, dispatches to the right syscall function, writes the return value into the saved x0, and returns. The assembly stub restores all registers from the stack and executes `ERET`, which returns to EL0 at the instruction after the SVC.
+The handler reads x8 from the saved context, dispatches to the right syscall function, and writes the result back into the saved register frame: x0 gets the `SyscallError` code (0 on success), x1 gets the return value if the syscall produces one, and x2–x4 carry additional return words for multi-value returns. The assembly stub then restores all registers from the stack and executes `ERET`, which returns to EL0 at the instruction after the SVC.
 
 ## Separate exception vectors for userspace
 
@@ -100,7 +114,7 @@ Without yield, a thread waiting for something would spin-wait (burning CPU) unti
 | 12 | bind_irq | x0=INTID, x1=notif handle | — | Bind hardware IRQ to notification |
 | 13 | create_endpoint | x0=PageSet handle | x1=handle | Create IPC endpoint |
 | 14 | recv_nb | x0=ep handle | x1-x4=msg | Non-blocking receive (WOULD_BLOCK if empty) |
-| 15 | wait_any | x0=entries ptr, x1=count | x1=ready bitmask | Wait on multiple endpoints/notifications |
+| 15 | wait_any | x0=entries ptr, x1=count, x2=deadline | x1=ready bitmask | Wait on objects and/or until deadline. See **wait_any (extended)** below. |
 | 16 | export_handle | x0=handle | x1=new index | Duplicate handle into bound caller's table |
 | 17 | get_boot_info | — | x1=PageSet handle | Get boot information (DTB PageSet handle) |
 | 18 | register_device_page | x0=phys addr | x1=PageSet handle | Register MMIO page as tracked PageSet |
@@ -110,3 +124,102 @@ Without yield, a thread waiting for something would spin-wait (burning CPU) unti
 | 22 | create_thread | x0=entry, x1=stack_top, x2=stack_base, x3=arg | — | Create thread in calling process (shares address space). VA range validated; mapping not checked (faults at EL0 if unmapped). stack_top must be 16-byte aligned. |
 | 23 | query_mapping | x0=VA (page-aligned) | x1=mapped (0/1), x2=run_pages | Query mapping state at a user VA. Returns whether the page is mapped and how many consecutive pages share the same state. |
 | 24 | close_handle | x0=handle | — | Remove a handle from caller's table, freeing the slot. Does NOT free backing object or pages (no refcounting). |
+
+## wait_any (extended)
+
+`sys_wait_any` is the substrate for every blocking primitive in
+Lockjaw. The kernel's job is to put a thread to sleep until one of
+two things happens — an object becomes ready, or wall-clock time
+crosses an absolute monotonic deadline — and to keep the surface
+area for that exactly one syscall wide.
+
+### Signature
+
+| Reg | Meaning |
+|---|---|
+| x0 | `*const WaitEntry` — entries array in caller memory (`null` allowed when `count == 0`). |
+| x1 | `u64` — `count`, the number of valid `WaitEntry` slots. Range: `0..=MAX_WAIT_OBJECTS` (currently 4). |
+| x2 | `u64` — absolute monotonic deadline in `CNTVCT_EL0` ticks. `u64::MAX` (= `MonoTicks::NO_DEADLINE`) means "no timeout". |
+| x8 | `SYS_WAIT_ANY` (= 15). |
+
+Returns `(err, mask)` per the standard 2-register convention:
+- `err == 0` and `mask != 0` → object N became ready (bit N set).
+- `err == 0` and `mask == 0` → deadline expired before any object
+  fired (timeout encoding — see *Three load-bearing details* below).
+- `err != 0` → the syscall itself failed validation (bad pointer,
+  count out of range, missing handle).
+
+Userspace wrappers in `lockjaw-userlib`:
+- `sys_wait_any(entries)` — no-timeout form, passes `NO_DEADLINE` in x2.
+- `sys_wait_any_until(entries, deadline)` — deadline-aware form.
+- `time::sleep_until(deadline)` / `time::sleep_for(nanos)` — pure-sleep
+  helpers built on `count == 0`.
+
+### Three load-bearing details
+
+These are framing decisions that work today but are not eternal
+contracts. A future reader who tightens any of them silently
+breaks something. Each is a deliberate scaffolding choice — call
+them out before "fixing" them.
+
+**1. `count == 0` is a first-class form, not a corner case.**
+`sys_wait_any` deliberately carries two roles on one syscall:
+- *wait on objects (with optional timeout)* — `count > 0`
+- *pure sleep, deadline-only* — `count == 0`, `deadline != NO_DEADLINE`
+
+The collapse onto a single syscall keeps the kernel substrate
+small and matches the long-term shape where every blocking
+primitive is "wait until any condition fires, or until a
+deadline." A reviewer who tightens `validate_wait_count` back to
+`>= 1` will silently break `lockjaw_userlib::time::sleep_until` /
+`sleep_for` — userland sleep is implemented exactly as
+`sys_wait_any(null, 0, deadline)`.
+
+**2. `mask == 0 == timeout` is deliberate scaffolding.**
+The encoding works today because there are exactly two wake
+sources — object readiness (sets a bit) and deadline expiry (sets
+nothing) — and one is the strict complement of the other. A bare
+`mask == 0` return is unambiguously the timeout outcome.
+
+The moment a third wake source appears (cancellation, signal-like
+interruption, IPC shutdown notice, any spurious unblock path), the
+encoding has to change. The migration is clean: switch to a typed
+return like `enum WaitResult { Ready(u64), Timeout, Cancelled, … }`
+carried across the existing return registers (e.g. tag in x0,
+mask in x1). Until then, "no bits set" means "deadline fired" —
+do not assume that's permanent.
+
+**3. Wake-up latency is tick-quantized.**
+The kernel scans for expired deadlines once per scheduler tick
+(currently 10 ms), inside `handle_tick` *before* `scheduler::tick()`
+so a just-expired sleeper participates in the same tick's scheduling
+decision. Wake ordering is "wake then schedule," not "schedule then
+wake" — see `src/arch/aarch64/timer.rs::handle_tick` for the
+rationale (the inverted order doubles worst-case wakeup latency).
+
+In practice `sleep_for(N ns)` returns no sooner than the deadline
+and at most ~one to two scheduler-tick periods later (one for
+request alignment, one of headroom for the post-deadline scan).
+On QEMU virt + cortex-a53 a 50 ms request lands in [50 ms, 70 ms];
+the integration test in `tests/qemu_integration.sh` pins this
+envelope. This is a *lower-bounded* sleep — fine for any spec
+requirement stated as a minimum ("wait at least N"), not a high-
+resolution facility. When sub-tick precision becomes load-bearing,
+the right move is reprogramming `CNTV_TVAL_EL0` to fire at the
+earliest pending deadline (Linux's `tickless` mode), not bolting
+on a separate facility.
+
+### EL0-direct counter reads
+
+`monotonic_now()` in userspace is a single `mrs CNTVCT_EL0` —
+ARMv8 lets EL0 read the virtual counter directly once
+`CNTKCTL_EL1.EL0VCTEN` is set, which the kernel does in
+`arch::aarch64::timer::enable_el0_counter_reads` at boot (boot
+CPU and every secondary). Likewise `cntfreq_hz()` reads
+`CNTFRQ_EL0` directly — no clock-read syscall, no vDSO page,
+just an architectural register that EL0 is allowed to touch.
+
+This is the same shape Linux's vDSO uses for
+`clock_gettime(CLOCK_MONOTONIC)` on ARM64: read CNTVCT in
+userspace, scale by CNTFRQ. We're not inventing a model — we're
+using the architectural feature the way it's intended.
