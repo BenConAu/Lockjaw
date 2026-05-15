@@ -77,6 +77,15 @@ pub const SDHCI_CAPABILITIES_HI: usize = 0x044;
 pub const SDHCI_HOST_VERSION: usize = 0x0fe;
 
 // ---------------------------------------------------------------------------
+// HOST_CONTROL_1 bits (offset 0x028)
+// ---------------------------------------------------------------------------
+
+/// `DAT_XFER_WIDTH` (bit 1): 0 = 1-bit DAT line (default after
+/// reset), 1 = 4-bit DAT lines. Mirror this on the host *after*
+/// successfully telling the card via ACMD6.
+pub const SDHCI_HOST_CTRL_DAT_4BIT: u8 = 0x02;
+
+// ---------------------------------------------------------------------------
 // CLOCK_CONTROL bits (offset 0x02c)
 // ---------------------------------------------------------------------------
 
@@ -127,6 +136,10 @@ pub const SDHCI_INT_CMD_INDEX: u16 = 0x0008;
 
 /// CMD Line Inhibit (bit 0). Set while a command transfer is in progress.
 pub const SDHCI_CMD_INHIBIT: u32 = 0x0000_0001;
+/// DAT Line Inhibit (bit 1). Set while a data transfer is in progress or
+/// the card is busy on DAT0 (R1b). Must be clear before issuing commands
+/// that use the DAT lines (R1b responses, data transfers).
+pub const SDHCI_DAT_INHIBIT: u32 = 0x0000_0002;
 
 // ---------------------------------------------------------------------------
 // COMMAND_REG flag constants (offset 0x00e, low byte)
@@ -141,8 +154,15 @@ pub const SDHCI_CMD_CRC: u8 = 0x08;
 pub const SDHCI_CMD_INDEX: u8 = 0x10;
 /// No response type (CMD0, broadcast commands with no reply).
 pub const SDHCI_CMD_RESP_NONE: u8 = 0x00;
+/// Long response — 136-bit (R2: CID, CSD).
+/// Response payload spans RESPONSE_3..RESPONSE_0.
+pub const SDHCI_CMD_RESP_LONG: u8 = 0x01;
 /// Short response — 48-bit (R1, R3, R4, R5, R6, R7).
 pub const SDHCI_CMD_RESP_SHORT: u8 = 0x02;
+/// Short response with busy on DAT0 (R1b, R5b — e.g. CMD7
+/// SELECT_CARD). The controller delays CMD_COMPLETE until the
+/// card releases DAT0.
+pub const SDHCI_CMD_RESP_SHORT_BUSY: u8 = 0x03;
 
 // ---------------------------------------------------------------------------
 // SOFTWARE_RESET bits (offset 0x02f)
@@ -296,6 +316,10 @@ pub enum SdCommand {
     AllSendCid = 2,
     /// CMD3 — SEND_RELATIVE_ADDR. R6 response (RCA).
     SendRelativeAddr = 3,
+    /// CMD6 — SWITCH_FUNC (M3 uses the ACMD form: ACMD6 SET_BUS_WIDTH).
+    /// Same opcode; the difference is the CMD55 prefix that turns
+    /// it into an application-specific command.
+    SetBusWidth = 6,
     /// CMD7 — SELECT/DESELECT_CARD. R1b response.
     SelectCard = 7,
     /// CMD8 — SEND_IF_COND. Required for SDv2+ identification.
@@ -317,6 +341,13 @@ pub enum SdCommand {
     SetBlockCount = 23,
     /// CMD24 — WRITE_BLOCK. R1 response.
     WriteBlock = 24,
+    /// ACMD41 — SD_SEND_OP_COND. R3 response (OCR). Sent after a
+    /// CMD55 prefix. Argument carries the host-supported voltage
+    /// window plus HCS=1 (Host Capacity Support — required to
+    /// negotiate SDHC/SDXC). The card returns OCR with the busy
+    /// bit cleared once it has finished its power-up sequence;
+    /// driver loops on this until ready.
+    SdSendOpCond = 41,
     /// CMD55 — APP_CMD. Prefixes any ACMD; R1 response.
     AppCmd = 55,
 }
@@ -325,6 +356,139 @@ impl SdCommand {
     /// Numeric command index for OR'ing into COMMAND_REG bits[13:8].
     pub const fn index(self) -> u8 {
         self as u8
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SD command arguments (named constants for common values)
+// ---------------------------------------------------------------------------
+
+/// CMD8 (SEND_IF_COND) argument: VHS = 1 (2.7–3.6 V) + check pattern 0xAA.
+/// A card that echoes this argument in its R7 response is an SDv2+ card
+/// capable of SDHC/SDXC negotiation.
+pub const CMD8_IF_COND_ARG: u32 = 0x0000_01AA;
+
+/// ACMD41 (SD_SEND_OP_COND) argument with HCS=1 (bit 30) and the full
+/// 2.7–3.6 V voltage window (bits[23:15] all set). HCS=1 is required to
+/// negotiate SDHC/SDXC block-addressing; without it the card always reports
+/// CCS=0 regardless of its internal capacity.
+pub const ACMD41_ARG_HCS: u32 = 0x40FF_8000;
+
+// ---------------------------------------------------------------------------
+// R3 response (OCR register) decode  — ACMD41
+// ---------------------------------------------------------------------------
+//
+// ACMD41 returns an R3 response.  SDHCI stores the 32-bit OCR value directly
+// in RESPONSE_0 (same short-response path as R1/R7).
+//
+// SD Physical Layer Spec § 5.1 (OCR Register).
+
+/// Decoded view of the OCR register returned in an R3 (ACMD41) response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OcrRegister {
+    /// Power-up Status Bit (OCR bit 31).  `false` while the card is still
+    /// initializing (busy); `true` once it is ready to accept commands.
+    /// ACMD41 must be retried until `power_up_done` is `true`.
+    pub power_up_done: bool,
+    /// Card Capacity Status (OCR bit 30).  Only meaningful after
+    /// `power_up_done` is `true`.  `true` = SDHC/SDXC (block-addressed);
+    /// `false` = SDSC (byte-addressed, legacy).  Requires HCS=1 in the
+    /// ACMD41 argument to elicit an honest answer from the card.
+    pub ccs: bool,
+}
+
+impl OcrRegister {
+    /// Decode the 32-bit OCR value stored in RESPONSE_0 after ACMD41.
+    pub const fn decode(response_0: u32) -> Self {
+        Self {
+            power_up_done: (response_0 & (1 << 31)) != 0,
+            ccs: (response_0 & (1 << 30)) != 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R6 response (CMD3 SEND_RELATIVE_ADDR) — RCA extraction
+// ---------------------------------------------------------------------------
+//
+// CMD3 returns an R6 response.  The 32-bit payload in RESPONSE_0:
+//   bits[31:16] — New Published RCA (Relative Card Address)
+//   bits[15:0]  — card status bits  (ignored during normal ID-mode flow)
+//
+// SD Physical Layer Spec § 4.9.5.
+
+/// Extract the Relative Card Address from a CMD3 R6 response.
+/// `response_0` is read directly from SDHCI RESPONSE_0.
+pub const fn r6_rca(response_0: u32) -> u16 {
+    (response_0 >> 16) as u16
+}
+
+// ---------------------------------------------------------------------------
+// R2 CSD-v2 decode — CMD9 SEND_CSD
+// ---------------------------------------------------------------------------
+//
+// CMD9 returns a 136-bit R2 response.  SDHCI strips the CRC7 byte from the
+// bottom of the R2 frame and stores the remaining 120 bits of the 128-bit
+// CSD register across four 32-bit words, MSB in the HIGHEST-address register:
+//
+//   RESPONSE_3 (0x01c) = CSD[127:104]  (high bits; bits[31:24] = 0)
+//   RESPONSE_2 (0x018) = CSD[103: 72]
+//   RESPONSE_1 (0x014) = CSD[ 71: 40]
+//   RESPONSE_0 (0x010) = CSD[ 39:  8]  (low bits; CSD[7:1] CRC stripped)
+//
+// CSD v2 (SDHC/SDXC, CSD_STRUCTURE = 0b01) capacity fields:
+//   CSD[127:126] — CSD_STRUCTURE (must be 1)
+//   CSD[ 69: 48] — C_SIZE (22-bit unsigned)
+//   Capacity      = (C_SIZE + 1) × 512 KiB
+//
+// Field extraction (all single-register):
+//   CSD_STRUCTURE = RESPONSE_3[23:22]
+//   C_SIZE        = RESPONSE_1[29:8]    (22 bits spanning CSD[69:48])
+//
+// SD Physical Layer Spec § 5.3.3; SDHCI Spec § 2.2.8.
+// Confirmed against Linux drivers/mmc/host/sdhci.c::sdhci_finish_command,
+// which reconstructs resp[0] = (RESPONSE_3 << 8) | RESPONSE_2[7:0] (i.e.
+// RESPONSE_3 is the high word with an 8-bit shift applied).
+
+/// Capacity information decoded from a CSD v2 (SDHC/SDXC) register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CsdV2 {
+    /// Total card capacity in bytes.
+    pub capacity_bytes: u64,
+    /// Total card capacity in 512-byte blocks (`capacity_bytes / 512`).
+    pub capacity_blocks: u64,
+}
+
+/// Returned when the CSD register is not CSD version 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotCsdV2 {
+    /// The `CSD_STRUCTURE` value actually seen (1 = v2 expected).
+    pub csd_structure: u8,
+}
+
+impl CsdV2 {
+    /// Decode a CSD v2 register from four SDHCI RESPONSE words.
+    ///
+    /// Pass the words in register-address order (lowest address first):
+    /// `r[0]` = RESPONSE_0 (0x010) = CSD[ 39:  8] (least significant, CRC stripped),
+    /// `r[1]` = RESPONSE_1 (0x014) = CSD[ 71: 40],
+    /// `r[2]` = RESPONSE_2 (0x018) = CSD[103: 72],
+    /// `r[3]` = RESPONSE_3 (0x01c) = CSD[127:104] (most significant, bits[31:24]=0).
+    ///
+    /// Returns `Err(NotCsdV2)` if `CSD_STRUCTURE != 1`.
+    pub const fn decode(r: [u32; 4]) -> Result<Self, NotCsdV2> {
+        // CSD_STRUCTURE = CSD[127:126] → RESPONSE_3[23:22].
+        let csd_structure = ((r[3] >> 22) & 0x3) as u8;
+        if csd_structure != 1 {
+            return Err(NotCsdV2 { csd_structure });
+        }
+        // C_SIZE = CSD[69:48] → RESPONSE_1[29:8] (22 bits, single register).
+        let c_size = ((r[1] >> 8) & 0x3FFFFF) as u64;
+        let capacity_bytes = (c_size + 1) * 512 * 1024;
+        Ok(Self {
+            capacity_bytes,
+            capacity_blocks: capacity_bytes / 512,
+        })
     }
 }
 
@@ -429,6 +593,11 @@ mod tests {
         assert_ne!(SW_RST_ALL, SW_RST_DATA);
     }
 
+    #[test]
+    fn present_state_inhibit_bits_distinct() {
+        assert_ne!(SDHCI_CMD_INHIBIT, SDHCI_DAT_INHIBIT);
+    }
+
     // ----- SD command opcodes -----
 
     #[test]
@@ -482,6 +651,114 @@ mod tests {
         assert_eq!(ctrl | SDHCI_CLOCK_INT_EN, 0xFA01);
         // With INT_EN + CARD_EN set:
         assert_eq!(ctrl | SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_CARD_EN, 0xFA05);
+    }
+
+    // ----- M3 command indices -----
+
+    #[test]
+    fn sd_command_m3_indices_match_spec() {
+        assert_eq!(SdCommand::AllSendCid.index(), 2);
+        assert_eq!(SdCommand::SendRelativeAddr.index(), 3);
+        assert_eq!(SdCommand::SetBusWidth.index(), 6);
+        assert_eq!(SdCommand::SelectCard.index(), 7);
+        assert_eq!(SdCommand::SendCsd.index(), 9);
+        assert_eq!(SdCommand::SdSendOpCond.index(), 41);
+    }
+
+    // ----- OCR decode -----
+
+    #[test]
+    fn ocr_card_ready_and_sdhc() {
+        // Bit 31 set (power up done), bit 30 set (CCS = SDHC/SDXC).
+        let ocr = OcrRegister::decode(0xC000_0000);
+        assert!(ocr.power_up_done);
+        assert!(ocr.ccs);
+    }
+
+    #[test]
+    fn ocr_card_busy() {
+        // Bit 31 clear → still initializing; loop must retry.
+        let ocr = OcrRegister::decode(0x00FF_8000);
+        assert!(!ocr.power_up_done);
+        assert!(!ocr.ccs);
+    }
+
+    #[test]
+    fn ocr_sdsc_card() {
+        // Bit 31 set (ready), bit 30 clear (legacy SDSC, byte-addressed).
+        let ocr = OcrRegister::decode(0x8000_0000);
+        assert!(ocr.power_up_done);
+        assert!(!ocr.ccs);
+    }
+
+    // ----- R6 RCA extraction -----
+
+    #[test]
+    fn r6_rca_upper_16_bits() {
+        // CMD3 response: RCA = 0xAAAA, status bits = 0x5555.
+        let rca = r6_rca(0xAAAA_5555);
+        assert_eq!(rca, 0xAAAA);
+    }
+
+    #[test]
+    fn r6_rca_ignores_status_bits() {
+        // Varying the lower 16 bits must not affect the RCA.
+        assert_eq!(r6_rca(0x1234_0000), 0x1234);
+        assert_eq!(r6_rca(0x1234_FFFF), 0x1234);
+    }
+
+    // ----- CSD v2 decode -----
+
+    #[test]
+    fn csd_v2_rejects_v1_structure() {
+        // CSD_STRUCTURE = 0 (v1) in RESPONSE_3[23:22] → r[3] bits[23:22] = 0.
+        let r = [0u32, 0, 0, 0x0000_0000]; // r[3] bits[23:22] = 00 → structure 0
+        let err = CsdV2::decode(r).unwrap_err();
+        assert_eq!(err.csd_structure, 0);
+    }
+
+    #[test]
+    fn csd_v2_rejects_reserved_structure() {
+        // CSD_STRUCTURE = 3 (reserved) in RESPONSE_3[23:22] → r[3] bits[23:22] = 11.
+        let r = [0u32, 0, 0, 0x00C0_0000]; // r[3] bits[23:22] = 11 → structure 3
+        let err = CsdV2::decode(r).unwrap_err();
+        assert_eq!(err.csd_structure, 3);
+    }
+
+    #[test]
+    fn csd_v2_capacity_32gib() {
+        // 32 GiB: C_SIZE = 65535 (0xFFFF).
+        // CSD_STRUCTURE = 1 in RESPONSE_3[23:22] → r[3] = 0x0040_0000.
+        // C_SIZE in RESPONSE_1[29:8] → r[1] = 0xFFFF << 8 = 0x00FFFF00.
+        let r = [0u32, 0x00FFFF00, 0, 0x00400000];
+        let csd = CsdV2::decode(r).unwrap();
+        let expected_bytes = 65536u64 * 512 * 1024; // 34_359_738_368
+        assert_eq!(csd.capacity_bytes, expected_bytes);
+        assert_eq!(csd.capacity_blocks, expected_bytes / 512);
+    }
+
+    #[test]
+    fn csd_v2_capacity_64gib() {
+        // 64 GiB: C_SIZE = 131071 (0x1FFFF).
+        // CSD_STRUCTURE = 1 in RESPONSE_3[23:22] → r[3] = 0x0040_0000.
+        // C_SIZE in RESPONSE_1[29:8] → r[1] = 0x1FFFF << 8 = 0x01FFFF00.
+        let r = [0u32, 0x01FFFF00, 0, 0x00400000];
+        let csd = CsdV2::decode(r).unwrap();
+        let expected_bytes = 131072u64 * 512 * 1024; // 68_719_476_736
+        assert_eq!(csd.capacity_bytes, expected_bytes);
+    }
+
+    #[test]
+    fn cmd8_if_cond_arg_vhs_and_pattern() {
+        // VHS = 0x1 (bits[11:8]), check pattern = 0xAA (bits[7:0]).
+        assert_eq!(CMD8_IF_COND_ARG & 0xF00, 0x100, "VHS must be 1");
+        assert_eq!(CMD8_IF_COND_ARG & 0xFF, 0xAA, "check pattern must be 0xAA");
+    }
+
+    #[test]
+    fn acmd41_arg_hcs_bit_set() {
+        // HCS must be bit 30.
+        assert_ne!(ACMD41_ARG_HCS & (1 << 30), 0, "HCS bit must be set");
     }
 
     // ----- Command word builder -----

@@ -21,22 +21,25 @@ use lockjaw_types::device::{
     BCM2711_EMMC2_HASH, CMD_CLAIM_DEVICE, CLAIM_OK, unpack_clock_ref,
 };
 use lockjaw_types::sdhci::{
-    Capabilities,
+    Capabilities, OcrRegister, r6_rca, CsdV2,
+    CMD8_IF_COND_ARG, ACMD41_ARG_HCS,
     SDHCI_SOFTWARE_RESET, SW_RST_ALL,
     SDHCI_CAPABILITIES, SDHCI_CAPABILITIES_HI,
     SDHCI_HOST_VERSION, SDHCI_SPEC_300,
     SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_EN, SDHCI_CLOCK_INT_STABLE, SDHCI_CLOCK_CARD_EN,
     SDHCI_POWER_CONTROL, SDHCI_POWER_ON, SDHCI_POWER_330,
     SDHCI_TIMEOUT_CONTROL,
-    SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT,
+    SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, SDHCI_DAT_INHIBIT,
     SDHCI_ARGUMENT, SDHCI_COMMAND,
     SDHCI_NORMAL_INT_STATUS, SDHCI_ERROR_INT_STATUS,
     SDHCI_NORMAL_INT_STATUS_ENABLE, SDHCI_ERROR_INT_STATUS_ENABLE,
     SDHCI_INT_CMD_COMPLETE, SDHCI_INT_ERROR,
     SDHCI_INT_CMD_TIMEOUT, SDHCI_INT_CMD_CRC,
     SDHCI_INT_CMD_END_BIT, SDHCI_INT_CMD_INDEX,
-    SDHCI_RESPONSE_0,
-    SDHCI_CMD_CRC, SDHCI_CMD_INDEX, SDHCI_CMD_RESP_NONE, SDHCI_CMD_RESP_SHORT,
+    SDHCI_RESPONSE_0, SDHCI_RESPONSE_1, SDHCI_RESPONSE_2, SDHCI_RESPONSE_3,
+    SDHCI_HOST_CONTROL, SDHCI_HOST_CTRL_DAT_4BIT,
+    SDHCI_CMD_CRC, SDHCI_CMD_INDEX,
+    SDHCI_CMD_RESP_NONE, SDHCI_CMD_RESP_SHORT, SDHCI_CMD_RESP_LONG, SDHCI_CMD_RESP_SHORT_BUSY,
     SdCommand, compute_clock_divisor, sd_command_word,
 };
 
@@ -180,19 +183,22 @@ unsafe fn soft_reset_all(base: u64) -> Result<(), ()> {
 // ID-mode clock setup
 // ---------------------------------------------------------------------------
 
-/// Configure the SDHCI internal clock for SD identification mode (≤ 400 kHz).
+/// Configure the SDHCI SD clock to `target_hz` using `base_hz` as the
+/// reference (the CPRMAN-provided rate the controller uses).
 ///
-/// Sequence per SDHCI spec § 3.2.3:
-///   1. Write divisor fields + INT_CLK_EN to CLOCK_CONTROL.
-///   2. Poll INT_CLK_STABLE.
-///   3. Write SD_CLK_EN to gate the clock through to the card.
+/// Sequence per SDHCI spec § 3.2.3 / § 3.2.4:
+///   1. Disable SD_CLK_EN (CLOCK_CARD_EN) before changing the divisor.
+///   2. Write new divisor + INT_CLK_EN to CLOCK_CONTROL.
+///   3. Poll INT_CLK_STABLE (typ. < 1 ms).
+///   4. Re-enable SD_CLK_EN.
 ///
-/// `base_hz` is the SDHCI base clock (the CPRMAN-provided rate the
-/// controller uses as its reference). Returns Err if the clock doesn't
-/// stabilise within a generous spin limit.
-unsafe fn configure_clock_id_mode(base: u64, base_hz: u64) -> Result<(), ()> {
-    let (lo, hi) = compute_clock_divisor(base_hz, 400_000);
+/// Used for both ID-mode (400 kHz) and data-transfer mode (25 MHz).
+unsafe fn configure_clock(base: u64, base_hz: u64, target_hz: u64) -> Result<(), ()> {
+    // Gate off the clock output before touching the divisor.
+    let cur = sdhci_read16(base, SDHCI_CLOCK_CONTROL);
+    sdhci_write16(base, SDHCI_CLOCK_CONTROL, cur & !SDHCI_CLOCK_CARD_EN);
     // Write divisor + internal clock enable in one shot.
+    let (lo, hi) = compute_clock_divisor(base_hz, target_hz);
     let ctrl = (lo as u16) << 8 | (hi as u16) << 6 | SDHCI_CLOCK_INT_EN;
     sdhci_write16(base, SDHCI_CLOCK_CONTROL, ctrl);
     // SDHCI spec gives a typical lock time well under 1 ms; 100 ms
@@ -282,7 +288,7 @@ unsafe fn issue_command(base: u64, arg: u32, cmd_word: u16) -> CmdResult {
 /// the SDHCI spec § 2.2.18 / Linux's headers so the output line can
 /// be grep'd against a reference.
 fn put_error_int_status(bits: u16) {
-    puts("ERROR_INT_STATUS=0x");
+    puts("ERROR_INT_STATUS=");
     put_hex(bits as u64);
     if bits & SDHCI_INT_CMD_TIMEOUT != 0 { puts(" CMD_TIMEOUT"); }
     if bits & SDHCI_INT_CMD_CRC      != 0 { puts(" CMD_CRC"); }
@@ -506,7 +512,7 @@ pub extern "C" fn _start() -> ! {
 
     // Enable the SDHCI internal clock at ID-mode rate (≤ 400 kHz), wait
     // for the oscillator to stabilise, then gate the clock to the card.
-    if unsafe { configure_clock_id_mode(mmio_va, base_hz) }.is_err() {
+    if unsafe { configure_clock(mmio_va, actual_base_hz, 400_000) }.is_err() {
         puts("emmc2: SDHCI INT_CLK_STABLE not set within timeout\n");
         halt();
     }
@@ -541,7 +547,7 @@ pub extern "C" fn _start() -> ! {
     // cards don't respond to CMD8; UHS and SDXC cards need it for ACMD41.
     let cmd8_flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX;
     let cmd8 = sd_command_word(SdCommand::SendIfCond.index(), cmd8_flags);
-    let resp = match unsafe { issue_command(mmio_va, 0x0000_01AA, cmd8) } {
+    let resp = match unsafe { issue_command(mmio_va, CMD8_IF_COND_ARG, cmd8) } {
         CmdResult::Ok(r) => r,
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] CMD8 FAILED: CMD_INHIBIT did not clear before deadline\n");
@@ -571,13 +577,300 @@ pub extern "C" fn _start() -> ! {
     // CMD8 R7: bits[11:8] = voltage accepted (echoes VHS=1), bits[7:0]
     // = check pattern (echoes 0xAA). Together bits[11:0] = 0x1AA.
     if resp & 0xFFF != 0x1AA {
-        puts("emmc2: CMD8 bad echo=0x");
+        puts("emmc2: CMD8 bad echo=");
         put_hex((resp & 0xFFF) as u64);
         puts("\n");
         sys_exit();
     }
 
     puts("[EMMC2:IDPHASE] CMD8 echo=0x1AA — card is SDv2+ (clk via cprman)\n");
+
+    // -----------------------------------------------------------------------
+    // M3 — Full SD identification: ACMD41 → CMD2 → CMD3 → CMD9 →
+    //       CMD7 → ACMD6 → HOST_CONTROL → 25 MHz
+    // -----------------------------------------------------------------------
+
+    // ACMD41 loop — SD spec § 4.2.3.1.  Each iteration: CMD55 (sets
+    // APP_CMD mode for the next command), then ACMD41 with HCS=1.
+    // The card returns OCR with power_up_done = false while still
+    // initializing (busy-bit clear); retry until power_up_done = true
+    // or the 1-second timeout expires.
+    //
+    // CMD55 in broadcast mode (arg=0, no RCA assigned yet).
+    // ACMD41 uses R3 (no CRC or index check — spec §4.9.3).
+    let cmd55_word = sd_command_word(
+        SdCommand::AppCmd.index(),
+        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
+    );
+    let acmd41_word = sd_command_word(
+        SdCommand::SdSendOpCond.index(),
+        SDHCI_CMD_RESP_SHORT, // R3: no CRC, no index check
+    );
+    let freq = cntfreq_hz();
+    let acmd41_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
+    let ocr = loop {
+        // CMD55 — prefixes ACMD41; response is R1 from the card.
+        match unsafe { issue_command(mmio_va, 0, cmd55_word) } {
+            CmdResult::Ok(_) => {}
+            CmdResult::InhibitStuck => {
+                puts("[EMMC2:IDPHASE] CMD55 FAILED: CMD_INHIBIT stuck\n");
+                sys_exit();
+            }
+            CmdResult::ControllerError(bits) => {
+                puts("[EMMC2:IDPHASE] CMD55 FAILED: ");
+                put_error_int_status(bits);
+                puts("\n");
+                sys_exit();
+            }
+            CmdResult::NoResponse => {
+                puts("[EMMC2:IDPHASE] CMD55 FAILED: no response within 1s\n");
+                sys_exit();
+            }
+        }
+        // ACMD41 — the card returns OCR; busy bit clears when ready.
+        let r0 = match unsafe { issue_command(mmio_va, ACMD41_ARG_HCS, acmd41_word) } {
+            CmdResult::Ok(r) => r,
+            CmdResult::InhibitStuck => {
+                puts("[EMMC2:IDPHASE] ACMD41 FAILED: CMD_INHIBIT stuck\n");
+                sys_exit();
+            }
+            CmdResult::ControllerError(bits) => {
+                puts("[EMMC2:IDPHASE] ACMD41 FAILED: ");
+                put_error_int_status(bits);
+                puts("\n");
+                sys_exit();
+            }
+            CmdResult::NoResponse => {
+                puts("[EMMC2:IDPHASE] ACMD41 FAILED: no response within 1s\n");
+                sys_exit();
+            }
+        };
+        let ocr = OcrRegister::decode(r0);
+        if ocr.power_up_done {
+            break ocr;
+        }
+        if monotonic_now() >= acmd41_deadline {
+            puts("[EMMC2:IDPHASE] ACMD41 timeout: card never became ready\n");
+            sys_exit();
+        }
+        // Short delay between retries — SD spec doesn't require one but
+        // gives the card breathing room between polls.
+        let _ = sleep_for(Nanos::from_millis(10));
+    };
+    puts("[EMMC2:IDPHASE] ACMD41 ready ccs=");
+    put_decimal(ocr.ccs as u64);
+    puts("\n");
+
+    // CMD2 — ALL_SEND_CID.  R2 (136-bit) response carries the card's
+    // unique CID register.  We read all four RESPONSE words (the SDHCI
+    // holds them until the next command) but only log, not decode, the
+    // CID in M3 — capacity and addressing come from CSD (CMD9).
+    let cmd2_word = sd_command_word(
+        SdCommand::AllSendCid.index(),
+        SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC,
+    );
+    match unsafe { issue_command(mmio_va, 0, cmd2_word) } {
+        CmdResult::Ok(_) => {}
+        CmdResult::InhibitStuck => {
+            puts("[EMMC2:IDPHASE] CMD2 FAILED: CMD_INHIBIT stuck\n");
+            sys_exit();
+        }
+        CmdResult::ControllerError(bits) => {
+            puts("[EMMC2:IDPHASE] CMD2 FAILED: ");
+            put_error_int_status(bits);
+            puts("\n");
+            sys_exit();
+        }
+        CmdResult::NoResponse => {
+            puts("[EMMC2:IDPHASE] CMD2 FAILED: no response within 1s\n");
+            sys_exit();
+        }
+    }
+    puts("[EMMC2:IDPHASE] CMD2 CID received\n");
+
+    // CMD3 — SEND_RELATIVE_ADDR.  Card publishes its RCA; the host
+    // stores it and uses it to address the card from here on.
+    // R6 response: bits[31:16] = RCA, bits[15:0] = card status.
+    let cmd3_word = sd_command_word(
+        SdCommand::SendRelativeAddr.index(),
+        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
+    );
+    let rca: u16 = match unsafe { issue_command(mmio_va, 0, cmd3_word) } {
+        CmdResult::Ok(r) => r6_rca(r),
+        CmdResult::InhibitStuck => {
+            puts("[EMMC2:IDPHASE] CMD3 FAILED: CMD_INHIBIT stuck\n");
+            sys_exit();
+        }
+        CmdResult::ControllerError(bits) => {
+            puts("[EMMC2:IDPHASE] CMD3 FAILED: ");
+            put_error_int_status(bits);
+            puts("\n");
+            sys_exit();
+        }
+        CmdResult::NoResponse => {
+            puts("[EMMC2:IDPHASE] CMD3 FAILED: no response within 1s\n");
+            sys_exit();
+        }
+    };
+    puts("[EMMC2:IDPHASE] CMD3 rca=");
+    put_hex(rca as u64);
+    puts("\n");
+
+    // CMD9 — SEND_CSD.  R2 (136-bit) response carries the CSD register.
+    // CSD v2 (SDHC/SDXC) encodes capacity in the C_SIZE field; the pure
+    // decoder in lockjaw-types computes capacity_bytes from the four
+    // RESPONSE words.  We re-read all four registers after CMD_COMPLETE
+    // because `issue_command` only returns RESPONSE_0.
+    let rca_arg = (rca as u32) << 16;
+    let cmd9_word = sd_command_word(
+        SdCommand::SendCsd.index(),
+        SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC,
+    );
+    let capacity_bytes: u64 = match unsafe { issue_command(mmio_va, rca_arg, cmd9_word) } {
+        CmdResult::Ok(_) => {
+            let resp = unsafe {[
+                sdhci_read32(mmio_va, SDHCI_RESPONSE_0),
+                sdhci_read32(mmio_va, SDHCI_RESPONSE_1),
+                sdhci_read32(mmio_va, SDHCI_RESPONSE_2),
+                sdhci_read32(mmio_va, SDHCI_RESPONSE_3),
+            ]};
+            match CsdV2::decode(resp) {
+                Ok(csd) => csd.capacity_bytes,
+                Err(e) => {
+                    puts("[EMMC2:IDPHASE] CMD9 CSD_STRUCTURE=");
+                    put_decimal(e.csd_structure as u64);
+                    puts(" (expected 1 for SDHC/SDXC)\n");
+                    sys_exit();
+                }
+            }
+        }
+        CmdResult::InhibitStuck => {
+            puts("[EMMC2:IDPHASE] CMD9 FAILED: CMD_INHIBIT stuck\n");
+            sys_exit();
+        }
+        CmdResult::ControllerError(bits) => {
+            puts("[EMMC2:IDPHASE] CMD9 FAILED: ");
+            put_error_int_status(bits);
+            puts("\n");
+            sys_exit();
+        }
+        CmdResult::NoResponse => {
+            puts("[EMMC2:IDPHASE] CMD9 FAILED: no response within 1s\n");
+            sys_exit();
+        }
+    };
+
+    // CMD7 — SELECT_CARD.  Moves the card from Stand-by to Transfer state.
+    // R1b response: CMD_COMPLETE fires immediately; controller holds
+    // CMD_COMPLETE until DAT0 deasserts (card releases busy indication).
+    // Wait for both CMD_INHIBIT and DAT_INHIBIT before the next command.
+    let cmd7_word = sd_command_word(
+        SdCommand::SelectCard.index(),
+        SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
+    );
+    match unsafe { issue_command(mmio_va, rca_arg, cmd7_word) } {
+        CmdResult::Ok(_) => {}
+        CmdResult::InhibitStuck => {
+            puts("[EMMC2:IDPHASE] CMD7 FAILED: CMD_INHIBIT stuck\n");
+            sys_exit();
+        }
+        CmdResult::ControllerError(bits) => {
+            puts("[EMMC2:IDPHASE] CMD7 FAILED: ");
+            put_error_int_status(bits);
+            puts("\n");
+            sys_exit();
+        }
+        CmdResult::NoResponse => {
+            puts("[EMMC2:IDPHASE] CMD7 FAILED: no response within 1s\n");
+            sys_exit();
+        }
+    }
+    // Wait for DAT0 to deassert — the card signals "ready" by releasing it.
+    if unsafe { poll_until_clear_32(
+        mmio_va, SDHCI_PRESENT_STATE,
+        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
+        Nanos::from_millis(500),
+    )}.is_err() {
+        puts("[EMMC2:IDPHASE] CMD7 DAT_INHIBIT did not clear (card busy timeout)\n");
+        sys_exit();
+    }
+    puts("[EMMC2:IDPHASE] CMD7 card selected\n");
+
+    // ACMD6 — SET_BUS_WIDTH.  Switch the card to 4-bit DAT bus.
+    // Must be preceded by CMD55 addressed to the selected card (RCA).
+    let cmd55_rca_word = sd_command_word(
+        SdCommand::AppCmd.index(),
+        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
+    );
+    match unsafe { issue_command(mmio_va, rca_arg, cmd55_rca_word) } {
+        CmdResult::Ok(_) => {}
+        CmdResult::InhibitStuck => {
+            puts("[EMMC2:IDPHASE] CMD55 (pre-ACMD6) FAILED: CMD_INHIBIT stuck\n");
+            sys_exit();
+        }
+        CmdResult::ControllerError(bits) => {
+            puts("[EMMC2:IDPHASE] CMD55 (pre-ACMD6) FAILED: ");
+            put_error_int_status(bits);
+            puts("\n");
+            sys_exit();
+        }
+        CmdResult::NoResponse => {
+            puts("[EMMC2:IDPHASE] CMD55 (pre-ACMD6) FAILED: no response\n");
+            sys_exit();
+        }
+    }
+    // ACMD6 argument: 0x2 = 4-bit bus (bits[1:0] = 10).
+    let acmd6_word = sd_command_word(
+        SdCommand::SetBusWidth.index(),
+        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
+    );
+    match unsafe { issue_command(mmio_va, 0x2, acmd6_word) } {
+        CmdResult::Ok(_) => {}
+        CmdResult::InhibitStuck => {
+            puts("[EMMC2:IDPHASE] ACMD6 FAILED: CMD_INHIBIT stuck\n");
+            sys_exit();
+        }
+        CmdResult::ControllerError(bits) => {
+            puts("[EMMC2:IDPHASE] ACMD6 FAILED: ");
+            put_error_int_status(bits);
+            puts("\n");
+            sys_exit();
+        }
+        CmdResult::NoResponse => {
+            puts("[EMMC2:IDPHASE] ACMD6 FAILED: no response\n");
+            sys_exit();
+        }
+    }
+    // Mirror the 4-bit bus width in HOST_CONTROL_1 immediately after
+    // the card acknowledges ACMD6 — the host side must match the card.
+    unsafe {
+        let hc = sdhci_read8(mmio_va, SDHCI_HOST_CONTROL);
+        sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc | SDHCI_HOST_CTRL_DAT_4BIT);
+    }
+
+    // Raise the SD bus clock from 400 kHz (ID mode) to 25 MHz (data
+    // transfer mode).  SDHCI spec § 3.2.4: disable SD_CLK_EN first,
+    // then reprogram divisor — `configure_clock` does this.
+    if unsafe { configure_clock(mmio_va, actual_base_hz, 25_000_000) }.is_err() {
+        puts("[EMMC2:READY] clock-to-25MHz FAILED: INT_CLK_STABLE timeout\n");
+        sys_exit();
+    }
+
+    // Derive and log the actual clock we set so the Pi log is self-
+    // contained for debugging.
+    let (lo25, hi25) = compute_clock_divisor(actual_base_hz, 25_000_000);
+    let n25 = ((hi25 as u64) << 8) | (lo25 as u64);
+    let card_clk_hz = if n25 == 0 { actual_base_hz } else { actual_base_hz / (2 * n25) };
+
+    // M3 success line.
+    puts("[EMMC2:READY] rca=");
+    put_hex(rca as u64);
+    puts(" capacity=");
+    put_decimal(capacity_bytes / (1024 * 1024 * 1024));
+    puts("GiB bus=4bit card_clk=");
+    put_decimal(card_clk_hz / 1_000_000);
+    puts("MHz\n");
+
     sys_exit();
 }
 
