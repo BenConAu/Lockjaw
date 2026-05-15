@@ -30,16 +30,19 @@ use lockjaw_types::sdhci::{
     SDHCI_POWER_CONTROL, SDHCI_POWER_ON, SDHCI_POWER_330,
     SDHCI_TIMEOUT_CONTROL,
     SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, SDHCI_DAT_INHIBIT,
-    SDHCI_ARGUMENT, SDHCI_COMMAND,
+    SDHCI_ARGUMENT, SDHCI_TRANSFER_MODE, SDHCI_COMMAND,
+    SDHCI_BLOCK_SIZE, SDHCI_BLOCK_COUNT, SDHCI_BUFFER_DATA_PORT,
     SDHCI_NORMAL_INT_STATUS, SDHCI_ERROR_INT_STATUS,
     SDHCI_NORMAL_INT_STATUS_ENABLE, SDHCI_ERROR_INT_STATUS_ENABLE,
-    SDHCI_INT_CMD_COMPLETE, SDHCI_INT_ERROR,
+    SDHCI_INT_CMD_COMPLETE, SDHCI_INT_DATA_COMPLETE, SDHCI_INT_BUF_RD_READY, SDHCI_INT_ERROR,
     SDHCI_INT_CMD_TIMEOUT, SDHCI_INT_CMD_CRC,
     SDHCI_INT_CMD_END_BIT, SDHCI_INT_CMD_INDEX,
+    SDHCI_INT_DATA_TIMEOUT, SDHCI_INT_DATA_CRC, SDHCI_INT_DATA_END_BIT,
     SDHCI_RESPONSE_0, SDHCI_RESPONSE_1, SDHCI_RESPONSE_2, SDHCI_RESPONSE_3,
     SDHCI_HOST_CONTROL, SDHCI_HOST_CTRL_DAT_4BIT,
-    SDHCI_CMD_CRC, SDHCI_CMD_INDEX,
+    SDHCI_CMD_CRC, SDHCI_CMD_INDEX, SDHCI_CMD_DATA,
     SDHCI_CMD_RESP_NONE, SDHCI_CMD_RESP_SHORT, SDHCI_CMD_RESP_LONG, SDHCI_CMD_RESP_SHORT_BUSY,
+    SDHCI_TRNS_READ,
     SdCommand, compute_clock_divisor, sd_command_word,
 };
 
@@ -284,16 +287,156 @@ unsafe fn issue_command(base: u64, arg: u32, cmd_word: u16) -> CmdResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PIO block read
+// ---------------------------------------------------------------------------
+
+/// Failure modes for `read_block_pio`.
+#[derive(Clone, Copy)]
+enum PioError {
+    /// CMD_INHIBIT or DAT_INHIBIT didn't clear before the deadline.
+    InhibitStuck,
+    /// ERROR_INT_STATUS fired during the command phase.
+    CmdError(u16),
+    /// Neither CMD_COMPLETE nor ERROR fired before the 1s deadline.
+    NoResponse,
+    /// ERROR_INT_STATUS fired while waiting for BUF_RD_READY or TRANSFER_COMPLETE.
+    DataError(u16),
+    /// BUF_RD_READY did not fire before the deadline.
+    DataTimeout,
+    /// TRANSFER_COMPLETE did not arrive after draining the buffer.
+    XferTimeout,
+}
+
+/// Issue CMD17 (READ_SINGLE_BLOCK) and drain the 512-byte block via PIO.
+///
+/// `lba` is the block address. For SDHC/SDXC (CCS=1) this is the block
+/// number directly. For SDSC (CCS=0) the caller must pass `lba * 512`
+/// (byte address). For LBA 0 both encodings are 0; the distinction
+/// becomes load-bearing at M5+ when non-zero LBAs are requested.
+///
+/// Returns the block as 128 LE u32 words. BUFFER_DATA_PORT serves bytes
+/// in card-native order: word[0] = bytes 0–3, word[127] = bytes 508–511.
+/// MBR signature check: `(block[127] >> 16) & 0xFFFF == 0xAA55`.
+unsafe fn read_block_pio(base: u64, lba: u32) -> Result<[u32; 128], PioError> {
+    // Data commands occupy both CMD and DAT lines from issue through
+    // TRANSFER_COMPLETE. Waiting for only CMD_INHIBIT (as in
+    // `issue_command`) would let the command fire while DAT is still
+    // busy from a prior R1b, corrupting the bus.
+    if poll_until_clear_32(
+        base, SDHCI_PRESENT_STATE,
+        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
+        Nanos::from_millis(100),
+    ).is_err() {
+        return Err(PioError::InhibitStuck);
+    }
+
+    // SDHCI spec §3.7: BLOCK_SIZE, BLOCK_COUNT, TRANSFER_MODE must be
+    // written before the COMMAND write that triggers the bus transaction.
+    sdhci_write16(base, SDHCI_BLOCK_SIZE, 512);
+    sdhci_write16(base, SDHCI_BLOCK_COUNT, 1);
+    // PIO single-block read: no DMA, no multi-block, direction = card→host.
+    sdhci_write16(base, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ);
+
+    // Write ARGUMENT then COMMAND. COMMAND write triggers the bus.
+    sdhci_write32(base, SDHCI_ARGUMENT, lba);
+    let cmd17 = sd_command_word(
+        SdCommand::ReadSingleBlock.index(),
+        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
+    );
+    sdhci_write16(base, SDHCI_COMMAND, cmd17);
+
+    // Poll for CMD_COMPLETE or ERROR. CMD_COMPLETE fires after the response
+    // phase; data transfer starts in parallel and fires BUF_RD_READY once
+    // the internal buffer is full.
+    let freq = cntfreq_hz();
+    let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
+    loop {
+        let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
+        if status & SDHCI_INT_ERROR != 0 {
+            let err = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
+            return Err(PioError::CmdError(err));
+        }
+        if status & SDHCI_INT_CMD_COMPLETE != 0 {
+            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+            break;
+        }
+        if monotonic_now() >= cmd_deadline {
+            return Err(PioError::NoResponse);
+        }
+        core::hint::spin_loop();
+    }
+
+    // Poll for BUF_RD_READY. At 25 MHz with 4-bit DAT: 512 bytes /
+    // (25M/8 bytes/s) ≈ 164 µs for the card to fill the internal buffer.
+    // 100 ms deadline is generous; PRESENT_STATE is logged on timeout
+    // so DAT_INHIBIT state is visible in the log.
+    let data_deadline = monotonic_now().deadline_in(Nanos::from_millis(100), freq);
+    loop {
+        let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
+        if status & SDHCI_INT_ERROR != 0 {
+            let err = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_BUF_RD_READY);
+            return Err(PioError::DataError(err));
+        }
+        if status & SDHCI_INT_BUF_RD_READY != 0 {
+            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_BUF_RD_READY);
+            break;
+        }
+        if monotonic_now() >= data_deadline {
+            return Err(PioError::DataTimeout);
+        }
+        core::hint::spin_loop();
+    }
+
+    // Drain all 128 u32 words (512 bytes) from BUFFER_DATA_PORT. SDHCI
+    // spec §3.7.2: PIO reads must consume the entire block in one pass —
+    // leaving data in the buffer leaves the controller in an inconsistent
+    // state that wedges subsequent commands.
+    let mut block = [0u32; 128];
+    for word in block.iter_mut() {
+        *word = sdhci_read32(base, SDHCI_BUFFER_DATA_PORT);
+    }
+
+    // TRANSFER_COMPLETE arrives after the card transmits the CRC trailer;
+    // typically fires immediately after the buffer drain.
+    let xfer_deadline = monotonic_now().deadline_in(Nanos::from_millis(100), freq);
+    loop {
+        let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
+        if status & SDHCI_INT_ERROR != 0 {
+            let err = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_DATA_COMPLETE);
+            return Err(PioError::DataError(err));
+        }
+        if status & SDHCI_INT_DATA_COMPLETE != 0 {
+            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
+            return Ok(block);
+        }
+        if monotonic_now() >= xfer_deadline {
+            return Err(PioError::XferTimeout);
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Pretty-print ERROR_INT_STATUS bits to the kernel UART. Names match
 /// the SDHCI spec § 2.2.18 / Linux's headers so the output line can
-/// be grep'd against a reference.
+/// be grep'd against a reference. Covers both command-phase bits (0–3)
+/// and data-phase bits (4–6) since the same register reports both.
 fn put_error_int_status(bits: u16) {
     puts("ERROR_INT_STATUS=");
     put_hex(bits as u64);
-    if bits & SDHCI_INT_CMD_TIMEOUT != 0 { puts(" CMD_TIMEOUT"); }
+    if bits & SDHCI_INT_CMD_TIMEOUT  != 0 { puts(" CMD_TIMEOUT"); }
     if bits & SDHCI_INT_CMD_CRC      != 0 { puts(" CMD_CRC"); }
     if bits & SDHCI_INT_CMD_END_BIT  != 0 { puts(" CMD_END_BIT"); }
     if bits & SDHCI_INT_CMD_INDEX    != 0 { puts(" CMD_INDEX"); }
+    if bits & SDHCI_INT_DATA_TIMEOUT != 0 { puts(" DATA_TIMEOUT"); }
+    if bits & SDHCI_INT_DATA_CRC     != 0 { puts(" DATA_CRC"); }
+    if bits & SDHCI_INT_DATA_END_BIT != 0 { puts(" DATA_END_BIT"); }
 }
 
 // ---------------------------------------------------------------------------
@@ -871,6 +1014,71 @@ pub extern "C" fn _start() -> ! {
     put_decimal(card_clk_hz / 1_000_000);
     puts("MHz\n");
 
+    // -----------------------------------------------------------------------
+    // M4 — Single-block PIO read of LBA 0
+    // -----------------------------------------------------------------------
+    // CMD17 argument: for SDHC/SDXC (ocr.ccs == true) the argument is the
+    // block number directly. For SDSC it would be a byte address (lba * 512).
+    // Both encodings produce 0 for LBA 0, so the ccs branch is degenerate
+    // here. The distinction becomes load-bearing at M5+ when non-zero LBAs
+    // are requested.
+    let block = match unsafe { read_block_pio(mmio_va, 0) } {
+        Ok(b) => b,
+        Err(PioError::InhibitStuck) => {
+            puts("[EMMC2:M4] CMD17 FAILED: CMD/DAT_INHIBIT stuck\n");
+            sys_exit();
+        }
+        Err(PioError::CmdError(bits)) => {
+            puts("[EMMC2:M4] CMD17 FAILED: ");
+            put_error_int_status(bits);
+            puts("\n");
+            sys_exit();
+        }
+        Err(PioError::NoResponse) => {
+            puts("[EMMC2:M4] CMD17 FAILED: no CMD_COMPLETE within 1s\n");
+            sys_exit();
+        }
+        Err(PioError::DataError(bits)) => {
+            puts("[EMMC2:M4] data FAILED: ");
+            put_error_int_status(bits);
+            puts("\n");
+            sys_exit();
+        }
+        Err(PioError::DataTimeout) => {
+            let pstate = unsafe { sdhci_read32(mmio_va, SDHCI_PRESENT_STATE) };
+            puts("[EMMC2:M4] data FAILED: BUF_RD_READY timeout PRESENT_STATE=");
+            put_hex(pstate as u64);
+            puts("\n");
+            sys_exit();
+        }
+        Err(PioError::XferTimeout) => {
+            puts("[EMMC2:M4] data FAILED: TRANSFER_COMPLETE timeout\n");
+            sys_exit();
+        }
+    };
+
+    // Log first 64 bytes (16 words) of LBA 0 as a hex dump.
+    puts("[EMMC2:M4] LBA 0 first 64 bytes:\n");
+    for i in 0..16usize {
+        if i % 4 == 0 { puts("  "); }
+        put_hex(block[i] as u64);
+        puts(if i % 4 == 3 { "\n" } else { " " });
+    }
+
+    // MBR boot signature: bytes 510–511 must be 0x55 0xAA.
+    // BUFFER_DATA_PORT returns LE u32: word[127] holds bytes 508–511,
+    // with byte 510 in bits[23:16] and byte 511 in bits[31:24].
+    // (block[127] >> 16) extracts 0xAA55 when the signature is valid.
+    let sig = (block[127] >> 16) & 0xFFFF;
+    puts("[EMMC2:M4] MBR signature=");
+    put_hex(sig as u64);
+    if sig != 0xAA55 {
+        puts(" BAD (expected 0xAA55) — byte-lane or decode error\n");
+        sys_exit();
+    }
+    puts(" OK\n");
+
+    puts("[EMMC2:M4] LBA 0 read OK\n");
     sys_exit();
 }
 

@@ -111,6 +111,10 @@ pub const SDHCI_POWER_330: u8 = 0x0E;
 
 /// Command Complete (bit 0). Set when the CMD/response phase finishes.
 pub const SDHCI_INT_CMD_COMPLETE: u16 = 0x0001;
+/// Transfer Complete (bit 1). Set when the data transfer phase finishes.
+pub const SDHCI_INT_DATA_COMPLETE: u16 = 0x0002;
+/// Buffer Read Ready (bit 5). Set when PIO data is available in BUFFER_DATA_PORT.
+pub const SDHCI_INT_BUF_RD_READY: u16 = 0x0020;
 /// Error Interrupt (bit 15). Summary bit — consult ERROR_INT_STATUS for
 /// which error fired.
 pub const SDHCI_INT_ERROR: u16 = 0x8000;
@@ -129,6 +133,12 @@ pub const SDHCI_INT_CMD_END_BIT: u16 = 0x0004;
 /// didn't match the issued command (only checked when CMD_INDEX
 /// flag is set in the COMMAND register).
 pub const SDHCI_INT_CMD_INDEX: u16 = 0x0008;
+/// Data Timeout Error (bit 4). Card did not provide data within the timeout window.
+pub const SDHCI_INT_DATA_TIMEOUT: u16 = 0x0010;
+/// Data CRC Error (bit 5). CRC mismatch on received data.
+pub const SDHCI_INT_DATA_CRC: u16 = 0x0020;
+/// Data End Bit Error (bit 6). End bit of received data was wrong.
+pub const SDHCI_INT_DATA_END_BIT: u16 = 0x0040;
 
 // ---------------------------------------------------------------------------
 // PRESENT_STATE bits (offset 0x024, read-only)
@@ -142,6 +152,22 @@ pub const SDHCI_CMD_INHIBIT: u32 = 0x0000_0001;
 pub const SDHCI_DAT_INHIBIT: u32 = 0x0000_0002;
 
 // ---------------------------------------------------------------------------
+// TRANSFER_MODE bits (offset 0x00c, u16)
+// ---------------------------------------------------------------------------
+//
+// Written before the COMMAND register write that triggers the transfer.
+// For single-block PIO reads: SDHCI_TRNS_READ only (no DMA, no multi-block).
+
+/// DMA Enable (bit 0). Clear for PIO; set for SDMA/ADMA2.
+pub const SDHCI_TRNS_DMA: u16 = 0x0001;
+/// Block Count Enable (bit 1). Set for multi-block; clear for single-block.
+pub const SDHCI_TRNS_BLK_CNT_EN: u16 = 0x0002;
+/// Data Transfer Direction (bit 4): 1 = read (card→host), 0 = write (host→card).
+pub const SDHCI_TRNS_READ: u16 = 0x0010;
+/// Multi Block Select (bit 5): 1 = multi-block, 0 = single block.
+pub const SDHCI_TRNS_MULTI: u16 = 0x0020;
+
+// ---------------------------------------------------------------------------
 // COMMAND_REG flag constants (offset 0x00e, low byte)
 // ---------------------------------------------------------------------------
 //
@@ -152,6 +178,10 @@ pub const SDHCI_DAT_INHIBIT: u32 = 0x0000_0002;
 pub const SDHCI_CMD_CRC: u8 = 0x08;
 /// Index check enable for the response field.
 pub const SDHCI_CMD_INDEX: u8 = 0x10;
+/// Data Present Select (bit 5). Set for commands that transfer data via the
+/// DAT lines (CMD17, CMD18, CMD24, CMD25). The TRANSFER_MODE register must
+/// be programmed before the COMMAND write that triggers the transfer.
+pub const SDHCI_CMD_DATA: u8 = 0x20;
 /// No response type (CMD0, broadcast commands with no reply).
 pub const SDHCI_CMD_RESP_NONE: u8 = 0x00;
 /// Long response — 136-bit (R2: CID, CSD).
@@ -778,5 +808,62 @@ mod tests {
         let flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX;
         let w = sd_command_word(SdCommand::SendIfCond.index(), flags);
         assert_eq!(w, 0x081A);
+    }
+
+    // ----- M4 data-transfer constants -----
+
+    #[test]
+    fn normal_int_data_bits_match_spec() {
+        // TRANSFER_COMPLETE is bit 1 of NORMAL_INT_STATUS.
+        assert_eq!(SDHCI_INT_DATA_COMPLETE, 0x0002);
+        // BUF_READ_READY is bit 5 of NORMAL_INT_STATUS.
+        assert_eq!(SDHCI_INT_BUF_RD_READY, 0x0020);
+        // Neither aliases CMD_COMPLETE (bit 0).
+        assert_eq!(SDHCI_INT_DATA_COMPLETE & SDHCI_INT_CMD_COMPLETE, 0);
+        assert_eq!(SDHCI_INT_BUF_RD_READY & SDHCI_INT_CMD_COMPLETE, 0);
+        assert_eq!(SDHCI_INT_BUF_RD_READY & SDHCI_INT_DATA_COMPLETE, 0);
+    }
+
+    #[test]
+    fn error_int_data_bits_match_spec() {
+        // Data timeout = bit 4, data CRC = bit 5, data end-bit = bit 6.
+        assert_eq!(SDHCI_INT_DATA_TIMEOUT, 0x0010);
+        assert_eq!(SDHCI_INT_DATA_CRC, 0x0020);
+        assert_eq!(SDHCI_INT_DATA_END_BIT, 0x0040);
+        // Data error bits must not overlap the command error bits (bits 0-3).
+        let cmd_mask = SDHCI_INT_CMD_TIMEOUT | SDHCI_INT_CMD_CRC
+            | SDHCI_INT_CMD_END_BIT | SDHCI_INT_CMD_INDEX;
+        assert_eq!(SDHCI_INT_DATA_TIMEOUT & cmd_mask, 0);
+        assert_eq!(SDHCI_INT_DATA_CRC     & cmd_mask, 0);
+        assert_eq!(SDHCI_INT_DATA_END_BIT & cmd_mask, 0);
+    }
+
+    #[test]
+    fn cmd_data_present_bit_matches_spec() {
+        // DATA_PRESENT is bit 5 of the flags byte.
+        assert_eq!(SDHCI_CMD_DATA, 0x20);
+        // Must not overlap response type, CRC, or index bits.
+        assert_eq!(
+            SDHCI_CMD_DATA & (SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX),
+            0,
+        );
+    }
+
+    #[test]
+    fn trns_read_bit_matches_spec() {
+        // DATA_XFER_DIR is bit 4 of TRANSFER_MODE.
+        assert_eq!(SDHCI_TRNS_READ, 0x0010);
+        // All TRNS_ bits are distinct.
+        assert_ne!(SDHCI_TRNS_DMA, SDHCI_TRNS_BLK_CNT_EN);
+        assert_ne!(SDHCI_TRNS_BLK_CNT_EN, SDHCI_TRNS_READ);
+        assert_ne!(SDHCI_TRNS_READ, SDHCI_TRNS_MULTI);
+    }
+
+    #[test]
+    fn cmd17_word_has_data_present() {
+        // CMD17: index=17, SHORT(0x02)|CRC(0x08)|INDEX(0x10)|DATA(0x20) = 0x3A.
+        let flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA;
+        let w = sd_command_word(SdCommand::ReadSingleBlock.index(), flags);
+        assert_eq!(w, (17u16 << 8) | 0x3A);
     }
 }
