@@ -265,6 +265,19 @@ pub fn tick() {
 /// Return the KVA of the currently running thread's TCB.
 /// TCBs live in the KVM pool (kernel-vmem-roadmap.md). Used by
 /// syscall handlers to look up the caller's handle table and TTBR0.
+///
+/// **Precondition**: this CPU has a current thread. Holds in syscall
+/// handlers (the caller's thread is current), IRQ handlers entered from
+/// a running thread (preempted thread is current), and any kernel path
+/// executing on a CPU it was scheduled onto. Idle CPUs (no thread
+/// assigned, parked in `idle_wait` — added in the scheduler refactor)
+/// MUST NOT reach here; use `try_current_tcb_kva` if a caller might
+/// run in a no-current context.
+///
+/// Panics on a missing current — treat as a contract violation, not a
+/// runtime condition. All current callers (syscall handlers, IPC paths,
+/// process.rs, exception/data-abort handler) were audited during the
+/// scheduler refactor plan and satisfy the precondition.
 pub fn current_tcb_kva() -> lockjaw_types::addr::KernelVa {
     // SAFETY: GKL held — exclusive access to scheduler state.
     unsafe {
@@ -578,7 +591,20 @@ fn finish_exit() {
 
     // Cannot clean up if the exited thread is still current on this CPU
     // (ExitAndHalt path — haven't context-switched to a different thread).
-    let current_idx = unsafe { (*SCHEDULER.state_ptr()).current_for(cpu_id) };
+    //
+    // Bootstrap-only safety on the None branch: before any thread has
+    // run on this CPU, current_per_cpu[cpu] is None — but in that window
+    // a pending-exit slot can't exist (no thread has been scheduled to
+    // exit), so a None current here is unreachable for the duration of
+    // this refactor's scope. Treating None as "skip" is correct now;
+    // if a future refactor makes None a true steady-state idle marker,
+    // finish_exit must drain pending exits on the now-idle CPU (cross-
+    // CPU drain or lazy-drain on next schedule). See
+    // docs/plans/scheduler-refactor.md Risk #2.
+    let current_idx = match unsafe { (*SCHEDULER.state_ptr()).try_current_for(cpu_id) } {
+        Some(idx) => idx,
+        None => return,
+    };
     if pending.thread_idx == current_idx {
         return;
     }
@@ -759,7 +785,17 @@ unsafe fn schedule(reason: SchedReason) {
 
     let cpu_id = crate::percpu::cpu_id() as usize;
     let state = &mut *SCHEDULER.state_ptr();
-    let old_idx = state.current_for(cpu_id);
+    // Schedule is called from syscall handlers, voluntary yield, and the
+    // tick path — all entered via a currently-running thread. An idle
+    // CPU (no current thread, parked in `idle_wait`) must NOT call
+    // schedule(); it routes through `schedule_from_idle` instead. The
+    // panic message is the contract — no caller triggers it today.
+    let old_idx = match state.try_current_for(cpu_id) {
+        Some(idx) => idx,
+        None => panic!(
+            "schedule called with no current thread — idle CPUs must use schedule_from_idle"
+        ),
+    };
     let old_paddr = (*SCHEDULER.threads_ptr())[old_idx].unwrap();
     let mut old_tcb = KernelMut::<Tcb>::from_kva(old_paddr);
 

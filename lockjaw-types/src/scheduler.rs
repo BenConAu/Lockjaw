@@ -170,9 +170,28 @@ impl SchedState {
         s
     }
 
-    /// Return the current thread index for a CPU, or panic if none assigned.
+    /// Return the current thread index for a CPU.
+    ///
+    /// **Precondition**: `current_per_cpu[cpu_id].is_some()`. This holds in:
+    /// syscall handlers (caller's thread is current), IRQ handlers entered
+    /// from a running thread (preempted thread is current), and any kernel
+    /// path executing on a CPU it was scheduled onto. It does NOT hold for
+    /// idle CPUs (no thread assigned) — those callers MUST use
+    /// `try_current_for` and handle `None` (typically by routing to
+    /// `step_from_idle` or a no-op return).
+    ///
+    /// Panics if the precondition is violated. Treat the panic as a contract
+    /// violation, not a runtime condition.
     pub fn current_for(&self, cpu_id: usize) -> usize {
         self.current_per_cpu[cpu_id].unwrap_or_else(|| panic!("no current thread for this CPU"))
+    }
+
+    /// Return the current thread index for a CPU, or `None` if no thread
+    /// is assigned. Used by code paths that may legitimately run on an
+    /// idle CPU (currently: `schedule()` defensive panic message; the
+    /// new `schedule_from_idle` path in the scheduler refactor).
+    pub fn try_current_for(&self, cpu_id: usize) -> Option<usize> {
+        self.current_per_cpu[cpu_id]
     }
 
     /// Add a new thread as Ready. Returns its index, or None if full.
@@ -538,6 +557,31 @@ mod tests {
         assert_eq!(s.get(0), Some(SchedThreadState::Running));
         assert_eq!(s.current_for(0), 0);
         assert!(s.check_invariants());
+    }
+
+    #[test]
+    fn try_current_for_none_when_unassigned() {
+        // `new()` only assigns CPU 0. Other CPUs have no current thread
+        // and `try_current_for` must observe that as `None` rather than
+        // panicking — that's what the scheduler refactor relies on for
+        // the idle-CPU path.
+        let s = SchedState::new();
+        assert_eq!(s.try_current_for(0), Some(0));
+        assert_eq!(s.try_current_for(1), None);
+        assert_eq!(s.try_current_for(2), None);
+        assert_eq!(s.try_current_for(3), None);
+    }
+
+    #[test]
+    fn try_current_for_some_after_set_initial_current() {
+        // After bootstrap registration, the CPU's slot transitions
+        // None -> Some(idx). Mirrors the kernel's add_thread_for_cpu
+        // path that assigns secondaries their per-CPU current at boot
+        // (today — the refactor removes that path).
+        let mut s = SchedState::new();
+        let idx = s.add_thread().unwrap();
+        s.set_initial_current(1, idx);
+        assert_eq!(s.try_current_for(1), Some(idx));
     }
 
     #[test]
