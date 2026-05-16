@@ -1475,7 +1475,209 @@ pub extern "C" fn _start() -> ! {
     put_decimal(pio_us);
     puts("us\n");
 
+    // -----------------------------------------------------------------------
+    // M6 perf sweep — multi-block ADMA2 vs multi-block PIO
+    // -----------------------------------------------------------------------
+    // Pi 4B single-block ADMA2 measured slower than PIO (5.6ms vs 0.22ms)
+    // on the first M6 boot — overhead-dominated for one block. This sweep
+    // measures the crossover. Each iteration:
+    //   - Allocates an N-page DmaPool buffer (8 blocks per page).
+    //   - Builds a single ADMA2 tran+end descriptor of N*4096 bytes
+    //     (well under the 65535-byte single-descriptor cap).
+    //   - Runs CMD18 + Auto-CMD23 + DMA, polls TRANSFER_COMPLETE.
+    //   - Compares against PIO read_blocks_pio with the same block count.
+    //
+    // The buffer page is leaked each iteration (no PageSet handle close
+    // path exercised in this driver) — acceptable for a one-shot boot
+    // probe; the M6 plan's DMA pool sizing (512 pages) covers it with
+    // room to spare.
+    perf_sweep_adma_vs_pio(mmio_va, freq, desc_va, desc_phys);
+
     sys_exit();
+}
+
+/// Helper: run one ADMA2 multi-block read of `n_blocks` starting at
+/// LBA 0 and return elapsed ticks. Allocates a fresh DmaPool buffer
+/// (does NOT free — driver is a one-shot probe). Uses CMD18 with
+/// Auto-CMD23 and a single descriptor covering the full transfer.
+unsafe fn adma2_multiblock_read(
+    mmio_va: u64,
+    n_blocks: u16,
+    n_pages: u64,
+    desc_va: u64,
+    desc_phys: u64,
+) -> Result<u64, &'static str> {
+    let buf_ps = sys_alloc_dma_pages(n_pages).map_err(|_| "alloc_dma_pages")?;
+    let buf_phys = sys_query_pageset_phys(buf_ps, 0).map_err(|_| "query_phys")?;
+    let buf_va = VMEM.alloc(n_pages as usize).ok_or("VA alloc")?;
+    if !sys_map_pages(buf_ps, buf_va, MapMemoryAttribute::NormalNonCacheable).is_ok() {
+        return Err("map_pages NC");
+    }
+    if buf_phys >= (1u64 << 32) {
+        return Err("phys > 4GiB");
+    }
+    let bytes = (n_blocks as u32) * 512;
+    if bytes > 65535 {
+        return Err("descriptor length > 65535");
+    }
+
+    // One descriptor covers the whole multi-block transfer. Descriptor
+    // table from the single-block path is reused (still mapped at
+    // desc_va); overwrite its 8 bytes for this sweep iteration.
+    let desc = adma2_tran_end_descriptor(buf_phys as u32, bytes as u16);
+    ptr::write_volatile(desc_va as *mut u64, desc);
+    asm!("dsb sy", options(nomem, nostack));
+
+    sdhci_write32(mmio_va, SDHCI_ADMA_ADDRESS, desc_phys as u32);
+    sdhci_write32(mmio_va, SDHCI_ARGUMENT2, n_blocks as u32);
+
+    if poll_until_clear_32(
+        mmio_va, SDHCI_PRESENT_STATE,
+        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
+        Nanos::from_millis(100),
+    ).is_err() {
+        return Err("inhibit stuck");
+    }
+    sdhci_write16(mmio_va, SDHCI_BLOCK_SIZE, 512);
+    sdhci_write16(mmio_va, SDHCI_BLOCK_COUNT, n_blocks);
+    sdhci_write16(mmio_va, SDHCI_TRANSFER_MODE,
+        SDHCI_TRNS_READ | SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN
+            | SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD23);
+    sdhci_write32(mmio_va, SDHCI_ARGUMENT, 0);
+
+    let cmd18 = sd_command_word(
+        SdCommand::ReadMultipleBlock.index(),
+        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
+    );
+
+    let freq = cntfreq_hz();
+    let t0 = monotonic_now();
+    sdhci_write16(mmio_va, SDHCI_COMMAND, cmd18);
+
+    // Poll CMD_COMPLETE
+    let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
+    loop {
+        let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
+        if status & SDHCI_INT_ERROR != 0 {
+            let err = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
+                SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
+            puts("    CMD18 controller error: ");
+            put_error_int_status(err);
+            puts("\n");
+            return Err("cmd error");
+        }
+        if status & SDHCI_INT_CMD_COMPLETE != 0 {
+            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+            break;
+        }
+        if monotonic_now() >= cmd_deadline { return Err("cmd_complete timeout"); }
+        core::hint::spin_loop();
+    }
+
+    // Poll TRANSFER_COMPLETE — for multi-block ADMA, the controller
+    // signals once after the FULL descriptor's transfer ends.
+    let xfer_deadline = monotonic_now().deadline_in(Nanos::from_millis(500), freq);
+    loop {
+        let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
+        if status & SDHCI_INT_ERROR != 0 {
+            let err = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
+                SDHCI_INT_ERROR | SDHCI_INT_DATA_COMPLETE);
+            puts("    ADMA2 multi data error: ");
+            put_error_int_status(err);
+            puts("\n");
+            return Err("data error");
+        }
+        if status & SDHCI_INT_DATA_COMPLETE != 0 {
+            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
+            break;
+        }
+        if monotonic_now() >= xfer_deadline { return Err("transfer_complete timeout"); }
+        core::hint::spin_loop();
+    }
+    let t1 = monotonic_now();
+    Ok(t1.0.saturating_sub(t0.0))
+}
+
+/// Sweep ADMA2 and PIO across block counts 1, 4, 8, 16, 32, 64, 127 to
+/// find the crossover where ADMA2 starts winning (or fails to). Logs
+/// elapsed in microseconds per (count, mode) pair. Caps at 127 blocks
+/// because that's the single-descriptor length max (65024 bytes;
+/// 65535 / 512 = 127).
+///
+/// Each ADMA iteration overwrites the descriptor table we set up
+/// earlier — reads VMEM_DESC_VA / VMEM_DESC_PHYS the single-block
+/// path stashed. Each iteration leaks one buffer PageSet (one-shot
+/// driver — pool is sized 512 pages = 2 MiB, total sweep usage
+/// 1+4+8+16+32+64+127 = 252 pages, fits with headroom).
+/// PIO compare buffer for the perf sweep. 127 blocks × 512 bytes = ~65 KiB —
+/// way too large for the userspace stack. Static BSS storage; driver is
+/// single-threaded so no concurrent access. One-shot use at boot.
+///
+/// SAFETY: single-threaded one-shot driver — perf_sweep_adma_vs_pio is
+/// the sole accessor and runs once during _start.
+static mut PIO_SWEEP_BUF: [[u32; 128]; 127] = [[0u32; 128]; 127];
+
+fn perf_sweep_adma_vs_pio(
+    mmio_va: u64,
+    freq: lockjaw_userlib::time::TickFreq,
+    desc_va: u64,
+    desc_phys: u64,
+) {
+    let counts: &[u16] = &[1, 4, 8, 16, 32, 64, 127];
+
+    // Re-select ADMA2-32 in HOST_CONTROL_1. The single-block M6 path
+    // restored DMA_SEL=SDMA at its end so PIO read_block_pio could
+    // run cleanly; the sweep needs it back at ADMA2 for the ADMA
+    // arm of each comparison.
+    unsafe {
+        let hc = sdhci_read8(mmio_va, SDHCI_HOST_CONTROL);
+        let hc_new = (hc & !SDHCI_HOST_CTRL_DMA_SEL_MASK)
+            | SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32;
+        sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc_new);
+    }
+
+    puts("[EMMC2:PERF] block-count sweep (ADMA2 / PIO) us\n");
+    for &n in counts {
+        // n_pages = ceil(n_blocks * 512 / 4096) = ceil(n / 8)
+        let n_pages = ((n as u64) * 512 + 4095) / 4096;
+
+        let adma_ticks = match unsafe { adma2_multiblock_read(mmio_va, n, n_pages, desc_va, desc_phys) } {
+            Ok(t) => t,
+            Err(e) => {
+                puts("[EMMC2:PERF]  n="); put_decimal(n as u64);
+                puts(" ADMA2 FAILED: "); puts(e); puts("\n");
+                continue;
+            }
+        };
+
+        // PIO compare: pass a sub-slice of the static buffer (64 KiB
+        // total in BSS — too large for the userspace stack).
+        let t2 = monotonic_now();
+        let pio_result = unsafe {
+            #[allow(static_mut_refs)]
+            read_blocks_pio(mmio_va, 0, &mut PIO_SWEEP_BUF[..n as usize])
+        };
+        let t3 = monotonic_now();
+        let pio_ticks = t3.0.saturating_sub(t2.0);
+        if let Err(e) = pio_result {
+            puts("[EMMC2:PERF]  n="); put_decimal(n as u64);
+            puts(" PIO FAILED: "); report_pio_error(mmio_va, "PERF", "CMD18 PIO", e);
+            continue;
+        }
+
+        let adma_us = ticks_to_us(adma_ticks, freq);
+        let pio_us = ticks_to_us(pio_ticks, freq);
+        puts("[EMMC2:PERF]  n="); put_decimal(n as u64);
+        puts(" bytes="); put_decimal((n as u64) * 512);
+        puts(" ADMA="); put_decimal(adma_us);
+        puts("us PIO="); put_decimal(pio_us);
+        puts("us ratio_x100="); put_decimal((adma_us * 100) / pio_us.max(1));
+        puts("\n");
+    }
 }
 
 /// Helper: raw timer ticks → microseconds via TickFreq. Drops fractional
