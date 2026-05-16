@@ -409,6 +409,32 @@ pub fn sys_wait_any_until(
     if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
 }
 
+/// Block the current thread forever. The kernel marks the thread
+/// Blocked and parks it in a wfi loop with no wake source — no
+/// IPC waiters, no deadline. Re-entry is impossible by construction;
+/// the only way out is reset.
+///
+/// Use this when a thread has reached "done" but the process must
+/// stay alive (init), or when a daemon has failed irrecoverably and
+/// `sys_exit` would propagate the failure (e.g., CPU 0 boot TCB
+/// cannot exit — its kernel stack lives in the linker image, not the
+/// KVM pool, so finish_exit panics).
+///
+/// **Do not** spin on `sys_yield` or `loop { wfi }` instead. Those
+/// keep the thread in `Running`/`Ready` state and contend for fair
+/// round-robin slots — every other Ready thread on the CPU then
+/// gets a 10ms timer-tick quantum even when there is no real work
+/// to do, which inflates perf measurements unpredictably.
+pub fn park_forever() -> ! {
+    // sys_wait_any with empty entries + NO_DEADLINE → kernel marks
+    // the thread Blocked, never wakes. The match arm covers
+    // belt-and-braces: if a future kernel change does wake the
+    // thread, we re-park instead of returning into caller code.
+    loop {
+        let _ = sys_wait_any_until(&[], lockjaw_types::time::MonoTicks::NO_DEADLINE);
+    }
+}
+
 /// Unmap a PageSet from the caller's address space.
 /// VA must match the address used in sys_map_pages. Validates that
 /// every PTE maps to the expected physical page before clearing.
@@ -546,6 +572,46 @@ pub fn sys_query_caller_token() -> u64 {
         );
     }
     val
+}
+
+/// Snapshot of scheduler-side counters for userspace perf diagnostics.
+/// Each counter is monotonically non-decreasing; the three are NOT
+/// snapshot-consistent (read with three separate atomic loads).
+#[derive(Clone, Copy, Debug)]
+pub struct SchedTelemetry {
+    pub ticks: u64,
+    pub ctx_switches: u64,
+    pub ttbr0_writes: u64,
+}
+
+impl SchedTelemetry {
+    /// Per-counter deltas (saturating) from `from` to `self`.
+    pub fn delta_from(&self, from: &SchedTelemetry) -> SchedTelemetry {
+        SchedTelemetry {
+            ticks: self.ticks.saturating_sub(from.ticks),
+            ctx_switches: self.ctx_switches.saturating_sub(from.ctx_switches),
+            ttbr0_writes: self.ttbr0_writes.saturating_sub(from.ttbr0_writes),
+        }
+    }
+}
+
+/// Diagnostic snapshot of scheduler counters (tick_count, context
+/// switches, TTBR0 writes). Read-only. See `SchedTelemetry`.
+pub fn sys_sched_telemetry() -> SchedTelemetry {
+    let ticks: u64;
+    let ctx_switches: u64;
+    let ttbr0_writes: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            lateout("x0") _,
+            lateout("x1") ticks,
+            lateout("x2") ctx_switches,
+            lateout("x3") ttbr0_writes,
+            in("x8") SYS_SCHED_TELEMETRY,
+        );
+    }
+    SchedTelemetry { ticks, ctx_switches, ttbr0_writes }
 }
 
 /// Close a handle, freeing the slot for reuse. Does not free the

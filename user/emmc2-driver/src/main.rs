@@ -1641,11 +1641,12 @@ fn perf_sweep_adma_vs_pio(
         sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc_new);
     }
 
-    puts("[EMMC2:PERF] block-count sweep (ADMA2 / PIO) us\n");
+    puts("[EMMC2:PERF] block-count sweep (ADMA2 / PIO) us [+sched deltas]\n");
     for &n in counts {
         // n_pages = ceil(n_blocks * 512 / 4096) = ceil(n / 8)
         let n_pages = ((n as u64) * 512 + 4095) / 4096;
 
+        let tel_a0 = sys_sched_telemetry();
         let adma_ticks = match unsafe { adma2_multiblock_read(mmio_va, n, n_pages, desc_va, desc_phys) } {
             Ok(t) => t,
             Err(e) => {
@@ -1654,15 +1655,20 @@ fn perf_sweep_adma_vs_pio(
                 continue;
             }
         };
+        let tel_a1 = sys_sched_telemetry();
+        let dt_adma = tel_a1.delta_from(&tel_a0);
 
         // PIO compare: pass a sub-slice of the static buffer (64 KiB
         // total in BSS — too large for the userspace stack).
+        let tel_p0 = sys_sched_telemetry();
         let t2 = monotonic_now();
         let pio_result = unsafe {
             #[allow(static_mut_refs)]
             read_blocks_pio(mmio_va, 0, &mut PIO_SWEEP_BUF[..n as usize])
         };
         let t3 = monotonic_now();
+        let tel_p1 = sys_sched_telemetry();
+        let dt_pio = tel_p1.delta_from(&tel_p0);
         let pio_ticks = t3.0.saturating_sub(t2.0);
         if let Err(e) = pio_result {
             puts("[EMMC2:PERF]  n="); put_decimal(n as u64);
@@ -1675,8 +1681,14 @@ fn perf_sweep_adma_vs_pio(
         puts("[EMMC2:PERF]  n="); put_decimal(n as u64);
         puts(" bytes="); put_decimal((n as u64) * 512);
         puts(" ADMA="); put_decimal(adma_us);
-        puts("us PIO="); put_decimal(pio_us);
-        puts("us ratio_x100="); put_decimal((adma_us * 100) / pio_us.max(1));
+        puts("us [d_ticks="); put_decimal(dt_adma.ticks);
+        puts(" d_cs="); put_decimal(dt_adma.ctx_switches);
+        puts(" d_ttbr0="); put_decimal(dt_adma.ttbr0_writes);
+        puts("] PIO="); put_decimal(pio_us);
+        puts("us [d_ticks="); put_decimal(dt_pio.ticks);
+        puts(" d_cs="); put_decimal(dt_pio.ctx_switches);
+        puts(" d_ttbr0="); put_decimal(dt_pio.ttbr0_writes);
+        puts("] ratio_x100="); put_decimal((adma_us * 100) / pio_us.max(1));
         puts("\n");
     }
 }

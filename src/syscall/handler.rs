@@ -71,6 +71,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_CLOSE_HANDLE => SyscallReturn::Void(sys_close_handle(ctx)),
         SYS_UNMAP_PAGES => SyscallReturn::Void(sys_unmap_pages(ctx)),
         SYS_QUERY_CALLER_TOKEN => SyscallReturn::Value(Ok(sys_query_caller_token())),
+        SYS_SCHED_TELEMETRY => sys_sched_telemetry(ctx),
         SYS_EXIT => {
             scheduler::exit_current(); // never returns
         }
@@ -934,6 +935,26 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         }
         Ok(idx as u64)
     }
+}
+
+/// sys_sched_telemetry() — diagnostic snapshot of scheduler counters.
+///
+/// Returns three monotonically-non-decreasing u64 counters:
+///   x1 = tick_count       — TIMER_TICK_MS ticks since boot
+///   x2 = context_switches — successful SwitchTo transitions
+///   x3 = ttbr0_writes     — process-switch TLB invalidates
+///
+/// Used by userspace perf harnesses to capture deltas around a
+/// measured operation. Snapshot is atomic per-counter (each is an
+/// AtomicU64 load), not snapshot-consistent across the three.
+/// Read-only — no scheduler state is mutated.
+fn sys_sched_telemetry(ctx: &mut ExceptionContext) -> SyscallReturn {
+    let ticks = crate::arch::aarch64::timer::tick_count();
+    let (ctx_switches, ttbr0_writes) = scheduler::scheduler_stats();
+    ctx.gpr[1] = ticks;
+    ctx.gpr[2] = ctx_switches as u64;
+    ctx.gpr[3] = ttbr0_writes as u64;
+    SyscallReturn::Message(SyscallError::OK)
 }
 
 /// sys_get_boot_info() — returns boot information about the DTB.
