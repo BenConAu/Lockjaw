@@ -62,7 +62,8 @@ pub struct PageSetHeader {
     pub header_pages: u32,  // contiguous header pages (>=1)
     pub refcount: u32,
     pub map_count: u32,
-    // pages[]: count u64s starting at byte offset 16, spanning
+    pub origin: PageSetOrigin,  // M6: u64-tagged enum (Buddy=0 / DmaPool=1)
+    // pages[]: count u64s starting at byte offset 24, spanning
     // into subsequent header pages as needed.
 }
 ```

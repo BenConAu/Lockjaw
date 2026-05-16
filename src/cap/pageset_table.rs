@@ -5,7 +5,7 @@ use crate::mm::page_alloc;
 use core::cell::UnsafeCell;
 use lockjaw_types::addr::KernelVa;
 use lockjaw_types::pageset_table::{
-    header_pages_for, PageSetEntry, PageSetHeader, PageSetTable,
+    header_pages_for, PageSetEntry, PageSetHeader, PageSetOrigin, PageSetTable,
     MAX_PRACTICAL_PAGES_PER_SET,
 };
 
@@ -41,7 +41,7 @@ static TABLE: PageSetTableWrapper = PageSetTableWrapper::new();
 /// Does NOT own the header range — the caller is responsible for
 /// cleanup on failure (typically via OwnedKvmRangeGuard).
 fn insert_into_table(count: usize, header_kva: KernelVa) -> Option<u64> {
-    let entry = PageSetEntry { count, header_kva };
+    let entry = PageSetEntry { count, header_kva, origin: PageSetOrigin::Buddy };
     // SAFETY: single-core, IRQs masked — exclusive table access.
     unsafe { (*TABLE.ptr()).insert(entry).ok().map(|id| id as u64) }
 }
@@ -79,7 +79,7 @@ fn alloc_and_insert_header(page_addrs: &[u64], count: usize) -> Option<u64> {
     let mut backed = unsafe { header_ref.get_mut().backed_mut(count) };
     backed.init(page_addrs);
 
-    let entry = PageSetEntry { count, header_kva };
+    let entry = PageSetEntry { count, header_kva, origin: PageSetOrigin::Buddy };
     // SAFETY: single-core, IRQs masked — exclusive table access.
     let id = unsafe { (*TABLE.ptr()).insert(entry).ok()? };
 
@@ -95,8 +95,9 @@ fn alloc_and_insert_header(page_addrs: &[u64], count: usize) -> Option<u64> {
 /// Allocate `count` physical pages and register them as a PageSet.
 /// Allocates header_pages_for(count) contiguous header pages plus
 /// `count` data pages. The header stores all data page addresses
-/// (in a variable-size array starting at byte offset 16 from the
-/// header), avoiding large stack arrays.
+/// (in a variable-size array starting at byte offset 24 from the
+/// header — 16 bytes of u32 counters + 8 bytes of origin enum),
+/// avoiding large stack arrays.
 /// Returns the PageSet ID, or `None` if out of memory or table full.
 pub fn alloc_pages(count: usize) -> Option<u64> {
     if count == 0 || count > MAX_PRACTICAL_PAGES_PER_SET {

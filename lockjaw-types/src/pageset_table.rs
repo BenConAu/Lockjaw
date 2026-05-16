@@ -18,13 +18,46 @@ pub const MAX_PAGESETS: usize = 128;
 pub const MAX_PRACTICAL_PAGES_PER_SET: usize = 16_384;
 
 // ---------------------------------------------------------------------------
+// PageSetOrigin — which allocator owns the data pages in a PageSet
+// ---------------------------------------------------------------------------
+
+/// Source of a PageSet's data pages. Determines which allocator the free
+/// path returns pages to and which kernel-side mapping policies are
+/// permitted (DmaPool pages can ONLY be mapped `NormalNonCacheable`;
+/// Buddy pages cannot be mapped that way).
+///
+/// `Buddy = 0` so a zero-initialised header (the default for any
+/// freshly-allocated kernel page) reads as Buddy without explicit init.
+/// Any pre-M6 PageSet path that doesn't explicitly set origin gets
+/// Buddy semantics, preserving behaviour during the M6 migration.
+///
+/// `#[repr(u64)]` makes the field 8-byte aligned so `PageSetHeader`
+/// keeps the trailing-`pages[]`-array u64 alignment without explicit
+/// padding (see the `pageset_header_size_pinned` test).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum PageSetOrigin {
+    /// Pages came from the buddy allocator. Mapping policy: cacheable
+    /// `Normal` (and `Device` for MMIO claims that are wrapped in
+    /// PageSet form). NC mapping rejected — would create the
+    /// mixed-attribute alias with the kernel direct map.
+    Buddy = 0,
+    /// Pages came from the DMA pool — physically reserved at boot,
+    /// excluded from the kernel direct map, never re-mapped cacheable
+    /// anywhere. Mapping policy: `NormalNonCacheable` only. Cacheable
+    /// `Normal` rejected. Donation as kernel object rejected.
+    DmaPool = 1,
+}
+
+// ---------------------------------------------------------------------------
 // PageSetHeader -- lives in the first one or more allocated pages of a PageSet
 // ---------------------------------------------------------------------------
 
 /// Page-resident header for a PageSet. Stored at the start of one or
 /// more physically-contiguous header pages. The metadata struct is a
-/// fixed 16 bytes; the data-page address array immediately follows
-/// (starting at byte offset 16) and may extend across header pages.
+/// fixed 24 bytes (16 bytes of u32 counters + 8 bytes of `origin`); the
+/// data-page address array immediately follows (starting at byte
+/// offset 24) and may extend across header pages.
 ///
 /// **Layout invariant**: when allocated by the kernel, `header_pages`
 /// contiguous physical pages back this header. Reads and writes of the
@@ -54,17 +87,25 @@ pub struct PageSetHeader {
     /// sys_map_pages, decremented by sys_unmap_pages. Pages are freed
     /// when both refcount and map_count reach zero.
     pub map_count: u32,
-    // pages[]: `count` u64 values starting at byte offset 16, possibly
+    /// Allocator-of-origin for the data pages. Determines free path
+    /// (buddy vs DMA pool) and mapping-attribute policy. Read by every
+    /// kernel path that would map this PageSet's pages (sys_map_pages,
+    /// KVM remap, kernel-object donation, create_process). u64-tagged
+    /// so the struct stays naturally aligned for the trailing pages[]
+    /// u64 array.
+    pub origin: PageSetOrigin,
+    // pages[]: `count` u64 values starting at byte offset 24, possibly
     // spanning into subsequent header pages. Accessed only via
     // get_page / set_page which compute the byte offset.
 }
 
 /// Number of contiguous header pages required to hold metadata + an
-/// array of `count` u64 page addresses. Header metadata is 16 bytes;
-/// each page address is 8 bytes; result is rounded up to whole pages.
+/// array of `count` u64 page addresses. Header metadata is 24 bytes
+/// (4 u32 counters + 8-byte origin); each page address is 8 bytes;
+/// result is rounded up to whole pages.
 ///
-/// For count ≤ 510: 1 page (the legacy single-page-header case).
-/// For count = 511: 2 pages.
+/// For count ≤ 509: 1 page (the legacy single-page-header case).
+/// For count = 510: 2 pages.
 /// For count = 16384 (the practical cap): 33 pages.
 pub const fn header_pages_for(count: usize) -> usize {
     let bytes = core::mem::size_of::<PageSetHeader>() + count * 8;
@@ -72,7 +113,7 @@ pub const fn header_pages_for(count: usize) -> usize {
 }
 
 impl PageSetHeader {
-    /// An empty header — a 16-byte stack value with zero data pages
+    /// An empty header — a 24-byte stack value with zero data pages
     /// and `header_pages = 1`. Safe regardless of where it lives:
     /// `BackedHeader` / `BackedHeaderMut` are the only way to access
     /// the page-addr array, and they require an unsafe construction
@@ -83,6 +124,7 @@ impl PageSetHeader {
             header_pages: 1,
             refcount: 0,
             map_count: 0,
+            origin: PageSetOrigin::Buddy,
         }
     }
 
@@ -377,6 +419,14 @@ impl<'a> core::ops::DerefMut for BackedHeaderMut<'a> {
 pub struct PageSetEntry {
     pub count: usize,
     pub header_kva: crate::addr::KernelVa,
+    /// Trusted cached copy of the page-resident header's `origin` —
+    /// lets table-driven checks (sys_map_pages dispatch, donation
+    /// rejection) avoid a header read on the hot path. Immutable
+    /// after allocation; the kernel writes this exactly once when
+    /// inserting the entry. The page-resident header is the durable
+    /// source of truth for the deallocator (which only has
+    /// `header_kva`).
+    pub origin: PageSetOrigin,
 }
 
 /// Errors from PageSet table operations.
@@ -465,6 +515,7 @@ mod tests {
         PageSetEntry {
             count,
             header_kva: crate::addr::KernelVa::new(0x1000 * (count as u64 + 1)),
+            origin: PageSetOrigin::Buddy,
         }
     }
 
@@ -519,7 +570,7 @@ mod tests {
     fn invalid_count_zero() {
         let mut table = PageSetTable::new();
         assert_eq!(
-            table.insert(PageSetEntry { count: 0, header_kva: crate::addr::KernelVa::new(0x1000) }),
+            table.insert(PageSetEntry { count: 0, header_kva: crate::addr::KernelVa::new(0x1000), origin: PageSetOrigin::Buddy }),
             Err(PageSetError::InvalidCount)
         );
     }
@@ -528,7 +579,7 @@ mod tests {
     fn invalid_count_too_large() {
         let mut table = PageSetTable::new();
         assert_eq!(
-            table.insert(PageSetEntry { count: MAX_PRACTICAL_PAGES_PER_SET + 1, header_kva: crate::addr::KernelVa::new(0x1000) }),
+            table.insert(PageSetEntry { count: MAX_PRACTICAL_PAGES_PER_SET + 1, header_kva: crate::addr::KernelVa::new(0x1000), origin: PageSetOrigin::Buddy }),
             Err(PageSetError::InvalidCount)
         );
     }
@@ -604,8 +655,9 @@ mod tests {
     /// `header_pages_for(count) * PAGE_SIZE` byte block, aligned to
     /// PAGE_SIZE so the layout matches the kernel's
     /// `alloc_pages_contiguous(header_pages)` invariant. PAGE_SIZE
-    /// alignment also satisfies the smaller alignof(PageSetHeader) = 4
-    /// and alignof(u64) = 8 needed by typed accesses. The block stays
+    /// alignment also satisfies the smaller alignof(PageSetHeader) = 8
+    /// (raised from 4 in M6 by the u64-tagged origin enum) and the
+    /// alignof(u64) = 8 needed by typed accesses. The block stays
     /// alive for the test's lifetime via Drop.
     ///
     /// Tests get a `BackedHeader` / `BackedHeaderMut` wrapper from the
@@ -716,11 +768,24 @@ mod tests {
     }
 
     #[test]
-    fn header_metadata_is_16_bytes() {
-        // Pinned ABI: the metadata struct is exactly 16 bytes so the
-        // page-addr array starts at byte offset 16. Variable-size
-        // header layout depends on this.
-        assert_eq!(core::mem::size_of::<PageSetHeader>(), 16);
+    fn header_metadata_is_24_bytes() {
+        // Pinned ABI: the metadata struct is exactly 24 bytes (4 u32
+        // counters + 8-byte origin enum) so the page-addr array starts
+        // at byte offset 24 and stays naturally u64-aligned. Variable-
+        // size header layout depends on this.
+        assert_eq!(core::mem::size_of::<PageSetHeader>(), 24);
+    }
+
+    #[test]
+    fn pageset_origin_default_is_buddy_via_zeroing() {
+        // PageSetOrigin::Buddy = 0 so a freshly-zeroed page-resident
+        // header reads as Buddy without explicit init. M6 substrate
+        // depends on this for backwards compatibility with pre-M6
+        // PageSet allocation paths that don't set origin.
+        let h = PageSetHeader::empty();
+        assert_eq!(h.origin, PageSetOrigin::Buddy);
+        assert_eq!(PageSetOrigin::Buddy as u64, 0);
+        assert_eq!(PageSetOrigin::DmaPool as u64, 1);
     }
 
     // --- header_pages_for arithmetic ---
@@ -729,28 +794,30 @@ mod tests {
     fn header_pages_for_small_counts() {
         assert_eq!(header_pages_for(0), 1);   // metadata only fits in 1 page
         assert_eq!(header_pages_for(1), 1);
-        assert_eq!(header_pages_for(510), 1); // (16 + 510*8) / 4096 = 1
+        assert_eq!(header_pages_for(509), 1); // (24 + 509*8) / 4096 = 1
     }
 
     #[test]
-    fn header_pages_for_boundary_at_510() {
-        // 510 entries: 16 + 510*8 = 4096 bytes exactly → 1 page.
-        assert_eq!(header_pages_for(510), 1);
-        // 511 entries: 16 + 511*8 = 4104 bytes → 2 pages.
-        assert_eq!(header_pages_for(511), 2);
+    fn header_pages_for_boundary_at_509() {
+        // 509 entries: 24 + 509*8 = 4096 bytes exactly → 1 page.
+        // (Pre-M6 boundary was 510 entries when header was 16 bytes;
+        // the 8-byte origin field shifts the boundary down by one.)
+        assert_eq!(header_pages_for(509), 1);
+        // 510 entries: 24 + 510*8 = 4104 bytes → 2 pages.
+        assert_eq!(header_pages_for(510), 2);
     }
 
     #[test]
-    fn header_pages_for_boundary_at_1022() {
-        // 1022 entries: 16 + 1022*8 = 8192 bytes exactly → 2 pages.
-        assert_eq!(header_pages_for(1022), 2);
-        // 1023: needs 3 pages.
-        assert_eq!(header_pages_for(1023), 3);
+    fn header_pages_for_boundary_at_1021() {
+        // 1021 entries: 24 + 1021*8 = 8192 bytes exactly → 2 pages.
+        assert_eq!(header_pages_for(1021), 2);
+        // 1022 entries: 24 + 1022*8 = 8200 bytes → 3 pages.
+        assert_eq!(header_pages_for(1022), 3);
     }
 
     #[test]
     fn header_pages_for_max_practical() {
-        // 16384 entries: 16 + 16384*8 = 131088 bytes → 33 pages.
+        // 16384 entries: 24 + 16384*8 = 131096 bytes → 33 pages.
         assert_eq!(header_pages_for(MAX_PRACTICAL_PAGES_PER_SET), 33);
     }
 
@@ -758,22 +825,24 @@ mod tests {
 
     #[test]
     fn header_get_set_at_page_boundary() {
-        // Index 510 is the first entry on header page 1. Index 511 is
-        // immediately after. Round-trip through both to verify the
-        // raw-pointer arithmetic crosses page boundaries correctly.
+        // Under the M6 24-byte header layout: index 508 is the last
+        // entry on page 0, index 509 is the first entry on page 1
+        // (was 510 pre-M6 with the 16-byte header). Round-trip across
+        // the boundary verifies the raw-pointer arithmetic crosses
+        // page boundaries correctly.
         let mut t = TestHeader::new(513);
         let mut bm = t.backed_mut();
         bm.set_count(513);
-        bm.set_page(509, 0xAAAA_0000);
-        bm.set_page(510, 0xBBBB_0000); // first entry on page 2
-        bm.set_page(511, 0xCCCC_0000);
-        bm.set_page(512, 0xDDDD_0000);
+        bm.set_page(508, 0xAAAA_0000); // last entry on page 0
+        bm.set_page(509, 0xBBBB_0000); // first entry on page 1
+        bm.set_page(510, 0xCCCC_0000);
+        bm.set_page(511, 0xDDDD_0000);
         drop(bm);
         let b = t.backed();
-        assert_eq!(b.get_page(509), Some(0xAAAA_0000));
-        assert_eq!(b.get_page(510), Some(0xBBBB_0000));
-        assert_eq!(b.get_page(511), Some(0xCCCC_0000));
-        assert_eq!(b.get_page(512), Some(0xDDDD_0000));
+        assert_eq!(b.get_page(508), Some(0xAAAA_0000));
+        assert_eq!(b.get_page(509), Some(0xBBBB_0000));
+        assert_eq!(b.get_page(510), Some(0xCCCC_0000));
+        assert_eq!(b.get_page(511), Some(0xDDDD_0000));
         assert_eq!(b.header_page_count(), 2);
     }
 
@@ -841,8 +910,8 @@ mod tests {
     #[test]
     fn find_by_header_kva_found() {
         let mut table = PageSetTable::new();
-        let e0 = PageSetEntry { count: 1, header_kva: crate::addr::KernelVa::new(0xA000) };
-        let e1 = PageSetEntry { count: 2, header_kva: crate::addr::KernelVa::new(0xB000) };
+        let e0 = PageSetEntry { count: 1, header_kva: crate::addr::KernelVa::new(0xA000), origin: PageSetOrigin::Buddy };
+        let e1 = PageSetEntry { count: 2, header_kva: crate::addr::KernelVa::new(0xB000), origin: PageSetOrigin::Buddy };
         let id0 = table.insert(e0).unwrap();
         let _id1 = table.insert(e1).unwrap();
 
@@ -853,14 +922,14 @@ mod tests {
     #[test]
     fn find_by_header_kva_not_found() {
         let mut table = PageSetTable::new();
-        table.insert(PageSetEntry { count: 1, header_kva: crate::addr::KernelVa::new(0xA000) }).unwrap();
+        table.insert(PageSetEntry { count: 1, header_kva: crate::addr::KernelVa::new(0xA000), origin: PageSetOrigin::Buddy }).unwrap();
         assert_eq!(table.find_by_header_kva(crate::addr::KernelVa::new(0xC000)), None);
     }
 
     #[test]
     fn find_by_header_kva_after_remove() {
         let mut table = PageSetTable::new();
-        let id = table.insert(PageSetEntry { count: 1, header_kva: crate::addr::KernelVa::new(0xA000) }).unwrap();
+        let id = table.insert(PageSetEntry { count: 1, header_kva: crate::addr::KernelVa::new(0xA000), origin: PageSetOrigin::Buddy }).unwrap();
         table.remove(id).unwrap();
         assert_eq!(table.find_by_header_kva(crate::addr::KernelVa::new(0xA000)), None);
     }
