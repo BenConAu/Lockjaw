@@ -1608,11 +1608,12 @@ unsafe fn adma2_multiblock_read(
 /// because that's the single-descriptor length max (65024 bytes;
 /// 65535 / 512 = 127).
 ///
-/// Each ADMA iteration overwrites the descriptor table we set up
-/// earlier — reads VMEM_DESC_VA / VMEM_DESC_PHYS the single-block
-/// path stashed. Each iteration leaks one buffer PageSet (one-shot
-/// driver — pool is sized 512 pages = 2 MiB, total sweep usage
-/// 1+4+8+16+32+64+127 = 252 pages, fits with headroom).
+/// Each ADMA iteration overwrites the descriptor table set up by the
+/// single-block M6 path (passed in as desc_va / desc_phys) and leaks
+/// one buffer PageSet — `ceil(n_blocks * 512 / 4096)` pages per
+/// iteration. Total leak across the sweep:
+/// `1 + 1 + 1 + 2 + 4 + 8 + 16 = 33` pages, comfortably within the
+/// 512-page DMA pool.
 /// PIO compare buffer for the perf sweep. 127 blocks × 512 bytes = ~65 KiB —
 /// way too large for the userspace stack. Static BSS storage; driver is
 /// single-threaded so no concurrent access. One-shot use at boot.
