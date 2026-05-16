@@ -43,16 +43,31 @@ pub const MAX_PRACTICAL_PAGES_PER_SET: usize = 16_384;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub enum PageSetOrigin {
-    /// Pages came from the buddy allocator. Mapping policy: cacheable
-    /// `Normal` (and `Device` for MMIO claims that are wrapped in
-    /// PageSet form). NC mapping rejected — would create the
-    /// mixed-attribute alias with the kernel direct map.
+    /// Pages came from the buddy allocator. Free path returns them to
+    /// `page_alloc::dealloc_page`. Mapping policy: cacheable `Normal`
+    /// (and `Device` for MMIO claims that are wrapped in PageSet
+    /// form). NC mapping rejected — would create the mixed-attribute
+    /// alias with the kernel direct map.
     Buddy = 1,
     /// Pages came from the DMA pool — physically reserved at boot,
     /// excluded from the kernel direct map, never re-mapped cacheable
-    /// anywhere. Mapping policy: `NormalNonCacheable` only. Cacheable
-    /// `Normal` rejected. Donation as kernel object rejected.
+    /// anywhere. Free path returns them to `dma_pool::free_pages`.
+    /// Mapping policy: `NormalNonCacheable` only. Cacheable `Normal`
+    /// rejected. Donation as kernel object rejected.
     DmaPool = 2,
+    /// Pages are externally owned — firmware-placed (DTB) or device
+    /// MMIO regions wrapped as a PageSet so handles can be exported
+    /// across the IPC boundary. The kernel never allocated them and
+    /// must NOT free them; the data-page free path is a no-op.
+    /// Mapping policy matches Buddy (cacheable Normal for RAM-shaped
+    /// externals like DTB; Device for MMIO). NC mapping rejected.
+    ///
+    /// Codex flagged the original 2-variant model as a high-severity
+    /// bug: register_existing / register_device_page were stamping
+    /// firmware/MMIO pages as Buddy, and the free path then tried to
+    /// dealloc them into the buddy allocator. On Pi 4B (ram_base = 0)
+    /// the "MMIO < ram_start" escape hatch no longer protects either.
+    ExternallyOwned = 3,
 }
 
 impl PageSetOrigin {
@@ -66,6 +81,7 @@ impl PageSetOrigin {
         match raw {
             1 => Some(Self::Buddy),
             2 => Some(Self::DmaPool),
+            3 => Some(Self::ExternallyOwned),
             _ => None,
         }
     }
@@ -828,10 +844,12 @@ mod tests {
         // back as raw=0 and from_raw returns None.
         assert_eq!(PageSetOrigin::Buddy as u64, 1);
         assert_eq!(PageSetOrigin::DmaPool as u64, 2);
+        assert_eq!(PageSetOrigin::ExternallyOwned as u64, 3);
         assert_eq!(PageSetOrigin::from_raw(0), None);
         assert_eq!(PageSetOrigin::from_raw(1), Some(PageSetOrigin::Buddy));
         assert_eq!(PageSetOrigin::from_raw(2), Some(PageSetOrigin::DmaPool));
-        assert_eq!(PageSetOrigin::from_raw(3), None);
+        assert_eq!(PageSetOrigin::from_raw(3), Some(PageSetOrigin::ExternallyOwned));
+        assert_eq!(PageSetOrigin::from_raw(4), None);
         assert_eq!(PageSetOrigin::from_raw(u64::MAX), None);
     }
 

@@ -58,7 +58,14 @@ fn insert_into_table(
 /// the header in place, and insert into the global table. On
 /// failure, the range is freed via the drop guard. Returns the
 /// PageSet table slot ID.
-fn alloc_and_insert_header(page_addrs: &[u64], count: usize) -> Option<u64> {
+/// Wrap an existing physical-page address list as a PageSet. The
+/// caller commits to the data pages' origin (currently always
+/// `ExternallyOwned` — `register_existing` for DTB pages and
+/// `register_device_page` for MMIO regions; the kernel did not
+/// allocate these pages and will not free them).
+fn alloc_and_insert_header(
+    page_addrs: &[u64], count: usize, origin: PageSetOrigin,
+) -> Option<u64> {
     let header_pages = header_pages_for(count);
     let range = kvm::alloc_kernel_pages(header_pages).ok()?;
     let mut guard = OwnedKvmRangeGuard::new(range);
@@ -84,12 +91,12 @@ fn alloc_and_insert_header(page_addrs: &[u64], count: usize) -> Option<u64> {
     // KVM stitched the backing frames into a contiguous VA.
     let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_kva(header_kva) };
     let mut backed = unsafe { header_ref.get_mut().backed_mut(count) };
-    backed.init(page_addrs, PageSetOrigin::Buddy);
+    backed.init(page_addrs, origin);
 
     let entry = PageSetEntry {
         count,
         header_kva,
-        origin: PageSetOrigin::Buddy,
+        origin,
     };
     // SAFETY: single-core, IRQs masked — exclusive table access.
     let id = unsafe { (*TABLE.ptr()).insert(entry).ok()? };
@@ -349,16 +356,18 @@ pub fn register_existing(count: usize, pages: &[PhysPage]) -> Option<u64> {
     }
 
     // Header pages freed by guard on insert failure.
-    // Data pages are firmware-placed — not ours to free.
-    alloc_and_insert_header(&addrs[..count], count)
+    // Data pages are firmware-placed — tagged ExternallyOwned so the
+    // free path skips dealloc (the kernel didn't allocate them).
+    alloc_and_insert_header(&addrs[..count], count, PageSetOrigin::ExternallyOwned)
 }
 
 /// Wrap a physical MMIO address as a 1-page PageSet (no allocation from pool, just tracking).
 /// Allocates one header page to store the MMIO address.
 /// Header page freed by guard on insert failure. The MMIO data page is
-/// device memory and is never freed.
+/// device memory and is never freed — tagged ExternallyOwned so the
+/// free path skips dealloc (the kernel never allocated it).
 pub fn register_device_page(phys_addr: u64) -> Option<u64> {
-    alloc_and_insert_header(&[phys_addr], 1)
+    alloc_and_insert_header(&[phys_addr], 1, PageSetOrigin::ExternallyOwned)
 }
 
 /// Free only the header range for a PageSet (not its data pages).
@@ -517,20 +526,19 @@ pub fn free_by_header_kva(header_kva: KernelVa) {
     let origin = backed.raw().origin()
         .expect("free_by_header_kva: header origin uninit — alloc-site bug");
 
-    // Free data pages (skip device MMIO pages — they are below RAM_START
-    // and were never allocated from any kernel allocator). Iterating
-    // 0..count uses the trusted PageSetTable count, so a corrupt
-    // header.count cannot extend or truncate the loop.
-    let ram_start = crate::mm::addr::ram_start().as_u64();
+    // Free data pages by origin. Iterating 0..count uses the trusted
+    // PageSetTable count, so a corrupt header.count cannot extend or
+    // truncate the loop. The old "skip if paddr < ram_start" escape
+    // hatch was removed: on Pi 4B ram_base == 0, so MMIO PAs are also
+    // >= ram_start and would have been returned to buddy. The typed
+    // origin enum replaces that fragile bound check.
     match origin {
         PageSetOrigin::Buddy => {
             for i in 0..count {
                 if let Some(paddr) = backed.get_page(i) {
-                    if paddr >= ram_start {
-                        page_alloc::dealloc_page(
-                            crate::mm::addr::PhysPage::containing(PhysAddr::new(paddr))
-                        );
-                    }
+                    page_alloc::dealloc_page(
+                        crate::mm::addr::PhysPage::containing(PhysAddr::new(paddr))
+                    );
                 }
             }
         }
@@ -543,6 +551,13 @@ pub fn free_by_header_kva(header_kva: KernelVa) {
                     crate::cap::dma_pool::free_pages(PhysAddr::new(first), count);
                 }
             }
+        }
+        PageSetOrigin::ExternallyOwned => {
+            // Firmware-placed (DTB) or device MMIO pages. The kernel
+            // never allocated them; do not free them. Falling through
+            // to the buddy or DMA-pool free path would corrupt the
+            // allocator's ownership tracking. The header range still
+            // gets freed below (it IS kernel-owned).
         }
     }
 

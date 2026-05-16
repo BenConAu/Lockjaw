@@ -9,14 +9,13 @@
 /// Threading: single-core, IRQs masked — same `UnsafeCell` pattern as
 /// `page_alloc.rs`. Replace with SpinMutex when SMP lands.
 ///
-/// **Direct-map note**: sub-commit 2a does NOT yet exclude pool PAs
-/// from the TTBR1 direct map. The structural alias prevention comes
-/// from (1) pool pages never being registered with buddy and (2) the
-/// kernel rejecting DmaPool-origin PageSets in every cacheable-
-/// mapping path. Speculative CPU caching via the direct-map block
-/// descriptor remains theoretically possible; the direct-map
-/// exclusion lands as a follow-up commit before sub-commit 2b
-/// exercises the pool from a real driver.
+/// **Direct-map exclusion**: the pool's 2 MiB L2 block is cleared
+/// from the TTBR1 direct map at boot by
+/// `arch::aarch64::mmu::exclude_dma_pool_from_direct_map` (called
+/// from `main.rs` after `setup_guard_pages`). Together with the
+/// rejection matrix in `sys_map_pages` / `create_process` / donate-
+/// as-kernel-object, this closes both sides of the mixed-attribute
+/// alias: pool pages cannot be reached cacheably from any TTBR.
 
 use core::cell::UnsafeCell;
 use lockjaw_types::addr::{PhysAddr, PAGE_SIZE};

@@ -131,15 +131,17 @@ fn create_kernel_object_kvm(
     // SAFETY: PageSet handle → registered header.
     let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
     // M6: donate-as-kernel-object remaps the donated frame as
-    // cacheable Normal in KVM (build_kernel_page). A DmaPool-origin
-    // PageSet would create the mixed-attribute alias — reject up-front.
-    // Uninit origin (None from from_raw) is also rejected: a header
-    // whose origin was never written is a bug at the alloc site.
+    // cacheable Normal in KVM (build_kernel_page) and TAKES OWNERSHIP
+    // of the frame from the PageSet (consume_pageset_apply). Only
+    // Buddy-origin pages are eligible:
+    //   - DmaPool: cacheable remap would create the alias.
+    //   - ExternallyOwned: kernel doesn't own these pages, can't
+    //     take ownership of something it didn't allocate.
+    //   - None: uninit origin is an alloc-site bug.
     match backed.raw().origin() {
-        Some(lockjaw_types::pageset_table::PageSetOrigin::DmaPool) =>
-            return Err(SyscallError::INVALID_PARAMETER),
-        None => return Err(SyscallError::INVALID_HANDLE),
         Some(lockjaw_types::pageset_table::PageSetOrigin::Buddy) => {}
+        Some(_) => return Err(SyscallError::INVALID_PARAMETER),
+        None => return Err(SyscallError::INVALID_HANDLE),
     }
     if backed.data_page_count() != 1 {
         return Err(SyscallError::INVALID_PARAMETER);
@@ -478,11 +480,21 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
         None => return SyscallError::INVALID_HANDLE,
     };
     match (origin, attr) {
-        (PageSetOrigin::Buddy,   MapMemoryAttribute::NormalNonCacheable) =>
+        // Buddy: cacheable Normal or Device OK; NC would create the
+        // mixed-attribute alias with the kernel direct map.
+        (PageSetOrigin::Buddy, MapMemoryAttribute::NormalNonCacheable) =>
             return SyscallError::INVALID_PARAMETER,
+        // DmaPool: NC only; cacheable mappings would reintroduce the
+        // alias from the other direction.
         (PageSetOrigin::DmaPool, MapMemoryAttribute::Normal) =>
             return SyscallError::INVALID_PARAMETER,
         (PageSetOrigin::DmaPool, MapMemoryAttribute::Device) =>
+            return SyscallError::INVALID_PARAMETER,
+        // ExternallyOwned (DTB / MMIO): cacheable Normal (DTB) or
+        // Device (MMIO) match the physical region's actual nature.
+        // NC has no use case here and is rejected for symmetry with
+        // Buddy.
+        (PageSetOrigin::ExternallyOwned, MapMemoryAttribute::NormalNonCacheable) =>
             return SyscallError::INVALID_PARAMETER,
         _ => {}
     }
