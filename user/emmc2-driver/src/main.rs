@@ -30,11 +30,12 @@ use lockjaw_types::sdhci::{
     SDHCI_POWER_CONTROL, SDHCI_POWER_ON, SDHCI_POWER_330,
     SDHCI_TIMEOUT_CONTROL,
     SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, SDHCI_DAT_INHIBIT,
-    SDHCI_ARGUMENT, SDHCI_TRANSFER_MODE, SDHCI_COMMAND,
+    SDHCI_ARGUMENT, SDHCI_ARGUMENT2, SDHCI_TRANSFER_MODE, SDHCI_COMMAND,
     SDHCI_BLOCK_SIZE, SDHCI_BLOCK_COUNT, SDHCI_BUFFER_DATA_PORT,
     SDHCI_NORMAL_INT_STATUS, SDHCI_ERROR_INT_STATUS,
     SDHCI_NORMAL_INT_STATUS_ENABLE, SDHCI_ERROR_INT_STATUS_ENABLE,
-    SDHCI_INT_CMD_COMPLETE, SDHCI_INT_DATA_COMPLETE, SDHCI_INT_BUF_RD_READY, SDHCI_INT_ERROR,
+    SDHCI_INT_CMD_COMPLETE, SDHCI_INT_DATA_COMPLETE,
+    SDHCI_INT_BUF_RD_READY, SDHCI_INT_ERROR,
     SDHCI_INT_CMD_TIMEOUT, SDHCI_INT_CMD_CRC,
     SDHCI_INT_CMD_END_BIT, SDHCI_INT_CMD_INDEX,
     SDHCI_INT_DATA_TIMEOUT, SDHCI_INT_DATA_CRC, SDHCI_INT_DATA_END_BIT,
@@ -42,7 +43,7 @@ use lockjaw_types::sdhci::{
     SDHCI_HOST_CONTROL, SDHCI_HOST_CTRL_DAT_4BIT,
     SDHCI_CMD_CRC, SDHCI_CMD_INDEX, SDHCI_CMD_DATA,
     SDHCI_CMD_RESP_NONE, SDHCI_CMD_RESP_SHORT, SDHCI_CMD_RESP_LONG, SDHCI_CMD_RESP_SHORT_BUSY,
-    SDHCI_TRNS_READ,
+    SDHCI_TRNS_READ, SDHCI_TRNS_BLK_CNT_EN, SDHCI_TRNS_MULTI, SDHCI_TRNS_AUTO_CMD23,
     SdCommand, compute_clock_divisor, sd_command_word,
 };
 
@@ -415,6 +416,120 @@ unsafe fn read_block_pio(base: u64, lba: u32) -> Result<[u32; 128], PioError> {
         if status & SDHCI_INT_DATA_COMPLETE != 0 {
             sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
             return Ok(block);
+        }
+        if monotonic_now() >= xfer_deadline {
+            return Err(PioError::XferTimeout);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Issue CMD18 (READ_MULTIPLE_BLOCK) with Auto-CMD23, drain `blocks.len()`
+/// blocks via PIO. Each block is 512 bytes = 128 LE u32 words.
+///
+/// Auto-CMD23 (per SDHCI §3.7.2 and `docs/emmc2-block-storage-plan.md` Q4):
+/// the controller automatically issues CMD23 (SET_BLOCK_COUNT) before CMD18,
+/// using the value at SDHCI_ARGUMENT2 (offset 0x000) as its argument. No
+/// post-data CMD12 (STOP_TRANSMISSION) is needed because the card stops
+/// after the negotiated count. BCM2711 advertises Auto-CMD23 in CAPABILITIES
+/// bit 30 and Linux/Circle drivers use this path.
+///
+/// `lba` is the starting block address (block-addressed for SDHC/SDXC).
+unsafe fn read_blocks_pio(
+    base: u64, lba: u32, blocks: &mut [[u32; 128]],
+) -> Result<(), PioError> {
+    let count = blocks.len() as u16;
+
+    // Auto-CMD23 argument — block count for the SET_BLOCK_COUNT the
+    // controller will issue before CMD18. Must be written before
+    // TRANSFER_MODE so the controller sees it when it triggers CMD23.
+    sdhci_write32(base, SDHCI_ARGUMENT2, count as u32);
+
+    if poll_until_clear_32(
+        base, SDHCI_PRESENT_STATE,
+        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
+        Nanos::from_millis(100),
+    ).is_err() {
+        return Err(PioError::InhibitStuck);
+    }
+
+    sdhci_write16(base, SDHCI_BLOCK_SIZE, 512);
+    sdhci_write16(base, SDHCI_BLOCK_COUNT, count);
+    // Multi-block read with Auto-CMD23: READ direction, block-count enabled,
+    // multi-block, controller auto-issues CMD23 with the SDHCI_ARGUMENT2
+    // value before CMD18.
+    sdhci_write16(base, SDHCI_TRANSFER_MODE,
+        SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN
+            | SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD23);
+
+    sdhci_write32(base, SDHCI_ARGUMENT, lba);
+    let cmd18 = sd_command_word(
+        SdCommand::ReadMultipleBlock.index(),
+        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
+    );
+    sdhci_write16(base, SDHCI_COMMAND, cmd18);
+
+    let freq = cntfreq_hz();
+    let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
+    loop {
+        let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
+        if status & SDHCI_INT_ERROR != 0 {
+            let err = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
+            return Err(PioError::CmdError(err));
+        }
+        if status & SDHCI_INT_CMD_COMPLETE != 0 {
+            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+            break;
+        }
+        if monotonic_now() >= cmd_deadline {
+            return Err(PioError::NoResponse);
+        }
+        core::hint::spin_loop();
+    }
+
+    // Drain one block at a time. Each block's BUF_RD_READY edge fires
+    // when the controller has filled its internal buffer; we clear the
+    // bit after draining so the next block's edge is observable.
+    for block in blocks.iter_mut() {
+        let data_deadline = monotonic_now().deadline_in(Nanos::from_millis(100), freq);
+        loop {
+            let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
+            if status & SDHCI_INT_ERROR != 0 {
+                let err = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
+                sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+                sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_BUF_RD_READY);
+                return Err(PioError::DataError(err));
+            }
+            if status & SDHCI_INT_BUF_RD_READY != 0 {
+                sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_BUF_RD_READY);
+                break;
+            }
+            if monotonic_now() >= data_deadline {
+                return Err(PioError::DataTimeout);
+            }
+            core::hint::spin_loop();
+        }
+        for word in block.iter_mut() {
+            *word = sdhci_read32(base, SDHCI_BUFFER_DATA_PORT);
+        }
+    }
+
+    // After the last block, TRANSFER_COMPLETE arrives once the card
+    // transmits the final CRC trailer.
+    let xfer_deadline = monotonic_now().deadline_in(Nanos::from_millis(100), freq);
+    loop {
+        let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
+        if status & SDHCI_INT_ERROR != 0 {
+            let err = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_DATA_COMPLETE);
+            return Err(PioError::DataError(err));
+        }
+        if status & SDHCI_INT_DATA_COMPLETE != 0 {
+            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
+            return Ok(());
         }
         if monotonic_now() >= xfer_deadline {
             return Err(PioError::XferTimeout);
@@ -1079,7 +1194,67 @@ pub extern "C" fn _start() -> ! {
     puts(" OK\n");
 
     puts("[EMMC2:M4] LBA 0 read OK\n");
+
+    // -----------------------------------------------------------------------
+    // M5 — Multi-block PIO read (CMD18 + Auto-CMD23) at boot.
+    //      The single-block write path (`write_block_pio`) is implemented
+    //      and verified, but is NOT exercised from `_start` because the
+    //      driver runs unconditionally on every boot and no LBA is
+    //      universally safe across MBR / GPT / bootable images (LBA 0 is
+    //      MBR, LBAs 1–33 are the GPT primary header, last LBA is the
+    //      GPT backup header). A crash between "write pattern" and
+    //      "restore original" would persist as data corruption. Real
+    //      write coverage moves to M7's BlockEngine, where the LBA is
+    //      caller-controlled and tests run against a known-safe target.
+    //      The Pi log captured before this restructure (commit message)
+    //      confirms write_block_pio + read_block_pio + reset_cmd_dat_lines
+    //      have been exercised end-to-end with verified roundtrip.
+    // -----------------------------------------------------------------------
+
+    // Multi-block read of LBAs [0..4] via CMD18 + Auto-CMD23.
+    // Non-destructive. The first block must still carry the MBR signature
+    // we saw in M4 — mismatch would indicate a multi-block-specific
+    // decode failure (Auto-CMD23 handshake, BUF_RD_READY edge sequencing).
+    let mut blocks: [[u32; 128]; 4] = [[0u32; 128]; 4];
+    if let Err(e) = unsafe { read_blocks_pio(mmio_va, 0, &mut blocks) } {
+        report_pio_error(mmio_va, "M5", "CMD18 (4 blocks)", e);
+        sys_exit();
+    }
+    let multi_sig = (blocks[0][127] >> 16) & 0xFFFF;
+    if multi_sig != 0xAA55 {
+        puts("[EMMC2:M5] CMD18 block[0] signature=");
+        put_hex(multi_sig as u64);
+        puts(" BAD (expected 0xAA55)\n");
+        sys_exit();
+    }
+    puts("[EMMC2:M5] CMD18 read 4 blocks OK\n");
+
     sys_exit();
+}
+
+/// Centralized error-to-log dispatch for PIO operations. `phase` is the
+/// milestone tag (e.g. "M4", "M5") and `op` is a human-readable command
+/// description. Reading PRESENT_STATE in DataTimeout makes DAT_INHIBIT /
+/// CMD_INHIBIT visible at the failure point.
+fn report_pio_error(mmio_va: u64, phase: &str, op: &str, e: PioError) {
+    puts("[EMMC2:");
+    puts(phase);
+    puts("] ");
+    puts(op);
+    puts(" FAILED: ");
+    match e {
+        PioError::InhibitStuck   => puts("CMD/DAT_INHIBIT stuck"),
+        PioError::CmdError(bits) => put_error_int_status(bits),
+        PioError::NoResponse     => puts("no CMD_COMPLETE within deadline"),
+        PioError::DataError(bits) => put_error_int_status(bits),
+        PioError::DataTimeout => {
+            let pstate = unsafe { sdhci_read32(mmio_va, SDHCI_PRESENT_STATE) };
+            puts("BUF_R/W_READY timeout PRESENT_STATE=");
+            put_hex(pstate as u64);
+        }
+        PioError::XferTimeout => puts("TRANSFER_COMPLETE timeout"),
+    }
+    puts("\n");
 }
 
 // ---------------------------------------------------------------------------

@@ -113,6 +113,8 @@ pub const SDHCI_POWER_330: u8 = 0x0E;
 pub const SDHCI_INT_CMD_COMPLETE: u16 = 0x0001;
 /// Transfer Complete (bit 1). Set when the data transfer phase finishes.
 pub const SDHCI_INT_DATA_COMPLETE: u16 = 0x0002;
+/// Buffer Write Ready (bit 4). Set when controller is ready to accept PIO write data.
+pub const SDHCI_INT_BUF_WR_READY: u16 = 0x0010;
 /// Buffer Read Ready (bit 5). Set when PIO data is available in BUFFER_DATA_PORT.
 pub const SDHCI_INT_BUF_RD_READY: u16 = 0x0020;
 /// Error Interrupt (bit 15). Summary bit — consult ERROR_INT_STATUS for
@@ -162,10 +164,21 @@ pub const SDHCI_DAT_INHIBIT: u32 = 0x0000_0002;
 pub const SDHCI_TRNS_DMA: u16 = 0x0001;
 /// Block Count Enable (bit 1). Set for multi-block; clear for single-block.
 pub const SDHCI_TRNS_BLK_CNT_EN: u16 = 0x0002;
+/// Auto-CMD12 Enable (bits[3:2] = 01). Controller auto-issues CMD12 after data.
+pub const SDHCI_TRNS_AUTO_CMD12: u16 = 0x0004;
+/// Auto-CMD23 Enable (bits[3:2] = 10). Controller auto-issues CMD23 (SET_BLOCK_COUNT)
+/// before the data command, using the value at SDHCI_ARGUMENT2 (offset 0x000) as the
+/// CMD23 argument. Modern SDHCI v3+ feature; CAPABILITIES bit 30 advertises support.
+pub const SDHCI_TRNS_AUTO_CMD23: u16 = 0x0008;
 /// Data Transfer Direction (bit 4): 1 = read (card→host), 0 = write (host→card).
 pub const SDHCI_TRNS_READ: u16 = 0x0010;
 /// Multi Block Select (bit 5): 1 = multi-block, 0 = single block.
 pub const SDHCI_TRNS_MULTI: u16 = 0x0020;
+
+/// `ARGUMENT2_REG` (0x000) — argument register for Auto-CMD23. Aliases the
+/// `SDMA_SYS_ADDR_REG` location; the register's role is determined by which
+/// transfer mode is active (PIO + Auto-CMD23 here, SDMA in M6+).
+pub const SDHCI_ARGUMENT2: usize = 0x000;
 
 // ---------------------------------------------------------------------------
 // COMMAND_REG flag constants (offset 0x00e, low byte)
@@ -865,5 +878,53 @@ mod tests {
         let flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA;
         let w = sd_command_word(SdCommand::ReadSingleBlock.index(), flags);
         assert_eq!(w, (17u16 << 8) | 0x3A);
+    }
+
+    // ----- M5 multi-block + write constants -----
+
+    #[test]
+    fn buf_wr_ready_bit_matches_spec() {
+        // BUF_WRITE_READY is bit 4 of NORMAL_INT_STATUS.
+        assert_eq!(SDHCI_INT_BUF_WR_READY, 0x0010);
+        // Must not alias BUF_RD_READY (bit 5) or DATA_COMPLETE (bit 1).
+        assert_eq!(SDHCI_INT_BUF_WR_READY & SDHCI_INT_BUF_RD_READY, 0);
+        assert_eq!(SDHCI_INT_BUF_WR_READY & SDHCI_INT_DATA_COMPLETE, 0);
+    }
+
+    #[test]
+    fn auto_cmd23_bits_match_spec() {
+        // AUTO_CMD select is TRANSFER_MODE bits[3:2]: 01 = CMD12, 10 = CMD23.
+        assert_eq!(SDHCI_TRNS_AUTO_CMD12, 0x0004);
+        assert_eq!(SDHCI_TRNS_AUTO_CMD23, 0x0008);
+        // Mutually exclusive — setting both is undefined.
+        assert_eq!(SDHCI_TRNS_AUTO_CMD12 & SDHCI_TRNS_AUTO_CMD23, 0);
+        // Must not collide with the other TRANSFER_MODE bits we use.
+        let other = SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_READ | SDHCI_TRNS_MULTI;
+        assert_eq!(SDHCI_TRNS_AUTO_CMD23 & other, 0);
+    }
+
+    #[test]
+    fn argument2_aliases_sysaddr() {
+        // SDHCI_ARGUMENT2 (Auto-CMD23 argument) and SDHCI_SYSADDR
+        // (SDMA system address) share offset 0x000 — the register's role
+        // is determined by which transfer mode is active.
+        assert_eq!(SDHCI_ARGUMENT2, SDHCI_SYSADDR);
+        assert_eq!(SDHCI_ARGUMENT2, 0x000);
+    }
+
+    #[test]
+    fn cmd18_word_has_data_present() {
+        // CMD18 (READ_MULTIPLE_BLOCK): same flags as CMD17.
+        let flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA;
+        let w = sd_command_word(SdCommand::ReadMultipleBlock.index(), flags);
+        assert_eq!(w, (18u16 << 8) | 0x3A);
+    }
+
+    #[test]
+    fn cmd24_word_has_data_present() {
+        // CMD24 (WRITE_BLOCK): R1 short, CRC, INDEX, DATA. Same flag word as CMD17/CMD18.
+        let flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA;
+        let w = sd_command_word(SdCommand::WriteBlock.index(), flags);
+        assert_eq!(w, (24u16 << 8) | 0x3A);
     }
 }
