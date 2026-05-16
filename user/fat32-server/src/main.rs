@@ -270,7 +270,7 @@ fn handle_open(
             return;
         }
     };
-    if !sys_map_pages(buffer_ps, buffer_va, 0).is_ok() {
+    if !sys_map_pages(buffer_ps, buffer_va, MapMemoryAttribute::Normal).is_ok() {
         let _ = sys_close_handle(buffer_ps);
         VMEM.free(buffer_va, buffer_pages as usize);
         sys_reply(FS_ERR_ALLOC, 0, 0, 0);
@@ -444,7 +444,7 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("fat32: blk alloc_buffer (BPB) FAILED\n"); halt(); }
     };
     let bpb_va = VMEM.alloc(1).expect("VA exhausted for BPB buffer");
-    if !sys_map_pages(bpb_buf.pageset, bpb_va, 0).is_ok() {
+    if !sys_map_pages(bpb_buf.pageset, bpb_va, MapMemoryAttribute::Normal).is_ok() {
         puts("fat32: BPB buffer map FAILED\n"); halt();
     }
     if blk.read(0, 1, bpb_buf.buffer_id).is_err() {
@@ -470,7 +470,7 @@ pub extern "C" fn _start() -> ! {
     };
     let cluster_pages = ((cluster_sectors * 512 + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
     let cluster_va = VMEM.alloc(cluster_pages).expect("VA exhausted for cluster scratch");
-    if !sys_map_pages(cluster_buf.pageset, cluster_va, 0).is_ok() {
+    if !sys_map_pages(cluster_buf.pageset, cluster_va, MapMemoryAttribute::Normal).is_ok() {
         puts("fat32: cluster scratch map FAILED\n"); halt();
     }
 
@@ -480,7 +480,7 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("fat32: blk alloc_buffer (fat) FAILED\n"); halt(); }
     };
     let fat_va = VMEM.alloc(1).expect("VA exhausted for FAT scratch");
-    if !sys_map_pages(fat_buf.pageset, fat_va, 0).is_ok() {
+    if !sys_map_pages(fat_buf.pageset, fat_va, MapMemoryAttribute::Normal).is_ok() {
         puts("fat32: FAT scratch map FAILED\n"); halt();
     }
 

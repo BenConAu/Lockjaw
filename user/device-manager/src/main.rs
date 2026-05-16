@@ -97,14 +97,14 @@ pub extern "C" fn _start() -> ! {
     // nonzero on platforms whose firmware places the DTB at an
     // unaligned physical address (Pi 4B's VC firmware typically uses
     // 0xe00). We add the offset to the mapped VA before reading.
-    // sys_map_pages without MAP_FLAG_DEVICE maps with normal memory
-    // attributes, avoiding the MAIR aliasing problem.
+    // sys_map_pages with MapMemoryAttribute::Normal maps with normal
+    // memory attributes, avoiding the MAIR aliasing problem.
     let boot_info = match sys_get_boot_info() {
         Ok(b) => b,
         Err(_) => { puts("devmgr: get_boot_info FAILED\n"); halt(); }
     };
     let dtb_va = VMEM.alloc(DTB_MAX_PAGES).expect("VA exhausted for DTB");
-    if !sys_map_pages(boot_info.dtb_pageset, dtb_va, 0).is_ok() {
+    if !sys_map_pages(boot_info.dtb_pageset, dtb_va, MapMemoryAttribute::Normal).is_ok() {
         puts("devmgr: DTB map FAILED\n");
         halt();
     }
@@ -465,7 +465,7 @@ fn handle_probe_device(devices: &mut lockjaw_types::fdt::FdtDevices, msg: &[u64;
     };
 
     let probe_va = VMEM.alloc(1).expect("VA exhausted for probe");
-    if !sys_map_pages(mmio_ps, probe_va, MAP_FLAG_DEVICE).is_ok() {
+    if !sys_map_pages(mmio_ps, probe_va, MapMemoryAttribute::Device).is_ok() {
         puts("devmgr: probe map FAILED\n");
         VMEM.free(probe_va, 1);
         sys_close_handle(mmio_ps);

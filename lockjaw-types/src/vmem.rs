@@ -19,10 +19,50 @@ pub struct Mapping {
 /// Callers allocate page(s) for the mapping buffer rather than using the stack.
 pub const MAPPINGS_PER_PAGE: usize = PAGE_SIZE as usize / core::mem::size_of::<Mapping>();
 
-/// Mapping flags for map_pages_in_existing. Shared between kernel and userspace.
-/// Device memory: use MAIR_DEVICE (strongly ordered, non-cacheable) instead of
-/// MAIR_NORMAL. Required for MMIO regions (UART, GIC, etc).
-pub const MAP_FLAG_DEVICE: u64 = 1 << 0;
+/// Memory-attribute selector for `sys_map_pages`. Carried in syscall x2;
+/// `#[repr(u64)]` with explicit discriminants pins the ABI so the kernel-
+/// side `from_raw` decoder and the userlib wrapper agree.
+///
+/// Variants name the MAIR regime (Normal / Device) — not the use case
+/// (DmaCoherent / MmioRegister) — so a future reader sees exactly which
+/// MAIR slot the kernel will install. Use-case typing happens at the
+/// userspace wrapper layer (e.g. ClockClient holds a `Device` mapping).
+///
+/// `Normal = 0` so callers that previously passed the literal `0` for
+/// "default normal memory" keep the same wire encoding through the
+/// migration. M6 sub-commit 2 adds the `NormalNonCacheable` variant for
+/// the ADMA2 buffer + descriptor-table mappings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum MapMemoryAttribute {
+    /// MAIR_NORMAL — write-back, write-allocate, inner shareable.
+    /// Default for all RAM mappings (DTB pages, IPC buffers, stacks).
+    Normal = 0,
+    /// MAIR_DEVICE — strongly ordered, non-cacheable, non-shareable.
+    /// Required for MMIO regions (UART, GIC, SDHCI controller registers).
+    Device = 1,
+}
+
+impl MapMemoryAttribute {
+    /// Decode from the raw u64 carried in syscall x2. Preserves the
+    /// existing `select_attrs(flags)` semantics: bit 0 set → Device,
+    /// otherwise Normal. Stray high bits ignored. M6 sub-commit 2 will
+    /// tighten this to reject unknown discriminants once the new variant
+    /// lands and we can characterise the validation surface as a whole.
+    pub const fn from_raw(raw: u64) -> Self {
+        if raw & 1 != 0 { Self::Device } else { Self::Normal }
+    }
+
+    /// Convert to the `(MAIR index, shareability)` pair consumed by
+    /// page-table entry construction. Pure; no MMU side effects.
+    pub const fn to_pte_attrs(self) -> (u8, u8) {
+        use crate::page_table::*;
+        match self {
+            Self::Normal => (MAIR_NORMAL, SH_INNER),
+            Self::Device => (MAIR_DEVICE, SH_NON),
+        }
+    }
+}
 
 /// Extract the 4-level page table indices from a virtual address (4KB granule).
 pub const fn page_table_indices(va: u64) -> (usize, usize, usize, usize) {
@@ -223,15 +263,12 @@ pub fn classify_l2_entry(pte: crate::page_table::PageTableEntry) -> L2SlotState 
     }
 }
 
-/// Select memory attributes from mapping flags.
-/// Returns (MAIR index, shareability) for the page table entry.
-pub fn select_attrs(flags: u64) -> (u8, u8) {
-    use crate::page_table::*;
-    if flags & MAP_FLAG_DEVICE != 0 {
-        (MAIR_DEVICE, SH_NON)
-    } else {
-        (MAIR_NORMAL, SH_INNER)
-    }
+/// Select memory attributes for the given attribute selector.
+/// Thin wrapper over `MapMemoryAttribute::to_pte_attrs` so existing
+/// kernel call sites in `map_pages_in_existing` keep their function-call
+/// shape; new code can call the method directly.
+pub fn select_attrs(attr: MapMemoryAttribute) -> (u8, u8) {
+    attr.to_pte_attrs()
 }
 
 /// Build a user-accessible page entry with no-execute permissions.
@@ -706,16 +743,37 @@ mod tests {
 
     #[test]
     fn attrs_normal_memory() {
-        let (attr, sh) = select_attrs(0);
+        let (attr, sh) = select_attrs(MapMemoryAttribute::Normal);
         assert_eq!(attr, MAIR_NORMAL);
         assert_eq!(sh, SH_INNER);
     }
 
     #[test]
     fn attrs_device_memory() {
-        let (attr, sh) = select_attrs(MAP_FLAG_DEVICE);
+        let (attr, sh) = select_attrs(MapMemoryAttribute::Device);
         assert_eq!(attr, MAIR_DEVICE);
         assert_eq!(sh, SH_NON);
+    }
+
+    #[test]
+    fn map_memory_attribute_discriminants_pinned() {
+        // Wire encoding must stay stable: x2 == 0 → Normal, x2 == 1 → Device.
+        // Both userlib (sender) and kernel (decoder) depend on this match.
+        assert_eq!(MapMemoryAttribute::Normal as u64, 0);
+        assert_eq!(MapMemoryAttribute::Device as u64, 1);
+    }
+
+    #[test]
+    fn map_memory_attribute_from_raw_preserves_legacy_bit_test() {
+        // Pre-M6 `select_attrs(flags)` was: bit 0 set → Device, else Normal.
+        // `from_raw` must preserve that for any legacy caller still passing
+        // `0` or `MAP_FLAG_DEVICE`-derived values across the syscall.
+        assert_eq!(MapMemoryAttribute::from_raw(0), MapMemoryAttribute::Normal);
+        assert_eq!(MapMemoryAttribute::from_raw(1), MapMemoryAttribute::Device);
+        // Stray high bits without bit 0 → still Normal (matches current semantics).
+        assert_eq!(MapMemoryAttribute::from_raw(0x4), MapMemoryAttribute::Normal);
+        // Stray high bits WITH bit 0 → Device (matches `flags & 1 != 0`).
+        assert_eq!(MapMemoryAttribute::from_raw(0x5), MapMemoryAttribute::Device);
     }
 
     // --- build_user_page tests ---

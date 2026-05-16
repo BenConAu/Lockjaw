@@ -43,7 +43,7 @@ pub extern "C" fn _start() -> ! {
 
     // Map the per-handle buffer locally so we can read it.
     let buf_va = VMEM.alloc(1).expect("VA exhausted");
-    if !sys_map_pages(opened.pageset, buf_va, 0).is_ok() {
+    if !sys_map_pages(opened.pageset, buf_va, MapMemoryAttribute::Normal).is_ok() {
         die("[FAT32-TEST] map FAILED\n");
     }
 

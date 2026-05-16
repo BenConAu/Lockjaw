@@ -67,7 +67,7 @@ pub extern "C" fn _start() -> ! {
     // Map the buffer into our address space.
     let pages = ((buf.size as usize) + 4095) / 4096;
     let fb_va = VMEM.alloc(pages).expect("VA exhausted for framebuffer");
-    if !sys_map_pages(buf.handle, fb_va, 0).is_ok() {
+    if !sys_map_pages(buf.handle, fb_va, MapMemoryAttribute::Normal).is_ok() {
         puts("[DISPLAY-TEST] map FAILED\n");
         sys_exit();
     }

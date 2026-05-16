@@ -90,8 +90,8 @@ impl AddressSpaceBuilder {
         // (TTBR1) and no longer references lower-half PAs, so the
         // identity is dead weight. Userspace device MMIO mappings
         // still flow through the normal sys_map_pages path with
-        // MAP_FLAG_DEVICE — drivers that need a device get a
-        // per-process mapping, not the kernel's.
+        // MapMemoryAttribute::Device — drivers that need a device
+        // get a per-process mapping, not the kernel's.
 
         builder.l2_va = l2_va;
         Ok(builder)
@@ -243,8 +243,9 @@ pub unsafe fn translate_user_va(ttbr0_paddr: PhysAddr, user_va: u64) -> Option<u
 /// requested virtual address.
 ///
 /// All mapped pages get AP_RW_ALL (user read-write), UXN + PXN (no execute).
-/// If MAP_FLAG_DEVICE is set, uses MAIR_DEVICE + SH_NON (strongly ordered,
-/// non-cacheable) instead of MAIR_NORMAL + SH_INNER.
+/// `attr` selects the MAIR regime: `Device` → MAIR_DEVICE + SH_NON
+/// (strongly ordered, non-cacheable, MMIO); `Normal` → MAIR_NORMAL +
+/// SH_INNER (write-back cacheable, RAM).
 ///
 /// Validation is done by the pure model in lockjaw_types::vmem (tested on host).
 ///
@@ -256,7 +257,7 @@ pub unsafe fn map_pages_in_existing(
     ttbr0_paddr: PhysAddr,
     virt_addr: u64,
     header: &lockjaw_types::pageset_table::BackedHeader<'_>,
-    flags: u64,
+    attr: lockjaw_types::vmem::MapMemoryAttribute,
 ) -> Result<(), VmemError> {
     use lockjaw_types::page_table::{MapWalk, MapWalkResult};
     use lockjaw_types::vmem::{
@@ -291,7 +292,7 @@ pub unsafe fn map_pages_in_existing(
         }
     };
 
-    let (attr, sh) = select_attrs(flags);
+    let (mair_attr, sh) = select_attrs(attr);
     // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
     let l2_va = (l2_table_paddr + KERNEL_VA_OFFSET) as *mut PageTable;
 
@@ -392,7 +393,7 @@ pub unsafe fn map_pages_in_existing(
         // pages_in_region all come from the iterator.
         for i in 0..region.pages_in_region {
             let phys = PhysAddr::new(header.get_page(region.data_offset + i).unwrap());
-            (*l3_va).entries[region.l3_start + i] = build_user_page(phys, attr, sh);
+            (*l3_va).entries[region.l3_start + i] = build_user_page(phys, mair_attr, sh);
         }
     }
 

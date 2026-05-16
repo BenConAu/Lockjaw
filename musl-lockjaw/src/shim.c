@@ -300,7 +300,7 @@ static long handle_brk(long addr) {
  * Failure-ordered handshake (the FS_MMAP_ROLLBACK protocol):
  *   1. lj_call(NR_MMAP, len, prot, flags) -> reply (status, base_va,
  *      exported_handle, total_pages).
- *   2. sys_map_pages(handle, base_va, 0). On failure: NR_MMAP_ROLLBACK,
+ *   2. sys_map_pages(handle, base_va, MapMemoryAttribute::Normal). On failure: NR_MMAP_ROLLBACK,
  *      sys_close_handle, return -ENOMEM. If rollback fails: lj_die.
  *   3. mmap_tracker[i] = (base_va, handle, len). On tracker-full:
  *      treat like step 2 failure (rollback + return -ENOMEM).

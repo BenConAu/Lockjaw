@@ -143,7 +143,7 @@ fn spawn_elf(
         Ok(id) => id,
         Err(_) => { puts("init: alloc map array FAILED\n"); return false; }
     };
-    if !sys_map_pages(map_array_ps, map_array_va, 0).is_ok() {
+    if !sys_map_pages(map_array_ps, map_array_va, MapMemoryAttribute::Normal).is_ok() {
         puts("init: map array FAILED\n");
         return false;
     }
@@ -185,7 +185,7 @@ fn spawn_elf(
         Ok(id) => id,
         Err(_) => { puts("init: alloc segments PageSet FAILED\n"); return false; }
     };
-    if !sys_map_pages(segs_ps, temp_base_va, 0).is_ok() {
+    if !sys_map_pages(segs_ps, temp_base_va, MapMemoryAttribute::Normal).is_ok() {
         puts("init: map segments PageSet FAILED\n");
         return false;
     }
@@ -350,7 +350,7 @@ pub extern "C" fn _start() -> ! {
 
             // Test sys_map_pages
             let test_va = VMEM.alloc(1).expect("VA exhausted for test page");
-            if sys_map_pages(test_ps, test_va, 0).is_ok() {
+            if sys_map_pages(test_ps, test_va, MapMemoryAttribute::Normal).is_ok() {
                 puts("init: map_pages OK\n");
                 unsafe {
                     let ptr = test_va as *mut u64;
@@ -401,7 +401,7 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("init: get_boot_info FAILED\n"); loop { sys_yield(); } }
     };
     let dtb_va = VMEM.alloc(16).expect("VA exhausted for DTB"); // 16 pages max
-    if sys_map_pages(boot_info.dtb_pageset, dtb_va, 0).is_ok() {
+    if sys_map_pages(boot_info.dtb_pageset, dtb_va, MapMemoryAttribute::Normal).is_ok() {
         let dtb_header_va = dtb_va + boot_info.dtb_in_page_offset as u64;
         let magic = unsafe {
             let p = dtb_header_va as *const u8;
@@ -473,7 +473,7 @@ pub extern "C" fn _start() -> ! {
         Ok(id) => id,
         Err(_) => { puts("init: alloc plan buffer FAILED\n"); loop { sys_yield(); } }
     };
-    if !sys_map_pages(plan_buf_ps, plan_buf_va, 0).is_ok() {
+    if !sys_map_pages(plan_buf_ps, plan_buf_va, MapMemoryAttribute::Normal).is_ok() {
         puts("init: map plan buffer FAILED\n");
         loop { sys_yield(); }
     }

@@ -631,14 +631,14 @@ pub extern "C" fn _start() -> ! {
 
     // Map the SDHCI register page. The DTB declares the region as
     // 0x100 bytes (one 4 KB page is plenty); the device-manager
-    // claim path returns a single-page PageSet. MAP_FLAG_DEVICE
+    // claim path returns a single-page PageSet. MapMemoryAttribute::Device
     // selects the Device-nGnRnE MAIR slot so loads/stores aren't
     // reordered or merged by the CPU.
     let mmio_va = match VMEM.alloc(1) {
         Some(va) => va,
         None => { puts("emmc2: VA exhausted for MMIO\n"); halt(); }
     };
-    if !sys_map_pages(mmio_pageset, mmio_va, MAP_FLAG_DEVICE).is_ok() {
+    if !sys_map_pages(mmio_pageset, mmio_va, MapMemoryAttribute::Device).is_ok() {
         puts("emmc2: map MMIO FAILED\n");
         halt();
     }

@@ -188,7 +188,7 @@ pub extern "C" fn _start() -> ! {
             Some(va) => va,
             None => { puts("cprman: VA exhausted for MMIO\n"); halt(); }
         };
-        if !sys_map_pages(mmio_pageset, va, MAP_FLAG_DEVICE).is_ok() {
+        if !sys_map_pages(mmio_pageset, va, MapMemoryAttribute::Device).is_ok() {
             puts("cprman: map MMIO FAILED\n");
             halt();
         }

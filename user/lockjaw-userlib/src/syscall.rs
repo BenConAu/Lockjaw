@@ -65,15 +65,19 @@ pub fn sys_alloc_pages_contiguous(count: u64) -> Result<PageSetHandle, SyscallEr
 }
 
 /// Map a PageSet's pages into the caller's address space.
-/// flags: 0 for normal memory, MAP_FLAG_DEVICE for MMIO attributes.
-pub fn sys_map_pages(ps: PageSetHandle, virt_addr: u64, flags: u64) -> SyscallError {
+/// `attr` selects MAIR regime: `Normal` for RAM, `Device` for MMIO.
+/// `attr as u64` discriminant lands in x2; the kernel decodes via
+/// `MapMemoryAttribute::from_raw`.
+pub fn sys_map_pages(
+    ps: PageSetHandle, virt_addr: u64, attr: lockjaw_types::vmem::MapMemoryAttribute,
+) -> SyscallError {
     let err: u64;
     unsafe {
         asm!(
             "svc #0",
             inlateout("x0") ps.0 => err,
             in("x1") virt_addr,
-            in("x2") flags,
+            in("x2") attr as u64,
             in("x8") SYS_MAP_PAGES,
         );
     }

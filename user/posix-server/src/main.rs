@@ -53,7 +53,7 @@ fn apply_elf_load_entry(
         Ok(ps) => ps,
         Err(_) => { puts("posix: seg alloc FAILED\n"); halt(); }
     };
-    if !sys_map_pages(ps, temp_va, 0).is_ok() {
+    if !sys_map_pages(ps, temp_va, MapMemoryAttribute::Normal).is_ok() {
         puts("posix: seg map FAILED\n");
         halt();
     }
@@ -424,7 +424,7 @@ fn handle_file_open(
             return;
         }
     };
-    if !sys_map_pages(opened.pageset, buffer_va, 0).is_ok() {
+    if !sys_map_pages(opened.pageset, buffer_va, MapMemoryAttribute::Normal).is_ok() {
         let _ = sys_close_handle(opened.pageset);
         VMEM.free(buffer_va, 1);
         close_remote_or_defer(fs, deferred, opened.handle);
@@ -798,7 +798,7 @@ pub extern "C" fn _start() -> ! {
         Ok(ps) => ps,
         Err(_) => { puts("posix: map array alloc FAILED\n"); halt(); }
     };
-    if !sys_map_pages(map_array_ps, map_array_va, 0).is_ok() {
+    if !sys_map_pages(map_array_ps, map_array_va, MapMemoryAttribute::Normal).is_ok() {
         puts("posix: map array FAILED\n");
         halt();
     }
@@ -816,7 +816,7 @@ pub extern "C" fn _start() -> ! {
     };
     // Map stack temporarily to write the argc/argv/auxv layout
     let temp_stack_va = VMEM.alloc(stack_pages as usize).expect("VA exhausted");
-    if !sys_map_pages(stack_ps, temp_stack_va, 0).is_ok() {
+    if !sys_map_pages(stack_ps, temp_stack_va, MapMemoryAttribute::Normal).is_ok() {
         puts("posix: stack map FAILED\n");
         halt();
     }
@@ -896,7 +896,7 @@ pub extern "C" fn _start() -> ! {
                     Err(_) => { puts("posix: shared alloc FAILED\n"); halt(); }
                 };
                 server_shared_va = VMEM.alloc(1).expect("VA exhausted");
-                if !sys_map_pages(shared_ps, server_shared_va, 0).is_ok() {
+                if !sys_map_pages(shared_ps, server_shared_va, MapMemoryAttribute::Normal).is_ok() {
                     puts("posix: shared map FAILED\n");
                     halt();
                 }

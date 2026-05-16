@@ -371,14 +371,14 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     }
 }
 
-/// sys_map_pages(handle, virt_addr, flags) — map pages into the caller's address space.
+/// sys_map_pages(handle, virt_addr, attr) — map pages into the caller's address space.
 /// x0 = PageSet handle (from sys_alloc_pages or sys_register_device_page).
 /// x1 = virtual address to map at (must be page-aligned, in user range).
-/// x2 = flags (MAP_FLAG_DEVICE for MMIO memory attributes).
+/// x2 = `MapMemoryAttribute` discriminant (Normal=0, Device=1) — selects MAIR regime.
 fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     let handle = ctx.gpr[0] as u32;
     let virt_addr = ctx.gpr[1];
-    let flags = ctx.gpr[2];
+    let attr = lockjaw_types::vmem::MapMemoryAttribute::from_raw(ctx.gpr[2]);
 
     // Reject VA 0 (mapped_va_page uses 0 as "not mapped" sentinel)
     // and unaligned VAs (would silently round down when stored as VA >> 12).
@@ -413,7 +413,7 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     // SAFETY: kva from a PageSet handle — registered header.
     let header = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
     unsafe {
-        match crate::arch::aarch64::vmem::map_pages_in_existing(addr_space.ttbr0(), virt_addr, &header, flags) {
+        match crate::arch::aarch64::vmem::map_pages_in_existing(addr_space.ttbr0(), virt_addr, &header, attr) {
             Ok(()) => {
                 // Record the mapping on this handle and increment the
                 // PageSet's global map count.

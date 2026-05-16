@@ -277,7 +277,7 @@ pub extern "C" fn _start() -> ! {
     // Map MMIO page. Multiple virtio-mmio devices share a single 4K page
     // (each device is 512 bytes), so add the intra-page offset.
     let mmio_page_va = VMEM.alloc(1).expect("VA exhausted for MMIO");
-    if !sys_map_pages(mmio_ps, mmio_page_va, MAP_FLAG_DEVICE).is_ok() {
+    if !sys_map_pages(mmio_ps, mmio_page_va, MapMemoryAttribute::Device).is_ok() {
         puts("blk: map MMIO FAILED\n");
         halt();
     }
@@ -343,7 +343,7 @@ pub extern "C" fn _start() -> ! {
         let vq_ps = sys_alloc_pages_contiguous(vq_pages).expect("blk: alloc vq pages");
         let vq_pa = sys_query_pageset_phys(vq_ps, 0).expect("blk: query vq phys");
         let vq_va = VMEM.alloc(vq_pages as usize).expect("VA exhausted for vq");
-        if !sys_map_pages(vq_ps, vq_va, 0).is_ok() {
+        if !sys_map_pages(vq_ps, vq_va, MapMemoryAttribute::Normal).is_ok() {
             puts("blk: map vq FAILED\n");
             halt();
         }
@@ -381,7 +381,7 @@ pub extern "C" fn _start() -> ! {
         let req_ps = sys_alloc_pages(1).expect("blk: alloc req page");
         let req_pa = sys_query_pageset_phys(req_ps, 0).expect("blk: query req phys");
         let req_va = VMEM.alloc(1).expect("VA exhausted for req header");
-        if !sys_map_pages(req_ps, req_va, 0).is_ok() {
+        if !sys_map_pages(req_ps, req_va, MapMemoryAttribute::Normal).is_ok() {
             puts("blk: map req page FAILED\n");
             halt();
         }
@@ -410,7 +410,7 @@ pub extern "C" fn _start() -> ! {
         // Self-test: read sector 0 and print the first 16 bytes.
         let test_buf = engine.alloc_buffer(1).expect("blk: selftest alloc");
         let test_va = VMEM.alloc(1).expect("VA exhausted for selftest");
-        if !sys_map_pages(test_buf, test_va, 0).is_ok() {
+        if !sys_map_pages(test_buf, test_va, MapMemoryAttribute::Normal).is_ok() {
             puts("blk: selftest map FAILED\n");
             halt();
         }

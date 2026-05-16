@@ -98,7 +98,7 @@ pub extern "C" fn _start() -> ! {
 
     // Step 1: Map UART MMIO page into our address space
     let uart_va = VMEM.alloc(1).expect("VA exhausted for UART MMIO");
-    if !sys_map_pages(mmio_pageset, uart_va, MAP_FLAG_DEVICE).is_ok() {
+    if !sys_map_pages(mmio_pageset, uart_va, MapMemoryAttribute::Device).is_ok() {
         puts("uart-driver: map MMIO FAILED\n");
         loop { unsafe { asm!("wfi"); } }
     }

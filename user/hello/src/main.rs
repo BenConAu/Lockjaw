@@ -7,7 +7,7 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
-use lockjaw_userlib::{puts, sys_debug_puts, sys_exit, sys_call_ret4, sys_alloc_pages, sys_map_pages, sys_create_reply, sys_create_thread, sys_yield, VMEM, bootstrap_endpoint};
+use lockjaw_userlib::{puts, sys_debug_puts, sys_exit, sys_call_ret4, sys_alloc_pages, sys_map_pages, sys_create_reply, sys_create_thread, sys_yield, MapMemoryAttribute, VMEM, bootstrap_endpoint};
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -44,7 +44,7 @@ pub extern "C" fn _start() -> ! {
         Ok(id) => id,
         Err(_) => { puts("[THREAD-TEST] alloc FAILED\n"); sys_exit(); }
     };
-    if !sys_map_pages(shared_ps, shared_va, 0).is_ok() {
+    if !sys_map_pages(shared_ps, shared_va, MapMemoryAttribute::Normal).is_ok() {
         puts("[THREAD-TEST] map FAILED\n");
         sys_exit();
     }
@@ -57,7 +57,7 @@ pub extern "C" fn _start() -> ! {
         Ok(id) => id,
         Err(_) => { puts("[THREAD-TEST] stack alloc FAILED\n"); sys_exit(); }
     };
-    if !sys_map_pages(stack_ps, thread_stack_va, 0).is_ok() {
+    if !sys_map_pages(stack_ps, thread_stack_va, MapMemoryAttribute::Normal).is_ok() {
         puts("[THREAD-TEST] stack map FAILED\n");
         sys_exit();
     }

@@ -370,7 +370,7 @@ fn self_test(fwcfg_va: u64, dma_va: u64, dma_pa: u64, ramfb_sel: u16) {
         Err(_) => { puts("ramfb: self-test alloc FAILED\n"); return; }
     };
     let fb_va = VMEM.alloc(SELFTEST_PAGES as usize).expect("VA exhausted for self-test fb");
-    if !sys_map_pages(fb_ps, fb_va, 0).is_ok() {
+    if !sys_map_pages(fb_ps, fb_va, MapMemoryAttribute::Normal).is_ok() {
         puts("ramfb: self-test map FAILED\n");
         return;
     }
@@ -453,7 +453,7 @@ pub extern "C" fn _start() -> ! {
 
     // Map fw_cfg MMIO page
     let fwcfg_va = VMEM.alloc(1).expect("VA exhausted for fw_cfg");
-    if !sys_map_pages(fwcfg_pageset, fwcfg_va, MAP_FLAG_DEVICE).is_ok() {
+    if !sys_map_pages(fwcfg_pageset, fwcfg_va, MapMemoryAttribute::Device).is_ok() {
         puts("ramfb: map fw_cfg FAILED\n");
         halt();
     }
@@ -475,7 +475,7 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("ramfb: alloc dma FAILED\n"); halt(); }
     };
     let dma_va = VMEM.alloc(1).expect("VA exhausted for DMA");
-    if !sys_map_pages(dma_ps, dma_va, 0).is_ok() {
+    if !sys_map_pages(dma_ps, dma_va, MapMemoryAttribute::Normal).is_ok() {
         puts("ramfb: map dma FAILED\n");
         halt();
     }
