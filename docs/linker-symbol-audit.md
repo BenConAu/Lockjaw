@@ -64,11 +64,7 @@ and any unclassified addition fails CI.
 | 264  | PA-prepivot    | `__guard_page_2` | same |
 | 266  | PA-prepivot    | `__guard_page_3` | same |
 | 311  | PA-prepivot    | `_secondary_start` (`fn` cast) | PSCI cpu_on entry — needs PA |
-| 656  | VA-image       | `__stack_bottom` | wrapped as `KernelImageVa::new(...)` → `create_idle_tcb` |
-| 682  | VA-image       | `__guard_page_0` (+4096) | wrapped as `KernelImageVa::new(...)` → secondary idle |
-| 684  | VA-image       | `__guard_page_1` (+4096) | same |
-| 686  | VA-image       | `__guard_page_2` (+4096) | same |
-| 688  | VA-image       | `__guard_page_3` (+4096) | same |
+| 656  | VA-image       | `__stack_bottom` | wrapped as `KernelImageVa::new(...)` → `create_idle_tcb` (CPU 0 boot TCB, becomes init) |
 
 ### `src/mm/stack.rs` — stack canary helpers
 

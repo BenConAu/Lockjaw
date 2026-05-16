@@ -639,10 +639,9 @@ mod tests {
 
     #[test]
     fn try_current_for_some_after_set_initial_current() {
-        // After bootstrap registration, the CPU's slot transitions
-        // None -> Some(idx). Mirrors the kernel's add_thread_for_cpu
-        // path that assigns secondaries their per-CPU current at boot
-        // (today — the refactor removes that path).
+        // None -> Some(idx) transition via set_initial_current on a
+        // CPU whose slot has not been pre-populated by SchedState::new
+        // (CPU 1 here; CPU 0 already gets Some(0) from new()).
         let mut s = SchedState::new();
         let idx = s.add_thread().unwrap();
         s.set_initial_current(1, idx);

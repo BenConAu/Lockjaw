@@ -665,41 +665,19 @@ pub extern "C" fn kmain() -> ! {
         sched::scheduler::add_thread(tcb_a_kva);      // index 1: thread A
         sched::scheduler::add_thread(tcb_b_kva);      // index 2: thread B
 
-        // Per-CPU idle threads for secondary CPUs described by the DTB.
-        // Constructed manually (not via create_tcb) because secondary_main
-        // IS the idle thread: the TCB uses the per-CPU boot stack from the
-        // linker script, and saved_sp=0 (same as the boot thread — never
-        // been switched out). When the scheduler first context-switches
-        // away from a secondary, it saves the real SP into saved_sp.
-        {
-            // Post-pivot: &__symbol gives higher-half VA directly (PC-relative
-            // from higher-half PC). No explicit + KERNEL_VA_OFFSET needed.
-            // Indexed by MPIDR (= linear CPU index on single-cluster).
-            // Each per-CPU stack bottom is in the kernel image
-            // (linker-reserved), so wrap as KernelImageVa.
-            let stack_bottoms: [lockjaw_types::addr::KernelImageVa; 4] = [
-                // SAFETY: linker symbol — per-CPU stack bottom for CPU 0
-                lockjaw_types::addr::KernelImageVa::new(&__guard_page_0 as *const u8 as u64 + 4096),
-                // SAFETY: linker symbol — per-CPU stack bottom for CPU 1
-                lockjaw_types::addr::KernelImageVa::new(&__guard_page_1 as *const u8 as u64 + 4096),
-                // SAFETY: linker symbol — per-CPU stack bottom for CPU 2
-                lockjaw_types::addr::KernelImageVa::new(&__guard_page_2 as *const u8 as u64 + 4096),
-                // SAFETY: linker symbol — per-CPU stack bottom for CPU 3
-                lockjaw_types::addr::KernelImageVa::new(&__guard_page_3 as *const u8 as u64 + 4096),
-            ];
-            let plat = arch::aarch64::platform::info();
-            for i in 0..plat.cpu_count as usize {
-                let mpidr = plat.cpus[i].mpidr as usize;
-                if mpidr == 0 { continue; } // skip boot CPU
-                if mpidr >= 4 { continue; } // safety bound
-                cap::process_obj::process_inc_thread_count(kernel_proc_kva);
-                let mut name = *b"idle-cpu0\0\0\0\0\0\0\0";
-                name[8] = b'0' + mpidr as u8;
-                let tcb_page = create_idle_tcb(
-                    stack_bottoms[mpidr], kernel_proc_kva, name);
-                sched::scheduler::add_thread_for_cpu(tcb_page, mpidr);
-            }
-        }
+        // Secondary CPUs no longer hold idle TCBs — the scheduler
+        // refactor (plan in /Users/Ben/.claude/plans/, see
+        // `sched::scheduler::idle_wait` / `schedule_from_idle`)
+        // replaced per-CPU idle threads with a kernel-owned wfi loop
+        // on each secondary's boot stack. Secondaries enter
+        // `secondary_main` which calls `idle_wait`; the first tick on
+        // a secondary routes through `schedule_from_idle` to pick up
+        // Ready work.
+        //
+        // Removing the idle TCBs eliminates the round-robin selection
+        // bug they caused on CPU 0 (M6 emmc2 ADMA2 perf measurements
+        // saw 5-30ms tick-boundary slack because synthetic idle Ready
+        // entries kept stealing CPU from real busy-poll workloads).
 
         // Do NOT call scheduler::start() here. CPU 0 still has kernel
         // setup work to do (ELF loading, process creation) outside the
@@ -1039,18 +1017,19 @@ pub extern "C" fn secondary_main(cpu_id: u64) -> ! {
     // Arm this CPU's virtual timer (silent variant)
     unsafe { arch::aarch64::timer::init_secondary(); }
 
-    // This CPU IS the idle thread. CPU 0 registered a TCB for us
-    // with saved_sp=0 and stack_base pointing at our per-CPU boot
-    // stack. When the scheduler context-switches away from us, it
-    // saves our real SP into that TCB. When switched back, we
-    // resume here in the wfi loop.
+    // This CPU has no thread of its own. It parks in the kernel-
+    // owned idle_wait until a timer tick selects work via
+    // schedule_from_idle (which transitions current_per_cpu[cpu]
+    // from None -> Some(picked_idx) and context-switches in). When
+    // that thread later blocks or exits, the path returns the CPU
+    // to idle_wait via the normal block/exit machinery — though see
+    // the plan's Known scope limit: block_current and ExitAndHalt
+    // still WFI in thread context, so this CPU only re-enters
+    // idle_wait between full thread lifecycles, not on every block.
     //
     // No GKL to release (we never held it — booted fresh from PSCI).
-    // Unmask IRQs so timer ticks can preempt us into the scheduler.
-    unsafe { core::arch::asm!("msr DAIFClr, #2"); }
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
+    // idle_wait unmasks IRQs internally.
+    sched::scheduler::idle_wait(cpu_id as usize)
 }
 
 #[panic_handler]

@@ -176,30 +176,6 @@ pub fn add_thread(tcb_kva: lockjaw_types::addr::KernelVa) -> bool {
     }
 }
 
-/// Register a thread and immediately assign it as the initial current
-/// thread for `cpu_id`. This is scheduler-state initialization for
-/// secondary CPUs — not a normal scheduling decision. The thread is
-/// added as Ready then transitioned to Running on the specified CPU.
-///
-/// Must be called from CPU 0 during boot, before the target CPU's
-/// timer is active (so it won't race with tick()).
-pub fn add_thread_for_cpu(tcb_kva: lockjaw_types::addr::KernelVa, cpu_id: usize) -> bool {
-    // SAFETY: GKL held (or boot-time single-core) — exclusive access.
-    unsafe {
-        let state = &mut *SCHEDULER.state_ptr();
-        let idx = match state.add_thread() {
-            Some(i) => i,
-            None => return false,
-        };
-        if idx >= MAX_THREADS {
-            return false;
-        }
-        (*SCHEDULER.threads_ptr())[idx] = Some(tcb_kva);
-        state.set_initial_current(cpu_id, idx);
-        true
-    }
-}
-
 /// Read-only check: would the next `add_thread` succeed?
 ///
 /// Used by `sys_create_process` as a precondition during the validate
@@ -258,19 +234,28 @@ pub fn start() {
 pub fn tick() {
     // SAFETY: GKL held — exclusive access to scheduler state.
     unsafe {
-        let active = *SCHEDULER.active.get();
-        let state = &*SCHEDULER.state_ptr();
-        if !active || state.thread_count() < 2 {
+        let cpu_id = crate::percpu::cpu_id() as usize;
+        // Read scheduler snapshot then drop the borrow before
+        // dispatching: schedule() and schedule_from_idle() both
+        // re-borrow state mutably.
+        let (active, thread_count, current_opt, current_state) = {
+            let state = &*SCHEDULER.state_ptr();
+            let active = *SCHEDULER.active.get();
+            let tc = state.thread_count();
+            let cur = state.try_current_for(cpu_id);
+            let cs = cur.and_then(|idx| state.get(idx));
+            (active, tc, cur, cs)
+        };
+        if !active || thread_count < 2 {
             return;
         }
-        let cpu_id = crate::percpu::cpu_id() as usize;
-        // Secondary CPUs that haven't been assigned a current thread yet
-        // (set_initial_current not called) must not touch the scheduler.
-        let current = match state.current_per_cpu.get(cpu_id).copied().flatten() {
-            Some(idx) => idx,
-            None => return,
-        };
-        let current_state = state.get(current);
+        // Idle CPU (no current thread) — route through the no-current
+        // scheduler path. If no Ready thread exists, schedule_from_idle
+        // is a no-op; idle_wait re-enters wfi on return from this IRQ.
+        if current_opt.is_none() {
+            schedule_from_idle(cpu_id);
+            return;
+        }
         if current_state == Some(SchedThreadState::Exited) {
             // ExitAndHalt case: current thread exited but no Ready thread
             // was available. An interrupt may have just unblocked a thread.
@@ -923,7 +908,6 @@ fn check_thread_canary(tcb: &Tcb) {
 /// # Safety
 /// GKL must be held. Must be called only when this CPU has no current
 /// thread (idle). Asserts.
-#[allow(dead_code)] // Wired live in Stage 3.
 unsafe fn schedule_from_idle(cpu_id: usize) {
     // Drain any pending exit first — matches the schedule() prologue
     // ordering. No-op on idle CPU today (see `finish_exit` note).
@@ -991,8 +975,7 @@ unsafe fn schedule_from_idle(cpu_id: usize) {
 ///
 /// # Safety
 /// GKL must NOT be held. IRQs must be in any state — this unmasks them.
-#[allow(dead_code)] // Wired live in Stage 3.
-fn idle_wait(_cpu_id: usize) -> ! {
+pub fn idle_wait(_cpu_id: usize) -> ! {
     // SAFETY: unmasking IRQs is required for the wfi loop to be
     // interruptible. The caller's contract is "no GKL held."
     unsafe { core::arch::asm!("msr DAIFClr, #2") };
