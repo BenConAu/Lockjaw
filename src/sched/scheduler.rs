@@ -386,22 +386,46 @@ pub fn block_current(_token: BlockToken) {
         (&mut *SCHEDULER.state_ptr()).block_current(cpu_id)
             .unwrap_or_else(|_| panic!("block_current: not Running"));
     }
-    // schedule() performs context_switch — when we resume here, another
-    // thread ran and eventually switched back to us. If we're Running
-    // again, an unblock_thread + schedule decided to pick us, so we
-    // return to the caller. Otherwise we loop and wait again.
+    // Wait-loop ordering: check state FIRST every iteration so that a
+    // self-wake (an IRQ on this CPU that ran `unblock_thread` while
+    // we were in wfi) is handled before we try to schedule again.
+    //
+    //   - Running: we got switched back to via a normal schedule call
+    //     on some other CPU / path. Return.
+    //   - Ready: we were unblocked inline while wfi'd. The CPU is
+    //     still on this thread's stack, so a context_switch back is
+    //     unnecessary; transition Ready → Running and return.
+    //   - Blocked: try to switch to someone else. If no other thread
+    //     is Ready, schedule returns WaitForInterrupt and we wfi.
+    //
+    // Before the resume_current path existed, a self-wake would leave
+    // current = Ready, then `schedule(Block)` would call `step(Block)`
+    // which asserts current = Blocked or Exited → kernel panic. The
+    // bug only surfaced once the IPC benchmark threads were removed:
+    // until then there was always another Ready thread to switch to,
+    // so block_current never re-entered the loop in Ready state.
     loop {
-        unsafe { schedule(SchedReason::Block); }
         unsafe {
-            let state = &*SCHEDULER.state_ptr();
+            let state = &mut *SCHEDULER.state_ptr();
             let current = state.current_for(cpu_id);
-            if state.get(current) == Some(SchedThreadState::Running) {
-                return;
+            match state.get(current) {
+                Some(SchedThreadState::Running) => return,
+                Some(SchedThreadState::Ready) => {
+                    state.resume_current(cpu_id)
+                        .unwrap_or_else(|_| panic!("block_current: resume_current failed"));
+                    return;
+                }
+                Some(SchedThreadState::Blocked) => {
+                    // fall through to schedule + wfi
+                }
+                _ => panic!("block_current: unexpected current state (Exited or absent)"),
             }
         }
-        // All blocked. Release GKL + unmask IRQs so other cores can run
-        // and this core can receive the interrupt that will unblock a
-        // thread. Re-mask + re-acquire after waking.
+        unsafe { schedule(SchedReason::Block); }
+        // schedule() may have switched away and back, so re-check at
+        // the top of the next iteration. If schedule returned without
+        // a context_switch (no Ready thread), release GKL + unmask
+        // IRQs so an IRQ can deliver the wake.
         crate::sched::gkl::gkl_unlock();
         unsafe {
             core::arch::asm!(
