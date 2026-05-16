@@ -7,7 +7,6 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 
-use core::arch::asm;
 use core::ptr;
 use lockjaw_userlib::*;
 use lockjaw_userlib::handle::PageSetGuard;
@@ -460,8 +459,12 @@ pub extern "C" fn _start() -> ! {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Terminate the driver process. EL0 wfi-loops keep the thread in
+/// `Running` state from the scheduler's POV — they don't block,
+/// they spin a tick-period each iteration after the next IRQ wakes
+/// the CPU. Use sys_exit so the scheduler removes us from rotation.
 fn halt() -> ! {
-    loop { unsafe { asm!("wfi"); } }
+    sys_exit();
 }
 
 // put_decimal is imported from lockjaw_userlib (atomic emit).

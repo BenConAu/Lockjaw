@@ -41,7 +41,7 @@
 # has no synthetic SavedContext, no context_switch INTO it), but listed
 # so check-stack accepts it as a known target if the disassembler still
 # sees the function pointer.
-"thread_entry" = ["ipc_sender", "ipc_receiver", "boot_tcb_entry_unreachable", "process_entry"]
+"thread_entry" = ["boot_tcb_entry_unreachable", "process_entry"]
 
 # Cycles involving the crash handler are guarded at runtime by an
 # AtomicBool re-entry flag in print_thread_context. The call graph

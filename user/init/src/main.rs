@@ -303,11 +303,11 @@ fn syscall_err_name(e: SyscallError) -> &'static str {
 fn alloc_endpoint(label: &str) -> EndpointHandle {
     let ps = match sys_alloc_pages(1) {
         Ok(id) => id,
-        Err(_) => { puts("init: alloc "); puts(label); puts(" FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: alloc "); puts(label); puts(" FAILED\n"); park_forever(); }
     };
     match sys_create_endpoint(ps) {
         Ok(h) => h,
-        Err(_) => { puts("init: create "); puts(label); puts(" FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: create "); puts(label); puts(" FAILED\n"); park_forever(); }
     }
 }
 
@@ -375,11 +375,11 @@ pub extern "C" fn _start() -> ! {
     // Create an endpoint and try to export a handle on it (no caller blocked → should fail).
     let test_ep_ps = match sys_alloc_pages(1) {
         Ok(id) => id,
-        Err(_) => { puts("init: alloc FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: alloc FAILED\n"); park_forever(); }
     };
     let test_ep = match sys_create_endpoint(test_ep_ps) {
         Ok(h) => h,
-        Err(_) => { puts("init: create endpoint FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: create endpoint FAILED\n"); park_forever(); }
     };
     match sys_export_handle(test_ep) {
         Err(e) if e == SyscallError::NO_CALLER => {
@@ -398,7 +398,7 @@ pub extern "C" fn _start() -> ! {
     // before reading.
     let boot_info = match sys_get_boot_info() {
         Ok(b) => b,
-        Err(_) => { puts("init: get_boot_info FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: get_boot_info FAILED\n"); park_forever(); }
     };
     let dtb_va = VMEM.alloc(16).expect("VA exhausted for DTB"); // 16 pages max
     if sys_map_pages(boot_info.dtb_pageset, dtb_va, MapMemoryAttribute::Normal).is_ok() {
@@ -420,7 +420,7 @@ pub extern "C" fn _start() -> ! {
     // The kernel uses it as a temporary Mapping buffer during address space creation.
     let scratch_ps = match sys_alloc_pages(1) {
         Ok(id) => id,
-        Err(_) => { puts("init: alloc scratch page FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: alloc scratch page FAILED\n"); park_forever(); }
     };
 
     // Create endpoints for IPC infrastructure.
@@ -471,11 +471,11 @@ pub extern "C" fn _start() -> ! {
     // into the prefix it populates, so no per-spawn re-init is needed.
     let plan_buf_ps = match sys_alloc_pages(INIT_PLAN_BUFFER_PAGES) {
         Ok(id) => id,
-        Err(_) => { puts("init: alloc plan buffer FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: alloc plan buffer FAILED\n"); park_forever(); }
     };
     if !sys_map_pages(plan_buf_ps, plan_buf_va, MapMemoryAttribute::Normal).is_ok() {
         puts("init: map plan buffer FAILED\n");
-        loop { sys_yield(); }
+        park_forever();
     }
 
     spawn_elf(HELLO_ELF, "hello", map_array_va, temp_base_va, plan_buf_va, scratch_ps, hello_boot_ep, 1);
@@ -521,15 +521,15 @@ pub extern "C" fn _start() -> ! {
     }
     let test_notif_ps = match sys_alloc_pages(1) {
         Ok(id) => id,
-        Err(_) => { puts("init: alloc notif FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: alloc notif FAILED\n"); park_forever(); }
     };
     let test_notif = match sys_create_notification(test_notif_ps) {
         Ok(h) => h,
-        Err(_) => { puts("init: create notif FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: create notif FAILED\n"); park_forever(); }
     };
     let exported_idx = match sys_export_handle(test_notif) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export FAILED\n"); park_forever(); }
     };
     sys_reply(exported_idx, 0, 0, 0);
     puts("[BOOTSTRAP] hello\n");
@@ -545,11 +545,11 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_receive(devmgr_boot_ep);
     let devmgr_ep_idx = match sys_export_handle(devmgr_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export devmgr_ep FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export devmgr_ep FAILED\n"); park_forever(); }
     };
     let devmgr_cprman_idx = match sys_export_handle(cprman_srv_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export cprman_srv_ep to devmgr FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export cprman_srv_ep to devmgr FAILED\n"); park_forever(); }
     };
     sys_reply(devmgr_ep_idx, devmgr_cprman_idx, 0, 0);
     puts("[BOOTSTRAP] devmgr\n");
@@ -561,11 +561,11 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_receive(cprman_boot_ep);
     let cprman_srv_idx = match sys_export_handle(cprman_srv_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export cprman_srv_ep to cprman FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export cprman_srv_ep to cprman FAILED\n"); park_forever(); }
     };
     let cprman_devmgr_idx = match sys_export_handle(devmgr_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export devmgr to cprman FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export devmgr to cprman FAILED\n"); park_forever(); }
     };
     sys_reply(cprman_srv_idx, cprman_devmgr_idx, 0, 0);
     puts("[BOOTSTRAP] cprman\n");
@@ -575,11 +575,11 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_receive(uart_boot_ep);
     let uart_ep_idx = match sys_export_handle(ep_handle) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export uart ep FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export uart ep FAILED\n"); park_forever(); }
     };
     let uart_devmgr_idx = match sys_export_handle(devmgr_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export devmgr to uart FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export devmgr to uart FAILED\n"); park_forever(); }
     };
     sys_reply(uart_ep_idx, uart_devmgr_idx, 0, 0);
     puts("[BOOTSTRAP] uart\n");
@@ -590,11 +590,11 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_receive(ramfb_boot_ep);
     let ramfb_devmgr_idx = match sys_export_handle(devmgr_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export devmgr to ramfb FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export devmgr to ramfb FAILED\n"); park_forever(); }
     };
     let ramfb_display_idx = match sys_export_handle(display_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export display_ep to ramfb FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export display_ep to ramfb FAILED\n"); park_forever(); }
     };
     sys_reply(ramfb_devmgr_idx, ramfb_display_idx, 0, 0);
     puts("[BOOTSTRAP] ramfb\n");
@@ -604,7 +604,7 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_receive(display_test_boot_ep);
     let dtest_display_idx = match sys_export_handle(display_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export display_ep to display-test FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export display_ep to display-test FAILED\n"); park_forever(); }
     };
     sys_reply(dtest_display_idx, 0, 0, 0);
     puts("[BOOTSTRAP] display-test\n");
@@ -615,11 +615,11 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_receive(blk_boot_ep);
     let blk_srv_idx = match sys_export_handle(blk_srv_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export blk_srv_ep FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export blk_srv_ep FAILED\n"); park_forever(); }
     };
     let blk_devmgr_idx = match sys_export_handle(devmgr_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export devmgr to blk FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export devmgr to blk FAILED\n"); park_forever(); }
     };
     sys_reply(blk_srv_idx, blk_devmgr_idx, 0, 0);
     puts("[BOOTSTRAP] blk\n");
@@ -631,11 +631,11 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_receive(fat32_boot_ep);
     let fat32_srv_idx = match sys_export_handle(fat32_srv_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export fat32_srv_ep FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export fat32_srv_ep FAILED\n"); park_forever(); }
     };
     let fat32_blk_idx = match sys_export_handle(blk_srv_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export blk to fat32 FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export blk to fat32 FAILED\n"); park_forever(); }
     };
     sys_reply(fat32_srv_idx, fat32_blk_idx, 0, 0);
     puts("[BOOTSTRAP] fat32\n");
@@ -646,7 +646,7 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_receive(fat32_test_boot_ep);
     let fat32_test_idx = match sys_export_handle(fat32_srv_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export fat32_srv_ep to fat32-test FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export fat32_srv_ep to fat32-test FAILED\n"); park_forever(); }
     };
     sys_reply(fat32_test_idx, 0, 0, 0);
     puts("[BOOTSTRAP] fat32-test\n");
@@ -657,7 +657,7 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_receive(posix_boot_ep);
     let posix_fs_idx = match sys_export_handle(fat32_srv_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export fs to posix-server FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export fs to posix-server FAILED\n"); park_forever(); }
     };
     sys_reply(posix_fs_idx, 0, 0, 0);
     puts("[BOOTSTRAP] posix-server\n");
@@ -671,7 +671,7 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_receive(clock_test_boot_ep);
     let clock_test_devmgr_idx = match sys_export_handle(devmgr_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export devmgr_ep to clock-test FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export devmgr_ep to clock-test FAILED\n"); park_forever(); }
     };
     sys_reply(clock_test_devmgr_idx, 0, 0, 0);
     puts("[BOOTSTRAP] clock-test\n");
@@ -684,7 +684,7 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_receive(emmc2_boot_ep);
     let emmc2_devmgr_idx = match sys_export_handle(devmgr_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export devmgr_ep to emmc2 FAILED\n"); loop { sys_yield(); } }
+        Err(_) => { puts("init: export devmgr_ep to emmc2 FAILED\n"); park_forever(); }
     };
     sys_reply(emmc2_devmgr_idx, 0, 0, 0);
     puts("[BOOTSTRAP] emmc2\n");
@@ -697,22 +697,15 @@ pub extern "C" fn _start() -> ! {
     sys_reply(0, 0, 0, 0);
     puts("[BOOTSTRAP] sleep-test\n");
 
-    // Allocate a Reply object for init's own outbound calls (ipc_puts to
-    // the uart server). Each client that issues sys_call needs one.
-    let init_reply_ps = match sys_alloc_pages(1) {
-        Ok(id) => id,
-        Err(_) => { puts("init: alloc reply page FAILED\n"); loop { sys_yield(); } }
-    };
-    let init_reply = match sys_create_reply(init_reply_ps) {
-        Ok(h) => h,
-        Err(_) => { puts("init: create reply FAILED\n"); loop { sys_yield(); } }
-    };
-
-    // Print via IPC to the UART server.
-    loop {
-        ipc_puts(ep_handle, init_reply, "init: alive (via IPC)\n");
-        sys_yield();
-    }
+    // Boot complete. Park indefinitely — init has no further work
+    // and the kernel cannot let it exit (boot TCB stack is in the
+    // linker image, not the KVM pool). The old heartbeat
+    // (`ipc_puts + sys_yield`) kept init Ready every 10ms tick,
+    // contending for fair round-robin slots with real work like
+    // emmc2's busy-poll transfers. The Reply object that fed the
+    // heartbeat was deleted along with it.
+    let _ = ep_handle;
+    park_forever();
 }
 
 #[panic_handler]

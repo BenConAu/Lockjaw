@@ -100,7 +100,10 @@ pub extern "C" fn _start() -> ! {
     };
 
     puts("[DISPLAY-TEST] done\n");
-    loop { sys_yield(); }
+    // sys_exit removes us from scheduler rotation. The old
+    // loop { sys_yield(); } kept this thread Ready every 10ms
+    // tick, contending for round-robin slots even when truly idle.
+    sys_exit();
 }
 
 // Decimal printing uses lockjaw_userlib::put_decimal (atomic emit).

@@ -559,40 +559,16 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("Process lifecycle test passed.");
     }
 
-    // --- Phase 5: Threads & Scheduling ---
+    // --- Phase 5: Boot TCB + Kernel Process ---
     kprintln!();
-    kprintln!("Starting threads...");
+    kprintln!("Starting init...");
 
-    // --- Phase 7: IPC Setup ---
-    // Create an endpoint and handle tables for the sender/receiver threads
     unsafe {
-        use sched::tcb::{TcbCreateInfo, create_tcb};
-        use cap::handle_table;
-
-        // Create endpoint object. Init through the linear map (paddr),
-        // then expose at a KVA via kvm::map_existing so the bench
-        // handle slot can carry `HandleKind::Endpoint { kva }`. The
-        // bench Endpoint lives for the kernel's lifetime — no destroy
-        // path needed.
-        let ep_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("endpoint alloc"));
-        let ep_paddr = ep_page.start_addr();
-        ipc::endpoint::create_endpoint(mm::addr::ObjectInitPage::new(ep_paddr)).unwrap_or_else(|_| panic!("create endpoint"));
-        let ep_kva = mm::kvm::map_existing(ep_page)
-            .unwrap_or_else(|_| panic!("endpoint kvm map")).kva;
-        kprintln!("  Endpoint created at phys ", Hex(ep_paddr.as_u64()), ", kva ", Hex(ep_kva.as_u64()));
-
-        // Reply object for the ipc_sender benchmark thread. One page,
-        // pre-allocated and exposed via KVA so the handle slot can carry
-        // a `HandleKind::Reply { kva }`. Init runs through the linear
-        // map (paddr); map_existing then makes the same frame reachable
-        // through a KVM-pool VA. The bench Reply lives for the kernel's
-        // lifetime — no destroy path needed.
-        let bench_reply_page = mm::page_alloc::alloc_page().unwrap_or_else(|| panic!("bench reply alloc"));
-        ipc::reply::create_reply(mm::addr::ObjectInitPage::new(bench_reply_page.start_addr())).unwrap_or_else(|_| panic!("create bench reply"));
-        let bench_reply_kva = mm::kvm::map_existing(bench_reply_page)
-            .unwrap_or_else(|_| panic!("bench reply kvm map")).kva;
-
-        // Create kernel process — immortal, ttbr0=0, owns all kernel threads.
+        // Create kernel process — immortal, ttbr0=0, owns the boot TCB
+        // until it is re-pointed to init's user process. The kernel
+        // handle table is currently empty (no kernel-thread IPC
+        // benchmark any more — see commit history for the removed
+        // sender/receiver pair); it stays in place as boilerplate.
         let kernel_ht_kva = mm::kvm::alloc_kernel_pages(1)
             .unwrap_or_else(|_| panic!("kernel ht kvm alloc")).kva;
         create_handle_table(
@@ -610,44 +586,7 @@ pub extern "C" fn kmain() -> ! {
             b"kernel\0\0\0\0\0\0\0\0\0\0",
         );
 
-        // Insert endpoint + reply handles into kernel handle table.
-        // Mint a sender token via the same path sys_export_handle uses
-        // (the master/receive-only handle would have caller_token=None
-        // and reject sends; the kernel sender thread needs a sender
-        // handle just like any userspace client would).
-        let ep_token = {
-            let mut ep_km = mm::kernel_ptr::KernelMut::<ipc::endpoint::EndpointObject>::from_kva(ep_kva);
-            ipc::endpoint::mint_caller_token(ep_km.get_mut())
-        };
-        handle_table::handle_insert(
-            kernel_ht_kva,
-            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
-            lockjaw_types::object::HandleKind::Endpoint { kva: ep_kva, caller_token: Some(ep_token) },
-        ).unwrap_or_else(|_| panic!("insert ep handle"));
-        handle_table::handle_insert(
-            kernel_ht_kva,
-            cap::rights::Rights::from_bits(cap::rights::RIGHT_READ | cap::rights::RIGHT_WRITE),
-            lockjaw_types::object::HandleKind::Reply { kva: bench_reply_kva },
-        ).unwrap_or_else(|_| panic!("insert reply handle"));
-
-        // Thread A (sender) — kernel thread in the kernel process.
-        // TCB pages and per-thread kernel stacks both live in the KVM
-        // pool. Bench threads are immortal; the KVA range and backing
-        // frame leak for the kernel's lifetime (no destroy path).
-        cap::process_obj::process_inc_thread_count(kernel_proc_kva);
-        let stack_a_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("stack a kvm alloc")).kva;
-        let tcb_a_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("tcb a kvm alloc")).kva;
-        create_tcb(&TcbCreateInfo { entry: ipc_sender, stack: lockjaw_types::thread::KernelStackBase::Pool(stack_a_kva), process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-sender\0\0\0\0\0\0" }, tcb_a_kva)
-            .unwrap_or_else(|_| panic!("create tcb a"));
-
-        // Thread B (receiver) — kernel thread in the kernel process
-        cap::process_obj::process_inc_thread_count(kernel_proc_kva);
-        let stack_b_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("stack b kvm alloc")).kva;
-        let tcb_b_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("tcb b kvm alloc")).kva;
-        create_tcb(&TcbCreateInfo { entry: ipc_receiver, stack: lockjaw_types::thread::KernelStackBase::Pool(stack_b_kva), process_kva: kernel_proc_kva, user_entry_point: 0, user_stack_top: 0, user_stack_base: 0, user_arg: 0, name: *b"ipc-receiver\0\0\0\0" }, tcb_b_kva)
-            .unwrap_or_else(|_| panic!("create tcb b"));
-
-        // Register idle/init thread (index 0 = this boot thread).
+        // Register init thread (index 0 = this boot thread).
         // This thread drops to EL0 and becomes the init process, so it
         // gets its own user process (created later in the ELF loading path).
         // For now it belongs to the kernel process.
@@ -662,8 +601,6 @@ pub extern "C" fn kmain() -> ! {
         );
 
         sched::scheduler::add_thread(boot_tcb_page);  // index 0: CPU 0 boot TCB (becomes init)
-        sched::scheduler::add_thread(tcb_a_kva);      // index 1: thread A
-        sched::scheduler::add_thread(tcb_b_kva);      // index 2: thread B
 
         // Secondary CPUs no longer hold idle TCBs — the scheduler
         // refactor (plan in /Users/Ben/.claude/plans/, see
@@ -873,61 +810,6 @@ pub extern "C" fn kmain() -> ! {
             user_stack_top,
             0, // user_arg: 0 for init process first thread
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// IPC test threads (Phase 7)
-// ---------------------------------------------------------------------------
-
-/// Client thread: calls the server with a request, gets a reply.
-/// Uses ipc_call (send + block for reply in one operation).
-/// Endpoint at handle 0, Reply at handle 1.
-fn ipc_sender() -> ! {
-    const BENCHMARK_ROUNDS: u64 = 500;
-    let mut counter: u64 = 1;
-
-    // Warm up
-    for _ in 0..10 {
-        cap::object_ops::call(0, 1, [counter, 0, 0, 0])
-            .unwrap_or_else(|_| panic!("lookup")).unwrap_or_else(|_| panic!("call"));
-        counter += 1;
-    }
-
-    // Benchmark using call/reply pattern
-    let start_tick = arch::aarch64::timer::tick_count();
-    for _ in 0..BENCHMARK_ROUNDS {
-        let reply_msg = cap::object_ops::call(0, 1, [counter, 0, 0, 0])
-            .unwrap_or_else(|_| panic!("lookup")).unwrap_or_else(|_| panic!("call"));
-        // Print first few to verify the server doubled our value
-        if counter <= 13 {
-            kprintln!("[IPC] call(", counter, ") -> reply(", reply_msg[0], ")");
-        }
-        counter += 1;
-    }
-    let end_tick = arch::aarch64::timer::tick_count();
-    let elapsed_ticks = end_tick - start_tick;
-
-    kprintln!();
-    kprintln!("[IPC BENCHMARK] ", BENCHMARK_ROUNDS, " call/reply round-trips in ", elapsed_ticks, " ticks");
-    if elapsed_ticks > 0 {
-        kprintln!("[IPC BENCHMARK] ", BENCHMARK_ROUNDS / elapsed_ticks, " round-trips per tick");
-    }
-
-    loop {
-        cap::object_ops::call(0, 1, [counter, 0, 0, 0])
-            .unwrap_or_else(|_| panic!("lookup")).unwrap_or_else(|_| panic!("call"));
-        counter += 1;
-    }
-}
-
-/// Server thread: receives a request, doubles the first value, replies.
-fn ipc_receiver() -> ! {
-    loop {
-        let msg = cap::object_ops::receive(0)
-            .unwrap_or_else(|_| panic!("lookup")).unwrap_or_else(|_| panic!("receive"));
-        let reply = [msg[0] * 2, msg[1], msg[2], msg[3]];
-        ipc::reply::ipc_reply(reply).unwrap_or_else(|_| panic!("reply"));
     }
 }
 
