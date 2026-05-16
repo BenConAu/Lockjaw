@@ -19,7 +19,7 @@
 
 use core::cell::UnsafeCell;
 use lockjaw_types::addr::{PhysAddr, PAGE_SIZE};
-use lockjaw_types::dma_pool::{DmaPool, DmaPoolError, DMA_POOL_PAGES};
+use lockjaw_types::dma_pool::{DmaPool, DmaPoolError};
 
 /// Wraps DmaPool + the pool's physical base address (set at boot).
 /// `base_phys = 0` is the "not yet initialised" sentinel — alloc
@@ -66,11 +66,6 @@ pub fn base_phys() -> u64 {
     unsafe { *POOL.base_phys.get() }
 }
 
-/// Total pool size in bytes.
-pub const fn size_bytes() -> u64 {
-    (DMA_POOL_PAGES as u64) * PAGE_SIZE
-}
-
 /// Allocate `count` physically-contiguous pages from the pool.
 /// Returns the physical address of the first page on success.
 ///
@@ -112,8 +107,3 @@ pub fn free_pages(first_phys: PhysAddr, count: usize) {
     }
 }
 
-/// Diagnostic: number of pages currently allocated from the pool.
-pub fn allocated_pages() -> usize {
-    // SAFETY: single-core read.
-    unsafe { (*POOL.pool.get()).allocated_pages() }
-}

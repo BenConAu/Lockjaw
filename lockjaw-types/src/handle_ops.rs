@@ -247,7 +247,7 @@ where
 mod tests {
     extern crate alloc;
     use super::*;
-    use crate::addr::{KernelVa, PhysAddr};
+    use crate::addr::KernelVa;
     use crate::rights::{RIGHT_READ, RIGHT_WRITE, RIGHT_GRANT};
     use alloc::vec;
 
@@ -275,7 +275,6 @@ mod tests {
     const KVA_A: u64 = 0xFFFF_8000_0000_1000;
     const KVA_B: u64 = 0xFFFF_8000_0000_2000;
     const KVA_C: u64 = 0xFFFF_8000_0000_3000;
-    const KVA_D: u64 = 0xFFFF_8000_0000_4000;
 
     // --- insert ---
 

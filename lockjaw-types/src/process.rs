@@ -709,7 +709,6 @@ mod tests {
 
     #[test]
     fn record_parent_copy_accepts_endpoint_notification_reply() {
-        let dummy = crate::addr::PhysAddr::new(0x4000_2000);
         let dummy_kva = crate::addr::KernelVa::new(0xFFFF_8000_0000_2000);
         for kind in [
             HandleKind::Endpoint { kva: dummy_kva, caller_token: None },

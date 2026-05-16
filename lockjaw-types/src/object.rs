@@ -403,7 +403,6 @@ mod tests {
 
     #[test]
     fn handle_kind_discriminants_match_object_type() {
-        let dummy_paddr = crate::addr::PhysAddr::new(0x1000);
         let dummy_kva = crate::addr::KernelVa::new(0xFFFF_8000_0000_1000);
         // Ensure HandleKind discriminant values match ObjectType for diagnostics.
         assert_eq!(HandleKind::Empty.obj_type(), ObjectType::HandleTable); // inert
@@ -430,9 +429,6 @@ mod tests {
         }
     }
 
-    fn dummy_paddr() -> crate::addr::PhysAddr {
-        crate::addr::PhysAddr::new(0x4000_1000)
-    }
     fn dummy_kva() -> crate::addr::KernelVa {
         crate::addr::KernelVa::new(0xFFFF_8000_0000_1000)
     }
