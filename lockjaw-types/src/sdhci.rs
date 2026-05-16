@@ -181,6 +181,80 @@ pub const SDHCI_TRNS_MULTI: u16 = 0x0020;
 pub const SDHCI_ARGUMENT2: usize = 0x000;
 
 // ---------------------------------------------------------------------------
+// HOST_CONTROL_1 DMA_SEL (bits[4:3], inside the existing SDHCI_HOST_CONTROL
+// register at offset 0x028)
+// ---------------------------------------------------------------------------
+
+/// DMA_SEL field mask. Two bits at [4:3] in HOST_CONTROL_1 selecting the
+/// DMA engine the controller drives when TRANSFER_MODE.DMA_EN is set:
+///   00 = SDMA          (single-buffer, legacy)
+///   01 = reserved
+///   10 = ADMA2 32-bit  (descriptor-table-driven, 32-bit phys)
+///   11 = ADMA2 64-bit  (descriptor-table-driven, 64-bit phys)
+/// Lockjaw uses ADMA2 32-bit (M6 sub-commit 2b); 64-bit ADMA2 is reserved
+/// for the day Lockjaw runs on a >4 GiB PA system.
+pub const SDHCI_HOST_CTRL_DMA_SEL_MASK: u8 = 0b0001_1000;
+/// DMA_SEL = ADMA2 32-bit. OR into HOST_CONTROL_1.
+pub const SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32: u8 = 0b0001_0000;
+
+// ---------------------------------------------------------------------------
+// ADMA2 descriptor-table address register
+// ---------------------------------------------------------------------------
+
+/// `ADMA_SYS_ADDR_REG` (0x058) — physical address of the ADMA2 descriptor
+/// table. 32-bit register; for 64-bit ADMA2 a paired register at 0x05C
+/// holds the high 32 bits (unused in this Lockjaw revision). DIFFERENT
+/// register from SDHCI_SYSADDR (0x000), which is the SDMA source/dest
+/// address (also aliased as ARGUMENT2 for Auto-CMD23 in M5).
+pub const SDHCI_ADMA_ADDRESS: usize = 0x058;
+
+// ---------------------------------------------------------------------------
+// ADMA2 descriptor — 32-bit address mode, per SDHCI v3 §1.13
+// ---------------------------------------------------------------------------
+//
+// Each descriptor is exactly 8 bytes:
+//   bits [15: 0] = Attributes
+//     bit  0  VALID — 1 = descriptor is valid (always set for live entries)
+//     bit  1  END   — 1 = last descriptor in the table (controller stops)
+//     bit  2  INT   — 1 = raise ADMA-end interrupt when this entry finishes
+//     bits[5:4] ACT — 00 = nop, 10 = tran (data transfer), 11 = link (chain)
+//   bits [31:16] = Length in bytes (0 = 65536 per spec; we cap at 65535)
+//   bits [63:32] = Data Address (must be 4-byte aligned)
+//
+// Wire layout in memory (little-endian u64):
+//   `(addr << 32) | (length << 16) | attrs`
+//
+// Descriptor table itself must be 8-byte aligned (a page-aligned alloc
+// from the DMA pool satisfies this trivially).
+
+/// Descriptor is live. Set on every entry the controller should process.
+pub const ADMA2_ATTR_VALID: u16 = 1 << 0;
+/// Last descriptor in the chain. Controller raises ADMA-end and stops.
+pub const ADMA2_ATTR_END: u16   = 1 << 1;
+/// Generate interrupt when the controller finishes this descriptor.
+/// Unused in M6 sub-commit 2b (poll-based wait).
+pub const ADMA2_ATTR_INT: u16   = 1 << 2;
+/// ACT field value: transfer (`tran`). Single-descriptor data move.
+pub const ADMA2_ATTR_ACT_TRAN: u16 = 0b10 << 4;
+/// ACT field value: link to next descriptor table. Future multi-segment
+/// transfers; M6 sub-commit 2b uses one tran+end descriptor.
+pub const ADMA2_ATTR_ACT_LINK: u16 = 0b11 << 4;
+
+/// Build the 8-byte (one-`u64` LE) wire encoding for a single ADMA2 32-bit
+/// `tran+end` descriptor. Pure; no MMIO.
+///
+/// `buf_phys`: physical address of the data buffer. Must be 4-byte aligned
+/// and fit in 32 bits (asserted at debug; release silently truncates upper
+/// bits — caller's responsibility).
+///
+/// `length`: transfer size in bytes. Max 65535 per descriptor; the SDHCI
+/// spec quirk where length=0 means 65536 is not exercised here.
+pub const fn adma2_tran_end_descriptor(buf_phys: u32, length: u16) -> u64 {
+    let attrs: u16 = ADMA2_ATTR_VALID | ADMA2_ATTR_END | ADMA2_ATTR_ACT_TRAN;
+    ((buf_phys as u64) << 32) | ((length as u64) << 16) | (attrs as u64)
+}
+
+// ---------------------------------------------------------------------------
 // COMMAND_REG flag constants (offset 0x00e, low byte)
 // ---------------------------------------------------------------------------
 //
@@ -926,5 +1000,68 @@ mod tests {
         let flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA;
         let w = sd_command_word(SdCommand::WriteBlock.index(), flags);
         assert_eq!(w, (24u16 << 8) | 0x3A);
+    }
+
+    // ----- M6 sub-commit 2b — ADMA2 descriptor + DMA_SEL -----
+
+    #[test]
+    fn host_ctrl_dma_sel_encoding() {
+        // DMA_SEL field is bits [4:3] of HOST_CONTROL_1. ADMA2 32-bit = 0b10
+        // shifted to position 3 = 0b0001_0000 = 0x10. Mask covers both bits.
+        assert_eq!(SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32, 0x10);
+        assert_eq!(SDHCI_HOST_CTRL_DMA_SEL_MASK, 0x18);
+        // Setting ADMA2_32 doesn't bleed outside the mask.
+        assert_eq!(SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32 & !SDHCI_HOST_CTRL_DMA_SEL_MASK, 0);
+        // DMA_SEL doesn't collide with the 4-bit bus width bit (bit 1).
+        assert_eq!(SDHCI_HOST_CTRL_DMA_SEL_MASK & SDHCI_HOST_CTRL_DAT_4BIT, 0);
+    }
+
+    #[test]
+    fn adma_address_register_offset_pinned() {
+        // ADMA2 descriptor table address at 0x058. Distinct from
+        // SDHCI_SYSADDR / SDHCI_ARGUMENT2 (both at 0x000).
+        assert_eq!(SDHCI_ADMA_ADDRESS, 0x058);
+        assert_ne!(SDHCI_ADMA_ADDRESS, SDHCI_SYSADDR);
+        assert_ne!(SDHCI_ADMA_ADDRESS, SDHCI_ARGUMENT2);
+    }
+
+    #[test]
+    fn adma2_attr_bits_pinned() {
+        // Discrete-bit attributes occupy distinct bit positions.
+        assert_eq!(ADMA2_ATTR_VALID, 0x0001);
+        assert_eq!(ADMA2_ATTR_END,   0x0002);
+        assert_eq!(ADMA2_ATTR_INT,   0x0004);
+        // ACT field bits[5:4]: tran=10, link=11.
+        assert_eq!(ADMA2_ATTR_ACT_TRAN, 0b10_0000);
+        assert_eq!(ADMA2_ATTR_ACT_LINK, 0b11_0000);
+        // Discrete bits and ACT field don't overlap.
+        let discrete = ADMA2_ATTR_VALID | ADMA2_ATTR_END | ADMA2_ATTR_INT;
+        let act = ADMA2_ATTR_ACT_TRAN | ADMA2_ATTR_ACT_LINK;
+        assert_eq!(discrete & act, 0);
+    }
+
+    #[test]
+    fn adma2_tran_end_descriptor_layout() {
+        // Spec wire layout: bits[63:32]=addr, [31:16]=length, [15:0]=attrs.
+        // Single-block 512-byte read at buf_phys=0xDEAD_B000 →
+        //   attrs = VALID|END|ACT_TRAN = 0x01 | 0x02 | 0x20 = 0x23
+        //   length = 0x0200
+        //   addr   = 0xDEAD_B000
+        // word = (0xDEAD_B000 << 32) | (0x0200 << 16) | 0x23
+        //      = 0xDEAD_B000_0200_0023
+        let d = adma2_tran_end_descriptor(0xDEAD_B000, 512);
+        assert_eq!(d, 0xDEAD_B000_0200_0023);
+        // Round-trip extraction.
+        assert_eq!((d & 0xFFFF) as u16, 0x0023);
+        assert_eq!(((d >> 16) & 0xFFFF) as u16, 512);
+        assert_eq!((d >> 32) as u32, 0xDEAD_B000);
+    }
+
+    #[test]
+    fn adma2_tran_end_descriptor_max_length() {
+        // Length field is 16-bit; max non-zero descriptor length is 65535.
+        // (Spec quirk: length=0 means 65536 — not used here.)
+        let d = adma2_tran_end_descriptor(0x1000, 65535);
+        assert_eq!(((d >> 16) & 0xFFFF) as u16, 65535);
     }
 }
