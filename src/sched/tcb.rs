@@ -16,8 +16,8 @@ pub use lockjaw_types::thread::{KernelStackBase, Tcb, TcbCreateInfo, ThreadBoots
 /// # Safety
 /// `base_kva` must be a KVM-allocated page. `info.stack` must be a
 /// `KernelStackBase::Pool(KernelVa)` for dynamically-allocated stacks
-/// (the only kind that goes through this constructor; idle/boot
-/// threads use `create_idle_tcb` with `KernelStackBase::Image`).
+/// (the only kind that goes through this constructor; the CPU 0
+/// boot TCB uses `create_boot_tcb` with `KernelStackBase::Image`).
 pub unsafe fn create_tcb(
     info: &TcbCreateInfo,
     base_kva: KernelVa,
@@ -26,7 +26,7 @@ pub unsafe fn create_tcb(
         KernelStackBase::Pool(kva) => kva,
         KernelStackBase::Image(_) => {
             // create_tcb requires a Pool stack — Image stacks belong
-            // to idle/boot threads which use create_idle_tcb.
+            // to the CPU 0 boot TCB which uses create_boot_tcb.
             return Err(CreateError::InvalidParameter);
         }
     };

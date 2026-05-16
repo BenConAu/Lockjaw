@@ -652,16 +652,16 @@ pub extern "C" fn kmain() -> ! {
         // gets its own user process (created later in the ELF loading path).
         // For now it belongs to the kernel process.
         // SAFETY: linker symbol — post-pivot, &__symbol gives higher-half VA directly
-        let idle_stack_base = lockjaw_types::addr::KernelImageVa::new(
+        let boot_stack_base = lockjaw_types::addr::KernelImageVa::new(
             &__stack_bottom as *const u8 as u64,
         );
         cap::process_obj::process_inc_thread_count(kernel_proc_kva);
 
-        let idle_tcb_page = create_idle_tcb(
-            idle_stack_base, kernel_proc_kva, *b"init\0\0\0\0\0\0\0\0\0\0\0\0",
+        let boot_tcb_page = create_boot_tcb(
+            boot_stack_base, kernel_proc_kva, *b"init\0\0\0\0\0\0\0\0\0\0\0\0",
         );
 
-        sched::scheduler::add_thread(idle_tcb_page);  // index 0: idle/boot (CPU 0)
+        sched::scheduler::add_thread(boot_tcb_page);  // index 0: CPU 0 boot TCB (becomes init)
         sched::scheduler::add_thread(tcb_a_kva);      // index 1: thread A
         sched::scheduler::add_thread(tcb_b_kva);      // index 2: thread B
 
@@ -931,47 +931,48 @@ fn ipc_receiver() -> ! {
     }
 }
 
-/// Create a TCB for an idle/boot thread using a linker-provided boot stack.
-/// Unlike create_tcb(), this does NOT set up a SavedContext or canary —
-/// idle threads are the initial thread on each CPU and start running
-/// directly, not via context_switch.
+/// Create the CPU 0 boot TCB using the linker-provided boot stack.
 ///
-/// Takes the stack base as `KernelImageVa` because boot stacks are
-/// reserved in the kernel image (linker symbols `__stack_bottom_*`),
-/// not allocated from the KVM pool. The regime distinction is
-/// preserved through Tcb.stack_base so finish_exit refuses to free
-/// an idle thread's stack.
-unsafe fn create_idle_tcb(
+/// Unlike create_tcb(), this does NOT set up a SavedContext or canary.
+/// CPU 0 is already running on this stack at boot; it never enters the
+/// TCB via context_switch (saved_sp stays 0). The TCB is later re-pointed
+/// (process_kva ← init's process) and CPU 0 drops directly to EL0 as
+/// init's first thread via drop_to_el0_with_ttbr0.
+///
+/// Takes the stack base as `KernelImageVa` because the boot stack is
+/// reserved in the kernel image (linker symbol `__stack_bottom`), not
+/// allocated from the KVM pool. The regime distinction is preserved
+/// through Tcb.stack_base so finish_exit refuses to free the boot stack.
+unsafe fn create_boot_tcb(
     stack_image_va: lockjaw_types::addr::KernelImageVa,
     process_kva: lockjaw_types::addr::KernelVa,
     name: [u8; 16],
 ) -> lockjaw_types::addr::KernelVa {
-    let tcb_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("idle tcb kvm alloc")).kva;
+    let tcb_kva = mm::kvm::alloc_kernel_pages(1).unwrap_or_else(|_| panic!("boot tcb kvm alloc")).kva;
     // Zero the TCB page (KVM allocator hands back uninitialized backing).
     {
         let mut p = mm::kernel_ptr::KernelMut::<u8>::from_kva(tcb_kva);
         core::ptr::write_bytes(p.as_mut_ptr(), 0, mm::addr::PAGE_SIZE as usize);
     }
     let mut tcb_km = mm::kernel_ptr::KernelMut::<sched::tcb::Tcb>::from_kva(tcb_kva);
-    // Idle TCBs don't use create_tcb() because they start directly
-    // (no synthetic SavedContext on a separate stack page). Initialize
-    // in place — no by-value Tcb on the kernel stack.
+    // No synthetic SavedContext: nothing context-switches INTO this
+    // TCB. The Tcb.entry field is required by init_in_place but its
+    // unreachable placeholder will panic loudly if a bug ever causes
+    // thread_entry to fire on this TCB.
     let p = tcb_km.as_mut_ptr();
-    sched::tcb::Tcb::init_in_place(p, idle_thread);
+    sched::tcb::Tcb::init_in_place(p, boot_tcb_entry_unreachable);
     (*p).stack_base = lockjaw_types::thread::KernelStackBase::Image(stack_image_va);
     (*p).process_kva = process_kva.as_u64();
     (*p).name = name;
     tcb_kva
 }
 
-fn idle_thread() -> ! {
-    // Release GKL inherited from thread_entry. Idle thread touches no
-    // shared state — just wfi. Timer ticks acquire GKL in the handler.
-    sched::gkl::gkl_unlock();
-    unsafe { core::arch::asm!("msr DAIFClr, #2"); } // Unmask IRQs
-    loop {
-        unsafe { core::arch::asm!("wfi") };
-    }
+/// Placeholder for the CPU 0 boot TCB's `entry` slot. This must never
+/// execute: the boot TCB has no synthetic SavedContext, so `thread_entry`
+/// is unreachable for it. CPU 0 transitions into init via direct
+/// drop_to_el0_with_ttbr0 from kernel_main, not via context_switch.
+fn boot_tcb_entry_unreachable() -> ! {
+    panic!("boot TCB entry executed — process_kva re-point + drop_to_el0 path was bypassed");
 }
 
 // ---------------------------------------------------------------------------

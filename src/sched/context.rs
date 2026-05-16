@@ -59,8 +59,9 @@ thread_entry:
     // handler that context-switched to us). Each entry function manages
     // its own transition:
     //   - process_entry: releases GKL, drops to EL0 (eret unmasks IRQs)
-    //   - idle_thread: releases GKL, unmasks IRQs, wfi loop
     //   - kernel threads: run under GKL with IRQs masked (cooperative)
+    // The CPU 0 boot TCB never reaches here (no synthetic SavedContext);
+    // secondary CPUs have no TCB (park in scheduler::idle_wait instead).
     blr     x19                          // Call the entry function via fn pointer in x19
     // entry function is fn() -> ! so we should never reach here
 .Lthread_halt:

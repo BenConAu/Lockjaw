@@ -26,9 +26,10 @@ use crate::wait::MAX_WAIT_OBJECTS;
 /// tagged with which VA regime owns the backing.
 ///
 /// The two regimes have different lifecycles:
-/// - `Image`: the boot stack reserved by the linker (`__stack_bottom_N`
-///   etc.). Lives for the kernel's lifetime. Idle / boot threads use
-///   this — the page is part of the kernel image and is never freed.
+/// - `Image`: the boot stack reserved by the linker (`__stack_bottom`).
+///   Lives for the kernel's lifetime. Only the CPU 0 boot TCB (becomes
+///   init) uses this — the page is part of the kernel image and is
+///   never freed.
 /// - `Pool`: a 4 KB page allocated from the KVM pool by the kernel
 ///   stack allocator. Freed via `kvm::free_kernel_pages` when the
 ///   thread exits.
@@ -139,7 +140,7 @@ pub struct Tcb {
     pub saved_sp: u64,
     pub entry: fn() -> !,
     /// Kernel stack base, regime-tagged. `Image` = boot stack from
-    /// the linker (idle threads); `Pool` = KVM-allocated dynamic
+    /// the linker (CPU 0 boot TCB only); `Pool` = KVM-allocated dynamic
     /// stack (everything else). `finish_exit` matches on this so
     /// the wrong free path is unrepresentable.
     pub stack_base: KernelStackBase,

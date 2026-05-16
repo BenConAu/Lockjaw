@@ -22,8 +22,10 @@
 ///            → resumed thread unlocks. 1:1 across threads.
 ///   Path 4 — Thread first run: thread_entry inherits lock+masked →
 ///            entry fn decides: process_entry unlocks before eret,
-///            idle_thread unlocks+unmasks before wfi, kernel threads
-///            run under lock until they block.
+///            kernel threads run under lock until they block. CPU 0's
+///            boot TCB never executes its entry fn (becomes init via
+///            process_kva re-point + direct drop_to_el0); secondary
+///            CPUs hold no TCB at all (see Path 5).
 ///   Path 5 — Idle CPU timer preemption (scheduler-refactor Stage 2+,
 ///            currently dead-code): CPU is parked in `idle_wait` with
 ///            no current thread (NO GKL held, IRQs unmasked). IRQ →

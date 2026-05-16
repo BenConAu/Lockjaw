@@ -146,10 +146,10 @@ pub static SCHEDULER: Scheduler = Scheduler::new();
 
 /// Register a thread in the run queue.
 ///
-/// The first thread registered (index 0) is the idle/boot thread — its
-/// saved_sp will be filled on the first context switch away from it, and
-/// its state is marked Running (since it's already executing).
-/// Subsequent threads are added as Ready.
+/// The first thread registered (index 0) is the CPU 0 boot TCB
+/// (later becomes init) — its saved_sp will be filled on the first
+/// context switch away from it, and its state is marked Running
+/// (since it's already executing). Subsequent threads are added as Ready.
 /// Returns `false` if the run queue is full (every `MAX_THREADS`
 /// slot occupied). Caller maps to `SyscallError::QUEUE_FULL`, not
 /// OUT_OF_MEMORY — exhaustion of the scheduler's slot table is a
@@ -639,9 +639,10 @@ fn finish_exit() {
     // Step 3: Free per-thread resources (kernel stack, TCB).
     // Stack regime determines the free path:
     // - Pool: KVM-allocated dynamic stack — free via kvm.
-    // - Image: linker-reserved boot stack — never freed (idle threads
-    //   are immortal). Reaching this branch means an idle thread
-    //   somehow exited; that's an invariant violation.
+    // - Image: linker-reserved boot stack — never freed (only the
+    //   CPU 0 boot TCB uses Image and it becomes init; exiting init
+    //   would mean exiting the kernel). Reaching this branch is an
+    //   invariant violation.
     // SAFETY: stack and tcb pages came from prior allocations at
     // thread create time; finish_exit holds the GKL and no live
     // references into either page exist by this point.
@@ -649,7 +650,7 @@ fn finish_exit() {
     let stack_kva = match stack_base {
         KernelStackBase::Pool(kva) => kva,
         KernelStackBase::Image(_) => {
-            panic!("finish_exit: idle/boot thread exited (Image-region stack)");
+            panic!("finish_exit: boot TCB exited (Image-region stack must not be freed)");
         }
     };
     unsafe {
