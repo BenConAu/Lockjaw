@@ -778,6 +778,24 @@ unsafe fn schedule(reason: SchedReason) {
         }
     };
 
+    // M6 perf diagnostic: log every SwitchTo to identify which thread
+    // is stealing CPU from a busy-poll workload (emmc2 ADMA2 measurement
+    // showed ~10 ms slack per tick — codex hypothesis is "some thread
+    // is semantically idle but staying Ready"). Logs from-idx and to-idx
+    // on every actual context switch (StayOnCurrent / WaitForInterrupt
+    // are NOT logged — too noisy and not useful for this question).
+    // Remove or feature-gate once the misbehaving thread is identified.
+    {
+        crate::kprintln!(
+            "[SCHED] from=", old_idx, " to=", next_idx, " reason=",
+            match reason {
+                SchedReason::Preempt => "P",
+                SchedReason::Block => "B",
+                SchedReason::Exit => "E",
+            }
+        );
+    }
+
     let new_paddr = (*SCHEDULER.threads_ptr())[next_idx].unwrap();
     let new_tcb = KernelMut::<Tcb>::from_kva(new_paddr);
 
