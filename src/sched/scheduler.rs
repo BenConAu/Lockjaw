@@ -64,6 +64,33 @@ static PENDING_EXITS: PendingExitSlots = PendingExitSlots(UnsafeCell::new(
     [None, None, None, None]
 ));
 
+/// Per-CPU scratch slot for `context_switch`'s `old_sp_ptr` argument when
+/// an idle CPU (no current TCB to save into) switches into a thread via
+/// `schedule_from_idle`.
+///
+/// **Write-only by contract.** The asm in
+/// [`crate::sched::context::context_switch`] stores to `*old_sp_ptr`
+/// then loads from `*new_sp_ptr`; it never reads the old slot back, and
+/// has no failure path that "returns to the old SP." So `IDLE_SP[cpu]`
+/// captures the abandoned IRQ-frame SP for that one switch and is never
+/// resumed-into.
+///
+/// On the next entry into `idle_wait` (after the picked thread blocks
+/// or exits and yields the CPU again), the path goes:
+/// IRQ → SAVE_REGS on boot stack (SP_EL1 = boot stack top) → gkl_lock
+/// → tick → schedule_from_idle. The fresh boot-stack SP overwrites
+/// the orphaned frame; one frame (~256 bytes ExceptionContext) of
+/// unrecoverable boot-stack space per idle-wake. Per-CPU guard pages
+/// catch pathological growth.
+///
+/// See `src/sched/gkl.rs` Path 5 for the GKL transfer reasoning.
+struct IdleSpSlots(UnsafeCell<[u64; MAX_CPUS]>);
+/// SAFETY: per-CPU indexed slot, GKL held during all access. Write-only:
+/// callers must never read these back (see contract above).
+unsafe impl Sync for IdleSpSlots {}
+
+static IDLE_SP: IdleSpSlots = IdleSpSlots(UnsafeCell::new([0; MAX_CPUS]));
+
 // ---------------------------------------------------------------------------
 // Scheduler singleton — wraps all mutable globals behind safe methods
 // ---------------------------------------------------------------------------
@@ -870,5 +897,108 @@ fn check_thread_canary(tcb: &Tcb) {
         KPrint::kprint(&Addr(value));
         uart.puts("\n");
         panic!("thread stack canary corrupted");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler-refactor Stage 2: idle-CPU primitives (dead code, no callers yet)
+// ---------------------------------------------------------------------------
+//
+// These primitives let the kernel handle a CPU with no current thread:
+// the CPU parks in `idle_wait` (kernel-owned wfi loop on its boot stack)
+// and the tick handler calls `schedule_from_idle` to pick up work via
+// the pure model's `step_from_idle`. Stage 3 wires the live callers.
+
+/// Schedule from an idle CPU — counterpart to `schedule()` for the case
+/// where `current_per_cpu[cpu_id]` is `None`.
+///
+/// Drains any pending exit on this CPU (no-op when idle, since
+/// `PendingExitSlots` requires a Running current to be populated — see
+/// the bootstrap-only-safety note on `finish_exit`), then calls
+/// `step_from_idle` to pick a Ready thread. If one is found, performs
+/// the TTBR0 swap (if the new thread's process is non-kernel) and
+/// `context_switch`es into it via `IDLE_SP[cpu_id]` as the save-side
+/// pointer. If no Ready thread exists, returns (caller re-enters wfi).
+///
+/// # Safety
+/// GKL must be held. Must be called only when this CPU has no current
+/// thread (idle). Asserts.
+#[allow(dead_code)] // Wired live in Stage 3.
+unsafe fn schedule_from_idle(cpu_id: usize) {
+    // Drain any pending exit first — matches the schedule() prologue
+    // ordering. No-op on idle CPU today (see `finish_exit` note).
+    finish_exit();
+
+    let state = &mut *SCHEDULER.state_ptr();
+    assert!(
+        state.try_current_for(cpu_id).is_none(),
+        "schedule_from_idle: CPU {} already has a current thread — use schedule() instead",
+        cpu_id
+    );
+
+    let decision = match state.step_from_idle(cpu_id) {
+        Some(d) => d,
+        None => return, // No work — caller re-enters idle_wait's wfi.
+    };
+
+    let next_idx = match decision {
+        SchedDecision::SwitchTo(idx) => idx,
+        // `step_from_idle` only returns SwitchTo or None today; any
+        // other variant is a model bug.
+        _ => unreachable!("step_from_idle returned non-SwitchTo decision"),
+    };
+
+    let new_paddr = (*SCHEDULER.threads_ptr())[next_idx].unwrap();
+    let new_tcb = KernelMut::<Tcb>::from_kva(new_paddr);
+
+    // TTBR0 swap. No old process to compare against — always swap when
+    // the new thread's process is non-kernel.
+    let new_process = new_tcb.get().process_kva;
+    let new_ttbr0 = crate::cap::process_obj::process_ttbr0(
+        lockjaw_types::addr::KernelVa::new(new_process),
+    );
+    if new_ttbr0 != 0 {
+        TTBR0_WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
+        core::arch::asm!(
+            "msr TTBR0_EL1, {val}",
+            "dsb ish",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            val = in(reg) new_ttbr0,
+        );
+    }
+
+    CONTEXT_SWITCH_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // SAFETY: IDLE_SP[cpu_id] is per-CPU scratch (see IdleSpSlots doc);
+    // GKL held. The store is the only access — never read back.
+    let old_sp_ptr = (IDLE_SP.0.get() as *mut u64).add(cpu_id);
+    // SAFETY: new_tcb is live; shared field reference.
+    let new_sp_ptr = &new_tcb.get().saved_sp as *const u64;
+    context_switch(old_sp_ptr, new_sp_ptr);
+}
+
+/// Park this CPU in a kernel-owned wfi loop. The CPU has no current
+/// thread (`current_per_cpu[cpu_id] == None`); ticks will eventually
+/// pick up work via `schedule_from_idle`.
+///
+/// Caller must NOT hold the GKL — wfi blocks IRQ delivery if DAIF.I is
+/// set, and even with IRQs unmasked, holding the GKL across wfi would
+/// deadlock the next tick (which acquires GKL on entry). Secondaries
+/// boot fresh from PSCI without the GKL; this is the only legal caller
+/// today.
+///
+/// # Safety
+/// GKL must NOT be held. IRQs must be in any state — this unmasks them.
+#[allow(dead_code)] // Wired live in Stage 3.
+fn idle_wait(_cpu_id: usize) -> ! {
+    // SAFETY: unmasking IRQs is required for the wfi loop to be
+    // interruptible. The caller's contract is "no GKL held."
+    unsafe { core::arch::asm!("msr DAIFClr, #2") };
+    loop {
+        // SAFETY: wfi is a hint instruction; safe in any context with
+        // IRQs unmasked.
+        unsafe { core::arch::asm!("wfi") };
     }
 }

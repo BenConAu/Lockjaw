@@ -117,6 +117,30 @@ where
     }
 }
 
+/// Selector for a CPU that has no current thread (idle CPU, no current
+/// to demote / preempt). Returns the index of the first thread reported
+/// as `Ready`, or `None` if no thread is runnable.
+///
+/// Unlike `select_next`, there is no `current` to rotate from; this scan
+/// starts at 0 and goes monotonically. The caller is responsible for
+/// the "Running on another CPU" predicate — typically by treating those
+/// threads as `Blocked` in the closure (same trick `decide` uses with
+/// `select_next`).
+///
+/// Used by the scheduler-refactor's `schedule_from_idle` path. Pure;
+/// host-tested.
+pub fn select_for_idle_cpu<F>(thread_count: usize, get_state: F) -> Option<usize>
+where
+    F: Fn(usize) -> SchedThreadState,
+{
+    for i in 0..thread_count {
+        if get_state(i) == SchedThreadState::Ready {
+            return Some(i);
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // State transitions (the model owns these)
 // ---------------------------------------------------------------------------
@@ -497,6 +521,47 @@ impl SchedState {
         self.states[thread_idx] = Some(SchedThreadState::Running);
         self.current_per_cpu[cpu_id] = Some(thread_idx);
     }
+
+    /// Step the scheduler from an idle CPU (no current thread).
+    ///
+    /// Counterpart to `step` for the case where `current_per_cpu[cpu_id]`
+    /// is `None`. Searches for a Ready thread not currently Running on any
+    /// CPU; if found, transitions it to Running and assigns it as this
+    /// CPU's current. Returns `Some(SwitchTo(idx))` for the caller to
+    /// context-switch into, or `None` if no Ready thread exists (caller
+    /// re-enters WFI).
+    ///
+    /// Asserts the CPU has no current on entry (use `step` if it does)
+    /// and that `check_invariants()` holds on exit.
+    ///
+    /// The `Running`-on-another-CPU predicate is folded into the closure
+    /// passed to `select_for_idle_cpu`: those threads are treated as
+    /// unavailable (Blocked) for selection.
+    pub fn step_from_idle(&mut self, cpu_id: usize) -> Option<SchedDecision> {
+        assert!(
+            self.current_per_cpu[cpu_id].is_none(),
+            "step_from_idle: CPU {} already has a current thread", cpu_id
+        );
+        let picked = select_for_idle_cpu(MAX_THREADS, |i| {
+            let state = self.get(i).unwrap_or(SchedThreadState::Blocked);
+            // Hide threads that are Running on some other CPU — they
+            // cannot be selected here. (We have no `current` to compare
+            // against, so any Running thread is "on another CPU".)
+            if state == SchedThreadState::Running {
+                return SchedThreadState::Blocked;
+            }
+            state
+        });
+        let next_idx = match picked {
+            Some(idx) => idx,
+            None => return None,
+        };
+        self.states[next_idx] = Some(SchedThreadState::Running);
+        self.current_per_cpu[cpu_id] = Some(next_idx);
+        debug_assert!(self.check_invariants(),
+            "scheduler invariants violated after step_from_idle");
+        Some(SchedDecision::SwitchTo(next_idx))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +647,97 @@ mod tests {
         let idx = s.add_thread().unwrap();
         s.set_initial_current(1, idx);
         assert_eq!(s.try_current_for(1), Some(idx));
+    }
+
+    // --- Idle-CPU selector tests (scheduler refactor Stage 2) ---
+
+    #[test]
+    fn select_for_idle_cpu_returns_first_ready() {
+        // Linear scan from 0; first Ready wins. No rotation, no
+        // current-skip — distinct from select_next.
+        let states = [
+            SchedThreadState::Blocked,
+            SchedThreadState::Ready,
+            SchedThreadState::Ready,
+        ];
+        assert_eq!(select_for_idle_cpu(3, |i| states[i]), Some(1));
+    }
+
+    #[test]
+    fn select_for_idle_cpu_none_when_nothing_ready() {
+        // All threads either Blocked or Running on other CPUs (caller's
+        // closure maps those to Blocked). select returns None; caller
+        // re-enters wfi.
+        let states = [
+            SchedThreadState::Blocked,
+            SchedThreadState::Blocked,
+            SchedThreadState::Blocked,
+        ];
+        assert_eq!(select_for_idle_cpu(3, |i| states[i]), None);
+    }
+
+    #[test]
+    fn select_for_idle_cpu_skips_running_via_predicate() {
+        // The selector itself doesn't filter Running — the caller
+        // does, by mapping Running-on-another-CPU to Blocked in the
+        // closure. Mirror that pattern here.
+        let raw = [
+            SchedThreadState::Running, // running on another CPU
+            SchedThreadState::Ready,
+        ];
+        let picked = select_for_idle_cpu(2, |i| match raw[i] {
+            SchedThreadState::Running => SchedThreadState::Blocked,
+            other => other,
+        });
+        assert_eq!(picked, Some(1));
+    }
+
+    #[test]
+    fn step_from_idle_transitions_to_running() {
+        // Set up: CPU 0 has a Running thread (idx 0, from `new()`),
+        // add a Ready thread (idx 1). CPU 1 has no current. step_from_idle
+        // on CPU 1 picks idx 1 (the Ready one), transitions it to
+        // Running, and assigns it as CPU 1's current.
+        let mut s = SchedState::new();
+        let idx = s.add_thread().unwrap();
+        assert_eq!(s.try_current_for(1), None);
+        let decision = s.step_from_idle(1);
+        assert_eq!(decision, Some(SchedDecision::SwitchTo(idx)));
+        assert_eq!(s.get(idx), Some(SchedThreadState::Running));
+        assert_eq!(s.try_current_for(1), Some(idx));
+        assert!(s.check_invariants());
+    }
+
+    #[test]
+    fn step_from_idle_returns_none_when_no_ready() {
+        // CPU 0's thread is Running; no other Ready threads exist.
+        // step_from_idle on CPU 1 finds nothing to pick.
+        let mut s = SchedState::new();
+        // Add a thread then immediately block it so it's not Ready.
+        let idx = s.add_thread().unwrap();
+        s.states[idx] = Some(SchedThreadState::Blocked);
+        assert_eq!(s.step_from_idle(1), None);
+        assert_eq!(s.try_current_for(1), None);
+    }
+
+    #[test]
+    fn step_from_idle_hides_running_on_other_cpu() {
+        // CPU 0's current (idx 0) is Running. step_from_idle on CPU 1
+        // must NOT select it (would be a multi-CPU invariant violation).
+        let mut s = SchedState::new();
+        assert_eq!(s.get(0), Some(SchedThreadState::Running));
+        // No other thread exists → step_from_idle returns None.
+        assert_eq!(s.step_from_idle(1), None);
+        assert_eq!(s.try_current_for(1), None);
+        assert_eq!(s.get(0), Some(SchedThreadState::Running)); // unchanged
+    }
+
+    #[test]
+    #[should_panic(expected = "already has a current thread")]
+    fn step_from_idle_panics_when_cpu_has_current() {
+        // Precondition: CPU must have no current. Asserts.
+        let mut s = SchedState::new();
+        let _ = s.step_from_idle(0); // CPU 0 has current → panic
     }
 
     #[test]

@@ -24,6 +24,17 @@
 ///            entry fn decides: process_entry unlocks before eret,
 ///            idle_thread unlocks+unmasks before wfi, kernel threads
 ///            run under lock until they block.
+///   Path 5 — Idle CPU timer preemption (scheduler-refactor Stage 2+,
+///            currently dead-code): CPU is parked in `idle_wait` with
+///            no current thread (NO GKL held, IRQs unmasked). IRQ →
+///            SAVE_REGS on boot stack → gkl_lock → tick →
+///            schedule_from_idle → context_switch into picked thread
+///            → resumed thread unlocks. The abandoned IRQ frame on the
+///            boot stack (~256 bytes ExceptionContext) is never popped;
+///            next entry into idle_wait starts from a fresh boot-stack
+///            SP set by the IRQ entry path, overwriting it. Worst-case
+///            unrecoverable boot-stack usage: one frame. Per-CPU guard
+///            pages catch real overflow.
 
 use lockjaw_types::ticket_lock::TicketLock;
 
