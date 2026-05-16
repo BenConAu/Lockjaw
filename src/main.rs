@@ -269,6 +269,15 @@ pub extern "C" fn kmain() -> ! {
         arch::aarch64::mmu::setup_guard_pages(&guard_pages);
         kprintln!("Guard pages active (unmapped).");
 
+        // M6: exclude the DMA pool's 2 MiB L2 block from the kernel
+        // TTBR1 direct map. Closes the speculative-cache-fill side
+        // of the mixed-attribute alias bug for NormalNonCacheable
+        // mappings (Tier 3 #13 / docs/m6-subcommit-2-plan.md).
+        // No-op if pool init was skipped on tight-RAM platforms.
+        arch::aarch64::mmu::exclude_dma_pool_from_direct_map(
+            cap::dma_pool::base_phys(),
+        );
+
         mm::stack::init_canary();
     }
     mm::stack::check_canary();

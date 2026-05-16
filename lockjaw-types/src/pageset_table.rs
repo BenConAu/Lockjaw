@@ -26,14 +26,20 @@ pub const MAX_PRACTICAL_PAGES_PER_SET: usize = 16_384;
 /// permitted (DmaPool pages can ONLY be mapped `NormalNonCacheable`;
 /// Buddy pages cannot be mapped that way).
 ///
-/// `Buddy = 0` so a zero-initialised header (the default for any
-/// freshly-allocated kernel page) reads as Buddy without explicit init.
-/// Any pre-M6 PageSet path that doesn't explicitly set origin gets
-/// Buddy semantics, preserving behaviour during the M6 migration.
+/// **Discriminant 0 is intentionally NOT a variant.** A zero-initialised
+/// header (the default for any freshly-allocated kernel page) reads as
+/// `0u64` in the origin field, which is NOT a valid `PageSetOrigin`.
+/// Any code path that fails to explicitly write origin before exposing
+/// the header observes an invalid discriminant — caught by the kernel's
+/// header read path which goes through `from_raw` to validate.
+///
+/// This makes "forgot to initialise origin" surface as a typed error
+/// instead of silently defaulting to Buddy (which would mis-classify a
+/// DmaPool page as cacheable-safe and reintroduce the alias bug).
 ///
 /// `#[repr(u64)]` makes the field 8-byte aligned so `PageSetHeader`
 /// keeps the trailing-`pages[]`-array u64 alignment without explicit
-/// padding (see the `pageset_header_size_pinned` test).
+/// padding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub enum PageSetOrigin {
@@ -41,12 +47,28 @@ pub enum PageSetOrigin {
     /// `Normal` (and `Device` for MMIO claims that are wrapped in
     /// PageSet form). NC mapping rejected — would create the
     /// mixed-attribute alias with the kernel direct map.
-    Buddy = 0,
+    Buddy = 1,
     /// Pages came from the DMA pool — physically reserved at boot,
     /// excluded from the kernel direct map, never re-mapped cacheable
     /// anywhere. Mapping policy: `NormalNonCacheable` only. Cacheable
     /// `Normal` rejected. Donation as kernel object rejected.
-    DmaPool = 1,
+    DmaPool = 2,
+}
+
+impl PageSetOrigin {
+    /// Decode a raw u64 from the page-resident header. Returns `None`
+    /// for the all-zero "uninitialised" discriminant or any unknown
+    /// value — kernel callers map this to `INVALID_PARAMETER` /
+    /// `UNKNOWN` per their context. A `None` result indicates a
+    /// PageSet whose origin was never explicitly written: a bug at
+    /// the alloc site, not a runtime condition.
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Buddy),
+            2 => Some(Self::DmaPool),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -87,13 +109,15 @@ pub struct PageSetHeader {
     /// sys_map_pages, decremented by sys_unmap_pages. Pages are freed
     /// when both refcount and map_count reach zero.
     pub map_count: u32,
-    /// Allocator-of-origin for the data pages. Determines free path
-    /// (buddy vs DMA pool) and mapping-attribute policy. Read by every
-    /// kernel path that would map this PageSet's pages (sys_map_pages,
-    /// KVM remap, kernel-object donation, create_process). u64-tagged
-    /// so the struct stays naturally aligned for the trailing pages[]
-    /// u64 array.
-    pub origin: PageSetOrigin,
+    /// Allocator-of-origin for the data pages, stored as raw u64
+    /// (NOT the typed enum). Reading a typed enum from possibly-
+    /// uninitialised memory is UB; storing raw and decoding via
+    /// `origin()` -> `Option<PageSetOrigin>` keeps Tier 3 #13's
+    /// "zero-init read is observably invalid" guarantee live at the
+    /// type-system layer instead of relying on convention. Direct
+    /// field access is `pub` only so the alloc paths can write it;
+    /// readers MUST go through the accessor.
+    pub origin_raw: u64,
     // pages[]: `count` u64 values starting at byte offset 24, possibly
     // spanning into subsequent header pages. Accessed only via
     // get_page / set_page which compute the byte offset.
@@ -114,18 +138,29 @@ pub const fn header_pages_for(count: usize) -> usize {
 
 impl PageSetHeader {
     /// An empty header — a 24-byte stack value with zero data pages
-    /// and `header_pages = 1`. Safe regardless of where it lives:
-    /// `BackedHeader` / `BackedHeaderMut` are the only way to access
-    /// the page-addr array, and they require an unsafe construction
-    /// that would have to forge a backing-pages witness.
-    pub const fn empty() -> Self {
+    /// and `header_pages = 1`. Required `origin` parameter: there is
+    /// no default origin; the caller must commit. Safe regardless of
+    /// where it lives: `BackedHeader` / `BackedHeaderMut` are the
+    /// only way to access the page-addr array, and they require an
+    /// unsafe construction that would have to forge a backing-pages
+    /// witness.
+    pub const fn empty(origin: PageSetOrigin) -> Self {
         Self {
             count: 0,
             header_pages: 1,
             refcount: 0,
             map_count: 0,
-            origin: PageSetOrigin::Buddy,
+            origin_raw: origin as u64,
         }
+    }
+
+    /// Decode the stored origin via `PageSetOrigin::from_raw`. Returns
+    /// `None` if the page-resident header was never initialised (raw=0
+    /// is observably invalid by Tier 3 #13) or carries an unknown
+    /// discriminant. Callers MUST go through this accessor — direct
+    /// `header.origin_raw` reads bypass the explicit-init guarantee.
+    pub fn origin(&self) -> Option<PageSetOrigin> {
+        PageSetOrigin::from_raw(self.origin_raw)
     }
 
     /// Number of data pages.
@@ -331,8 +366,8 @@ impl<'a> BackedHeaderMut<'a> {
     /// Asserts `header_pages_for(page_addrs.len()) <= backing_pages` —
     /// calling with more pages than the wrapper was constructed for
     /// would write past the backing.
-    pub fn init(&mut self, page_addrs: &[u64]) {
-        self.set_count(page_addrs.len());
+    pub fn init(&mut self, page_addrs: &[u64], origin: PageSetOrigin) {
+        self.set_count(page_addrs.len(), origin);
         self.header.refcount = 0;
         self.header.map_count = 0;
         for (i, addr) in page_addrs.iter().enumerate() {
@@ -340,10 +375,18 @@ impl<'a> BackedHeaderMut<'a> {
         }
     }
 
-    /// Update count: writes `header.count` and `header.header_pages`
-    /// AND updates the wrapper's tracked `self.count`. Asserts the
-    /// new count fits within the backing established at construction.
-    pub fn set_count(&mut self, count: usize) {
+    /// Initialise count, header_pages, and origin atomically. Required
+    /// signature: explicit `origin` parameter means every caller must
+    /// commit to which allocator owns the data pages before exposing
+    /// the header. There is no zero-default for origin — the variant
+    /// discriminants start at 1, so a zero-init header field reads as
+    /// an invalid discriminant. This forces "forgot to set origin" to
+    /// surface as a typed error in the kernel's header-read path
+    /// rather than silently behaving as Buddy.
+    ///
+    /// Asserts the new count fits within the backing established at
+    /// construction.
+    pub fn set_count(&mut self, count: usize, origin: PageSetOrigin) {
         let needed = header_pages_for(count);
         assert!(
             needed <= self.backing_pages,
@@ -353,6 +396,7 @@ impl<'a> BackedHeaderMut<'a> {
         );
         self.header.count = count as u32;
         self.header.header_pages = needed as u32;
+        self.header.origin_raw = origin as u64;
         self.count = count;
     }
 
@@ -718,12 +762,12 @@ mod tests {
 
     #[test]
     fn header_empty() {
-        // PageSetHeader::empty() is a stack value with count=0. Inline
+        // PageSetHeader::empty(PageSetOrigin::Buddy) is a stack value with count=0. Inline
         // accessors (data_page_count, header_page_count) are safe to
         // call directly; page-addr accessors are not reachable without
         // an unsafe `backed` construction (which a sound caller cannot
         // perform on a 16-byte stack value).
-        let h = PageSetHeader::empty();
+        let h = PageSetHeader::empty(PageSetOrigin::Buddy);
         assert_eq!(h.data_page_count(), 0);
         assert_eq!(h.header_page_count(), 1);
     }
@@ -731,7 +775,7 @@ mod tests {
     #[test]
     fn header_init_and_get() {
         let mut t = TestHeader::new(3);
-        t.backed_mut().init(&[0x1000, 0x2000, 0x3000]);
+        t.backed_mut().init(&[0x1000, 0x2000, 0x3000], PageSetOrigin::Buddy);
         let b = t.backed();
         assert_eq!(b.data_page_count(), 3);
         assert_eq!(b.get_page(0), Some(0x1000));
@@ -743,7 +787,7 @@ mod tests {
     #[test]
     fn header_single_page() {
         let mut t = TestHeader::new(1);
-        t.backed_mut().init(&[0xABCD_0000]);
+        t.backed_mut().init(&[0xABCD_0000], PageSetOrigin::Buddy);
         let b = t.backed();
         assert_eq!(b.data_page_count(), 1);
         assert_eq!(b.get_page(0), Some(0xABCD_0000));
@@ -758,7 +802,7 @@ mod tests {
         for i in 0..75 {
             addrs[i] = (i as u64 + 1) * 0x1000;
         }
-        t.backed_mut().init(&addrs);
+        t.backed_mut().init(&addrs, PageSetOrigin::Buddy);
         let b = t.backed();
         assert_eq!(b.data_page_count(), 75);
         assert_eq!(b.get_page(0), Some(0x1000));
@@ -777,15 +821,45 @@ mod tests {
     }
 
     #[test]
-    fn pageset_origin_default_is_buddy_via_zeroing() {
-        // PageSetOrigin::Buddy = 0 so a freshly-zeroed page-resident
-        // header reads as Buddy without explicit init. M6 substrate
-        // depends on this for backwards compatibility with pre-M6
-        // PageSet allocation paths that don't set origin.
-        let h = PageSetHeader::empty();
-        assert_eq!(h.origin, PageSetOrigin::Buddy);
-        assert_eq!(PageSetOrigin::Buddy as u64, 0);
-        assert_eq!(PageSetOrigin::DmaPool as u64, 1);
+    fn pageset_origin_discriminants_pinned() {
+        // Discriminants start at 1 so the zero-init pattern is
+        // observably invalid. Every alloc path MUST explicitly write
+        // origin before the header is exposed; a missed init reads
+        // back as raw=0 and from_raw returns None.
+        assert_eq!(PageSetOrigin::Buddy as u64, 1);
+        assert_eq!(PageSetOrigin::DmaPool as u64, 2);
+        assert_eq!(PageSetOrigin::from_raw(0), None);
+        assert_eq!(PageSetOrigin::from_raw(1), Some(PageSetOrigin::Buddy));
+        assert_eq!(PageSetOrigin::from_raw(2), Some(PageSetOrigin::DmaPool));
+        assert_eq!(PageSetOrigin::from_raw(3), None);
+        assert_eq!(PageSetOrigin::from_raw(u64::MAX), None);
+    }
+
+    #[test]
+    fn pageset_header_empty_requires_explicit_origin() {
+        // `empty(origin)` takes the origin as a parameter — there is
+        // no default. Validates the explicit-init invariant.
+        let h = PageSetHeader::empty(PageSetOrigin::Buddy);
+        assert_eq!(h.origin(), Some(PageSetOrigin::Buddy));
+        let h = PageSetHeader::empty(PageSetOrigin::DmaPool);
+        assert_eq!(h.origin(), Some(PageSetOrigin::DmaPool));
+    }
+
+    #[test]
+    fn pageset_header_zero_init_origin_is_invalid() {
+        // A zero-initialised header (e.g. from page_alloc's zeroing)
+        // has origin_raw = 0, which is NOT a valid PageSetOrigin
+        // discriminant. The accessor must surface that as None so
+        // kernel callers can reject. This is the load-bearing test
+        // for Tier 3 #13: explicit init enforced by the type system.
+        let h = PageSetHeader {
+            count: 0,
+            header_pages: 1,
+            refcount: 0,
+            map_count: 0,
+            origin_raw: 0,
+        };
+        assert_eq!(h.origin(), None);
     }
 
     // --- header_pages_for arithmetic ---
@@ -832,7 +906,7 @@ mod tests {
         // page boundaries correctly.
         let mut t = TestHeader::new(513);
         let mut bm = t.backed_mut();
-        bm.set_count(513);
+        bm.set_count(513, PageSetOrigin::Buddy);
         bm.set_page(508, 0xAAAA_0000); // last entry on page 0
         bm.set_page(509, 0xBBBB_0000); // first entry on page 1
         bm.set_page(510, 0xCCCC_0000);
@@ -854,7 +928,7 @@ mod tests {
         for i in 0..800 {
             addrs.push((i as u64 + 1) * 0x1000);
         }
-        t.backed_mut().init(&addrs);
+        t.backed_mut().init(&addrs, PageSetOrigin::Buddy);
         let b = t.backed();
         assert_eq!(b.data_page_count(), 800);
         assert_eq!(b.header_page_count(), 2);
@@ -873,7 +947,7 @@ mod tests {
         for i in 0..MAX_PRACTICAL_PAGES_PER_SET {
             addrs.push((i as u64 + 1) * 0x1000);
         }
-        t.backed_mut().init(&addrs);
+        t.backed_mut().init(&addrs, PageSetOrigin::Buddy);
         let b = t.backed();
         assert_eq!(b.data_page_count(), MAX_PRACTICAL_PAGES_PER_SET);
         assert_eq!(b.header_page_count(), 33);
@@ -893,7 +967,7 @@ mod tests {
         // wrapper must panic instead of writing past backing.
         let mut t = TestHeader::new(3);
         let addrs = std::vec![0u64; 511];
-        t.backed_mut().init(&addrs);
+        t.backed_mut().init(&addrs, PageSetOrigin::Buddy);
     }
 
     #[test]
@@ -902,7 +976,7 @@ mod tests {
         let mut t = TestHeader::new(3);
         // Try to expand to 511 entries (would need 2 header pages)
         // when only 1 is backed.
-        t.backed_mut().set_count(511);
+        t.backed_mut().set_count(511, PageSetOrigin::Buddy);
     }
 
     // --- find_by_header_kva ---
@@ -938,7 +1012,7 @@ mod tests {
 
     #[test]
     fn map_count_inc_dec() {
-        let mut h = PageSetHeader::empty();
+        let mut h = PageSetHeader::empty(PageSetOrigin::Buddy);
         h.refcount = 1;
         h.inc_map_count();
         assert_eq!(h.map_count, 1);
@@ -950,7 +1024,7 @@ mod tests {
 
     #[test]
     fn map_count_zero_with_zero_refcount_signals_free() {
-        let mut h = PageSetHeader::empty();
+        let mut h = PageSetHeader::empty(PageSetOrigin::Buddy);
         h.refcount = 0;
         h.inc_map_count();
         assert!(h.dec_map_count()); // map_count=0, refcount=0 → free
@@ -959,7 +1033,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "map_count underflow")]
     fn map_count_underflow_panics() {
-        let mut h = PageSetHeader::empty();
+        let mut h = PageSetHeader::empty(PageSetOrigin::Buddy);
         h.dec_map_count();
     }
 
@@ -967,7 +1041,7 @@ mod tests {
 
     #[test]
     fn zeroed_header_has_no_pages() {
-        let h = PageSetHeader::empty();
+        let h = PageSetHeader::empty(PageSetOrigin::Buddy);
         // A zeroed header (as would result from page zeroing after
         // consumption) must report 0 pages. Page-addr access requires
         // a BackedHeader, which a sound caller can't construct from
@@ -980,7 +1054,7 @@ mod tests {
 
     #[test]
     fn inc_refcount() {
-        let mut h = PageSetHeader::empty();
+        let mut h = PageSetHeader::empty(PageSetOrigin::Buddy);
         h.inc_refcount();
         assert_eq!(h.refcount, 1);
         h.inc_refcount();
@@ -989,7 +1063,7 @@ mod tests {
 
     #[test]
     fn dec_refcount_not_zero() {
-        let mut h = PageSetHeader::empty();
+        let mut h = PageSetHeader::empty(PageSetOrigin::Buddy);
         h.inc_refcount();
         h.inc_refcount();
         assert!(!h.dec_refcount()); // refcount 1, not free-on-zero
@@ -997,14 +1071,14 @@ mod tests {
 
     #[test]
     fn dec_refcount_free_on_zero() {
-        let mut h = PageSetHeader::empty();
+        let mut h = PageSetHeader::empty(PageSetOrigin::Buddy);
         h.inc_refcount();
         assert!(h.dec_refcount()); // refcount 0, map_count 0 → free
     }
 
     #[test]
     fn dec_refcount_not_free_if_mapped() {
-        let mut h = PageSetHeader::empty();
+        let mut h = PageSetHeader::empty(PageSetOrigin::Buddy);
         h.inc_refcount();
         h.inc_map_count();
         assert!(!h.dec_refcount()); // refcount 0, map_count 1 → NOT free
@@ -1012,7 +1086,7 @@ mod tests {
 
     #[test]
     fn dec_map_count_free_when_refcount_zero() {
-        let mut h = PageSetHeader::empty();
+        let mut h = PageSetHeader::empty(PageSetOrigin::Buddy);
         h.inc_map_count();
         // refcount is 0, map_count goes to 0 → free
         assert!(h.dec_map_count());
@@ -1020,7 +1094,7 @@ mod tests {
 
     #[test]
     fn dec_map_count_not_free_when_refcount_nonzero() {
-        let mut h = PageSetHeader::empty();
+        let mut h = PageSetHeader::empty(PageSetOrigin::Buddy);
         h.inc_refcount();
         h.inc_map_count();
         assert!(!h.dec_map_count()); // refcount 1 → NOT free
@@ -1029,7 +1103,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "refcount underflow")]
     fn dec_refcount_underflow_panics() {
-        let mut h = PageSetHeader::empty();
+        let mut h = PageSetHeader::empty(PageSetOrigin::Buddy);
         h.dec_refcount();
     }
 }

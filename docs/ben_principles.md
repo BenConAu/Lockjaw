@@ -102,6 +102,31 @@ Specific Rust patterns that implement tiers 1 and 2.
 12. **Use RAII wherever possible rather than rely on manual
     cleanup.**
 
+13. **Explicit initialization everywhere — no code path may rely
+    on a zero-default value coincidentally being correct.** Every
+    constructor and setter takes the discriminating fields as
+    explicit parameters. New `#[repr(uN)]` enums whose value is
+    read out of memory MUST start their discriminants at 1 (not 0),
+    so a zero-init read is observably invalid (via `from_raw ->
+    None`) rather than silently mapping to a "default" variant.
+    Applies recursively: any struct field with such an enum needs
+    its constructors / setters to require the value as a parameter,
+    never as a method-side default.
+
+    The reason: a zero-default that happens to line up with the
+    intended variant makes "forgot to set X" indistinguishable from
+    "deliberately set X to default". The silent failure compounds
+    the moment a third variant lands — the existing forgotten-init
+    sites are now mis-classifying as the wrong default. Surface
+    "forgot to set" as a typed error at the boundary, not as a
+    convenient fallback.
+
+    Canonical example: `PageSetOrigin` (M6 DMA pool). Buddy=1,
+    DmaPool=2; `PageSetHeader::empty(origin)` and
+    `BackedHeaderMut::set_count(count, origin)` both take origin
+    as a required parameter; `from_raw(0) -> None` lets the kernel
+    reject any header whose origin was never written.
+
 ## Tier 4 — Project & Process
 
 Working rules that aren't directly about correctness.
@@ -122,3 +147,25 @@ Working rules that aren't directly about correctness.
     counterpoint: substrate debt is need-but-can't-build-yet
     debt that *also* keeps the surface working — the surface
     working is not a reason to defer it.
+
+17. **Codex reviews must be reminded of these principles.** A
+    fresh `codex review` session starts without project context,
+    so its baseline taste is "idiomatic Rust", not "Lockjaw
+    architectural rules". Every review prompt (review of a plan,
+    review of a staged diff, follow-up via `codex exec resume`)
+    must point Codex at `docs/ben_principles.md` and call out
+    the principles most relevant to that review (correctness by
+    construction, explicit init / no-zero-default discriminants,
+    reach for userspace before reaching for the kernel, etc.).
+    Without the reminder, Codex will sign off on plans that
+    silently violate Tier 3 idioms — verified during the M6
+    PageSetOrigin design pass, where Buddy=0 (a zero-default that
+    coincidentally matched the pre-M6 behaviour) made it through
+    plan v3 sign-off and only surfaced when the human reviewed
+    the implementation. Prompt template:
+
+    > "Reviewing <diff/plan>. See `docs/ben_principles.md` for
+    > Lockjaw's architectural rules — especially Tier 3 #13
+    > (explicit init / no zero-default discriminants) and Tier 2
+    > #6 (reach for userspace before reaching for the kernel).
+    > Flag any violations even if the diff is internally consistent."

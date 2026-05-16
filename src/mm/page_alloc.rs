@@ -72,10 +72,61 @@ pub unsafe fn init_with_gap(
         buddy.add_range(kernel_end_page, gap_count);
     }
 
-    // Region 2: everything after the stacks
+    // Region 2: everything after the stacks, MINUS the M6 DMA pool
+    // (carved off the tail so it is never registered with buddy AND
+    // is excluded from the kernel TTBR1 direct map — see
+    // `enable_higher_half`'s KERNEL_RAM_L2 init).
+    //
+    // The pool is exactly DMA_POOL_PAGES pages (one AArch64 L2 block
+    // = 2 MiB) and is anchored to the highest 2-MiB-aligned PA
+    // boundary that fits below ram_end. This alignment is the
+    // precondition for the L2-only exclusion in mmu.rs: the pool
+    // covers exactly one L2 block descriptor, no L3-split needed.
+    //
+    // Pool init is separate (`cap::dma_pool::init`); the MMU code
+    // reads `cap::dma_pool::base_phys()` to find the L2 block to
+    // clear.
     if crate::mm::addr::total_pages() > stacks_end_page {
-        let post_count = crate::mm::addr::total_pages() - stacks_end_page;
-        buddy.add_range(stacks_end_page, post_count);
+        let dma_pool_pages = lockjaw_types::dma_pool::DMA_POOL_PAGES;
+        let l2_block_pages = lockjaw_types::dma_pool::DMA_POOL_PAGES; // = pages-per-2MiB
+        let ram_start_phys = crate::mm::addr::ram_start().as_u64();
+        let ram_end_phys = crate::mm::addr::ram_end().as_u64();
+
+        // Round ram_end down to a 2 MiB boundary; subtract the pool
+        // size to get the pool's base PA. Both must lie within the
+        // post-stacks region for the carve-out to be valid.
+        let l2_size_bytes = (l2_block_pages as u64) * PAGE_SIZE;
+        let pool_end_aligned = ram_end_phys & !(l2_size_bytes - 1);
+        let pool_base_phys = pool_end_aligned.saturating_sub(l2_size_bytes);
+        let pool_first_page = ((pool_base_phys - ram_start_phys) / PAGE_SIZE) as usize;
+        let pool_last_page = pool_first_page + dma_pool_pages;
+
+        if pool_first_page >= stacks_end_page
+            && pool_last_page <= crate::mm::addr::total_pages()
+        {
+            // Buddy region 2a: stacks_end → pool_base (everything
+            // before the pool, aligned to whatever fits).
+            let pre_pool_count = pool_first_page - stacks_end_page;
+            if pre_pool_count > 0 {
+                buddy.add_range(stacks_end_page, pre_pool_count);
+            }
+            // Buddy region 2b: pool_end → ram_end (whatever tail is
+            // beyond the aligned pool end, if any).
+            let post_pool_count = crate::mm::addr::total_pages() - pool_last_page;
+            if post_pool_count > 0 {
+                buddy.add_range(pool_last_page, post_pool_count);
+            }
+            crate::cap::dma_pool::init(pool_base_phys);
+        } else {
+            // Tight RAM: pool can't fit aligned without starving
+            // buddy entirely. Skip pool init — dma_pool::alloc_pages
+            // returns Exhausted; sys_alloc_dma_pages → OUT_OF_MEMORY.
+            // Should never happen on Pi 4B (≥2 GiB RAM) or QEMU virt
+            // (≥1 GiB).
+            let total_post = crate::mm::addr::total_pages() - stacks_end_page;
+            buddy.add_range(stacks_end_page, total_post);
+            crate::kprintln!("  WARNING: insufficient RAM for DMA pool, skipping");
+        }
     }
 
     let reserved = crate::mm::addr::total_pages() - buddy.free_count();

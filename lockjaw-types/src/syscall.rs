@@ -101,6 +101,7 @@ pub const SYS_QUERY_MAPPING: u64 = 23;
 pub const SYS_CLOSE_HANDLE: u64 = 24;
 pub const SYS_UNMAP_PAGES: u64 = 25;
 pub const SYS_QUERY_CALLER_TOKEN: u64 = 26;
+pub const SYS_ALLOC_DMA_PAGES: u64 = 27;
 
 /// Flag for SYS_ALLOC_PAGES: allocated pages must be physically contiguous.
 pub const ALLOC_FLAG_CONTIGUOUS: u64 = 1 << 0;
@@ -126,6 +127,7 @@ pub fn syscall_name(num: u64) -> &'static str {
         SYS_WAIT_ANY => "sys_wait_any",
         SYS_EXPORT_HANDLE => "sys_export_handle",
         SYS_GET_BOOT_INFO => "sys_get_boot_info",
+        SYS_ALLOC_DMA_PAGES => "sys_alloc_dma_pages",
         SYS_REGISTER_DEVICE_PAGE => "sys_register_device_page",
         SYS_QUERY_PAGESET_PHYS => "sys_query_pageset_phys",
         SYS_CREATE_REPLY => "sys_create_reply",

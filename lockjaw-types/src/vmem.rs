@@ -41,16 +41,33 @@ pub enum MapMemoryAttribute {
     /// MAIR_DEVICE — strongly ordered, non-cacheable, non-shareable.
     /// Required for MMIO regions (UART, GIC, SDHCI controller registers).
     Device = 1,
+    /// MAIR_NORMAL_NC — Normal memory, inner + outer non-cacheable,
+    /// outer shareable. Used for DMA buffers and descriptor tables
+    /// when the device drives RAM directly without participating in
+    /// CPU cache coherency (M6: emmc2 ADMA2 on Pi 4B).
+    ///
+    /// Kernel-side restriction: only valid on DmaPool-origin PageSets
+    /// (pages that are physically excluded from the kernel direct map).
+    /// Applying NC to a Buddy-origin PageSet would create the mixed-
+    /// attribute alias bug — `sys_map_pages` rejects with
+    /// INVALID_PARAMETER.
+    NormalNonCacheable = 2,
 }
 
 impl MapMemoryAttribute {
-    /// Decode from the raw u64 carried in syscall x2. Preserves the
-    /// existing `select_attrs(flags)` semantics: bit 0 set → Device,
-    /// otherwise Normal. Stray high bits ignored. M6 sub-commit 2 will
-    /// tighten this to reject unknown discriminants once the new variant
-    /// lands and we can characterise the validation surface as a whole.
-    pub const fn from_raw(raw: u64) -> Self {
-        if raw & 1 != 0 { Self::Device } else { Self::Normal }
+    /// Decode from the raw u64 carried in syscall x2. Returns `None`
+    /// for unknown discriminants (M6 tightening: pre-M6 the decoder
+    /// fell back to Normal for any non-matching value; with three
+    /// valid variants the silent-fallback would hide real callers'
+    /// bugs). Kernel handler maps `None` to
+    /// `SyscallError::INVALID_PARAMETER`.
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Normal),
+            1 => Some(Self::Device),
+            2 => Some(Self::NormalNonCacheable),
+            _ => None,
+        }
     }
 
     /// Convert to the `(MAIR index, shareability)` pair consumed by
@@ -60,6 +77,7 @@ impl MapMemoryAttribute {
         match self {
             Self::Normal => (MAIR_NORMAL, SH_INNER),
             Self::Device => (MAIR_DEVICE, SH_NON),
+            Self::NormalNonCacheable => (MAIR_NORMAL_NC, SH_OUTER),
         }
     }
 }
@@ -757,23 +775,38 @@ mod tests {
 
     #[test]
     fn map_memory_attribute_discriminants_pinned() {
-        // Wire encoding must stay stable: x2 == 0 → Normal, x2 == 1 → Device.
-        // Both userlib (sender) and kernel (decoder) depend on this match.
+        // Wire encoding must stay stable: x2 == 0 → Normal, 1 → Device,
+        // 2 → NormalNonCacheable. Both userlib (sender) and kernel
+        // (decoder) depend on this match.
         assert_eq!(MapMemoryAttribute::Normal as u64, 0);
         assert_eq!(MapMemoryAttribute::Device as u64, 1);
+        assert_eq!(MapMemoryAttribute::NormalNonCacheable as u64, 2);
     }
 
     #[test]
-    fn map_memory_attribute_from_raw_preserves_legacy_bit_test() {
-        // Pre-M6 `select_attrs(flags)` was: bit 0 set → Device, else Normal.
-        // `from_raw` must preserve that for any legacy caller still passing
-        // `0` or `MAP_FLAG_DEVICE`-derived values across the syscall.
-        assert_eq!(MapMemoryAttribute::from_raw(0), MapMemoryAttribute::Normal);
-        assert_eq!(MapMemoryAttribute::from_raw(1), MapMemoryAttribute::Device);
-        // Stray high bits without bit 0 → still Normal (matches current semantics).
-        assert_eq!(MapMemoryAttribute::from_raw(0x4), MapMemoryAttribute::Normal);
-        // Stray high bits WITH bit 0 → Device (matches `flags & 1 != 0`).
-        assert_eq!(MapMemoryAttribute::from_raw(0x5), MapMemoryAttribute::Device);
+    fn map_memory_attribute_from_raw_known_discriminants() {
+        assert_eq!(MapMemoryAttribute::from_raw(0), Some(MapMemoryAttribute::Normal));
+        assert_eq!(MapMemoryAttribute::from_raw(1), Some(MapMemoryAttribute::Device));
+        assert_eq!(MapMemoryAttribute::from_raw(2), Some(MapMemoryAttribute::NormalNonCacheable));
+    }
+
+    #[test]
+    fn map_memory_attribute_from_raw_rejects_unknown() {
+        // M6 tightening: anything that isn't a pinned discriminant
+        // returns None (kernel maps to INVALID_PARAMETER). Pre-M6
+        // permissive fallback (any non-1 → Normal) is gone.
+        assert_eq!(MapMemoryAttribute::from_raw(3), None);
+        assert_eq!(MapMemoryAttribute::from_raw(0x4), None);
+        assert_eq!(MapMemoryAttribute::from_raw(0x5), None);
+        assert_eq!(MapMemoryAttribute::from_raw(u64::MAX), None);
+    }
+
+    #[test]
+    fn attrs_normal_nc_memory() {
+        use crate::page_table::*;
+        let (attr, sh) = select_attrs(MapMemoryAttribute::NormalNonCacheable);
+        assert_eq!(attr, MAIR_NORMAL_NC);
+        assert_eq!(sh, SH_OUTER);
     }
 
     // --- build_user_page tests ---

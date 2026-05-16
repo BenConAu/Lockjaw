@@ -3,6 +3,7 @@
 pub mod addr;
 pub mod buddy;
 pub mod constants;
+pub mod dma_pool;
 pub mod elf;
 pub mod elf_loader;
 pub mod ipc_state;

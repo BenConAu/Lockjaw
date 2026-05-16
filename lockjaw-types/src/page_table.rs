@@ -11,10 +11,20 @@ pub const MAIR_DEVICE: u8 = 0;
 /// MAIR_EL1 attribute index 1: Normal, Inner/Outer Write-Back Read/Write-Allocate.
 pub const MAIR_NORMAL: u8 = 1;
 
+/// MAIR_EL1 attribute index 2: Normal, Inner + Outer Non-cacheable.
+/// Used for DMA-pool pages (M6) where the device drives RAM directly
+/// without participating in CPU cache coherency. Encoding 0x44 per
+/// ARM ARM Table D8-43 (Normal memory attribute encoding):
+///   bits[7:4] = 0100 = Outer Non-cacheable
+///   bits[3:0] = 0100 = Inner Non-cacheable
+pub const MAIR_NORMAL_NC: u8 = 2;
+
 /// MAIR_EL1 register value.
 ///   Attr[0] (bits  7:0) = 0x00: Device-nGnRnE
 ///   Attr[1] (bits 15:8) = 0xFF: Normal WB RA WA (inner + outer)
-pub const MAIR_EL1_VALUE: u64 = (0x00 << 0) | (0xFF << 8);
+///   Attr[2] (bits 23:16) = 0x44: Normal Non-cacheable (inner + outer)
+pub const MAIR_EL1_VALUE: u64 =
+    (0x00 << 0) | (0xFF << 8) | (0x44 << 16);
 
 // ---------------------------------------------------------------------------
 // Access permission constants (AP field, bits [7:6])
@@ -31,6 +41,11 @@ pub const AP_RW_ALL: u8 = 0b01;
 // ---------------------------------------------------------------------------
 
 pub const SH_NON: u8 = 0b00;
+/// Outer Shareable — required for non-cacheable mappings that need to be
+/// coherent with DMA-capable masters outside the inner shareability
+/// domain (the SDHCI controller on Pi 4B is outer-shareable per the
+/// SoC topology).
+pub const SH_OUTER: u8 = 0b10;
 pub const SH_INNER: u8 = 0b11;
 
 // ---------------------------------------------------------------------------
@@ -768,8 +783,27 @@ mod tests {
 
     #[test]
     fn mair_el1_value_correct() {
-        // Attr[0] = 0x00 (device), Attr[1] = 0xFF (normal WB)
-        assert_eq!(MAIR_EL1_VALUE, 0xFF00);
+        // Attr[0] = 0x00 (device-nGnRnE)
+        // Attr[1] = 0xFF (normal WB RA WA, inner + outer)
+        // Attr[2] = 0x44 (normal non-cacheable, inner + outer) — M6 DMA pool
+        assert_eq!(MAIR_EL1_VALUE, 0x44_FF00);
+    }
+
+    #[test]
+    fn mair_normal_nc_slot_distinct() {
+        assert_eq!(MAIR_NORMAL_NC, 2);
+        assert_ne!(MAIR_NORMAL_NC, MAIR_NORMAL);
+        assert_ne!(MAIR_NORMAL_NC, MAIR_DEVICE);
+        // Slot 2 carries encoding 0x44 in bits [23:16] of MAIR_EL1.
+        assert_eq!((MAIR_EL1_VALUE >> 16) & 0xFF, 0x44);
+    }
+
+    #[test]
+    fn sh_outer_distinct() {
+        // SH_OUTER must not collide with the existing SH_NON / SH_INNER.
+        assert_eq!(SH_OUTER, 0b10);
+        assert_ne!(SH_OUTER, SH_NON);
+        assert_ne!(SH_OUTER, SH_INNER);
     }
 
     // --- Page table walk tests ---

@@ -51,6 +51,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_CALL => sys_call(ctx),
         SYS_REPLY => SyscallReturn::Void(sys_reply(ctx)),
         SYS_ALLOC_PAGES => SyscallReturn::Value(sys_alloc_pages(ctx)),
+        SYS_ALLOC_DMA_PAGES => SyscallReturn::Value(sys_alloc_dma_pages(ctx)),
         SYS_MAP_PAGES => SyscallReturn::Void(sys_map_pages(ctx)),
         SYS_CREATE_PROCESS => SyscallReturn::Void(sys_create_process(ctx)),
         SYS_CREATE_NOTIFICATION => SyscallReturn::Value(sys_create_notification(ctx)),
@@ -129,6 +130,17 @@ fn create_kernel_object_kvm(
 
     // SAFETY: PageSet handle → registered header.
     let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
+    // M6: donate-as-kernel-object remaps the donated frame as
+    // cacheable Normal in KVM (build_kernel_page). A DmaPool-origin
+    // PageSet would create the mixed-attribute alias — reject up-front.
+    // Uninit origin (None from from_raw) is also rejected: a header
+    // whose origin was never written is a bug at the alloc site.
+    match backed.raw().origin() {
+        Some(lockjaw_types::pageset_table::PageSetOrigin::DmaPool) =>
+            return Err(SyscallError::INVALID_PARAMETER),
+        None => return Err(SyscallError::INVALID_HANDLE),
+        Some(lockjaw_types::pageset_table::PageSetOrigin::Buddy) => {}
+    }
     if backed.data_page_count() != 1 {
         return Err(SyscallError::INVALID_PARAMETER);
     }
@@ -371,14 +383,52 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     }
 }
 
+/// sys_alloc_dma_pages(count) — allocate physically-contiguous DMA-safe pages.
+/// x0 = number of pages to allocate (1..=MAX_PRACTICAL_PAGES_PER_SET).
+/// Returns a PageSet handle in x1 with `origin = DmaPool`.
+///
+/// Pages come from the boot-reserved DMA pool, which is not registered
+/// with buddy and (in a follow-up commit) is excluded from the kernel
+/// direct map. The resulting PageSet can ONLY be mapped via
+/// `MapMemoryAttribute::NormalNonCacheable`; cacheable mapping paths
+/// reject DmaPool origin to prevent the mixed-attribute alias bug.
+///
+/// The phys address of the first data page is queryable via
+/// `sys_query_pageset_phys(handle, 0)` — needed by drivers programming
+/// ADMA descriptor targets.
+fn sys_alloc_dma_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
+    let count = ctx.gpr[0] as usize;
+    let id = crate::cap::pageset_table::alloc_dma_pages(count)
+        .ok_or(SyscallError::OUT_OF_MEMORY)?;
+    let (_, header_kva) = crate::cap::pageset_table::get_pageset(id)
+        .ok_or(SyscallError::UNKNOWN)?;
+    let ht = CurrentThread::handle_table();
+    match ht.insert(
+        Rights::from_bits(RIGHT_READ | RIGHT_WRITE),
+        lockjaw_types::object::HandleKind::PageSet { kva: header_kva, mapped_va_page: 0 },
+    ) {
+        Ok(h) => {
+            unsafe { crate::cap::pageset_table::read_header_mut(header_kva).inc_refcount(); }
+            Ok(h as u64)
+        }
+        Err(e) => {
+            crate::cap::pageset_table::free_by_header_kva(header_kva);
+            Err(e)
+        }
+    }
+}
+
 /// sys_map_pages(handle, virt_addr, attr) — map pages into the caller's address space.
-/// x0 = PageSet handle (from sys_alloc_pages or sys_register_device_page).
+/// x0 = PageSet handle (from sys_alloc_pages, sys_alloc_dma_pages, or sys_register_device_page).
 /// x1 = virtual address to map at (must be page-aligned, in user range).
 /// x2 = `MapMemoryAttribute` discriminant (Normal=0, Device=1) — selects MAIR regime.
 fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     let handle = ctx.gpr[0] as u32;
     let virt_addr = ctx.gpr[1];
-    let attr = lockjaw_types::vmem::MapMemoryAttribute::from_raw(ctx.gpr[2]);
+    let attr = match lockjaw_types::vmem::MapMemoryAttribute::from_raw(ctx.gpr[2]) {
+        Some(a) => a,
+        None => return SyscallError::INVALID_PARAMETER,
+    };
 
     // Reject VA 0 (mapped_va_page uses 0 as "not mapped" sentinel)
     // and unaligned VAs (would silently round down when stored as VA >> 12).
@@ -412,6 +462,31 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     };
     // SAFETY: kva from a PageSet handle — registered header.
     let header = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
+
+    // M6 attribute-vs-origin enforcement: the page-resident origin
+    // field decides which mapping regimes are legal. Buddy pages can
+    // be mapped Normal / Device; mapping them NormalNonCacheable would
+    // create the mixed-attribute alias with the kernel direct map.
+    // DmaPool pages can ONLY be mapped NormalNonCacheable; cacheable
+    // mappings would reintroduce the alias from the other direction.
+    // (See docs/ben_principles.md Tier 3 #13 — origin discriminants
+    // start at 1 so a zero-init read is observably invalid.)
+    use lockjaw_types::pageset_table::PageSetOrigin;
+    use lockjaw_types::vmem::MapMemoryAttribute;
+    let origin = match header.raw().origin() {
+        Some(o) => o,
+        None => return SyscallError::INVALID_HANDLE,
+    };
+    match (origin, attr) {
+        (PageSetOrigin::Buddy,   MapMemoryAttribute::NormalNonCacheable) =>
+            return SyscallError::INVALID_PARAMETER,
+        (PageSetOrigin::DmaPool, MapMemoryAttribute::Normal) =>
+            return SyscallError::INVALID_PARAMETER,
+        (PageSetOrigin::DmaPool, MapMemoryAttribute::Device) =>
+            return SyscallError::INVALID_PARAMETER,
+        _ => {}
+    }
+
     unsafe {
         match crate::arch::aarch64::vmem::map_pages_in_existing(addr_space.ttbr0(), virt_addr, &header, attr) {
             Ok(()) => {

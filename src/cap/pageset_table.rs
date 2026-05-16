@@ -39,9 +39,16 @@ static TABLE: PageSetTableWrapper = PageSetTableWrapper::new();
 
 /// Insert an already-initialized header range into the global table.
 /// Does NOT own the header range — the caller is responsible for
-/// cleanup on failure (typically via OwnedKvmRangeGuard).
-fn insert_into_table(count: usize, header_kva: KernelVa) -> Option<u64> {
-    let entry = PageSetEntry { count, header_kva, origin: PageSetOrigin::Buddy };
+/// cleanup on failure (typically via OwnedKvmRangeGuard). `origin`
+/// records which allocator owns the DATA pages (header pages always
+/// come from buddy via KVM); the kernel reads this in every cacheable-
+/// mapping path to enforce the DmaPool-NC-only rule (M6).
+fn insert_into_table(
+    count: usize,
+    header_kva: KernelVa,
+    origin: PageSetOrigin,
+) -> Option<u64> {
+    let entry = PageSetEntry { count, header_kva, origin };
     // SAFETY: single-core, IRQs masked — exclusive table access.
     unsafe { (*TABLE.ptr()).insert(entry).ok().map(|id| id as u64) }
 }
@@ -77,9 +84,13 @@ fn alloc_and_insert_header(page_addrs: &[u64], count: usize) -> Option<u64> {
     // KVM stitched the backing frames into a contiguous VA.
     let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_kva(header_kva) };
     let mut backed = unsafe { header_ref.get_mut().backed_mut(count) };
-    backed.init(page_addrs);
+    backed.init(page_addrs, PageSetOrigin::Buddy);
 
-    let entry = PageSetEntry { count, header_kva, origin: PageSetOrigin::Buddy };
+    let entry = PageSetEntry {
+        count,
+        header_kva,
+        origin: PageSetOrigin::Buddy,
+    };
     // SAFETY: single-core, IRQs masked — exclusive table access.
     let id = unsafe { (*TABLE.ptr()).insert(entry).ok()? };
 
@@ -128,7 +139,7 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
     // see the same value.
     let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_kva(header_kva) };
     let mut backed = unsafe { header_ref.get_mut().backed_mut(count) };
-    backed.set_count(count);
+    backed.set_count(count, PageSetOrigin::Buddy);
 
     // Allocate data pages one at a time, writing each address directly into the header.
     // Zero each page so userspace mmap-backed allocations see the zero-init
@@ -155,7 +166,7 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
         }
     }
 
-    let id = insert_into_table(count, header_kva)?;
+    let id = insert_into_table(count, header_kva, PageSetOrigin::Buddy)?;
     guard.take(); // success — table owns the header range now
     Some(id)
 }
@@ -203,7 +214,7 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
     // header.count + header.header_pages fields.
     let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_kva(header_kva) };
     let mut backed = unsafe { header_ref.get_mut().backed_mut(actual_count) };
-    backed.set_count(actual_count);
+    backed.set_count(actual_count, PageSetOrigin::Buddy);
     let base = first_data.start_addr().as_u64();
     // Zero pages so userspace mmap-backed allocations see the
     // POSIX MAP_ANONYMOUS zero-init contract (see alloc_pages above).
@@ -213,7 +224,7 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
         backed.set_page(i, paddr.as_u64());
     }
 
-    match insert_into_table(actual_count, header_kva) {
+    match insert_into_table(actual_count, header_kva, PageSetOrigin::Buddy) {
         Some(id) => {
             guard.take(); // success — table owns the header range now
             Some(id)
@@ -221,6 +232,76 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
         None => {
             // Table full — free data pages. Header range freed by guard.
             page_alloc::dealloc_pages_contiguous(first_data, count);
+            None
+        }
+    }
+}
+
+/// Allocate `count` physically-contiguous pages from the DMA pool and
+/// register as a PageSet with origin = DmaPool. Used for ADMA2
+/// descriptor tables and buffers (M6 sub-commit 2b).
+///
+/// The header pages come from buddy/KVM as usual (regular cacheable
+/// kernel memory — only the DATA pages are DMA-pool-origin). The
+/// kernel rejects DmaPool-origin PageSets in every cacheable-mapping
+/// path (see `sys_map_pages`, `create_process`, KVM remap, donate-as-
+/// kernel-object) so the data pages can only be reached through a
+/// per-process `NormalNonCacheable` mapping.
+///
+/// Returns the PageSet ID, or `None` if:
+/// - count is 0 or > MAX_PRACTICAL_PAGES_PER_SET
+/// - DMA pool is exhausted (no contiguous run of `count` free pages)
+/// - KVM/buddy out of memory for the header pages
+/// - PageSet table is full
+pub fn alloc_dma_pages(count: usize) -> Option<u64> {
+    if count == 0 || count > MAX_PRACTICAL_PAGES_PER_SET {
+        return None;
+    }
+
+    let header_pages = header_pages_for(count);
+    let range = kvm::alloc_kernel_pages(header_pages).ok()?;
+    let mut guard = OwnedKvmRangeGuard::new(range);
+    let header_kva = guard.kva();
+
+    // SAFETY: header_kva is a freshly-allocated KVM range.
+    unsafe {
+        let mut p = KernelMut::<u8>::from_kva(header_kva);
+        core::ptr::write_bytes(p.as_mut_ptr(), 0, header_pages * (PAGE_SIZE as usize));
+    }
+
+    // Allocate DMA pool pages. Pool returns the first PA of a
+    // contiguous run; we DO NOT zero through the direct map because
+    // the alias would defeat the whole point. Pool pages are zeroed
+    // once at boot (in dma_pool init) and stay zero until written via
+    // a per-process NC mapping.
+    let first_data = match crate::cap::dma_pool::alloc_pages(count) {
+        Ok(phys) => phys,
+        Err(_) => return None, // guard frees header range
+    };
+
+    // SAFETY: header_kva is freshly allocated, zeroed KVM range
+    // backed by header_pages_for(count) pages. set_count takes origin
+    // explicitly so the page-resident header's origin field is the
+    // commit point for "this PageSet is DmaPool-origin" — no separate
+    // post-write needed, no zero-default to coincidentally line up.
+    let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_kva(header_kva) };
+    let mut backed = unsafe { header_ref.get_mut().backed_mut(count) };
+    backed.set_count(count, PageSetOrigin::DmaPool);
+    let base = first_data.as_u64();
+    for i in 0..count {
+        let paddr = base + (i as u64) * PAGE_SIZE;
+        backed.set_page(i, paddr);
+    }
+
+    match insert_into_table(count, header_kva, PageSetOrigin::DmaPool) {
+        Some(id) => {
+            guard.take();
+            Some(id)
+        }
+        None => {
+            // Table full — return data pages to the pool. Header
+            // range freed by guard.
+            crate::cap::dma_pool::free_pages(first_data, count);
             None
         }
     }
@@ -427,17 +508,40 @@ pub fn free_by_header_kva(header_kva: KernelVa) {
     // get_page safe.
     let backed = unsafe { read_header_backed(header_kva) };
 
+    // M6: data pages return to the allocator that owned them. The
+    // alloc paths write origin via set_count; a None reading here
+    // would indicate a header that was never properly initialised
+    // (Tier 3 #13 — bug at the alloc site). Panic rather than
+    // silently leak: this code is on the cleanup hot path and a
+    // missed origin tag would compound into ownership corruption.
+    let origin = backed.raw().origin()
+        .expect("free_by_header_kva: header origin uninit — alloc-site bug");
+
     // Free data pages (skip device MMIO pages — they are below RAM_START
-    // and were never allocated from the buddy allocator). Iterating
+    // and were never allocated from any kernel allocator). Iterating
     // 0..count uses the trusted PageSetTable count, so a corrupt
     // header.count cannot extend or truncate the loop.
     let ram_start = crate::mm::addr::ram_start().as_u64();
-    for i in 0..count {
-        if let Some(paddr) = backed.get_page(i) {
-            if paddr >= ram_start {
-                page_alloc::dealloc_page(
-                    crate::mm::addr::PhysPage::containing(PhysAddr::new(paddr))
-                );
+    match origin {
+        PageSetOrigin::Buddy => {
+            for i in 0..count {
+                if let Some(paddr) = backed.get_page(i) {
+                    if paddr >= ram_start {
+                        page_alloc::dealloc_page(
+                            crate::mm::addr::PhysPage::containing(PhysAddr::new(paddr))
+                        );
+                    }
+                }
+            }
+        }
+        PageSetOrigin::DmaPool => {
+            // DmaPool data pages are physically contiguous (alloc'd
+            // via dma_pool::alloc_pages(count)). Return them as a
+            // single contiguous range to the pool's free-list.
+            if count > 0 {
+                if let Some(first) = backed.get_page(0) {
+                    crate::cap::dma_pool::free_pages(PhysAddr::new(first), count);
+                }
             }
         }
     }
@@ -504,6 +608,20 @@ impl PageSetRef {
         // wrapper, after which get_page is safe.
         let backed = unsafe { read_header_backed(self.header_kva) };
         backed.get_page(index).map(PhysAddr::new)
+    }
+
+    /// Allocator-of-origin for the data pages. Returns `Some` for any
+    /// PageSet whose alloc path explicitly wrote origin via
+    /// `set_count(_, origin)`; returns `None` if the page-resident
+    /// header carries a zero or unknown discriminant (signals a bug
+    /// at the alloc site — Tier 3 #13's typed-error surface). Used
+    /// by every kernel path that would map the pages cacheably to
+    /// reject DmaPool-origin PageSets (sys_map_pages, create_process,
+    /// KVM remap, donate-as-kernel-object).
+    pub fn origin(&self) -> Option<PageSetOrigin> {
+        // SAFETY: self.header_kva is registered.
+        let backed = unsafe { read_header_backed(self.header_kva) };
+        backed.raw().origin()
     }
 }
 

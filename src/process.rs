@@ -317,6 +317,16 @@ fn provision_resources(
     };
     // SAFETY: kva from a PageSet handle — registered header KVA.
     let stack_ps = unsafe { PageSetRef::from_header_kva(stack_kva) };
+    // M6: reject DmaPool-origin PageSets as process stacks. Stack
+    // pages get mapped cacheable Normal in the new address space,
+    // which would create the mixed-attribute alias with the direct
+    // map. DmaPool PageSets can ONLY be mapped NormalNonCacheable
+    // via sys_map_pages. Uninit origin (None) is also rejected as
+    // a typed surface for the explicit-init invariant.
+    match stack_ps.origin() {
+        Some(lockjaw_types::pageset_table::PageSetOrigin::Buddy) => {}
+        _ => return Err(CreateProcessError::BadHandle),
+    }
 
     // Resolve parent_handle_to_copy in validate phase. The actual
     // child-table insertion runs in apply (step 6) so the
@@ -347,6 +357,13 @@ fn provision_resources(
         _ => return Err(CreateProcessError::BadHandle),
     };
     let scratch_ps = unsafe { PageSetRef::from_header_kva(scratch_kva) };
+    // M6: scratch pages get accessed cacheably by the kernel during
+    // mapping batch flush (they're treated as a Mapping[]). DmaPool
+    // pages would alias; uninit origin is rejected as a bug signal.
+    match scratch_ps.origin() {
+        Some(lockjaw_types::pageset_table::PageSetOrigin::Buddy) => {}
+        _ => return Err(CreateProcessError::BadHandle),
+    }
     let scratch_count = scratch_ps.count();
     if scratch_count == 0 {
         return Err(CreateProcessError::InvalidUserMemory);
@@ -402,6 +419,15 @@ fn provision_resources(
         };
         // SAFETY: kva from a PageSet handle — registered header KVA.
         let ps = unsafe { PageSetRef::from_header_kva(ps_kva) };
+        // M6: process mappings get installed as cacheable Normal
+        // PTEs by AddressSpaceBuilder::map_batch (no per-mapping
+        // attribute selector — this is the create_process path, not
+        // sys_map_pages). DmaPool PageSets must not enter this path;
+        // uninit origin is rejected as a typed bug signal.
+        match ps.origin() {
+            Some(lockjaw_types::pageset_table::PageSetOrigin::Buddy) => {}
+            _ => return Err(CreateProcessError::BadHandle),
+        }
         let page_idx = user_mapping.page_index as usize;
         let phys = ps.page(page_idx).ok_or(CreateProcessError::InvalidUserMemory)?;
 

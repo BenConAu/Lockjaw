@@ -46,6 +46,31 @@ pub fn sys_alloc_pages(count: u64) -> Result<PageSetHandle, SyscallError> {
     if err == 0 { Ok(PageSetHandle(val)) } else { Err(SyscallError(err)) }
 }
 
+/// Allocate physically-contiguous DMA-safe pages from the kernel's DMA
+/// pool. Returns a PageSet handle on success; the resulting PageSet
+/// has `origin = DmaPool` and can ONLY be mapped via
+/// `MapMemoryAttribute::NormalNonCacheable`. Use
+/// `sys_query_pageset_phys(handle, 0)` to obtain the first page's
+/// physical address (needed by drivers programming ADMA / SDMA
+/// descriptor targets).
+///
+/// Pool pages are physically reserved at kernel boot and never
+/// registered with buddy — kernel cacheable-mapping paths reject
+/// DmaPool-origin PageSets to prevent the mixed-attribute alias bug.
+pub fn sys_alloc_dma_pages(count: u64) -> Result<PageSetHandle, SyscallError> {
+    let err: u64;
+    let val: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") count => err,
+            lateout("x1") val,
+            in("x8") SYS_ALLOC_DMA_PAGES,
+        );
+    }
+    if err == 0 { Ok(PageSetHandle(val)) } else { Err(SyscallError(err)) }
+}
+
 /// Allocate physically contiguous pages. Returns a PageSet handle on success.
 /// The pages are guaranteed to be sequential in physical memory,
 /// suitable for DMA buffers. The block size is rounded up to the next
