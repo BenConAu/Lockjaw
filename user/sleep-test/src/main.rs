@@ -7,7 +7,6 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 
-use core::arch::asm;
 use lockjaw_userlib::{
     bootstrap_endpoint, put_decimal, puts, sys_alloc_pages, sys_call_ret4,
     sys_create_reply, sys_exit,
@@ -79,9 +78,9 @@ pub extern "C" fn _start() -> ! {
     // Loud single-line assertion. The integration test greps this
     // and a separate line that also pins the requested budget so the
     // test fails the moment elapsed_ns drops below the deadline floor
-    // (which would mean the kernel's deadline machinery never ran)
-    // or rises above two ticks (which would mean the wake-before-
-    // schedule ordering broke).
+    // (kernel's deadline machinery never ran) or rises above 200ms
+    // (the per-tick scan + fair-round-robin slack budget on 1-CPU
+    // QEMU — see SLEEP_NANOS doc for the full rationale).
     if elapsed_ns >= SLEEP_NANOS && elapsed_ns <= 200_000_000 {
         puts("[SLEEP-TEST] elapsed within tolerance\n");
     } else {
@@ -91,8 +90,12 @@ pub extern "C" fn _start() -> ! {
     sys_exit();
 }
 
+/// Terminate the process. EL0 `wfi`-loops keep the thread `Running`
+/// from the scheduler's POV — they don't block; they spin a
+/// tick-period each iteration. Use sys_exit so the scheduler removes
+/// us from rotation.
 fn halt() -> ! {
-    loop { unsafe { asm!("wfi"); } }
+    sys_exit();
 }
 
 #[panic_handler]

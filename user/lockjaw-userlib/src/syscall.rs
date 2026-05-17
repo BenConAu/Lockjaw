@@ -603,12 +603,12 @@ pub fn sys_sched_telemetry() -> SchedTelemetry {
     let ttbr0_writes: u64;
     unsafe {
         asm!(
-            "svc #0",
-            lateout("x0") _,
-            lateout("x1") ticks,
-            lateout("x2") ctx_switches,
-            lateout("x3") ttbr0_writes,
-            in("x8") SYS_SCHED_TELEMETRY,
+            "svc #0",                 // Trap to EL1; kernel reads x8 for syscall number.
+            lateout("x0") _,          // x0: syscall error (always OK for read-only telemetry).
+            lateout("x1") ticks,      // x1: TICK_COUNT snapshot (tick handler increments).
+            lateout("x2") ctx_switches, // x2: CONTEXT_SWITCH_COUNT snapshot (each SwitchTo bumps).
+            lateout("x3") ttbr0_writes, // x3: TTBR0_WRITE_COUNT snapshot (process-switch flushes).
+            in("x8") SYS_SCHED_TELEMETRY, // x8: syscall dispatch number.
         );
     }
     SchedTelemetry { ticks, ctx_switches, ttbr0_writes }

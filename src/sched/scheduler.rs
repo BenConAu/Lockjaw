@@ -308,10 +308,7 @@ pub fn current_thread_index() -> usize {
         let cpu_id = crate::percpu::cpu_id() as usize;
         // SAFETY: UnsafeCell interior pointer for crash-safe read
         let state_ptr = SCHEDULER.state.get() as *const SchedState;
-        match (*state_ptr).current_per_cpu.get(cpu_id) {
-            Some(Some(idx)) => *idx,
-            _ => 0,
-        }
+        (*state_ptr).current_for_panic_safe(cpu_id).unwrap_or(0)
     }
 }
 
@@ -324,10 +321,7 @@ pub fn try_current_tcb_kva() -> Option<lockjaw_types::addr::KernelVa> {
         let cpu_id = crate::percpu::cpu_id() as usize;
         // SAFETY: UnsafeCell interior pointer for crash-safe volatile read
         let state_ptr = SCHEDULER.state.get() as *const SchedState;
-        let idx = match (*state_ptr).current_per_cpu.get(cpu_id) {
-            Some(Some(i)) => *i,
-            _ => return None,
-        };
+        let idx = (*state_ptr).current_for_panic_safe(cpu_id)?;
         if idx >= MAX_THREADS { return None; }
         // SAFETY: raw pointer to UnsafeCell interior for crash-safe volatile read
         let threads_ptr = SCHEDULER.threads.get()

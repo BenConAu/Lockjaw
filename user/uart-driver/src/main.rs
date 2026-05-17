@@ -6,7 +6,6 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[used]
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
-use core::arch::asm;
 use core::ptr;
 use lockjaw_userlib::*;
 
@@ -69,14 +68,14 @@ pub extern "C" fn _start() -> ! {
     // Allocate our Reply object for outbound sys_call (bootstrap + claim).
     let reply_obj = match sys_alloc_pages(1).and_then(sys_create_reply) {
         Ok(h) => h,
-        Err(_) => { puts("uart-driver: create reply FAILED\n"); loop { unsafe { asm!("wfi"); } } }
+        Err(_) => { puts("uart-driver: create reply FAILED\n"); halt() }
     };
 
     // Bootstrap: call init on handle 0 to receive our handles.
     puts("uart-driver: bootstrapping...\n");
     let reply = match sys_call_ret4(bootstrap_endpoint(), reply_obj, 0, 0, 0, 0) {
         Ok(r) => r,
-        Err(_) => { puts("uart-driver: bootstrap FAILED\n"); loop { unsafe { asm!("wfi"); } } }
+        Err(_) => { puts("uart-driver: bootstrap FAILED\n"); halt() }
     };
     // Bootstrap reply words are raw handle indices exported by init.
     let uart_srv_ep = EndpointHandle(reply[0]);
@@ -86,11 +85,11 @@ pub extern "C" fn _start() -> ! {
     // Claim a PL011 device from the device manager.
     let claim = match sys_call_ret4(devmgr_client, reply_obj, CMD_CLAIM_DEVICE, PL011_HASH, 0, 0) {
         Ok(r) => r,
-        Err(_) => { puts("uart-driver: claim call FAILED\n"); loop { unsafe { asm!("wfi"); } } }
+        Err(_) => { puts("uart-driver: claim call FAILED\n"); halt() }
     };
     if claim[0] != CLAIM_OK {
         puts("uart-driver: no PL011 available\n");
-        loop { unsafe { asm!("wfi"); } }
+        halt()
     }
     let mmio_pageset = PageSetHandle(claim[1]);
     let uart_intid = claim[2];
@@ -100,21 +99,21 @@ pub extern "C" fn _start() -> ! {
     let uart_va = VMEM.alloc(1).expect("VA exhausted for UART MMIO");
     if !sys_map_pages(mmio_pageset, uart_va, MapMemoryAttribute::Device).is_ok() {
         puts("uart-driver: map MMIO FAILED\n");
-        loop { unsafe { asm!("wfi"); } }
+        halt()
     }
     puts("uart-driver: MMIO mapped\n");
 
     // Step 2: Create a notification for the UART RX interrupt
     let notif_handle = match sys_alloc_pages(1).and_then(sys_create_notification) {
         Ok(h) => h,
-        Err(_) => { puts("uart-driver: create notif FAILED\n"); loop { unsafe { asm!("wfi"); } } }
+        Err(_) => { puts("uart-driver: create notif FAILED\n"); halt() }
     };
     puts("uart-driver: notification created\n");
 
     // Step 3: Bind UART IRQ to the notification
     if !sys_bind_irq(uart_intid, notif_handle).is_ok() {
         puts("uart-driver: bind IRQ FAILED\n");
-        loop { unsafe { asm!("wfi"); } }
+        halt()
     }
     puts("uart-driver: IRQ bound\n");
 
@@ -175,10 +174,16 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
+/// Terminate the process. EL0 `wfi`-loops keep the thread `Running`
+/// from the scheduler's POV — they don't block; they spin a
+/// tick-period each iteration. Use sys_exit so the scheduler removes
+/// us from rotation.
+fn halt() -> ! {
+    sys_exit();
+}
+
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     puts("uart-driver: PANIC\n");
-    loop {
-        unsafe { asm!("wfi"); }
-    }
+    sys_exit();
 }

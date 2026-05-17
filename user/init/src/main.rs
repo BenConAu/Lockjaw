@@ -710,7 +710,9 @@ pub extern "C" fn _start() -> ! {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {
-        unsafe { asm!("wfi") };
-    }
+    // Cannot sys_exit: init's boot TCB stack lives in the linker
+    // image, not the KVM pool, so finish_exit panics the kernel.
+    // park_forever leaves the panicked thread Blocked, releasing
+    // the CPU to anything else still runnable.
+    park_forever();
 }

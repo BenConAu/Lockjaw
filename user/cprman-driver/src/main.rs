@@ -7,7 +7,6 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 
-use core::arch::asm;
 use core::ptr;
 use lockjaw_userlib::*;
 use lockjaw_types::clock::{
@@ -265,8 +264,12 @@ unsafe fn dispatch_emmc2(base: u64, op: u64, arg: u64) -> Result<u64, ClockError
     }
 }
 
+/// Terminate the process. EL0 `wfi`-loops keep the thread `Running`
+/// from the scheduler's POV — they don't block; they spin a
+/// tick-period each iteration. Use sys_exit so the scheduler removes
+/// us from rotation.
 fn halt() -> ! {
-    loop { unsafe { asm!("wfi"); } }
+    sys_exit();
 }
 
 #[panic_handler]

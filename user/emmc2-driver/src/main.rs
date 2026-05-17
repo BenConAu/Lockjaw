@@ -1746,8 +1746,12 @@ fn put_clock_error(e: ClockError) {
     }
 }
 
+/// Terminate the process. EL0 `wfi`-loops keep the thread `Running`
+/// from the scheduler's POV — they don't block; they spin a
+/// tick-period each iteration. Use sys_exit so the scheduler removes
+/// us from rotation.
 fn halt() -> ! {
-    loop { unsafe { asm!("wfi"); } }
+    sys_exit();
 }
 
 #[panic_handler]

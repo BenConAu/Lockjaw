@@ -148,12 +148,19 @@ where
 /// The scheduler's abstract state: per-CPU current thread and each
 /// thread's state. The kernel's real state (a static array of Option<PhysAddr>
 /// TCBs) is a concrete realization of this.
+///
+/// Fields are crate-private so the invariants enforced by the mutating
+/// methods (`block_current`, `unblock`, `step`, etc.) cannot be bypassed
+/// by direct field writes from outside this crate. External readers must
+/// go through accessors (`get`, `try_current_for`, `current_for_panic_safe`).
+/// Tests in this module can still construct invariant-violating states
+/// to verify `check_invariants` rejects them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchedState {
     /// Per-CPU current thread index. `Some(idx)` means this CPU is running
     /// thread `idx`. `None` means the CPU has no thread assigned yet.
-    pub current_per_cpu: [Option<usize>; MAX_CPUS],
-    pub states: [Option<SchedThreadState>; MAX_THREADS],
+    pub(crate) current_per_cpu: [Option<usize>; MAX_CPUS],
+    pub(crate) states: [Option<SchedThreadState>; MAX_THREADS],
 }
 
 /// Maximum number of threads the kernel can track simultaneously.
@@ -216,6 +223,16 @@ impl SchedState {
     /// new `schedule_from_idle` path in the scheduler refactor).
     pub fn try_current_for(&self, cpu_id: usize) -> Option<usize> {
         self.current_per_cpu[cpu_id]
+    }
+
+    /// Bounds-safe version of `try_current_for`: `None` for either an
+    /// out-of-range `cpu_id` or an unassigned CPU. The only caller is
+    /// the kernel's crash-diagnostic path, which must not panic
+    /// re-entrantly while printing a fault context with corrupt or
+    /// indeterminate state. Internal callers should use `current_for` /
+    /// `try_current_for` so an out-of-bounds CPU is a contract panic.
+    pub fn current_for_panic_safe(&self, cpu_id: usize) -> Option<usize> {
+        self.current_per_cpu.get(cpu_id).copied().flatten()
     }
 
     /// Add a new thread as Ready. Returns its index, or None if full.

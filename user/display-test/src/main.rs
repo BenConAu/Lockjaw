@@ -6,7 +6,6 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[used]
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
-use core::arch::asm;
 use lockjaw_userlib::*;
 use lockjaw_userlib::display::DisplayClient;
 
@@ -111,7 +110,5 @@ pub extern "C" fn _start() -> ! {
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     puts("[DISPLAY-TEST] PANIC\n");
-    loop {
-        unsafe { asm!("wfi") };
-    }
+    sys_exit();
 }
