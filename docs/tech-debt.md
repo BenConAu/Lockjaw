@@ -289,3 +289,34 @@ The right primitives — `park_forever` (block-forever) and `sys_exit` (terminat
 **Why bootstrap:** Caught during the scheduler-refactor cleanup pass on 2026-05-17. The `init` heartbeat (`loop { ipc_puts; sys_yield(); }`) and several daemons' `halt() = loop { wfi }` were silently inflating perf measurements; the workaround was to audit each binary manually and replace with `park_forever`/`sys_exit`. A CI gate would have caught all of them at once and would prevent reintroduction.
 
 **Fix:** Add `cargo xtask check-userspace-loops` that walks `user/*/src/**.rs` (the existing crates' main bodies are simple enough to grep) and fails on either pattern. Wire into the `build:` Makefile target alongside the other check-* xtasks.
+
+---
+
+## emmc2 SD card has intermittent ~5.6ms read stalls
+
+**Where:** SD card hardware (the Samsung 128GB card we're testing with). Not our driver, not the BCM2711 SDHCI controller, not the kernel scheduler.
+
+**What:** Single ADMA2 reads from LBA 0 occasionally pay an extra ~5.6ms beyond the card-only ceiling (~41us per block at 25 MHz × 4-bit). The 2026-05-17 investigation showed:
+
+- The slow set is **not deterministic between boots**. One boot had n=4 and n=16 consistently slow across 10 passes; a fresh boot of the same kernel/card had n=1, n=8, n=4, n=16, or n=127 slow depending on which pass — different iterations each boot. So it's not block-count-specific.
+- `PRESENT_STATE.DAT_INHIBIT` drops at the exact moment `DATA_COMPLETE` fires (`dat_idle == data_to_complete` on every measurement, slow or fast). The controller is not delaying the completion signal; the card is genuinely holding DAT busy for the full stall duration.
+- The cmd phase is constantly ~10us regardless of block count, so CMD18+Auto-CMD23 sequencing is fine.
+- `d_cs=0` and `new_tick_max_us=0` across the sweep — no scheduler contribution.
+- The ~5.6ms quantum is consistent: when a stall happens, it's always ~5.5-5.7ms, never 1ms or 20ms. Even an 11ms outlier on n=127 decomposes as "expected 5500us + one 5500us stall."
+
+The most likely cause is internal flash management on the card (wear leveling, garbage collection, cache refresh, sequencer protocol switch) that takes a fixed ~5.6ms when triggered. The driver waits correctly via `DATA_COMPLETE` polling, so the only effect is observed latency.
+
+**Why bootstrap:** Pi 4B emmc2 M6 ADMA perf measurements showed wild variance (5-30ms slack). The scheduler refactor (commits 960cb67 / f4504dc / aa86ff1) removed several real lockjaw-side contributors. The remaining ~5.6ms variance turned out to be card-side; codex (consulted 2026-05-17) agreed: *"diagnosis lands at card-side read stalls, not ADMA programming, controller bookkeeping, or scheduler interference."*
+
+**Fix:** Nothing to fix in lockjaw. Downstream:
+
+- M7 BlockEngine should measure throughput across many transfers, not single-transfer latency. A single slow read in 1000 amortizes to ~5.6us per read.
+- If the application needs latency SLOs, consider testing with a different SD card (industrial / health-monitored cards have lower variance).
+- The lockjaw emmc2 driver could optionally retry transfers with abnormally long observed latency, but this is anti-pattern (the card will still complete, just slowly; retrying mid-transfer is racy). Don't.
+
+**Diagnostic primitives kept in tree from this investigation:**
+- `sys_sched_telemetry` syscall (kernel + userlib): exposes tick count, ctx switches, TTBR0 writes, tick-handler peak cycles.
+- `tick_self_timing` in `src/arch/aarch64/timer.rs`: tracks tick handler `last/max` cycles, exposed via syscall.
+- emmc2 perf sweep keeps cmd-vs-data phase split timings (helped this investigation rule out CMD18+Auto-CMD23 sequencing as a cause).
+
+These would help diagnose similar latency mysteries in future drivers.

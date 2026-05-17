@@ -1500,19 +1500,24 @@ pub extern "C" fn _start() -> ! {
 /// LBA 0 and return elapsed ticks. Allocates a fresh DmaPool buffer
 /// (does NOT free — driver is a one-shot probe). Uses CMD18 with
 /// Auto-CMD23 and a single descriptor covering the full transfer.
+/// Result of an ADMA2 multi-block read with phase-split timing.
+/// `cmd_to_complete` is the controller's response latency; the rest
+/// is card-side data delivery. Useful for distinguishing controller
+/// bugs from card-side stalls — see `docs/tech-debt.md` for the
+/// 2026-05-17 card-stall investigation.
+pub struct AdmaTiming {
+    pub total: u64,
+    pub cmd_to_complete: u64,
+    pub data_to_complete: u64,
+}
+
 unsafe fn adma2_multiblock_read(
     mmio_va: u64,
     n_blocks: u16,
-    n_pages: u64,
+    buf_phys: u64,
     desc_va: u64,
     desc_phys: u64,
-) -> Result<u64, &'static str> {
-    let buf_ps = sys_alloc_dma_pages(n_pages).map_err(|_| "alloc_dma_pages")?;
-    let buf_phys = sys_query_pageset_phys(buf_ps, 0).map_err(|_| "query_phys")?;
-    let buf_va = VMEM.alloc(n_pages as usize).ok_or("VA alloc")?;
-    if !sys_map_pages(buf_ps, buf_va, MapMemoryAttribute::NormalNonCacheable).is_ok() {
-        return Err("map_pages NC");
-    }
+) -> Result<AdmaTiming, &'static str> {
     if buf_phys >= (1u64 << 32) {
         return Err("phys > 4GiB");
     }
@@ -1575,6 +1580,7 @@ unsafe fn adma2_multiblock_read(
         if monotonic_now() >= cmd_deadline { return Err("cmd_complete timeout"); }
         core::hint::spin_loop();
     }
+    let t_cmd = monotonic_now();
 
     // Poll TRANSFER_COMPLETE — for multi-block ADMA, the controller
     // signals once after the FULL descriptor's transfer ends.
@@ -1599,7 +1605,11 @@ unsafe fn adma2_multiblock_read(
         core::hint::spin_loop();
     }
     let t1 = monotonic_now();
-    Ok(t1.0.saturating_sub(t0.0))
+    Ok(AdmaTiming {
+        total: t1.0.saturating_sub(t0.0),
+        cmd_to_complete: t_cmd.0.saturating_sub(t0.0),
+        data_to_complete: t1.0.saturating_sub(t_cmd.0),
+    })
 }
 
 /// Sweep ADMA2 and PIO across block counts 1, 4, 8, 16, 32, 64, 127 to
@@ -1641,13 +1651,40 @@ fn perf_sweep_adma_vs_pio(
         sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc_new);
     }
 
-    puts("[EMMC2:PERF] block-count sweep (ADMA2 / PIO) us [+sched deltas]\n");
-    for &n in counts {
-        // n_pages = ceil(n_blocks * 512 / 4096) = ceil(n / 8)
-        let n_pages = ((n as u64) * 512 + 4095) / 4096;
+    // One stable DMA buffer big enough for the largest block count
+    // (127 blocks × 512 = 65024 bytes → 16 pages). Reuse across every
+    // iteration. Stable buf_phys was a deliberate choice during the
+    // 2026-05-17 ADMA stall investigation: previous "allocate fresh
+    // per iteration" runs left buf_phys varying with the DMA pool
+    // allocation order, which conflated buffer state with block count
+    // as variables. With stable buf_phys, block count is the only
+    // thing that changes per iteration. (Confirmed via 10-pass run
+    // that the residual variance is intermittent SD-card stalls, not
+    // anything in our driver — see docs/tech-debt.md.)
+    const MAX_N_PAGES: u64 = 16;
+    let buf_ps = match sys_alloc_dma_pages(MAX_N_PAGES) {
+        Ok(ps) => ps,
+        Err(_) => { puts("[EMMC2:PERF] sweep buf alloc FAILED\n"); return; }
+    };
+    let buf_phys = match sys_query_pageset_phys(buf_ps, 0) {
+        Ok(p) => p,
+        Err(_) => { puts("[EMMC2:PERF] sweep buf query_phys FAILED\n"); return; }
+    };
+    let buf_va = match VMEM.alloc(MAX_N_PAGES as usize) {
+        Some(v) => v,
+        None => { puts("[EMMC2:PERF] sweep buf VA alloc FAILED\n"); return; }
+    };
+    if !sys_map_pages(buf_ps, buf_va, MapMemoryAttribute::NormalNonCacheable).is_ok() {
+        puts("[EMMC2:PERF] sweep buf map_pages NC FAILED\n");
+        return;
+    }
 
-        let tel_a0 = sys_sched_telemetry();
-        let adma_ticks = match unsafe { adma2_multiblock_read(mmio_va, n, n_pages, desc_va, desc_phys) } {
+    puts("[EMMC2:PERF] block-count sweep (ADMA2 / PIO) us [phase split; stable buf_phys=");
+    put_hex(buf_phys);
+    puts("]\n");
+
+    for &n in counts {
+        let adma = match unsafe { adma2_multiblock_read(mmio_va, n, buf_phys, desc_va, desc_phys) } {
             Ok(t) => t,
             Err(e) => {
                 puts("[EMMC2:PERF]  n="); put_decimal(n as u64);
@@ -1655,20 +1692,15 @@ fn perf_sweep_adma_vs_pio(
                 continue;
             }
         };
-        let tel_a1 = sys_sched_telemetry();
-        let dt_adma = tel_a1.delta_from(&tel_a0);
 
         // PIO compare: pass a sub-slice of the static buffer (64 KiB
         // total in BSS — too large for the userspace stack).
-        let tel_p0 = sys_sched_telemetry();
         let t2 = monotonic_now();
         let pio_result = unsafe {
             #[allow(static_mut_refs)]
             read_blocks_pio(mmio_va, 0, &mut PIO_SWEEP_BUF[..n as usize])
         };
         let t3 = monotonic_now();
-        let tel_p1 = sys_sched_telemetry();
-        let dt_pio = tel_p1.delta_from(&tel_p0);
         let pio_ticks = t3.0.saturating_sub(t2.0);
         if let Err(e) = pio_result {
             puts("[EMMC2:PERF]  n="); put_decimal(n as u64);
@@ -1676,19 +1708,17 @@ fn perf_sweep_adma_vs_pio(
             continue;
         }
 
-        let adma_us = ticks_to_us(adma_ticks, freq);
+        let adma_us = ticks_to_us(adma.total, freq);
+        let cmd_us = ticks_to_us(adma.cmd_to_complete, freq);
+        let data_us = ticks_to_us(adma.data_to_complete, freq);
         let pio_us = ticks_to_us(pio_ticks, freq);
         puts("[EMMC2:PERF]  n="); put_decimal(n as u64);
         puts(" bytes="); put_decimal((n as u64) * 512);
         puts(" ADMA="); put_decimal(adma_us);
-        puts("us [d_ticks="); put_decimal(dt_adma.ticks);
-        puts(" d_cs="); put_decimal(dt_adma.ctx_switches);
-        puts(" d_ttbr0="); put_decimal(dt_adma.ttbr0_writes);
-        puts("] PIO="); put_decimal(pio_us);
-        puts("us [d_ticks="); put_decimal(dt_pio.ticks);
-        puts(" d_cs="); put_decimal(dt_pio.ctx_switches);
-        puts(" d_ttbr0="); put_decimal(dt_pio.ttbr0_writes);
-        puts("] ratio_x100="); put_decimal((adma_us * 100) / pio_us.max(1));
+        puts("us (cmd="); put_decimal(cmd_us);
+        puts(" data="); put_decimal(data_us);
+        puts(") PIO="); put_decimal(pio_us);
+        puts("us ratio_x100="); put_decimal((adma_us * 100) / pio_us.max(1));
         puts("\n");
     }
 }

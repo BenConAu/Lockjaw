@@ -575,43 +575,53 @@ pub fn sys_query_caller_token() -> u64 {
 }
 
 /// Snapshot of scheduler-side counters for userspace perf diagnostics.
-/// Each counter is monotonically non-decreasing; the three are NOT
-/// snapshot-consistent (read with three separate atomic loads).
+/// Each counter is monotonically non-decreasing; the four are NOT
+/// snapshot-consistent (read with four separate atomic loads).
 #[derive(Clone, Copy, Debug)]
 pub struct SchedTelemetry {
     pub ticks: u64,
     pub ctx_switches: u64,
     pub ttbr0_writes: u64,
+    /// High-water mark of tick-handler elapsed CNTVCT ticks since
+    /// boot. Divide by `cntfreq_hz` to convert to microseconds.
+    pub tick_max_cycles: u64,
 }
 
 impl SchedTelemetry {
     /// Per-counter deltas (saturating) from `from` to `self`.
+    /// `tick_max_cycles` is a HIGH-WATER MARK, so the delta is
+    /// "how much the max grew during this window" — 0 means the
+    /// max-cost tick handler in the window was <= the prior max.
     pub fn delta_from(&self, from: &SchedTelemetry) -> SchedTelemetry {
         SchedTelemetry {
             ticks: self.ticks.saturating_sub(from.ticks),
             ctx_switches: self.ctx_switches.saturating_sub(from.ctx_switches),
             ttbr0_writes: self.ttbr0_writes.saturating_sub(from.ttbr0_writes),
+            tick_max_cycles: self.tick_max_cycles.saturating_sub(from.tick_max_cycles),
         }
     }
 }
 
 /// Diagnostic snapshot of scheduler counters (tick_count, context
-/// switches, TTBR0 writes). Read-only. See `SchedTelemetry`.
+/// switches, TTBR0 writes, tick-handler max cycles). Read-only.
+/// See `SchedTelemetry`.
 pub fn sys_sched_telemetry() -> SchedTelemetry {
     let ticks: u64;
     let ctx_switches: u64;
     let ttbr0_writes: u64;
+    let tick_max_cycles: u64;
     unsafe {
         asm!(
-            "svc #0",                 // Trap to EL1; kernel reads x8 for syscall number.
-            lateout("x0") _,          // x0: syscall error (always OK for read-only telemetry).
-            lateout("x1") ticks,      // x1: TICK_COUNT snapshot (tick handler increments).
-            lateout("x2") ctx_switches, // x2: CONTEXT_SWITCH_COUNT snapshot (each SwitchTo bumps).
-            lateout("x3") ttbr0_writes, // x3: TTBR0_WRITE_COUNT snapshot (process-switch flushes).
-            in("x8") SYS_SCHED_TELEMETRY, // x8: syscall dispatch number.
+            "svc #0",                       // Trap to EL1; kernel reads x8 for syscall number.
+            lateout("x0") _,                // x0: syscall error (always OK for read-only telemetry).
+            lateout("x1") ticks,            // x1: TICK_COUNT snapshot.
+            lateout("x2") ctx_switches,     // x2: CONTEXT_SWITCH_COUNT snapshot.
+            lateout("x3") ttbr0_writes,     // x3: TTBR0_WRITE_COUNT snapshot.
+            lateout("x4") tick_max_cycles,  // x4: TICK_MAX_CYCLES high-water mark (CNTVCT ticks).
+            in("x8") SYS_SCHED_TELEMETRY,   // x8: syscall dispatch number.
         );
     }
-    SchedTelemetry { ticks, ctx_switches, ttbr0_writes }
+    SchedTelemetry { ticks, ctx_switches, ttbr0_writes, tick_max_cycles }
 }
 
 /// Close a handle, freeing the slot for reuse. Does not free the

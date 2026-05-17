@@ -4,6 +4,16 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Global tick counter — incremented by the timer IRQ handler.
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Tick-handler self-timing in CNTVCT ticks. Updated atomically each
+/// tick; codex flagged that a multi-ms tick handler could mimic
+/// SD-card stalls, so we keep these as a permanent monitor. Both
+/// counters are read by `sys_sched_telemetry` so userspace can
+/// correlate "how long did the tick handler take last/at peak" with
+/// observed measurement variance. `LAST` is the most recent
+/// completed tick's elapsed ticks; `MAX` is the high-water mark.
+static TICK_LAST_CYCLES: AtomicU64 = AtomicU64::new(0);
+static TICK_MAX_CYCLES: AtomicU64 = AtomicU64::new(0);
+
 /// Read the timer frequency from CNTFRQ_EL0.
 fn timer_freq() -> u64 {
     let freq: u64;
@@ -115,15 +125,32 @@ pub unsafe fn init_secondary() {
 /// latency for no reason and breaking the [50ms, 70ms] tolerance
 /// the integration test pins.
 pub fn handle_tick() {
+    let start = kernel_now();
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     unsafe {
         arm_timer(lockjaw_types::constants::TIMER_TICK_MS);
         crate::sched::scheduler::wake_expired_deadlines(kernel_now());
         crate::sched::scheduler::tick();
     }
+    let elapsed = kernel_now().0.saturating_sub(start.0);
+    TICK_LAST_CYCLES.store(elapsed, Ordering::Relaxed);
+    // Atomic max via fetch_max (Relaxed is fine: a single read-write
+    // race may lose an update, but the high-water mark trends right
+    // over many ticks).
+    TICK_MAX_CYCLES.fetch_max(elapsed, Ordering::Relaxed);
 }
 
 /// Read the current tick count.
 pub fn tick_count() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
+}
+
+/// Read last/max tick-handler elapsed cycles (CNTVCT ticks). Used
+/// by `sys_sched_telemetry` so userspace can correlate measurement
+/// variance with tick-handler cost.
+pub fn tick_self_timing() -> (u64, u64) {
+    (
+        TICK_LAST_CYCLES.load(Ordering::Relaxed),
+        TICK_MAX_CYCLES.load(Ordering::Relaxed),
+    )
 }

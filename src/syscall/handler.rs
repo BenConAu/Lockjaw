@@ -939,21 +939,28 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 
 /// sys_sched_telemetry() — diagnostic snapshot of scheduler counters.
 ///
-/// Returns three monotonically-non-decreasing u64 counters:
-///   x1 = tick_count       — TIMER_TICK_MS ticks since boot
-///   x2 = context_switches — successful SwitchTo transitions
-///   x3 = ttbr0_writes     — process-switch TLB invalidates
+/// Returns four monotonically-non-decreasing u64 counters:
+///   x1 = tick_count          — TIMER_TICK_MS ticks since boot
+///   x2 = context_switches    — successful SwitchTo transitions
+///   x3 = ttbr0_writes        — process-switch TLB invalidates
+///   x4 = tick_max_cycles     — high-water mark for tick-handler
+///                              CNTVCT-tick elapsed time. Added to
+///                              distinguish "scheduler tick handler
+///                              is slow" from "SD card is slow"
+///                              during the emmc2 perf investigation.
 ///
 /// Used by userspace perf harnesses to capture deltas around a
 /// measured operation. Snapshot is atomic per-counter (each is an
-/// AtomicU64 load), not snapshot-consistent across the three.
+/// AtomicU64 load), not snapshot-consistent across the four.
 /// Read-only — no scheduler state is mutated.
 fn sys_sched_telemetry(ctx: &mut ExceptionContext) -> SyscallReturn {
     let ticks = crate::arch::aarch64::timer::tick_count();
     let (ctx_switches, ttbr0_writes) = scheduler::scheduler_stats();
+    let (_tick_last, tick_max) = crate::arch::aarch64::timer::tick_self_timing();
     ctx.gpr[1] = ticks;
     ctx.gpr[2] = ctx_switches as u64;
     ctx.gpr[3] = ttbr0_writes as u64;
+    ctx.gpr[4] = tick_max;
     SyscallReturn::Message(SyscallError::OK)
 }
 
