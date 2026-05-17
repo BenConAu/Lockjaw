@@ -271,3 +271,21 @@ The functional correctness isn't affected, but every Pi log read is harder than 
 **Why bootstrap:** The QEMU path looks clean, so the bug-class hid until we started capturing Pi logs in earnest during the sleep-primitive plan.
 
 **Fix:** Make the UART writer atomic w.r.t. other CPUs/processes — a simple mutex around the per-byte loop, or a proper kernel print buffer. The right shape is probably a ticket-locked per-CPU print buffer flushed on either newline or timer tick, but a coarse spinlock around the existing path would fix the readability problem immediately.
+
+---
+
+## xtask lint for userspace busy-spin anti-patterns
+
+**Where:** `xtask/src/main.rs`, alongside the existing check-* commands.
+
+**What:** Search every `user/*/src/**.rs` binary for the two anti-patterns:
+  - `loop { sys_yield(); }` or `loop { sys_yield() }` (variants).
+  - `loop { unsafe { asm!("wfi"); } }` or any `loop { wfi }` shape.
+
+Both keep the thread in `Running`/`Ready` state from the scheduler's POV. The first contends for fair round-robin slots every tick; the second is also `Running` because EL0 `wfi` just pauses the CPU until the next IRQ — the scheduler doesn't see a state change. Either pattern monopolizes a scheduler slot on a system that should be idle.
+
+The right primitives — `park_forever` (block-forever) and `sys_exit` (terminate) — exist in `lockjaw_userlib`. The lint forces drivers/clients to use them instead of reinventing footguns.
+
+**Why bootstrap:** Caught during the scheduler-refactor cleanup pass on 2026-05-17. The `init` heartbeat (`loop { ipc_puts; sys_yield(); }`) and several daemons' `halt() = loop { wfi }` were silently inflating perf measurements; the workaround was to audit each binary manually and replace with `park_forever`/`sys_exit`. A CI gate would have caught all of them at once and would prevent reintroduction.
+
+**Fix:** Add `cargo xtask check-userspace-loops` that walks `user/*/src/**.rs` (the existing crates' main bodies are simple enough to grep) and fails on either pattern. Wire into the `build:` Makefile target alongside the other check-* xtasks.

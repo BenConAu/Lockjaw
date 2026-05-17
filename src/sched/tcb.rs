@@ -13,6 +13,20 @@ pub use lockjaw_types::thread::{KernelStackBase, Tcb, TcbCreateInfo, ThreadBoots
 /// Initialize a TCB in a KVM-mapped page and set up its stack with a
 /// synthetic frame so it can be context-switched into.
 ///
+/// Rejects kernel-process TCBs (`info.process_kva` with TTBR0 = 0).
+/// The reason is a substrate-level invariant: kernel-mode threads
+/// run with `DAIF.I` masked (see `src/sched/context.rs`'s
+/// `thread_entry` doc — "kernel threads run under GKL with IRQs
+/// masked"). A tight loop in such a thread starves IRQ delivery on
+/// its CPU, breaking timer ticks, deadline wakes, and IPC unblock —
+/// see the deleted ipc_sender/ipc_receiver bench threads, which
+/// concretely deadlocked the system in single-CPU QEMU once init
+/// stopped busy-spinning. The boot TCB is the only legitimate
+/// kernel-process TCB and uses `create_boot_tcb` (a separate
+/// constructor); every TCB created through `create_tcb` must run
+/// in a user process so it returns to EL0 between syscalls and
+/// allows IRQ delivery.
+///
 /// # Safety
 /// `base_kva` must be a KVM-allocated page. `info.stack` must be a
 /// `KernelStackBase::Pool(KernelVa)` for dynamically-allocated stacks
@@ -22,6 +36,13 @@ pub unsafe fn create_tcb(
     info: &TcbCreateInfo,
     base_kva: KernelVa,
 ) -> Result<(), CreateError> {
+    // Reject kernel-process TCBs — see the doc on this fn for why.
+    // Kernel processes are identified by TTBR0 = 0 (no user address
+    // space). Only the boot TCB legitimately runs in the kernel
+    // process and it uses `create_boot_tcb`, never this path.
+    if crate::cap::process_obj::process_ttbr0(info.process_kva) == 0 {
+        return Err(CreateError::InvalidParameter);
+    }
     let stack_kva = match info.stack {
         KernelStackBase::Pool(kva) => kva,
         KernelStackBase::Image(_) => {

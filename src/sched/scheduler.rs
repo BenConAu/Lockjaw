@@ -386,39 +386,30 @@ pub fn block_current(_token: BlockToken) {
         (&mut *SCHEDULER.state_ptr()).block_current(cpu_id)
             .unwrap_or_else(|_| panic!("block_current: not Running"));
     }
-    // Wait-loop ordering: check state FIRST every iteration so that a
-    // self-wake (an IRQ on this CPU that ran `unblock_thread` while
-    // we were in wfi) is handled before we try to schedule again.
+    // Wait-loop. State at the top of each iteration is either:
+    //   - Running: we got switched back via a normal schedule call
+    //     (someone else blocked, we were the picked Ready thread) OR
+    //     `unblock` self-wake transitioned us Blocked → Running
+    //     directly because we're current on this CPU. Either way:
+    //     return.
+    //   - Blocked: try to switch to someone else, then wfi.
     //
-    //   - Running: we got switched back to via a normal schedule call
-    //     on some other CPU / path. Return.
-    //   - Ready: we were unblocked inline while wfi'd. The CPU is
-    //     still on this thread's stack, so a context_switch back is
-    //     unnecessary; transition Ready → Running and return.
-    //   - Blocked: try to switch to someone else. If no other thread
-    //     is Ready, schedule returns WaitForInterrupt and we wfi.
-    //
-    // Before the resume_current path existed, a self-wake would leave
-    // current = Ready, then `schedule(Block)` would call `step(Block)`
-    // which asserts current = Blocked or Exited → kernel panic. The
-    // bug only surfaced once the IPC benchmark threads were removed:
-    // until then there was always another Ready thread to switch to,
-    // so block_current never re-entered the loop in Ready state.
+    // The "Ready" case is unreachable by construction: `unblock` sets
+    // a current thread to Running (not Ready) — see
+    // SchedState::unblock + check_invariants. Before that invariant
+    // existed, a self-wake on this CPU's wfi could leave current
+    // in Ready state and the next `schedule(Block)` would trip
+    // `step(Block)`'s assert. The invariant kills that bug class.
     loop {
         unsafe {
-            let state = &mut *SCHEDULER.state_ptr();
+            let state = &*SCHEDULER.state_ptr();
             let current = state.current_for(cpu_id);
             match state.get(current) {
                 Some(SchedThreadState::Running) => return,
-                Some(SchedThreadState::Ready) => {
-                    state.resume_current(cpu_id)
-                        .unwrap_or_else(|_| panic!("block_current: resume_current failed"));
-                    return;
-                }
                 Some(SchedThreadState::Blocked) => {
                     // fall through to schedule + wfi
                 }
-                _ => panic!("block_current: unexpected current state (Exited or absent)"),
+                _ => panic!("block_current: invariant broken — current is Ready/Exited/absent"),
             }
         }
         unsafe { schedule(SchedReason::Block); }

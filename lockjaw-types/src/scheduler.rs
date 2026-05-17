@@ -269,32 +269,28 @@ impl SchedState {
         }
     }
 
-    /// Transition the current thread on `cpu_id` from Ready back to
-    /// Running. Used by `block_current`'s wfi loop when an IRQ on this
-    /// CPU unblocked us inline (state went Blocked → Ready via
-    /// `unblock`) without an intervening context_switch. The CPU is
-    /// still executing on this thread's stack — Ready→Running is a
-    /// pure bookkeeping fix so subsequent scheduler asserts hold.
+    /// Mark a Blocked thread as ready to run. If the thread is current
+    /// on some CPU (i.e., that CPU is parked in `block_current`'s wfi
+    /// on this thread's stack), it transitions Blocked → **Running**
+    /// directly — no context_switch needed, the CPU just returns from
+    /// wfi onto its own stack. Otherwise transitions Blocked → **Ready**
+    /// and the scheduler picks it on the next round.
     ///
-    /// Fails if the current thread isn't Ready.
-    pub fn resume_current(&mut self, cpu_id: usize) -> Result<(), SchedError> {
-        let current = self.current_for(cpu_id);
-        match self.get(current) {
-            Some(SchedThreadState::Ready) => {
-                self.states[current] = Some(SchedThreadState::Running);
-                Ok(())
-            }
-            _ => Err(SchedError::InvalidTransition),
-        }
-    }
-
-    /// Mark a Blocked thread as Ready so the scheduler can pick it.
-    /// Used by IPC endpoints and notifications when a partner arrives.
+    /// This enforces the invariant "`current_per_cpu[cpu]`'s state is
+    /// never `Ready`" — see `check_invariants`. Without that invariant,
+    /// `step(Block)` (which asserts current is Blocked or Exited)
+    /// would panic if a self-wake left current in Ready state. Used
+    /// by IPC endpoints, notifications, and the per-tick deadline scan.
     /// Rejects Exited threads — once exited, a thread cannot be woken.
     pub fn unblock(&mut self, idx: usize) -> Result<(), SchedError> {
         match self.get(idx) {
             Some(SchedThreadState::Blocked) => {
-                self.states[idx] = Some(SchedThreadState::Ready);
+                let is_current = self.current_per_cpu.iter().any(|c| *c == Some(idx));
+                self.states[idx] = Some(if is_current {
+                    SchedThreadState::Running
+                } else {
+                    SchedThreadState::Ready
+                });
                 Ok(())
             }
             Some(_) => Err(SchedError::InvalidTransition),
@@ -498,6 +494,24 @@ impl SchedState {
                     .filter(|c| **c == Some(i))
                     .count();
                 if cpu_count != 1 {
+                    return false;
+                }
+            }
+        }
+
+        // The thread that is current on a CPU must never be in state
+        // Ready. Ready means "eligible to run, waiting for a CPU" —
+        // but if you're already current on a CPU, you have one. The
+        // legal current-states are Running (executing), Blocked (parked
+        // in block_current's wfi on this CPU's stack), and Exited
+        // (parked in exit_current's halt on this CPU's stack). `unblock`
+        // upholds this by transitioning Blocked → Running for current
+        // threads (not Blocked → Ready), so the scheduler's
+        // `step(Block)` assert ("current must be Blocked or Exited")
+        // cannot be tripped by an inline self-wake.
+        for cpu_current in &self.current_per_cpu {
+            if let Some(idx) = cpu_current {
+                if self.states[*idx] == Some(SchedThreadState::Ready) {
                     return false;
                 }
             }
@@ -804,13 +818,28 @@ mod tests {
     }
 
     #[test]
-    fn unblock_valid_from_blocked() {
+    fn unblock_non_current_to_ready() {
+        // Non-current Blocked thread → Ready (normal wake path).
         let mut s = SchedState::new();
-        s.add_thread().unwrap(); // idx 1 Ready
-        // Block thread 1
-        s.states[1] = Some(SchedThreadState::Blocked);
+        s.add_thread().unwrap(); // idx 1, Ready by default
+        s.states[1] = Some(SchedThreadState::Blocked); // simulate block
         assert!(s.unblock(1).is_ok());
         assert_eq!(s.get(1), Some(SchedThreadState::Ready));
+        assert!(s.check_invariants());
+    }
+
+    #[test]
+    fn unblock_current_to_running() {
+        // Current Blocked thread → Running (self-wake path). The
+        // bug class this prevents: if unblock left current = Ready,
+        // step(Block) on the next block_current loop iteration
+        // would panic ("requires current Blocked or Exited").
+        let mut s = SchedState::new();
+        s.block_current(0).unwrap();                  // CPU 0 current → Blocked
+        assert_eq!(s.get(0), Some(SchedThreadState::Blocked));
+        assert!(s.unblock(0).is_ok());
+        assert_eq!(s.get(0), Some(SchedThreadState::Running)); // not Ready!
+        assert!(s.check_invariants());
     }
 
     #[test]
@@ -821,33 +850,13 @@ mod tests {
     }
 
     #[test]
-    fn resume_current_valid_from_ready() {
-        // Simulates the block_current self-wake path: a Blocked current
-        // gets unblocked (Blocked → Ready) by an inline IRQ, then
-        // block_current's loop calls resume_current to transition the
-        // same thread Ready → Running before re-asserting Scheduler
-        // invariants downstream.
+    fn check_invariants_rejects_ready_current() {
+        // Direct construction of the forbidden state — proves
+        // check_invariants catches it. Real callers cannot reach
+        // this state because `unblock` upholds the invariant.
         let mut s = SchedState::new();
-        s.block_current(0).unwrap();                  // Running → Blocked
-        s.unblock(0).unwrap();                        // Blocked → Ready
-        assert_eq!(s.get(0), Some(SchedThreadState::Ready));
-        assert!(s.resume_current(0).is_ok());         // Ready → Running
-        assert_eq!(s.get(0), Some(SchedThreadState::Running));
-        assert!(s.check_invariants());
-    }
-
-    #[test]
-    fn resume_current_invalid_when_running() {
-        let mut s = SchedState::new();
-        // CPU 0 starts with thread 0 Running per SchedState::new().
-        assert_eq!(s.resume_current(0), Err(SchedError::InvalidTransition));
-    }
-
-    #[test]
-    fn resume_current_invalid_when_blocked() {
-        let mut s = SchedState::new();
-        s.block_current(0).unwrap();
-        assert_eq!(s.resume_current(0), Err(SchedError::InvalidTransition));
+        s.states[0] = Some(SchedThreadState::Ready); // tampered: current is Ready
+        assert!(!s.check_invariants());
     }
 
     #[test]
