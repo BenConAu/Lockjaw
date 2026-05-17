@@ -163,7 +163,11 @@ pub fn dtb_content_size(header: &[u8]) -> Result<usize, FdtError> {
     }
     let off_dt_strings = read_u32_be(header, 12) as usize;
     let size_dt_strings = read_u32_be(header, 32) as usize;
-    Ok(off_dt_strings + size_dt_strings)
+    // Checked add: a malformed header could otherwise wrap `usize`
+    // before the caller bound-checks against the mapped DTB window.
+    off_dt_strings
+        .checked_add(size_dt_strings)
+        .ok_or(FdtError::InvalidOffsets)
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +194,124 @@ fn parse_all_compat(data: &[u8], start: usize, len: usize) -> ([u64; MAX_COMPAT]
         pos += s.len() + 1; // skip past null terminator
     }
     (hashes, count)
+}
+
+/// Walk the DTB structure block looking for ANY node whose
+/// `compatible` property hashes to `target`. Returns true on
+/// first match. Allocation-free; suitable for init's "are we on
+/// Pi 4B?" probe (DTB blob is already mapped, no need to build
+/// the full FdtDevices summary just to answer a yes/no question).
+///
+/// Used by init to choose between virtio-blk and emmc2 as the
+/// block backend wired to fat32-server. Future callers that need
+/// the same "device present?" yes/no without the full device
+/// table can reuse this directly.
+pub fn has_compatible_hash(data: &[u8], target: u64) -> bool {
+    if data.len() < 40 {
+        return false;
+    }
+    let magic = read_u32_be(data, 0);
+    if magic != FDT_MAGIC {
+        return false;
+    }
+    let off_dt_struct = read_u32_be(data, 8) as usize;
+    let off_dt_strings = read_u32_be(data, 12) as usize;
+    let size_dt_struct = read_u32_be(data, 36) as usize;
+    let size_dt_strings = read_u32_be(data, 32) as usize;
+    // Every header-derived range must fit within `data`. Checked
+    // adds guard against malformed DTBs that could overflow `usize`
+    // before the inequality compare.
+    let struct_end = match off_dt_struct.checked_add(size_dt_struct) {
+        Some(v) => v,
+        None => return false,
+    };
+    let strings_end = match off_dt_strings.checked_add(size_dt_strings) {
+        Some(v) => v,
+        None => return false,
+    };
+    if struct_end > data.len() || strings_end > data.len() {
+        return false;
+    }
+    let mut pos = off_dt_struct;
+    while pos + 4 <= struct_end {
+        let token = read_u32_be(data, pos);
+        pos += 4;
+        match token {
+            FDT_BEGIN_NODE => {
+                // skip null-terminated unit name, then 4-byte align
+                let mut name_end = pos;
+                while name_end < struct_end && data[name_end] != 0 {
+                    name_end += 1;
+                }
+                pos = match name_end.checked_add(4) {
+                    Some(v) => v & !3,
+                    None => return false,
+                };
+            }
+            FDT_END_NODE | FDT_NOP => {}
+            FDT_END => break,
+            FDT_PROP => {
+                if pos + 8 > struct_end { break; }
+                let prop_len = read_u32_be(data, pos) as usize;
+                let name_off = read_u32_be(data, pos + 4) as usize;
+                pos += 8;
+                // Property name lives in the strings block; bound the
+                // read to that block to keep mis-decode local. Without
+                // these checks a corrupt name_off could read past the
+                // DTB end into adjacent memory.
+                let name_start = match off_dt_strings.checked_add(name_off) {
+                    Some(v) => v,
+                    None => break,
+                };
+                if name_start >= strings_end { break; }
+                let name = read_string_bounded(data, name_start, strings_end);
+                if name == b"compatible" {
+                    // Hash each null-terminated string; match any.
+                    let val_end = match pos.checked_add(prop_len) {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    if val_end > struct_end { break; }
+                    let mut s_off = pos;
+                    while s_off < val_end {
+                        let s = read_string_bounded(data, s_off, val_end);
+                        if s.is_empty() {
+                            break;
+                        }
+                        if compatible_hash(s) == target {
+                            return true;
+                        }
+                        match s_off.checked_add(s.len()).and_then(|v| v.checked_add(1)) {
+                            Some(v) => s_off = v,
+                            None => break,
+                        }
+                    }
+                }
+                // 4-byte-align the next position; saturating because a
+                // pathological prop_len could otherwise overflow.
+                pos = match pos.checked_add(prop_len)
+                    .and_then(|v| v.checked_add(3))
+                {
+                    Some(v) => v & !3,
+                    None => break,
+                };
+            }
+            _ => break, // unknown token; bail rather than mis-decode
+        }
+    }
+    false
+}
+
+/// Bounded variant of `read_string`: stops at `end` even if no NUL
+/// is encountered. Used by `has_compatible_hash` to prevent a
+/// malformed DTB from reading past the strings or property region.
+fn read_string_bounded(data: &[u8], start: usize, end: usize) -> &[u8] {
+    let end = end.min(data.len());
+    let mut i = start;
+    while i < end && data[i] != 0 {
+        i += 1;
+    }
+    &data[start..i]
 }
 
 /// Read 1 or 2 big-endian u32 cells as a u64 value.

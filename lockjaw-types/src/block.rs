@@ -10,7 +10,12 @@
 
 /// Query block device info.
 /// Request:  msg = [CMD_GET_INFO, 0, 0, 0]
-/// Response: msg = [capacity_sectors, sector_size, 0, 0]
+/// Response: msg = [capacity_sectors, sector_size, buffer_attribute, 0]
+///   buffer_attribute: `MapMemoryAttribute` discriminant the client
+///     MUST pass to `sys_map_pages` when mapping a buffer the engine
+///     returned from CMD_ALLOC_BUFFER. emmc2's DMA-pool buffers are
+///     NC-only (kernel-enforced), virtio-blk's pages are cacheable
+///     Normal; the engine declares which, the client uses it.
 pub const CMD_GET_INFO: u64 = 1;
 
 /// Allocate a physically contiguous DMA buffer.

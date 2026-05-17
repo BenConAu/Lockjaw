@@ -64,6 +64,9 @@ impl BlockEngine for VirtioBlkEngine {
         BlockInfo {
             capacity_sectors: self.capacity,
             sector_size: 512,
+            // virtio-blk allocs buffers via `sys_alloc_pages_contiguous`
+            // (Buddy origin), so the client must map them cacheable.
+            buffer_attribute: MapMemoryAttribute::Normal,
         }
     }
 

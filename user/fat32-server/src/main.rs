@@ -441,13 +441,23 @@ pub extern "C" fn _start() -> ! {
 
     let blk = BlockClient::new(blk_srv_ep, reply);
 
+    // Query the block engine's required buffer attribute. virtio-blk
+    // returns Normal (cacheable, sys_alloc_pages_contiguous); emmc2
+    // returns NormalNonCacheable (DMA pool, NC-only at the kernel).
+    // Mapping with the wrong attribute fails at sys_map_pages.
+    let blk_info = match blk.get_info() {
+        Ok(i) => i,
+        Err(_) => { puts("fat32: blk get_info FAILED\n"); halt(); }
+    };
+    let blk_attr = blk_info.buffer_attribute;
+
     // ---- Mount: read sector 0, parse BPB, allocate scratch buffers. ----
     let bpb_buf = match blk.alloc_buffer(1) {
         Ok(b) => b,
         Err(_) => { puts("fat32: blk alloc_buffer (BPB) FAILED\n"); halt(); }
     };
     let bpb_va = VMEM.alloc(1).expect("VA exhausted for BPB buffer");
-    if !sys_map_pages(bpb_buf.pageset, bpb_va, MapMemoryAttribute::Normal).is_ok() {
+    if !sys_map_pages(bpb_buf.pageset, bpb_va, blk_attr).is_ok() {
         puts("fat32: BPB buffer map FAILED\n"); halt();
     }
     if blk.read(0, 1, bpb_buf.buffer_id).is_err() {
@@ -473,7 +483,7 @@ pub extern "C" fn _start() -> ! {
     };
     let cluster_pages = ((cluster_sectors * 512 + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
     let cluster_va = VMEM.alloc(cluster_pages).expect("VA exhausted for cluster scratch");
-    if !sys_map_pages(cluster_buf.pageset, cluster_va, MapMemoryAttribute::Normal).is_ok() {
+    if !sys_map_pages(cluster_buf.pageset, cluster_va, blk_attr).is_ok() {
         puts("fat32: cluster scratch map FAILED\n"); halt();
     }
 
@@ -483,7 +493,7 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("fat32: blk alloc_buffer (fat) FAILED\n"); halt(); }
     };
     let fat_va = VMEM.alloc(1).expect("VA exhausted for FAT scratch");
-    if !sys_map_pages(fat_buf.pageset, fat_va, MapMemoryAttribute::Normal).is_ok() {
+    if !sys_map_pages(fat_buf.pageset, fat_va, blk_attr).is_ok() {
         puts("fat32: FAT scratch map FAILED\n"); halt();
     }
 

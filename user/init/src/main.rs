@@ -629,16 +629,79 @@ pub extern "C" fn _start() -> ! {
     sys_reply(blk_srv_idx, blk_devmgr_idx, 0, 0);
     puts("[BOOTSTRAP] blk\n");
 
+    // Bootstrap emmc2 BEFORE fat32 so the chosen block server is
+    // already running its receive loop by the time fat32 issues its
+    // first sys_call. Codex flagged this ordering during M7 review:
+    // if fat32 bootstraps first and we route it to emmc2, fat32 blocks
+    // until emmc2 reaches run_block_server later in this loop.
+    puts("init: waiting for emmc2 bootstrap...\n");
+    let _ = sys_receive(emmc2_boot_ep);
+    let emmc2_devmgr_idx = match sys_export_handle(devmgr_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export devmgr_ep to emmc2 FAILED\n"); park_forever(); }
+    };
+    let emmc2_blk_srv_idx_for_emmc2 = match sys_export_handle(emmc2_blk_srv_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export emmc2_blk_srv_ep to emmc2 FAILED\n"); park_forever(); }
+    };
+    sys_reply(emmc2_devmgr_idx, emmc2_blk_srv_idx_for_emmc2, 0, 0);
+    puts("[BOOTSTRAP] emmc2\n");
+
+    // Pick the block backend for fat32-server. On Pi 4B the
+    // bcm2711-emmc2 compatible string appears in the DTB; on QEMU it
+    // does not. Probe via `has_compatible_hash` on the DTB pageset
+    // init already mapped — allocation-free, no IPC.
+    //
+    // Note: this detects HARDWARE PRESENCE, not driver liveness. If
+    // emmc2-driver later fails its claim or selftest on a real Pi,
+    // fat32's first sys_call to it will block forever — acceptable
+    // for M7 follow-up scope (codex consult). A liveness handshake
+    // is out of scope.
+    // Build a slice covering exactly the DTB bytes — not the full
+    // 16-page VA window (which may extend past the mapped pageset
+    // for smaller DTBs and is UB to materialize as a slice). Read
+    // the 40-byte FDT header first, compute `dtb_content_size`, then
+    // construct the exact slice. Same pattern device-manager uses.
+    //
+    // A header-derived `size` is untrusted: a corrupt header could
+    // claim a size larger than the actual mapping. Bound `size`
+    // against `max_dtb_bytes` (16 pages minus the in-page offset of
+    // the DTB inside the first mapped page) before materializing
+    // the slice. `dtb_content_size` itself uses checked_add so the
+    // value passed in here can never wrap usize.
+    let dtb_base = dtb_va + boot_info.dtb_in_page_offset as u64;
+    let max_dtb_bytes =
+        16 * PAGE_SIZE as usize - boot_info.dtb_in_page_offset as usize;
+    let use_emmc2 = unsafe {
+        let header = core::slice::from_raw_parts(dtb_base as *const u8, 40);
+        match lockjaw_userlib::fdt::dtb_content_size(header) {
+            Ok(size) if size <= max_dtb_bytes => {
+                let body = core::slice::from_raw_parts(dtb_base as *const u8, size);
+                lockjaw_userlib::fdt::has_compatible_hash(
+                    body, lockjaw_userlib::BCM2711_EMMC2_HASH,
+                )
+            }
+            _ => false,
+        }
+    };
+    let active_blk_srv_ep = if use_emmc2 {
+        puts("init: Pi 4B detected (bcm2711-emmc2 in DTB) — fat32 over emmc2\n");
+        emmc2_blk_srv_ep
+    } else {
+        puts("init: no bcm2711-emmc2 in DTB — fat32 over virtio-blk\n");
+        blk_srv_ep
+    };
+
     // Bootstrap fat32-server: export its own server endpoint (so it
     // can sys_receive on it once Phase E wires up clients) plus the
-    // block-driver endpoint (so it can read sectors).
+    // active block-server endpoint (chosen above).
     puts("init: waiting for fat32 bootstrap...\n");
     let _ = sys_receive(fat32_boot_ep);
     let fat32_srv_idx = match sys_export_handle(fat32_srv_ep) {
         Ok(idx) => idx,
         Err(_) => { puts("init: export fat32_srv_ep FAILED\n"); park_forever(); }
     };
-    let fat32_blk_idx = match sys_export_handle(blk_srv_ep) {
+    let fat32_blk_idx = match sys_export_handle(active_blk_srv_ep) {
         Ok(idx) => idx,
         Err(_) => { puts("init: export blk to fat32 FAILED\n"); park_forever(); }
     };
@@ -680,23 +743,6 @@ pub extern "C" fn _start() -> ! {
     };
     sys_reply(clock_test_devmgr_idx, 0, 0, 0);
     puts("[BOOTSTRAP] clock-test\n");
-
-    // Bootstrap emmc2-driver: export devmgr_ep so it can call
-    // CMD_CLAIM_DEVICE + CMD_GET_CLOCK_HANDLE through the proxy.
-    // On QEMU the claim returns CLAIM_ERR immediately; the driver
-    // exits cleanly without touching the clock path.
-    puts("init: waiting for emmc2 bootstrap...\n");
-    let _ = sys_receive(emmc2_boot_ep);
-    let emmc2_devmgr_idx = match sys_export_handle(devmgr_ep) {
-        Ok(idx) => idx,
-        Err(_) => { puts("init: export devmgr_ep to emmc2 FAILED\n"); park_forever(); }
-    };
-    let emmc2_blk_srv_idx = match sys_export_handle(emmc2_blk_srv_ep) {
-        Ok(idx) => idx,
-        Err(_) => { puts("init: export emmc2_blk_srv_ep to emmc2 FAILED\n"); park_forever(); }
-    };
-    sys_reply(emmc2_devmgr_idx, emmc2_blk_srv_idx, 0, 0);
-    puts("[BOOTSTRAP] emmc2\n");
 
     // Bootstrap sleep-test: no handles to export, just a sync reply
     // so the client knows init has acknowledged its startup. The

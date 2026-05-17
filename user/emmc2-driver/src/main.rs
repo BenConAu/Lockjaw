@@ -1202,6 +1202,10 @@ impl BlockEngine for Emmc2BlockEngine {
         BlockInfo {
             capacity_sectors: self.capacity_sectors,
             sector_size: 512,
+            // emmc2 allocs buffers via `sys_alloc_dma_pages` (DmaPool
+            // origin); the kernel rejects any non-NC mapping for
+            // those PageSets, so clients MUST map NormalNonCacheable.
+            buffer_attribute: MapMemoryAttribute::NormalNonCacheable,
         }
     }
 

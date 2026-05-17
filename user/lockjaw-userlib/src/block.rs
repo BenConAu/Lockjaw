@@ -12,6 +12,7 @@
 pub use lockjaw_types::block::*;
 use crate::syscall::*;
 use crate::handle::{EndpointHandle, ReplyHandle, PageSetHandle};
+use lockjaw_types::vmem::MapMemoryAttribute;
 
 // ---------------------------------------------------------------------------
 // BlockError
@@ -45,6 +46,13 @@ pub struct BlockInfo {
     pub capacity_sectors: u64,
     /// Sector size in bytes (typically 512).
     pub sector_size: u64,
+    /// MapMemoryAttribute the client MUST use when calling
+    /// `sys_map_pages` on a buffer the engine allocates. emmc2's
+    /// DMA-pool buffers are NC-only (kernel-enforced); virtio-blk's
+    /// `sys_alloc_pages_contiguous` pages are cacheable Normal.
+    /// Mapping with the wrong attribute fails at the kernel boundary
+    /// — this contract makes the right choice queryable.
+    pub buffer_attribute: MapMemoryAttribute,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +192,8 @@ pub fn run_block_server(
 
         if cmd == CMD_GET_INFO {
             let info = engine.info();
-            sys_reply(info.capacity_sectors, info.sector_size, 0, 0);
+            sys_reply(info.capacity_sectors, info.sector_size,
+                info.buffer_attribute as u64, 0);
 
         } else if cmd == CMD_ALLOC_BUFFER {
             let sector_count = msg[1];
@@ -315,12 +324,17 @@ impl BlockClient {
         Self { endpoint, reply }
     }
 
-    /// Query block device info (capacity + sector size).
+    /// Query block device info (capacity, sector size, buffer
+    /// attribute). The attribute MUST be used when calling
+    /// `sys_map_pages` on buffers allocated via this client.
     pub fn get_info(&self) -> Result<BlockInfo, BlockError> {
         let msg = self.call(CMD_GET_INFO, 0, 0, 0)?;
+        let buffer_attribute = MapMemoryAttribute::from_raw(msg[2])
+            .ok_or(BlockError::InvalidParameter)?;
         Ok(BlockInfo {
             capacity_sectors: msg[0],
             sector_size: msg[1],
+            buffer_attribute,
         })
     }
 
