@@ -320,3 +320,28 @@ The most likely cause is internal flash management on the card (wear leveling, g
 - emmc2 perf sweep keeps cmd-vs-data phase split timings (helped this investigation rule out CMD18+Auto-CMD23 sequencing as a cause).
 
 These would help diagnose similar latency mysteries in future drivers.
+
+---
+
+## 72ms tick-handler peak on Pi 4B boot
+
+**Where:** `src/arch/aarch64/timer.rs::handle_tick` (with `tick_self_timing` enabled).
+
+**What:** During a Pi 4B boot the kernel timer handler hit a 72.7 ms peak (`tick_max_us_at_end=72756` after the emmc2 perf sweep, with `new_tick_max_us=0` across every sweep iteration — so the peak happened before the sweep started). The tick handler's body is just `arm_timer + wake_expired_deadlines + tick()`; on paper that should be tens of microseconds, not 72 ms. Something in the boot phase makes one tick handler take ~3 orders of magnitude longer than expected.
+
+`new_tick_max_us=0` per sweep iteration means whatever causes this does NOT recur during steady-state operation — only during boot. So it's not affecting current driver work, but a 72ms tick handler is concerning as the kernel grows (longer handlers eat into latency budgets for real-time-ish drivers).
+
+Likely candidates to investigate:
+1. **Cache-cold scan of `wake_expired_deadlines` across MAX_THREADS=1024 TCBs** — if the first tick walks slots that are still in L2/L3 from boot allocation patterns, the scan could be slow. But ~72ms for a 1024-slot walk is hard to justify even cache-cold.
+2. **GKL contention during secondary CPU bring-up** — if a secondary CPU is holding the lock for a long boot section while the timer IRQ fires on CPU 0, the IRQ handler waits.
+3. **Interrupt-disabled kernel section that runs unusually long during boot** — `init`'s ELF parse + spawn loop holds GKL throughout. If a tick is queued during a long spawn, it fires when GKL releases, but the time-to-acquire-GKL is counted in our self-timing window.
+4. **Something specific to Pi 4B boot ordering** (cprman initialization, MMIO probe loops, etc.) — would not appear on QEMU.
+
+**Why bootstrap:** Surfaced 2026-05-17 during the emmc2 perf-sweep investigation when we added `tick_self_timing` and printed `tick_max_us_at_end`. Was tactical to the ADMA chase; deferred to here once the ADMA chase resolved as card-side.
+
+**Fix:** First instrument: log every tick that exceeds e.g. 1 ms with its elapsed time and a label of what was running before/after. Tools to use:
+- `tick_self_timing` already in `src/arch/aarch64/timer.rs` (CNTVCT-based).
+- `try_current_tcb_kva` to identify the displaced thread.
+- A small ring buffer of `(timestamp, elapsed_cycles, current_thread_name)` for the worst N ticks since boot.
+
+After the worst tick is identified, the candidate-list above points at where to look.

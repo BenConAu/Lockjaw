@@ -11,6 +11,12 @@ use core::arch::asm;
 use core::ptr;
 use lockjaw_userlib::*;
 use lockjaw_userlib::clock::{ClockClient, ClockError};
+use lockjaw_userlib::block::{
+    BlockEngine, BlockError, BlockInfo, run_block_server,
+};
+use lockjaw_userlib::handle::PageSetGuard;
+use lockjaw_userlib::sys_unmap_pages;
+use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, sleep_for, Nanos};
 // `monotonic_now` returns `MonoTicks`, which is `Ord`; the comparisons in the
 // poll helpers don't need the type imported by name. `sleep_for` is used only
@@ -31,11 +37,11 @@ use lockjaw_types::sdhci::{
     SDHCI_TIMEOUT_CONTROL,
     SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, SDHCI_DAT_INHIBIT,
     SDHCI_ARGUMENT, SDHCI_ARGUMENT2, SDHCI_TRANSFER_MODE, SDHCI_COMMAND,
-    SDHCI_BLOCK_SIZE, SDHCI_BLOCK_COUNT, SDHCI_BUFFER_DATA_PORT,
+    SDHCI_BLOCK_SIZE, SDHCI_BLOCK_COUNT,
     SDHCI_NORMAL_INT_STATUS, SDHCI_ERROR_INT_STATUS,
     SDHCI_NORMAL_INT_STATUS_ENABLE, SDHCI_ERROR_INT_STATUS_ENABLE,
     SDHCI_INT_CMD_COMPLETE, SDHCI_INT_DATA_COMPLETE,
-    SDHCI_INT_BUF_RD_READY, SDHCI_INT_ERROR,
+    SDHCI_INT_ERROR,
     SDHCI_INT_CMD_TIMEOUT, SDHCI_INT_CMD_CRC,
     SDHCI_INT_CMD_END_BIT, SDHCI_INT_CMD_INDEX,
     SDHCI_INT_DATA_TIMEOUT, SDHCI_INT_DATA_CRC, SDHCI_INT_DATA_END_BIT,
@@ -291,255 +297,6 @@ unsafe fn issue_command(base: u64, arg: u32, cmd_word: u16) -> CmdResult {
     }
 }
 
-// ---------------------------------------------------------------------------
-// PIO block read
-// ---------------------------------------------------------------------------
-
-/// Failure modes for `read_block_pio`.
-#[derive(Clone, Copy)]
-enum PioError {
-    /// CMD_INHIBIT or DAT_INHIBIT didn't clear before the deadline.
-    InhibitStuck,
-    /// ERROR_INT_STATUS fired during the command phase.
-    CmdError(u16),
-    /// Neither CMD_COMPLETE nor ERROR fired before the 1s deadline.
-    NoResponse,
-    /// ERROR_INT_STATUS fired while waiting for BUF_RD_READY or TRANSFER_COMPLETE.
-    DataError(u16),
-    /// BUF_RD_READY did not fire before the deadline.
-    DataTimeout,
-    /// TRANSFER_COMPLETE did not arrive after draining the buffer.
-    XferTimeout,
-}
-
-/// Issue CMD17 (READ_SINGLE_BLOCK) and drain the 512-byte block via PIO.
-///
-/// `lba` is the block address. For SDHC/SDXC (CCS=1) this is the block
-/// number directly. For SDSC (CCS=0) the caller must pass `lba * 512`
-/// (byte address). For LBA 0 both encodings are 0; the distinction
-/// becomes load-bearing at M5+ when non-zero LBAs are requested.
-///
-/// Returns the block as 128 LE u32 words. BUFFER_DATA_PORT serves bytes
-/// in card-native order: word[0] = bytes 0–3, word[127] = bytes 508–511.
-/// MBR signature check: `(block[127] >> 16) & 0xFFFF == 0xAA55`.
-unsafe fn read_block_pio(base: u64, lba: u32) -> Result<[u32; 128], PioError> {
-    // Data commands occupy both CMD and DAT lines from issue through
-    // TRANSFER_COMPLETE. Waiting for only CMD_INHIBIT (as in
-    // `issue_command`) would let the command fire while DAT is still
-    // busy from a prior R1b, corrupting the bus.
-    if poll_until_clear_32(
-        base, SDHCI_PRESENT_STATE,
-        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
-        Nanos::from_millis(100),
-    ).is_err() {
-        return Err(PioError::InhibitStuck);
-    }
-
-    // SDHCI spec §3.7: BLOCK_SIZE, BLOCK_COUNT, TRANSFER_MODE must be
-    // written before the COMMAND write that triggers the bus transaction.
-    sdhci_write16(base, SDHCI_BLOCK_SIZE, 512);
-    sdhci_write16(base, SDHCI_BLOCK_COUNT, 1);
-    // PIO single-block read: no DMA, no multi-block, direction = card→host.
-    sdhci_write16(base, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ);
-
-    // Write ARGUMENT then COMMAND. COMMAND write triggers the bus.
-    sdhci_write32(base, SDHCI_ARGUMENT, lba);
-    let cmd17 = sd_command_word(
-        SdCommand::ReadSingleBlock.index(),
-        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
-    );
-    sdhci_write16(base, SDHCI_COMMAND, cmd17);
-
-    // Poll for CMD_COMPLETE or ERROR. CMD_COMPLETE fires after the response
-    // phase; data transfer starts in parallel and fires BUF_RD_READY once
-    // the internal buffer is full.
-    let freq = cntfreq_hz();
-    let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
-    loop {
-        let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
-        if status & SDHCI_INT_ERROR != 0 {
-            let err = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
-            sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
-            return Err(PioError::CmdError(err));
-        }
-        if status & SDHCI_INT_CMD_COMPLETE != 0 {
-            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
-            break;
-        }
-        if monotonic_now() >= cmd_deadline {
-            return Err(PioError::NoResponse);
-        }
-        core::hint::spin_loop();
-    }
-
-    // Poll for BUF_RD_READY. At 25 MHz with 4-bit DAT: 512 bytes /
-    // (25M/8 bytes/s) ≈ 164 µs for the card to fill the internal buffer.
-    // 100 ms deadline is generous; PRESENT_STATE is logged on timeout
-    // so DAT_INHIBIT state is visible in the log.
-    let data_deadline = monotonic_now().deadline_in(Nanos::from_millis(100), freq);
-    loop {
-        let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
-        if status & SDHCI_INT_ERROR != 0 {
-            let err = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
-            sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_BUF_RD_READY);
-            return Err(PioError::DataError(err));
-        }
-        if status & SDHCI_INT_BUF_RD_READY != 0 {
-            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_BUF_RD_READY);
-            break;
-        }
-        if monotonic_now() >= data_deadline {
-            return Err(PioError::DataTimeout);
-        }
-        core::hint::spin_loop();
-    }
-
-    // Drain all 128 u32 words (512 bytes) from BUFFER_DATA_PORT. SDHCI
-    // spec §3.7.2: PIO reads must consume the entire block in one pass —
-    // leaving data in the buffer leaves the controller in an inconsistent
-    // state that wedges subsequent commands.
-    let mut block = [0u32; 128];
-    for word in block.iter_mut() {
-        *word = sdhci_read32(base, SDHCI_BUFFER_DATA_PORT);
-    }
-
-    // TRANSFER_COMPLETE arrives after the card transmits the CRC trailer;
-    // typically fires immediately after the buffer drain.
-    let xfer_deadline = monotonic_now().deadline_in(Nanos::from_millis(100), freq);
-    loop {
-        let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
-        if status & SDHCI_INT_ERROR != 0 {
-            let err = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
-            sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_DATA_COMPLETE);
-            return Err(PioError::DataError(err));
-        }
-        if status & SDHCI_INT_DATA_COMPLETE != 0 {
-            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
-            return Ok(block);
-        }
-        if monotonic_now() >= xfer_deadline {
-            return Err(PioError::XferTimeout);
-        }
-        core::hint::spin_loop();
-    }
-}
-
-/// Issue CMD18 (READ_MULTIPLE_BLOCK) with Auto-CMD23, drain `blocks.len()`
-/// blocks via PIO. Each block is 512 bytes = 128 LE u32 words.
-///
-/// Auto-CMD23 (per SDHCI §3.7.2 and `docs/emmc2-block-storage-plan.md` Q4):
-/// the controller automatically issues CMD23 (SET_BLOCK_COUNT) before CMD18,
-/// using the value at SDHCI_ARGUMENT2 (offset 0x000) as its argument. No
-/// post-data CMD12 (STOP_TRANSMISSION) is needed because the card stops
-/// after the negotiated count. BCM2711 advertises Auto-CMD23 in CAPABILITIES
-/// bit 30 and Linux/Circle drivers use this path.
-///
-/// `lba` is the starting block address (block-addressed for SDHC/SDXC).
-unsafe fn read_blocks_pio(
-    base: u64, lba: u32, blocks: &mut [[u32; 128]],
-) -> Result<(), PioError> {
-    let count = blocks.len() as u16;
-
-    // Auto-CMD23 argument — block count for the SET_BLOCK_COUNT the
-    // controller will issue before CMD18. Must be written before
-    // TRANSFER_MODE so the controller sees it when it triggers CMD23.
-    sdhci_write32(base, SDHCI_ARGUMENT2, count as u32);
-
-    if poll_until_clear_32(
-        base, SDHCI_PRESENT_STATE,
-        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
-        Nanos::from_millis(100),
-    ).is_err() {
-        return Err(PioError::InhibitStuck);
-    }
-
-    sdhci_write16(base, SDHCI_BLOCK_SIZE, 512);
-    sdhci_write16(base, SDHCI_BLOCK_COUNT, count);
-    // Multi-block read with Auto-CMD23: READ direction, block-count enabled,
-    // multi-block, controller auto-issues CMD23 with the SDHCI_ARGUMENT2
-    // value before CMD18.
-    sdhci_write16(base, SDHCI_TRANSFER_MODE,
-        SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN
-            | SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD23);
-
-    sdhci_write32(base, SDHCI_ARGUMENT, lba);
-    let cmd18 = sd_command_word(
-        SdCommand::ReadMultipleBlock.index(),
-        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
-    );
-    sdhci_write16(base, SDHCI_COMMAND, cmd18);
-
-    let freq = cntfreq_hz();
-    let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
-    loop {
-        let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
-        if status & SDHCI_INT_ERROR != 0 {
-            let err = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
-            sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
-            return Err(PioError::CmdError(err));
-        }
-        if status & SDHCI_INT_CMD_COMPLETE != 0 {
-            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
-            break;
-        }
-        if monotonic_now() >= cmd_deadline {
-            return Err(PioError::NoResponse);
-        }
-        core::hint::spin_loop();
-    }
-
-    // Drain one block at a time. Each block's BUF_RD_READY edge fires
-    // when the controller has filled its internal buffer; we clear the
-    // bit after draining so the next block's edge is observable.
-    for block in blocks.iter_mut() {
-        let data_deadline = monotonic_now().deadline_in(Nanos::from_millis(100), freq);
-        loop {
-            let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
-            if status & SDHCI_INT_ERROR != 0 {
-                let err = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
-                sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-                sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_BUF_RD_READY);
-                return Err(PioError::DataError(err));
-            }
-            if status & SDHCI_INT_BUF_RD_READY != 0 {
-                sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_BUF_RD_READY);
-                break;
-            }
-            if monotonic_now() >= data_deadline {
-                return Err(PioError::DataTimeout);
-            }
-            core::hint::spin_loop();
-        }
-        for word in block.iter_mut() {
-            *word = sdhci_read32(base, SDHCI_BUFFER_DATA_PORT);
-        }
-    }
-
-    // After the last block, TRANSFER_COMPLETE arrives once the card
-    // transmits the final CRC trailer.
-    let xfer_deadline = monotonic_now().deadline_in(Nanos::from_millis(100), freq);
-    loop {
-        let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
-        if status & SDHCI_INT_ERROR != 0 {
-            let err = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
-            sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_DATA_COMPLETE);
-            return Err(PioError::DataError(err));
-        }
-        if status & SDHCI_INT_DATA_COMPLETE != 0 {
-            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
-            return Ok(());
-        }
-        if monotonic_now() >= xfer_deadline {
-            return Err(PioError::XferTimeout);
-        }
-        core::hint::spin_loop();
-    }
-}
 
 /// Pretty-print ERROR_INT_STATUS bits to the kernel UART. Names match
 /// the SDHCI spec § 2.2.18 / Linux's headers so the output line can
@@ -578,10 +335,15 @@ pub extern "C" fn _start() -> ! {
         Ok(r) => r,
         Err(_) => { puts("emmc2: bootstrap FAILED\n"); halt(); }
     };
-    // Reply layout: [devmgr_client, _, _, _]. The driver's only
-    // server peer is device-manager (CMD_CLAIM_DEVICE for the SDHCI
-    // MMIO and CMD_GET_CLOCK_HANDLE for the clock binding).
+    // Reply layout: [devmgr_client, blk_srv_ep, _, _].
+    //   - devmgr_client: used for CMD_CLAIM_DEVICE (SDHCI MMIO) and
+    //     CMD_GET_CLOCK_HANDLE (clock binding).
+    //   - blk_srv_ep: the endpoint init created for us to receive
+    //     BlockEngine IPC requests on (M7). Owned by init outside
+    //     this driver; init exports the same handle to other
+    //     processes that need block storage on Pi 4B.
     let devmgr_client = EndpointHandle(reply[0]);
+    let blk_srv_ep = EndpointHandle(reply[1]);
     puts("emmc2: bootstrapped\n");
 
     // Claim the BCM2711 emmc2 device. Reply layout (per
@@ -1133,373 +895,68 @@ pub extern "C" fn _start() -> ! {
     puts("MHz\n");
 
     // -----------------------------------------------------------------------
-    // M4 — Single-block PIO read of LBA 0
+    // M7 — block-device server. Set up the persistent ADMA2 descriptor
+    // table, select ADMA2-32 in HOST_CONTROL_1, build an Emmc2BlockEngine,
+    // run a one-shot selftest against LBA 0, then enter `run_block_server`.
+    //
+    // M4 / M5 / M6 demos (single-block PIO, multi-block PIO, single-block
+    // ADMA, perf sweep) used to run here at boot — that code is now
+    // subsumed by the BlockEngine path. The driver-level reads/writes a
+    // BlockClient performs exercise the same SDHCI paths under
+    // caller-controlled LBAs.
     // -----------------------------------------------------------------------
-    // CMD17 argument: for SDHC/SDXC (ocr.ccs == true) the argument is the
-    // block number directly. For SDSC it would be a byte address (lba * 512).
-    // Both encodings produce 0 for LBA 0, so the ccs branch is degenerate
-    // here. The distinction becomes load-bearing at M5+ when non-zero LBAs
-    // are requested.
-    let block = match unsafe { read_block_pio(mmio_va, 0) } {
+    let capacity_sectors = capacity_bytes / 512;
+    let engine = match unsafe { Emmc2BlockEngine::new(mmio_va, capacity_sectors) } {
+        Ok(e) => e,
+        Err(msg) => { puts("[EMMC2:BLK] engine init FAILED: "); puts(msg); puts("\n"); halt(); }
+    };
+    let mut engine = engine;
+
+    // Selftest: alloc a 1-sector buffer, read LBA 0 via the engine,
+    // verify MBR signature. Mirrors virtio-blk-driver's selftest so the
+    // success line matches the same shape.
+    let selftest_buf = match engine.alloc_buffer(1) {
         Ok(b) => b,
-        Err(PioError::InhibitStuck) => {
-            puts("[EMMC2:M4] CMD17 FAILED: CMD/DAT_INHIBIT stuck\n");
-            sys_exit();
-        }
-        Err(PioError::CmdError(bits)) => {
-            puts("[EMMC2:M4] CMD17 FAILED: ");
-            put_error_int_status(bits);
-            puts("\n");
-            sys_exit();
-        }
-        Err(PioError::NoResponse) => {
-            puts("[EMMC2:M4] CMD17 FAILED: no CMD_COMPLETE within 1s\n");
-            sys_exit();
-        }
-        Err(PioError::DataError(bits)) => {
-            puts("[EMMC2:M4] data FAILED: ");
-            put_error_int_status(bits);
-            puts("\n");
-            sys_exit();
-        }
-        Err(PioError::DataTimeout) => {
-            let pstate = unsafe { sdhci_read32(mmio_va, SDHCI_PRESENT_STATE) };
-            puts("[EMMC2:M4] data FAILED: BUF_RD_READY timeout PRESENT_STATE=");
-            put_hex(pstate as u64);
-            puts("\n");
-            sys_exit();
-        }
-        Err(PioError::XferTimeout) => {
-            puts("[EMMC2:M4] data FAILED: TRANSFER_COMPLETE timeout\n");
-            sys_exit();
-        }
+        Err(_) => { puts("[EMMC2:BLK] selftest alloc FAILED\n"); halt(); }
     };
-
-    // Log first 64 bytes (16 words) of LBA 0 as a hex dump.
-    puts("[EMMC2:M4] LBA 0 first 64 bytes:\n");
-    for i in 0..16usize {
-        if i % 4 == 0 { puts("  "); }
-        put_hex(block[i] as u64);
-        puts(if i % 4 == 3 { "\n" } else { " " });
+    let selftest_va = VMEM.alloc(1).expect("[EMMC2:BLK] selftest VA alloc FAILED");
+    if !sys_map_pages(selftest_buf, selftest_va, MapMemoryAttribute::NormalNonCacheable).is_ok() {
+        puts("[EMMC2:BLK] selftest map FAILED\n");
+        halt();
     }
-
-    // MBR boot signature: bytes 510–511 must be 0x55 0xAA.
-    // BUFFER_DATA_PORT returns LE u32: word[127] holds bytes 508–511,
-    // with byte 510 in bits[23:16] and byte 511 in bits[31:24].
-    // (block[127] >> 16) extracts 0xAA55 when the signature is valid.
-    let sig = (block[127] >> 16) & 0xFFFF;
-    puts("[EMMC2:M4] MBR signature=");
-    put_hex(sig as u64);
+    // Zero the buffer to distinguish read data from any prior content.
+    unsafe { ptr::write_bytes(selftest_va as *mut u8, 0, 512); }
+    if engine.read(0, 1, selftest_buf).is_err() {
+        puts("[EMMC2:BLK] selftest read FAILED\n");
+        halt();
+    }
+    // MBR boot signature lives at bytes 510-511 = 0x55 0xAA (little-endian).
+    let sig = unsafe {
+        let p = selftest_va as *const u8;
+        let lo = ptr::read_volatile(p.add(510)) as u16;
+        let hi = ptr::read_volatile(p.add(511)) as u16;
+        (hi << 8) | lo
+    };
     if sig != 0xAA55 {
-        puts(" BAD (expected 0xAA55) — byte-lane or decode error\n");
-        sys_exit();
-    }
-    puts(" OK\n");
-
-    puts("[EMMC2:M4] LBA 0 read OK\n");
-
-    // -----------------------------------------------------------------------
-    // M5 — Multi-block PIO read (CMD18 + Auto-CMD23) at boot.
-    //      The single-block write path (`write_block_pio`) is implemented
-    //      and verified, but is NOT exercised from `_start` because the
-    //      driver runs unconditionally on every boot and no LBA is
-    //      universally safe across MBR / GPT / bootable images (LBA 0 is
-    //      MBR, LBAs 1–33 are the GPT primary header, last LBA is the
-    //      GPT backup header). A crash between "write pattern" and
-    //      "restore original" would persist as data corruption. Real
-    //      write coverage moves to M7's BlockEngine, where the LBA is
-    //      caller-controlled and tests run against a known-safe target.
-    //      The Pi log captured before this restructure (commit message)
-    //      confirms write_block_pio + read_block_pio + reset_cmd_dat_lines
-    //      have been exercised end-to-end with verified roundtrip.
-    // -----------------------------------------------------------------------
-
-    // Multi-block read of LBAs [0..4] via CMD18 + Auto-CMD23.
-    // Non-destructive. The first block must still carry the MBR signature
-    // we saw in M4 — mismatch would indicate a multi-block-specific
-    // decode failure (Auto-CMD23 handshake, BUF_RD_READY edge sequencing).
-    let mut blocks: [[u32; 128]; 4] = [[0u32; 128]; 4];
-    if let Err(e) = unsafe { read_blocks_pio(mmio_va, 0, &mut blocks) } {
-        report_pio_error(mmio_va, "M5", "CMD18 (4 blocks)", e);
-        sys_exit();
-    }
-    let multi_sig = (blocks[0][127] >> 16) & 0xFFFF;
-    if multi_sig != 0xAA55 {
-        puts("[EMMC2:M5] CMD18 block[0] signature=");
-        put_hex(multi_sig as u64);
-        puts(" BAD (expected 0xAA55)\n");
-        sys_exit();
-    }
-    puts("[EMMC2:M5] CMD18 read 4 blocks OK\n");
-
-    // -----------------------------------------------------------------------
-    // M6 — Single-block ADMA2-32 read of LBA 0
-    // -----------------------------------------------------------------------
-    // Consumes the M6 sub-commit 2a substrate: sys_alloc_dma_pages
-    // returns DmaPool-origin PageSets that can ONLY be mapped
-    // NormalNonCacheable. The pool is physically reserved at boot and
-    // excluded from the kernel direct map, so the SDHCI DMA engine
-    // writing this buffer cannot race the CPU's cached view of the
-    // same PA (the alias never exists).
-    let freq = cntfreq_hz();
-
-    // Descriptor table: 1 page from the DMA pool (8-byte aligned by
-    // virtue of being page-aligned). Only the first 8 bytes hold a
-    // single tran+end descriptor; remainder is unused this milestone.
-    let desc_ps = match sys_alloc_dma_pages(1) {
-        Ok(h) => h,
-        Err(e) => {
-            puts("[EMMC2:M6] sys_alloc_dma_pages(desc) FAILED: ");
-            put_decimal(e.0);
-            puts("\n");
-            sys_exit();
-        }
-    };
-    let desc_phys = match sys_query_pageset_phys(desc_ps, 0) {
-        Ok(p) => p,
-        Err(e) => {
-            puts("[EMMC2:M6] sys_query_pageset_phys(desc) FAILED: ");
-            put_decimal(e.0);
-            puts("\n");
-            sys_exit();
-        }
-    };
-    let desc_va = match VMEM.alloc(1) {
-        Some(va) => va,
-        None => { puts("[EMMC2:M6] VA exhausted for desc table\n"); sys_exit(); }
-    };
-    if !sys_map_pages(desc_ps, desc_va, MapMemoryAttribute::NormalNonCacheable).is_ok() {
-        puts("[EMMC2:M6] sys_map_pages(desc, NC) FAILED\n");
-        sys_exit();
-    }
-
-    // Data buffer: 1 page from the DMA pool (4 KiB; we use only the
-    // first 512 bytes for one block, plenty of slack).
-    let buf_ps = match sys_alloc_dma_pages(1) {
-        Ok(h) => h,
-        Err(e) => {
-            puts("[EMMC2:M6] sys_alloc_dma_pages(buf) FAILED: ");
-            put_decimal(e.0);
-            puts("\n");
-            sys_exit();
-        }
-    };
-    let buf_phys = match sys_query_pageset_phys(buf_ps, 0) {
-        Ok(p) => p,
-        Err(e) => {
-            puts("[EMMC2:M6] sys_query_pageset_phys(buf) FAILED: ");
-            put_decimal(e.0);
-            puts("\n");
-            sys_exit();
-        }
-    };
-    let buf_va = match VMEM.alloc(1) {
-        Some(va) => va,
-        None => { puts("[EMMC2:M6] VA exhausted for buffer\n"); sys_exit(); }
-    };
-    if !sys_map_pages(buf_ps, buf_va, MapMemoryAttribute::NormalNonCacheable).is_ok() {
-        puts("[EMMC2:M6] sys_map_pages(buf, NC) FAILED\n");
-        sys_exit();
-    }
-
-    // The controller programs ADMA descriptors using 32-bit PAs.
-    // Pi 4B and QEMU virt RAM both fit under 4 GiB so this truncation
-    // is safe; the DMA pool sits below ram_end which is below 4 GiB.
-    if buf_phys >= (1u64 << 32) || desc_phys >= (1u64 << 32) {
-        puts("[EMMC2:M6] phys addr beyond 32-bit ADMA2 range\n");
-        sys_exit();
-    }
-
-    // Build the single tran+end descriptor: 8 bytes describing a
-    // 512-byte transfer ending at this descriptor. Write through the
-    // NC mapping so the value reaches RAM (the controller reads
-    // descriptors via DMA, NOT via the CPU's cacheable mapping).
-    let desc = adma2_tran_end_descriptor(buf_phys as u32, 512);
-    unsafe { ptr::write_volatile(desc_va as *mut u64, desc); }
-
-    // DMA publication barrier: the descriptor write above must reach
-    // RAM (and be visible to the SDHCI controller via its DMA path)
-    // BEFORE the MMIO writes that kick the transfer. write_volatile
-    // alone doesn't impose this ordering on AArch64. `dsb sy` waits
-    // for all preceding memory accesses to complete to the full
-    // system shareability domain — covering the controller, which
-    // sits in the outer-shareable domain on Pi 4B (matches the
-    // SH_OUTER attribute the NC mapping uses). Same pattern as
-    // ramfb-driver/main.rs:174.
-    unsafe { asm!("dsb sy", options(nomem, nostack)); }
-
-    // Switch HOST_CONTROL_1.DMA_SEL to ADMA2 32-bit. Preserve the
-    // 4-bit bus width bit (set during M3 ACMD6); replace the DMA_SEL
-    // field bits only.
-    unsafe {
-        let hc = sdhci_read8(mmio_va, SDHCI_HOST_CONTROL);
-        let hc_new = (hc & !SDHCI_HOST_CTRL_DMA_SEL_MASK)
-            | SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32;
-        sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc_new);
-    }
-
-    // Program the ADMA descriptor table address.
-    unsafe { sdhci_write32(mmio_va, SDHCI_ADMA_ADDRESS, desc_phys as u32); }
-
-    // Wait for both inhibit bits and program block params.
-    if unsafe { poll_until_clear_32(
-        mmio_va, SDHCI_PRESENT_STATE,
-        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
-        Nanos::from_millis(100),
-    )}.is_err() {
-        puts("[EMMC2:M6] CMD/DAT_INHIBIT stuck pre-ADMA2 CMD17\n");
-        sys_exit();
-    }
-    unsafe {
-        sdhci_write16(mmio_va, SDHCI_BLOCK_SIZE, 512);
-        sdhci_write16(mmio_va, SDHCI_BLOCK_COUNT, 1);
-        // Single-block ADMA2 read: READ direction + DMA enable. No
-        // block-count enable, no Auto-CMD23 — those are for multi-
-        // block transfers; one block doesn't need them.
-        sdhci_write16(mmio_va, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ | SDHCI_TRNS_DMA);
-        sdhci_write32(mmio_va, SDHCI_ARGUMENT, 0);
-    }
-    let cmd17 = sd_command_word(
-        SdCommand::ReadSingleBlock.index(),
-        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
-    );
-
-    let t0 = monotonic_now();
-    unsafe { sdhci_write16(mmio_va, SDHCI_COMMAND, cmd17); }
-
-    // Poll for CMD_COMPLETE (response phase) — DMA fires in parallel.
-    let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
-    loop {
-        let status = unsafe { sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS) };
-        if status & SDHCI_INT_ERROR != 0 {
-            let err = unsafe { sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS) };
-            unsafe {
-                sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-                sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
-            }
-            puts("[EMMC2:M6] CMD17 controller error: ");
-            put_error_int_status(err);
-            puts("\n");
-            sys_exit();
-        }
-        if status & SDHCI_INT_CMD_COMPLETE != 0 {
-            unsafe { sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE); }
-            break;
-        }
-        if monotonic_now() >= cmd_deadline {
-            puts("[EMMC2:M6] CMD17 CMD_COMPLETE timeout\n");
-            sys_exit();
-        }
-        core::hint::spin_loop();
-    }
-
-    // Poll for TRANSFER_COMPLETE — controller signals when the DMA
-    // engine drains the descriptor (one ACT=tran, END=1) and the
-    // card delivers the CRC trailer. No per-block BUF_RD_READY draining
-    // for ADMA2 — that's what makes this faster than PIO.
-    let xfer_deadline = monotonic_now().deadline_in(Nanos::from_millis(100), freq);
-    loop {
-        let status = unsafe { sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS) };
-        if status & SDHCI_INT_ERROR != 0 {
-            let err = unsafe { sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS) };
-            unsafe {
-                sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-                sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_ERROR | SDHCI_INT_DATA_COMPLETE);
-            }
-            puts("[EMMC2:M6] ADMA2 data error: ");
-            put_error_int_status(err);
-            puts("\n");
-            sys_exit();
-        }
-        if status & SDHCI_INT_DATA_COMPLETE != 0 {
-            unsafe { sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE); }
-            break;
-        }
-        if monotonic_now() >= xfer_deadline {
-            puts("[EMMC2:M6] ADMA2 TRANSFER_COMPLETE timeout\n");
-            sys_exit();
-        }
-        core::hint::spin_loop();
-    }
-    let t1 = monotonic_now();
-    let adma_ticks = t1.0.saturating_sub(t0.0);
-
-    // Verify MBR signature from the NC-mapped buffer. The DMA engine
-    // wrote 512 bytes into the buffer's PA; the NC mapping lets us
-    // read those bytes without cache coherence concerns. word[127]
-    // (bytes 508-511) carries the signature in little-endian.
-    let sig_word = unsafe { ptr::read_volatile((buf_va + 4 * 127) as *const u32) };
-    let sig = (sig_word >> 16) & 0xFFFF;
-    if sig != 0xAA55 {
-        puts("[EMMC2:M6] ADMA2 MBR signature=");
+        puts("[EMMC2:BLK] selftest MBR signature=");
         put_hex(sig as u64);
         puts(" BAD (expected 0xAA55)\n");
-        sys_exit();
+        halt();
     }
+    let _ = sys_unmap_pages(selftest_buf, selftest_va);
+    VMEM.free(selftest_va, 1);
+    engine.free_buffer(selftest_buf);
 
-    // ADMA2 done. Re-run the PIO single-block read of LBA 0 for a
-    // wall-clock comparison. PIO drains 128 u32 words through the
-    // controller's internal buffer one at a time; ADMA2 has the
-    // engine DMA all 512 bytes directly into RAM, so ADMA2 should be
-    // measurably faster at SDHCI 25 MHz on Pi 4B.
-    let t2 = monotonic_now();
-    let _pio_block = match unsafe { read_block_pio(mmio_va, 0) } {
-        Ok(b) => b,
-        Err(e) => {
-            report_pio_error(mmio_va, "M6", "PIO compare read", e);
-            sys_exit();
-        }
-    };
-    let t3 = monotonic_now();
-    let pio_ticks = t3.0.saturating_sub(t2.0);
+    puts("[BLOCKDEV] /dev/sd0 ready: 512B x ");
+    put_decimal(capacity_sectors);
+    puts(" blocks; selftest read OK\n");
 
-    // Restore HOST_CONTROL.DMA_SEL to its prior state so the PIO M4
-    // path (and any future caller) doesn't see ADMA2 selected. M4's
-    // read_block_pio above ran while DMA_SEL was still ADMA2 — the
-    // PIO path doesn't set TRNS_DMA so the engine stays idle, but the
-    // bit being wrong is still confusing for future readers.
-    unsafe {
-        let hc = sdhci_read8(mmio_va, SDHCI_HOST_CONTROL);
-        sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc & !SDHCI_HOST_CTRL_DMA_SEL_MASK);
-    }
-
-    // M6 success line: descriptor count + ADMA2 elapsed in microseconds.
-    // The PIO comparison is logged on its own line so a regression in
-    // either path is visible in isolation.
-    let adma_us = ticks_to_us(adma_ticks, freq);
-    let pio_us = ticks_to_us(pio_ticks, freq);
-    puts("[EMMC2:ADMA] LBA0 read via ADMA2-32, descriptors=1, t=");
-    put_decimal(adma_us);
-    puts("us\n");
-    puts("[EMMC2:ADMA] PIO compare t=");
-    put_decimal(pio_us);
-    puts("us\n");
-
-    // -----------------------------------------------------------------------
-    // M6 perf sweep — multi-block ADMA2 vs multi-block PIO
-    // -----------------------------------------------------------------------
-    // Pi 4B single-block ADMA2 measured slower than PIO (5.6ms vs 0.22ms)
-    // on the first M6 boot — overhead-dominated for one block. This sweep
-    // measures the crossover. Each iteration:
-    //   - Allocates an N-page DmaPool buffer (8 blocks per page).
-    //   - Builds a single ADMA2 tran+end descriptor of N*4096 bytes
-    //     (well under the 65535-byte single-descriptor cap).
-    //   - Runs CMD18 + Auto-CMD23 + DMA, polls TRANSFER_COMPLETE.
-    //   - Compares against PIO read_blocks_pio with the same block count.
-    //
-    // The buffer page is leaked each iteration (no PageSet handle close
-    // path exercised in this driver) — acceptable for a one-shot boot
-    // probe; the M6 plan's DMA pool sizing (512 pages) covers it with
-    // room to spare.
-    perf_sweep_adma_vs_pio(mmio_va, freq, desc_va, desc_phys);
-
-    sys_exit();
+    run_block_server(&mut engine, blk_srv_ep);
 }
 
-/// Helper: run one ADMA2 multi-block read of `n_blocks` starting at
-/// LBA 0 and return elapsed ticks. Allocates a fresh DmaPool buffer
-/// (does NOT free — driver is a one-shot probe). Uses CMD18 with
-/// Auto-CMD23 and a single descriptor covering the full transfer.
+// ---------------------------------------------------------------------------
+// ADMA2 transfer primitive (used by Emmc2BlockEngine for both read + write).
+// ---------------------------------------------------------------------------
 /// Result of an ADMA2 multi-block read with phase-split timing.
 /// `cmd_to_complete` is the controller's response latency; the rest
 /// is card-side data delivery. Useful for distinguishing controller
@@ -1511,8 +968,20 @@ pub struct AdmaTiming {
     pub data_to_complete: u64,
 }
 
-unsafe fn adma2_multiblock_read(
+/// Direction selector for ADMA2 transfers. `Read` programs CMD18
+/// (READ_MULTIPLE_BLOCK) with TRNS_READ; `Write` programs CMD25
+/// (WRITE_MULTIPLE_BLOCK) without TRNS_READ. Both use Auto-CMD23
+/// to set BLOCK_COUNT in a single command pair (no post-data CMD12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmaDirection {
+    Read,
+    Write,
+}
+
+unsafe fn adma2_transfer(
     mmio_va: u64,
+    direction: AdmaDirection,
+    sector: u64,
     n_blocks: u16,
     buf_phys: u64,
     desc_va: u64,
@@ -1528,7 +997,7 @@ unsafe fn adma2_multiblock_read(
 
     // One descriptor covers the whole multi-block transfer. Descriptor
     // table from the single-block path is reused (still mapped at
-    // desc_va); overwrite its 8 bytes for this sweep iteration.
+    // desc_va); overwrite its 8 bytes for this transfer.
     let desc = adma2_tran_end_descriptor(buf_phys as u32, bytes as u16);
     ptr::write_volatile(desc_va as *mut u64, desc);
     asm!("dsb sy", options(nomem, nostack));
@@ -1545,19 +1014,27 @@ unsafe fn adma2_multiblock_read(
     }
     sdhci_write16(mmio_va, SDHCI_BLOCK_SIZE, 512);
     sdhci_write16(mmio_va, SDHCI_BLOCK_COUNT, n_blocks);
+    let trns_dir = match direction {
+        AdmaDirection::Read => SDHCI_TRNS_READ,
+        AdmaDirection::Write => 0, // absence of TRNS_READ = write
+    };
     sdhci_write16(mmio_va, SDHCI_TRANSFER_MODE,
-        SDHCI_TRNS_READ | SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN
+        trns_dir | SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN
             | SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD23);
-    sdhci_write32(mmio_va, SDHCI_ARGUMENT, 0);
+    // CMD18/CMD25 argument is the LBA (SDHC/SDXC blocks-as-units).
+    sdhci_write32(mmio_va, SDHCI_ARGUMENT, sector as u32);
 
-    let cmd18 = sd_command_word(
-        SdCommand::ReadMultipleBlock.index(),
+    let cmd = sd_command_word(
+        match direction {
+            AdmaDirection::Read => SdCommand::ReadMultipleBlock.index(),
+            AdmaDirection::Write => SdCommand::WriteMultipleBlock.index(),
+        },
         SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
     );
 
     let freq = cntfreq_hz();
     let t0 = monotonic_now();
-    sdhci_write16(mmio_va, SDHCI_COMMAND, cmd18);
+    sdhci_write16(mmio_va, SDHCI_COMMAND, cmd);
 
     // Poll CMD_COMPLETE
     let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
@@ -1568,7 +1045,7 @@ unsafe fn adma2_multiblock_read(
             sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
             sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
                 SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
-            puts("    CMD18 controller error: ");
+            puts("    CMD18/25 controller error: ");
             put_error_int_status(err);
             puts("\n");
             return Err("cmd error");
@@ -1612,153 +1089,6 @@ unsafe fn adma2_multiblock_read(
     })
 }
 
-/// Sweep ADMA2 and PIO across block counts 1, 4, 8, 16, 32, 64, 127 to
-/// find the crossover where ADMA2 starts winning (or fails to). Logs
-/// elapsed in microseconds per (count, mode) pair. Caps at 127 blocks
-/// because that's the single-descriptor length max (65024 bytes;
-/// 65535 / 512 = 127).
-///
-/// Each ADMA iteration overwrites the descriptor table set up by the
-/// single-block M6 path (passed in as desc_va / desc_phys) and leaks
-/// one buffer PageSet — `ceil(n_blocks * 512 / 4096)` pages per
-/// iteration. Total leak across the sweep:
-/// `1 + 1 + 1 + 2 + 4 + 8 + 16 = 33` pages, comfortably within the
-/// 512-page DMA pool.
-/// PIO compare buffer for the perf sweep. 127 blocks × 512 bytes = ~65 KiB —
-/// way too large for the userspace stack. Static BSS storage; driver is
-/// single-threaded so no concurrent access. One-shot use at boot.
-///
-/// SAFETY: single-threaded one-shot driver — perf_sweep_adma_vs_pio is
-/// the sole accessor and runs once during _start.
-static mut PIO_SWEEP_BUF: [[u32; 128]; 127] = [[0u32; 128]; 127];
-
-fn perf_sweep_adma_vs_pio(
-    mmio_va: u64,
-    freq: lockjaw_userlib::time::TickFreq,
-    desc_va: u64,
-    desc_phys: u64,
-) {
-    let counts: &[u16] = &[1, 4, 8, 16, 32, 64, 127];
-
-    // Re-select ADMA2-32 in HOST_CONTROL_1. The single-block M6 path
-    // restored DMA_SEL=SDMA at its end so PIO read_block_pio could
-    // run cleanly; the sweep needs it back at ADMA2 for the ADMA
-    // arm of each comparison.
-    unsafe {
-        let hc = sdhci_read8(mmio_va, SDHCI_HOST_CONTROL);
-        let hc_new = (hc & !SDHCI_HOST_CTRL_DMA_SEL_MASK)
-            | SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32;
-        sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc_new);
-    }
-
-    // One stable DMA buffer big enough for the largest block count
-    // (127 blocks × 512 = 65024 bytes → 16 pages). Reuse across every
-    // iteration. Stable buf_phys was a deliberate choice during the
-    // 2026-05-17 ADMA stall investigation: previous "allocate fresh
-    // per iteration" runs left buf_phys varying with the DMA pool
-    // allocation order, which conflated buffer state with block count
-    // as variables. With stable buf_phys, block count is the only
-    // thing that changes per iteration. (Confirmed via 10-pass run
-    // that the residual variance is intermittent SD-card stalls, not
-    // anything in our driver — see docs/tech-debt.md.)
-    const MAX_N_PAGES: u64 = 16;
-    let buf_ps = match sys_alloc_dma_pages(MAX_N_PAGES) {
-        Ok(ps) => ps,
-        Err(_) => { puts("[EMMC2:PERF] sweep buf alloc FAILED\n"); return; }
-    };
-    let buf_phys = match sys_query_pageset_phys(buf_ps, 0) {
-        Ok(p) => p,
-        Err(_) => { puts("[EMMC2:PERF] sweep buf query_phys FAILED\n"); return; }
-    };
-    let buf_va = match VMEM.alloc(MAX_N_PAGES as usize) {
-        Some(v) => v,
-        None => { puts("[EMMC2:PERF] sweep buf VA alloc FAILED\n"); return; }
-    };
-    if !sys_map_pages(buf_ps, buf_va, MapMemoryAttribute::NormalNonCacheable).is_ok() {
-        puts("[EMMC2:PERF] sweep buf map_pages NC FAILED\n");
-        return;
-    }
-
-    puts("[EMMC2:PERF] block-count sweep (ADMA2 / PIO) us [phase split; stable buf_phys=");
-    put_hex(buf_phys);
-    puts("]\n");
-
-    for &n in counts {
-        let adma = match unsafe { adma2_multiblock_read(mmio_va, n, buf_phys, desc_va, desc_phys) } {
-            Ok(t) => t,
-            Err(e) => {
-                puts("[EMMC2:PERF]  n="); put_decimal(n as u64);
-                puts(" ADMA2 FAILED: "); puts(e); puts("\n");
-                continue;
-            }
-        };
-
-        // PIO compare: pass a sub-slice of the static buffer (64 KiB
-        // total in BSS — too large for the userspace stack).
-        let t2 = monotonic_now();
-        let pio_result = unsafe {
-            #[allow(static_mut_refs)]
-            read_blocks_pio(mmio_va, 0, &mut PIO_SWEEP_BUF[..n as usize])
-        };
-        let t3 = monotonic_now();
-        let pio_ticks = t3.0.saturating_sub(t2.0);
-        if let Err(e) = pio_result {
-            puts("[EMMC2:PERF]  n="); put_decimal(n as u64);
-            puts(" PIO FAILED: "); report_pio_error(mmio_va, "PERF", "CMD18 PIO", e);
-            continue;
-        }
-
-        let adma_us = ticks_to_us(adma.total, freq);
-        let cmd_us = ticks_to_us(adma.cmd_to_complete, freq);
-        let data_us = ticks_to_us(adma.data_to_complete, freq);
-        let pio_us = ticks_to_us(pio_ticks, freq);
-        puts("[EMMC2:PERF]  n="); put_decimal(n as u64);
-        puts(" bytes="); put_decimal((n as u64) * 512);
-        puts(" ADMA="); put_decimal(adma_us);
-        puts("us (cmd="); put_decimal(cmd_us);
-        puts(" data="); put_decimal(data_us);
-        puts(") PIO="); put_decimal(pio_us);
-        puts("us ratio_x100="); put_decimal((adma_us * 100) / pio_us.max(1));
-        puts("\n");
-    }
-}
-
-/// Helper: raw timer ticks → microseconds via TickFreq. Drops fractional
-/// microseconds (round-down); fine for the millisecond-scale timings
-/// the M6 diagnostic prints.
-fn ticks_to_us(ticks: u64, freq: lockjaw_userlib::time::TickFreq) -> u64 {
-    // us = ticks * 1_000_000 / freq. Order matters: multiply first to
-    // keep precision for small tick counts. Saturating against
-    // overflow because ticks * 1e6 can exceed u64 for very long
-    // intervals; for M6 timings (single-digit ms) it's safe.
-    ticks.saturating_mul(1_000_000) / freq.0
-}
-
-/// Centralized error-to-log dispatch for PIO operations. `phase` is the
-/// milestone tag (e.g. "M4", "M5") and `op` is a human-readable command
-/// description. Reading PRESENT_STATE in DataTimeout makes DAT_INHIBIT /
-/// CMD_INHIBIT visible at the failure point.
-fn report_pio_error(mmio_va: u64, phase: &str, op: &str, e: PioError) {
-    puts("[EMMC2:");
-    puts(phase);
-    puts("] ");
-    puts(op);
-    puts(" FAILED: ");
-    match e {
-        PioError::InhibitStuck   => puts("CMD/DAT_INHIBIT stuck"),
-        PioError::CmdError(bits) => put_error_int_status(bits),
-        PioError::NoResponse     => puts("no CMD_COMPLETE within deadline"),
-        PioError::DataError(bits) => put_error_int_status(bits),
-        PioError::DataTimeout => {
-            let pstate = unsafe { sdhci_read32(mmio_va, SDHCI_PRESENT_STATE) };
-            puts("BUF_R/W_READY timeout PRESENT_STATE=");
-            put_hex(pstate as u64);
-        }
-        PioError::XferTimeout => puts("TRANSFER_COMPLETE timeout"),
-    }
-    puts("\n");
-}
-
 // ---------------------------------------------------------------------------
 // Diagnostics helpers
 // ---------------------------------------------------------------------------
@@ -1788,4 +1118,167 @@ fn halt() -> ! {
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     puts("emmc2: PANIC\n");
     halt();
+}
+
+// ---------------------------------------------------------------------------
+// Emmc2BlockEngine — implements lockjaw_userlib::block::BlockEngine
+// against the SDHCI controller. Wraps `adma2_transfer` for both read
+// and write, plus per-buffer PageSet tracking.
+// ---------------------------------------------------------------------------
+
+const MAX_DMA_BUFFERS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct DmaBuf {
+    /// Handle (0 marks the slot empty).
+    handle: u64,
+    pa: u64,
+    sector_count: u64,
+}
+
+const DMA_BUF_EMPTY: DmaBuf = DmaBuf { handle: 0, pa: 0, sector_count: 0 };
+
+struct Emmc2BlockEngine {
+    mmio_va: u64,
+    capacity_sectors: u64,
+    /// Persistent ADMA2-32 descriptor table. One 8-byte tran+end
+    /// descriptor is rewritten per transfer. Allocated from the DMA
+    /// pool and mapped NormalNonCacheable.
+    desc_va: u64,
+    desc_phys: u64,
+    dma_buffers: [DmaBuf; MAX_DMA_BUFFERS],
+    dma_count: usize,
+}
+
+impl Emmc2BlockEngine {
+    /// Allocate the descriptor table page, switch the controller to
+    /// ADMA2-32, return a ready-to-serve engine. Caller still owns
+    /// `mmio_va` and is responsible for keeping the controller
+    /// initialized through enumeration before calling this.
+    unsafe fn new(mmio_va: u64, capacity_sectors: u64)
+        -> Result<Self, &'static str>
+    {
+        // Descriptor table: 1 page from the DMA pool, NormalNonCacheable.
+        let desc_ps = sys_alloc_dma_pages(1).map_err(|_| "desc alloc")?;
+        let desc_phys = sys_query_pageset_phys(desc_ps, 0).map_err(|_| "desc phys")?;
+        let desc_va = VMEM.alloc(1).ok_or("desc VA")?;
+        if !sys_map_pages(desc_ps, desc_va, MapMemoryAttribute::NormalNonCacheable).is_ok() {
+            return Err("desc map NC");
+        }
+        if desc_phys >= (1u64 << 32) {
+            return Err("desc phys > 4GiB");
+        }
+        // Switch HOST_CONTROL_1.DMA_SEL to ADMA2-32; preserve the
+        // 4-bit bus width from ACMD6.
+        let hc = sdhci_read8(mmio_va, SDHCI_HOST_CONTROL);
+        let hc_new = (hc & !SDHCI_HOST_CTRL_DMA_SEL_MASK)
+            | SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32;
+        sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc_new);
+        // Program the descriptor table address once; the same table
+        // is reused across every transfer.
+        sdhci_write32(mmio_va, SDHCI_ADMA_ADDRESS, desc_phys as u32);
+        Ok(Self {
+            mmio_va,
+            capacity_sectors,
+            desc_va,
+            desc_phys,
+            dma_buffers: [DMA_BUF_EMPTY; MAX_DMA_BUFFERS],
+            dma_count: 0,
+        })
+    }
+
+    fn find_buf(&self, ps: PageSetHandle) -> Result<DmaBuf, BlockError> {
+        for slot in &self.dma_buffers {
+            if slot.handle == ps.0 && slot.pa != 0 {
+                return Ok(*slot);
+            }
+        }
+        Err(BlockError::InvalidBuffer)
+    }
+}
+
+impl BlockEngine for Emmc2BlockEngine {
+    fn info(&self) -> BlockInfo {
+        BlockInfo {
+            capacity_sectors: self.capacity_sectors,
+            sector_size: 512,
+        }
+    }
+
+    fn alloc_buffer(&mut self, sector_count: u64) -> Result<PageSetHandle, BlockError> {
+        if self.dma_count >= MAX_DMA_BUFFERS {
+            return Err(BlockError::AllocFailed);
+        }
+        // ADMA2-32 single-descriptor max is 65535 bytes = 127 sectors.
+        // Larger transfers would need multi-descriptor chains (out of
+        // scope for M7 MVP; future work).
+        if sector_count == 0 || sector_count > 127 {
+            return Err(BlockError::InvalidParameter);
+        }
+        let pages = (sector_count * 512 + (PAGE_SIZE - 1)) / PAGE_SIZE;
+        let guard = PageSetGuard::new(
+            sys_alloc_dma_pages(pages).map_err(|_| BlockError::AllocFailed)?
+        );
+        let pa = sys_query_pageset_phys(guard.handle(), 0)
+            .map_err(|_| BlockError::AllocFailed)?;
+        if pa >= (1u64 << 32) {
+            return Err(BlockError::AllocFailed);
+        }
+        for slot in self.dma_buffers.iter_mut() {
+            if slot.pa == 0 {
+                let ps = guard.take();
+                *slot = DmaBuf { handle: ps.0, pa, sector_count };
+                self.dma_count += 1;
+                return Ok(ps);
+            }
+        }
+        Err(BlockError::AllocFailed)
+    }
+
+    fn read(&mut self, sector: u64, count: u64, buffer: PageSetHandle)
+        -> Result<(), BlockError>
+    {
+        let buf = self.find_buf(buffer)?;
+        if count == 0 || count > buf.sector_count
+            || sector.saturating_add(count) > self.capacity_sectors
+        {
+            return Err(BlockError::InvalidParameter);
+        }
+        unsafe {
+            adma2_transfer(
+                self.mmio_va, AdmaDirection::Read,
+                sector, count as u16, buf.pa,
+                self.desc_va, self.desc_phys,
+            ).map(|_timing| ()).map_err(|_| BlockError::IoError)
+        }
+    }
+
+    fn write(&mut self, sector: u64, count: u64, buffer: PageSetHandle)
+        -> Result<(), BlockError>
+    {
+        let buf = self.find_buf(buffer)?;
+        if count == 0 || count > buf.sector_count
+            || sector.saturating_add(count) > self.capacity_sectors
+        {
+            return Err(BlockError::InvalidParameter);
+        }
+        unsafe {
+            adma2_transfer(
+                self.mmio_va, AdmaDirection::Write,
+                sector, count as u16, buf.pa,
+                self.desc_va, self.desc_phys,
+            ).map(|_timing| ()).map_err(|_| BlockError::IoError)
+        }
+    }
+
+    fn free_buffer(&mut self, buffer: PageSetHandle) {
+        for slot in self.dma_buffers.iter_mut() {
+            if slot.handle == buffer.0 && slot.pa != 0 {
+                sys_close_handle(PageSetHandle(slot.handle));
+                *slot = DMA_BUF_EMPTY;
+                self.dma_count -= 1;
+                return;
+            }
+        }
+    }
 }

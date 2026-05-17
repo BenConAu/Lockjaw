@@ -449,6 +449,11 @@ pub extern "C" fn _start() -> ! {
     let cprman_boot_ep = alloc_endpoint("cprman boot");
     let clock_test_boot_ep = alloc_endpoint("clock-test boot");
     let emmc2_boot_ep = alloc_endpoint("emmc2 boot");
+    // M7: emmc2 is a second block backend (alongside virtio-blk on QEMU).
+    // Init owns the server endpoint so it can route clients to either
+    // backend; emmc2 receives the endpoint via bootstrap reply and
+    // calls run_block_server on it.
+    let emmc2_blk_srv_ep = alloc_endpoint("emmc2 blk srv");
     let sleep_test_boot_ep = alloc_endpoint("sleep-test boot");
 
     // Spawn child processes.
@@ -686,7 +691,11 @@ pub extern "C" fn _start() -> ! {
         Ok(idx) => idx,
         Err(_) => { puts("init: export devmgr_ep to emmc2 FAILED\n"); park_forever(); }
     };
-    sys_reply(emmc2_devmgr_idx, 0, 0, 0);
+    let emmc2_blk_srv_idx = match sys_export_handle(emmc2_blk_srv_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export emmc2_blk_srv_ep to emmc2 FAILED\n"); park_forever(); }
+    };
+    sys_reply(emmc2_devmgr_idx, emmc2_blk_srv_idx, 0, 0);
     puts("[BOOTSTRAP] emmc2\n");
 
     // Bootstrap sleep-test: no handles to export, just a sync reply

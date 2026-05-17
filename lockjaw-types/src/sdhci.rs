@@ -458,6 +458,9 @@ pub enum SdCommand {
     SetBlockCount = 23,
     /// CMD24 — WRITE_BLOCK. R1 response.
     WriteBlock = 24,
+    /// CMD25 — WRITE_MULTIPLE_BLOCK. R1 response. M7 BlockEngine
+    /// writes use this with Auto-CMD23 (same shape as CMD18).
+    WriteMultipleBlock = 25,
     /// ACMD41 — SD_SEND_OP_COND. R3 response (OCR). Sent after a
     /// CMD55 prefix. Argument carries the host-supported voltage
     /// window plus HCS=1 (Host Capacity Support — required to
@@ -728,6 +731,7 @@ mod tests {
         assert_eq!(SdCommand::ReadMultipleBlock.index(), 18);
         assert_eq!(SdCommand::SetBlockCount.index(), 23);
         assert_eq!(SdCommand::WriteBlock.index(), 24);
+        assert_eq!(SdCommand::WriteMultipleBlock.index(), 25);
         assert_eq!(SdCommand::AppCmd.index(), 55);
     }
 
