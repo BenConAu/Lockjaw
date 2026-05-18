@@ -1,0 +1,53 @@
+# SKELETAL spec for VirtIO MMIO transport. Filled out and emitted in
+# Phase 3 (virtio-blk-driver conversion). For Phase 2 it exists so the
+# parser/--check validates the schema features virtio needs:
+# - plain `rw` access (most regs)
+# - `trigger` access (QueueNotify; write-only, command-style)
+# - `w1c` access (InterruptAck)
+# - enum-valued multi-bit field (DeviceStatus is a flags set; modeled
+#   here as `flags` to test the flags shape)
+
+[device]
+name = "VirtioMmio"
+description = "VirtIO MMIO transport"
+emit = false
+
+[[registers]]
+name = "magic_value"
+offset = 0x000
+width = 32
+access = "ro"
+description = "0x74726976 ('virt' little-endian)"
+
+[[registers]]
+name = "device_status"
+offset = 0x070
+width = 32
+access = "rw"
+description = "Device status register (state machine)"
+flags = [
+    { name = "acknowledge", bit = 0 },
+    { name = "driver", bit = 1 },
+    { name = "driver_ok", bit = 2 },
+    { name = "features_ok", bit = 3 },
+    { name = "needs_reset", bit = 6 },
+    { name = "failed", bit = 7 },
+]
+
+[[registers]]
+name = "queue_notify"
+offset = 0x050
+width = 32
+access = "trigger"
+description = "Write to notify a virtqueue (value = queue index)"
+
+[[registers]]
+name = "interrupt_ack"
+offset = 0x064
+width = 32
+access = "w1c"
+description = "Acknowledge interrupts (write 1 to clear bits)"
+flags = [
+    { name = "used_buffer", bit = 0 },
+    { name = "config_change", bit = 1 },
+]

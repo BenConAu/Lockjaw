@@ -1,0 +1,64 @@
+# SKELETAL spec for BCM2711 emmc2 (SDHCI v3 compatible).
+# Filled out and emitted in Phase 7 (emmc2-driver conversion — the
+# biggest payoff; saved for last for safety). For Phase 2 it exists so
+# the parser/--check validates the schema features SDHCI needs:
+# - `kind = "aliased"` — SYSADDR (CMD17 single block) and ARGUMENT2
+#   (CMD23 auto-CMD23 arg) live at the SAME offset 0x000 with different
+#   semantics; codegen emits two accessor names for one cell.
+# - `kind = "combined_trigger"` — TRANSFER_MODE (0x00c lower 16) +
+#   COMMAND (0x00c upper 16) must be a SINGLE u32 write to fire the
+#   command; otherwise the controller never sees the trigger.
+# - `[[descriptors]]` — ADMA2-32 descriptor format (8 bytes:
+#   attr/length/address) with typed field accessors.
+
+[device]
+name = "Sdhci"
+description = "SD Host Controller v3 / BCM2711 emmc2"
+emit = false
+
+# SYSADDR / ARGUMENT2 alias at offset 0x000
+[[registers]]
+name = "sysaddr"
+offset = 0x000
+width = 32
+access = "rw"
+kind = "aliased"
+aliases = ["argument2"]
+description = "SDMA system address (also used as ARGUMENT2 for CMD23)"
+
+[[registers]]
+name = "block_size"
+offset = 0x004
+width = 16
+access = "rw"
+description = "Block size in bytes (12-bit field)"
+
+# TRANSFER_MODE + COMMAND combined trigger at offset 0x00c
+[[registers]]
+name = "transfer_mode_command"
+offset = 0x00c
+width = 32
+access = "wo"
+kind = "combined_trigger"
+description = "Issuing a CMD = writing both halves as ONE u32 transaction"
+parts = [
+    { name = "transfer_mode", bits = "15:0" },
+    { name = "command", bits = "31:16" },
+]
+
+# ADMA descriptor — declared but not a register; codegen emits a typed
+# value type, not a struct field.
+[[descriptors]]
+name = "Adma2Descriptor32"
+width = 64
+description = "ADMA2 32-bit-address descriptor (8 bytes)"
+fields = [
+    { name = "attr", bits = "5:0", enum_values = [
+        { name = "Nop", value = 0 },
+        { name = "Tran", value = 0x20 },
+        { name = "TranEnd", value = 0x23 },
+        { name = "Link", value = 0x30 },
+    ] },
+    { name = "length", bits = "31:16" },
+    { name = "address", bits = "63:32" },
+]

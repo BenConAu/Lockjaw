@@ -1,0 +1,35 @@
+# SKELETAL spec for QEMU fw_cfg + ramfb. Filled out and emitted in
+# Phase 5 (ramfb-driver conversion). For Phase 2 it exists so the
+# parser/--check validates the schema features fw_cfg needs:
+# - `endian = "big"` per-register (fw_cfg selector and DMA address)
+# - `kind = "stream"` data port (emits accessor methods, not a struct
+#   field — multiple reads/writes hit the same address)
+
+[device]
+name = "FwCfg"
+description = "QEMU fw_cfg control + DMA + ramfb"
+emit = false
+
+[[registers]]
+name = "data"
+offset = 0x000
+width = 8
+access = "rw"
+kind = "stream"
+description = "Selector data port; read/write byte stream"
+
+[[registers]]
+name = "selector"
+offset = 0x008
+width = 16
+access = "wo"
+endian = "big"
+description = "Pick a fw_cfg entry"
+
+[[registers]]
+name = "dma_addr"
+offset = 0x010
+width = 64
+access = "wo"
+endian = "big"
+description = "DMA-mode request control address"

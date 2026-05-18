@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::process::{self, Command, Stdio};
 
+mod gen_regs;
+
 /// Per-function stack frame cap in bytes. Any single function exceeding
 /// this fails immediately — catches large locals before they interact
 /// with call depth. Set to 1600 to accommodate create_process's frame
@@ -24,12 +26,18 @@ const IRQ_EXCEPTION_ENTRY: &str = "__vec_irq";
 const ANNOTATIONS_PATH: &str = "xtask/stack-annotations.toml";
 
 fn main() {
-    match env::args().nth(1).as_deref() {
+    let cmd = env::args().nth(1);
+    let rest: Vec<String> = env::args().skip(2).collect();
+    match cmd.as_deref() {
         Some("check-stack") => check_stack(),
         Some("check-pointers") => check_pointers(),
         Some("check-vtables") => check_vtables(),
         Some("check-init-size") => check_init_size(),
         Some("check-linker-symbols") => check_linker_symbols(),
+        Some("gen-regs") => {
+            let check = rest.iter().any(|a| a == "--check");
+            gen_regs::run(check);
+        }
         _ => {
             eprintln!("Usage: cargo xtask <command>");
             eprintln!("Commands:");
@@ -38,6 +46,7 @@ fn main() {
             eprintln!("  check-vtables          Scan data sections for absolute code pointers");
             eprintln!("  check-init-size        Verify init ELF fits in kernel mapping buffer");
             eprintln!("  check-linker-symbols   Enforce docs/linker-symbol-audit.md allowlist");
+            eprintln!("  gen-regs [--check]     Generate lockjaw-regs from user/regspecs/*.toml");
             process::exit(1);
         }
     }

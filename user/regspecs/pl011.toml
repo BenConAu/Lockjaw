@@ -1,0 +1,126 @@
+# PrimeCell PL011 UART register specification.
+#
+# Generates user/lockjaw-regs/src/pl011.rs via `cargo xtask gen-regs`.
+# Drivers consume the generated module; this TOML is the source of truth.
+#
+# Reference: ARM PrimeCell UART (PL011) Technical Reference Manual r1p5.
+# Used by QEMU `virt` and BCM2711 Pi 4B (the "arm,pl011" compatible).
+
+[device]
+name = "Pl011"
+description = "PrimeCell PL011 UART (ARM)"
+emit = true
+
+# ---------------------------------------------------------------------------
+# DATA — kind="stream": read consumes RX byte, write enqueues TX byte.
+# Read and write touch DIFFERENT logical state (RX FIFO vs TX FIFO), so
+# the codegen must NOT emit a `modify_data` RMW helper — that would
+# dequeue a received byte and retransmit it, corrupting UART traffic.
+# The fw_cfg data port (Phase 5) uses the same stream model at u8 width.
+# ---------------------------------------------------------------------------
+[[registers]]
+name = "data"
+offset = 0x00
+width = 32
+access = "rw"
+kind = "stream"
+description = "Data register (RX on read, TX on write — independent streams)"
+
+# ---------------------------------------------------------------------------
+# FR — flag register. All flags are read-only status bits.
+# ---------------------------------------------------------------------------
+[[registers]]
+name = "flag"
+offset = 0x18
+width = 32
+access = "ro"
+description = "Flag register (RX/TX FIFO status, UART busy)"
+flags = [
+    { name = "busy", bit = 3, description = "UART busy transmitting" },
+    { name = "rxfe", bit = 4, description = "Receive FIFO empty" },
+    { name = "txff", bit = 5, description = "Transmit FIFO full" },
+]
+
+# ---------------------------------------------------------------------------
+# IBRD/FBRD — baud rate divisors. Plain RW scalars.
+# ---------------------------------------------------------------------------
+[[registers]]
+name = "ibrd"
+offset = 0x24
+width = 32
+access = "rw"
+description = "Integer baud rate divisor"
+
+[[registers]]
+name = "fbrd"
+offset = 0x28
+width = 32
+access = "rw"
+description = "Fractional baud rate divisor"
+
+# ---------------------------------------------------------------------------
+# LCR_H — line control. Exercises multi-bit fields and enum-valued fields.
+# ---------------------------------------------------------------------------
+[[registers]]
+name = "lcrh"
+offset = 0x2c
+width = 32
+access = "rw"
+description = "Line control"
+fields = [
+    { name = "parity_enable", bits = "1:1" },
+    { name = "parity_select", bits = "2:2", enum_values = [
+        { name = "Odd", value = 0 },
+        { name = "Even", value = 1 },
+    ] },
+    { name = "fifo_enable", bits = "4:4" },
+    { name = "word_length", bits = "6:5", enum_values = [
+        { name = "Bits5", value = 0 },
+        { name = "Bits6", value = 1 },
+        { name = "Bits7", value = 2 },
+        { name = "Bits8", value = 3 },
+    ] },
+]
+
+# ---------------------------------------------------------------------------
+# CR — control register. RW with single-bit flags.
+# ---------------------------------------------------------------------------
+[[registers]]
+name = "control"
+offset = 0x30
+width = 32
+access = "rw"
+description = "Control register"
+flags = [
+    { name = "uart_enable", bit = 0 },
+    { name = "tx_enable", bit = 8 },
+    { name = "rx_enable", bit = 9 },
+]
+
+# ---------------------------------------------------------------------------
+# IMSC — interrupt mask set/clear. RW with single-bit flags.
+# ---------------------------------------------------------------------------
+[[registers]]
+name = "imsc"
+offset = 0x38
+width = 32
+access = "rw"
+description = "Interrupt mask set/clear"
+flags = [
+    { name = "rxim", bit = 4, description = "RX interrupt mask" },
+    { name = "txim", bit = 5, description = "TX interrupt mask" },
+]
+
+# ---------------------------------------------------------------------------
+# ICR — interrupt clear. Write-1-to-clear; no read API by convention.
+# ---------------------------------------------------------------------------
+[[registers]]
+name = "icr"
+offset = 0x44
+width = 32
+access = "w1c"
+description = "Interrupt clear (write 1 to clear)"
+flags = [
+    { name = "rxic", bit = 4 },
+    { name = "txic", bit = 5 },
+]

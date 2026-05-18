@@ -1,0 +1,37 @@
+# SKELETAL spec for BCM2711 CPRMAN (clock & power manager).
+# Filled out and emitted in Phase 6 (cprman-driver conversion).
+# For Phase 2 it exists so the parser/--check validates the schema
+# features cprman needs:
+# - `kind = "passwd_protected"` — every write must include the
+#   0x5a000000 PASSWD prefix (XOR with 0xff000000 from the read value).
+# - register-level access semantics for the CM_<peripheral>_CTL pattern.
+
+[device]
+name = "Cprman"
+description = "BCM2711 Clock & Power Manager"
+emit = false
+
+[[registers]]
+name = "cm_emmc2_ctl"
+offset = 0x1d0
+width = 32
+access = "rw"
+kind = "passwd_protected"
+description = "EMMC2 clock control. Writes must include PASSWD = 0x5a"
+fields = [
+    { name = "src", bits = "3:0", enum_values = [
+        { name = "Gnd", value = 0 },
+        { name = "Osc", value = 1 },
+        { name = "PllD", value = 6 },
+    ] },
+    { name = "enable", bits = "4:4" },
+    { name = "busy", bits = "7:7" },
+]
+
+[[registers]]
+name = "cm_emmc2_div"
+offset = 0x1d4
+width = 32
+access = "rw"
+kind = "passwd_protected"
+description = "EMMC2 clock integer divider (DIV.INT << 12 | DIV.FRAC)"

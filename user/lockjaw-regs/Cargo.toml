@@ -1,0 +1,16 @@
+[package]
+name = "lockjaw-regs"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+
+[dependencies]
+lockjaw-mmio = { path = "../lockjaw-mmio" }
+lockjaw-types = { path = "../../lockjaw-types" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2

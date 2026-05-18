@@ -51,10 +51,12 @@ build-user: clean-all build-hash
 	cd user/init && cargo build --release
 
 build: build-user check-stack check-pointers check-init-size check-linker-symbols
+	cargo xtask gen-regs --check
 	cargo build
 	cargo xtask check-vtables
 
 build-release: build-user check-stack
+	cargo xtask gen-regs --check
 	cargo build --release
 
 run: build
@@ -130,6 +132,7 @@ test: test-unit test-qemu-gicv3 test-qemu-gicv2
 test-unit:
 	cargo test -p lockjaw-types --target aarch64-apple-darwin
 	cargo test --manifest-path user/lockjaw-mmio/Cargo.toml --target aarch64-apple-darwin
+	cargo test --manifest-path user/lockjaw-regs/Cargo.toml --target aarch64-apple-darwin
 
 test-qemu-gicv3: build test-img
 	GIC_VERSION=3 bash tests/qemu_integration.sh

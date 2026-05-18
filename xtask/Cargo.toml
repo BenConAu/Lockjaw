@@ -2,3 +2,11 @@
 name = "xtask"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+# Build-time-only dependencies for the gen-regs codegen. xtask runs on
+# the host (aarch64-apple-darwin per .cargo/config.toml alias), so
+# stdlib deps are fine here — they never leak into kernel or driver
+# binaries.
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
