@@ -1111,26 +1111,14 @@ unsafe fn adma2_single_block_read(
     if buf_phys >= (1u64 << 32) {
         return Err(Emmc2Error::BufferPhysAbove4Gib(buf_phys));
     }
-    // One descriptor covers the whole 512-byte transfer. Same shape
-    // as the M6 sub-commit 2b inline block: desc write → dsb sy →
-    // HOST_CONTROL DMA_SEL re-write → ADMA_ADDRESS → inhibit poll →
-    // BLOCK_SIZE/COUNT/MODE/ARG → CMD17. The DMA_SEL re-write is
-    // idempotent (engine.new already sets it) but kept here to make
-    // this function byte-equivalent to the proven-on-Pi M6 sequence.
-    let desc = adma2_tran_end_descriptor(buf_phys as u32, 512);
-    ptr::write_volatile(desc_va as *mut u64, desc);
-    asm!("dsb sy", options(nomem, nostack));
 
-    // Re-select ADMA2-32 in HOST_CONTROL_1. Preserve the 4-bit bus
-    // width bit (set during M3 ACMD6); replace the DMA_SEL field
-    // bits only.
-    let hc = sdhci_read8(mmio_va, SDHCI_HOST_CONTROL);
-    let hc_new = (hc & !SDHCI_HOST_CTRL_DMA_SEL_MASK)
-        | SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32;
-    sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc_new);
-
-    sdhci_write32(mmio_va, SDHCI_ADMA_ADDRESS, desc_phys as u32);
-
+    // Inhibit poll FIRST, before touching any controller config registers.
+    // Per SDHCI spec, writing HOST_CONTROL.DMA_SEL or ADMA_ADDRESS while a
+    // transfer is in progress has undefined behaviour — for back-to-back
+    // CMD17s on BCM2711 emmc2 it wedges the state machine such that
+    // PRESENT_STATE bits 1/2/9 (CMD_INHIBIT_DAT, DAT_LINE_ACTIVE,
+    // READ_TRANSFER_ACTIVE) never clear. Polling inhibit before any
+    // writes is what Linux's sdhci_send_command does.
     if poll_until_clear_32(
         mmio_va, SDHCI_PRESENT_STATE,
         SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
@@ -1140,6 +1128,26 @@ unsafe fn adma2_single_block_read(
             present_state: sdhci_read32(mmio_va, SDHCI_PRESENT_STATE),
         });
     }
+
+    // One descriptor covers the whole 512-byte transfer. Same descriptor
+    // table memory is reused across calls; the controller has either not
+    // started yet (first call) or has fully released (inhibit cleared
+    // above), so we can safely overwrite the previous descriptor.
+    let desc = adma2_tran_end_descriptor(buf_phys as u32, 512);
+    ptr::write_volatile(desc_va as *mut u64, desc);
+    asm!("dsb sy", options(nomem, nostack));
+
+    // Re-select ADMA2-32 in HOST_CONTROL_1. Preserve the 4-bit bus
+    // width bit (set during M3 ACMD6); replace the DMA_SEL field
+    // bits only. Idempotent (engine.new already set it) but kept for
+    // safety against any other code path that might have changed it.
+    let hc = sdhci_read8(mmio_va, SDHCI_HOST_CONTROL);
+    let hc_new = (hc & !SDHCI_HOST_CTRL_DMA_SEL_MASK)
+        | SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32;
+    sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc_new);
+
+    sdhci_write32(mmio_va, SDHCI_ADMA_ADDRESS, desc_phys as u32);
+
     sdhci_write16(mmio_va, SDHCI_BLOCK_SIZE, 512);
     sdhci_write16(mmio_va, SDHCI_BLOCK_COUNT, 1);
     sdhci_write16(mmio_va, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ | SDHCI_TRNS_DMA);
@@ -1235,6 +1243,19 @@ unsafe fn adma2_transfer(
         return Err(Emmc2Error::DescriptorLengthOverflow(bytes));
     }
 
+    // Inhibit poll FIRST — see adma2_single_block_read for rationale.
+    // Writing ADMA_ADDRESS or other transfer-affecting registers while
+    // a previous transfer is still active wedges the controller.
+    if poll_until_clear_32(
+        mmio_va, SDHCI_PRESENT_STATE,
+        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
+        Nanos::from_millis(100),
+    ).is_err() {
+        return Err(Emmc2Error::InhibitStuck {
+            present_state: sdhci_read32(mmio_va, SDHCI_PRESENT_STATE),
+        });
+    }
+
     // One descriptor covers the whole multi-block transfer. Descriptor
     // table from the single-block path is reused (still mapped at
     // desc_va); overwrite its 8 bytes for this transfer.
@@ -1245,15 +1266,6 @@ unsafe fn adma2_transfer(
     sdhci_write32(mmio_va, SDHCI_ADMA_ADDRESS, desc_phys as u32);
     sdhci_write32(mmio_va, SDHCI_ARGUMENT2, n_blocks as u32);
 
-    if poll_until_clear_32(
-        mmio_va, SDHCI_PRESENT_STATE,
-        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
-        Nanos::from_millis(100),
-    ).is_err() {
-        return Err(Emmc2Error::InhibitStuck {
-            present_state: sdhci_read32(mmio_va, SDHCI_PRESENT_STATE),
-        });
-    }
     sdhci_write16(mmio_va, SDHCI_BLOCK_SIZE, 512);
     sdhci_write16(mmio_va, SDHCI_BLOCK_COUNT, n_blocks);
     let trns_dir = match direction {
