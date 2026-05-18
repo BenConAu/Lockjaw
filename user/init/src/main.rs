@@ -89,6 +89,13 @@ static EMMC2_ELF: &[u8] = include_bytes!("../../emmc2-driver/target/aarch64-unkn
 /// against regressions.
 static SLEEP_TEST_ELF: &[u8] = include_bytes!("../../sleep-test/target/aarch64-unknown-none/release/lockjaw-sleep-test");
 
+/// The partition-manager ELF binary, embedded at compile time.
+/// Built by: cd user/partition-manager && cargo build --release
+/// Sits between the raw block server and fat32-server: reads LBA 0,
+/// parses the partition table (MBR or bare FAT32), translates sector
+/// addresses, and exposes partition_srv_ep as a standard BlockEngine.
+static PARTMGR_ELF: &[u8] = include_bytes!("../../partition-manager/target/aarch64-unknown-none/release/lockjaw-partition-manager");
+
 // ---------------------------------------------------------------------------
 // ELF spawn helper
 // ---------------------------------------------------------------------------
@@ -455,6 +462,12 @@ pub extern "C" fn _start() -> ! {
     // calls run_block_server on it.
     let emmc2_blk_srv_ep = alloc_endpoint("emmc2 blk srv");
     let sleep_test_boot_ep = alloc_endpoint("sleep-test boot");
+    let partmgr_boot_ep = alloc_endpoint("partmgr boot");
+    // init owns partition_srv_ep: given to partition-manager (to serve on)
+    // and to fat32-server (as its upstream block device). Partition-manager
+    // translates sector addresses from fat32's view of LBA 0 to the actual
+    // partition start on the physical device.
+    let partition_srv_ep = alloc_endpoint("partition srv");
 
     // Spawn child processes.
     // Allocate VAs for ELF loading. These are reused across spawns
@@ -502,6 +515,11 @@ pub extern "C" fn _start() -> ! {
     // driver calls CMD_GET_CLOCK_HANDLE. On QEMU the claim fails immediately
     // (no bcm2711-emmc2 in the virt DTB) and the driver exits cleanly.
     spawn_elf(EMMC2_ELF, "emmc2-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, emmc2_boot_ep, 2);
+    // partition-manager spawns after both block backends so its bootstrap
+    // can receive active_blk_srv_ep (chosen after the DTB probe below).
+    // Bootstrapped between block-server and fat32 so the kernel IPC ordering
+    // guarantee holds: fat32's first get_info() blocks until partmgr receives.
+    spawn_elf(PARTMGR_ELF, "partition-manager", map_array_va, temp_base_va, plan_buf_va, scratch_ps, partmgr_boot_ep, 2);
     // sleep-test verifies the kernel's deadline/sleep primitive
     // (sys_wait_any with absolute monotonic deadline). It needs no
     // device handles — bootstrap is a synchronization handshake only.
@@ -692,18 +710,38 @@ pub extern "C" fn _start() -> ! {
         blk_srv_ep
     };
 
-    // Bootstrap fat32-server: export its own server endpoint (so it
-    // can sys_receive on it once Phase E wires up clients) plus the
-    // active block-server endpoint (chosen above).
+    // Bootstrap partition-manager: give it (partition_srv_ep, active_blk_srv_ep).
+    // Ordering: block-server is in run_block_server before partmgr bootstraps,
+    // so partmgr's LBA 0 read to active_blk_srv_ep cannot deadlock. fat32-server
+    // bootstraps after this block, so by the time fat32 calls partition_srv_ep,
+    // partmgr has already entered (or is about to enter) run_block_server. The
+    // kernel's IPC blocking handles the race window without a ready-signal.
+    puts("init: waiting for partmgr bootstrap...\n");
+    let _ = sys_receive(partmgr_boot_ep);
+    let partmgr_srv_idx = match sys_export_handle(partition_srv_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export partition_srv_ep to partmgr FAILED\n"); park_forever(); }
+    };
+    let partmgr_blk_idx = match sys_export_handle(active_blk_srv_ep) {
+        Ok(idx) => idx,
+        Err(_) => { puts("init: export active_blk_srv_ep to partmgr FAILED\n"); park_forever(); }
+    };
+    sys_reply(partmgr_srv_idx, partmgr_blk_idx, 0, 0);
+    puts("[BOOTSTRAP] partmgr\n");
+
+    // Bootstrap fat32-server: export its own server endpoint plus
+    // partition_srv_ep (the partition-manager's block interface). Partition-
+    // manager translates fat32's sector addresses to the actual partition
+    // start on the physical device — fat32 sees a contiguous disk at LBA 0.
     puts("init: waiting for fat32 bootstrap...\n");
     let _ = sys_receive(fat32_boot_ep);
     let fat32_srv_idx = match sys_export_handle(fat32_srv_ep) {
         Ok(idx) => idx,
         Err(_) => { puts("init: export fat32_srv_ep FAILED\n"); park_forever(); }
     };
-    let fat32_blk_idx = match sys_export_handle(active_blk_srv_ep) {
+    let fat32_blk_idx = match sys_export_handle(partition_srv_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export blk to fat32 FAILED\n"); park_forever(); }
+        Err(_) => { puts("init: export partition_srv_ep to fat32 FAILED\n"); park_forever(); }
     };
     sys_reply(fat32_srv_idx, fat32_blk_idx, 0, 0);
     puts("[BOOTSTRAP] fat32\n");

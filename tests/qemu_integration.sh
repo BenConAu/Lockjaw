@@ -200,6 +200,13 @@ assert_contains "blk: selftest read OK, sector 0 = \[eb 58 90" "blk driver read 
 assert_contains "blk: serving" "blk driver entered server loop after selftest"
 assert_not_contains "blk: no virtio-blk device found" "blk driver did NOT take the no-device path"
 
+echo "Phase 14.5 — Partition Manager:"
+# Bare FAT32 test.img: parse_disk returns BareFat, start_lba=0, pass-through.
+assert_contains "partmgr: starting" "partition-manager started"
+assert_contains "partmgr: bootstrapped" "partition-manager completed bootstrap"
+assert_contains "partmgr: bare FAT32 disk" "partition-manager detected bare FAT32 layout"
+assert_contains "partmgr: serving" "partition-manager entered server loop"
+
 echo "Phase 15 — FAT32 Filesystem Server (mount):"
 assert_contains "fat32: starting" "fat32-server started"
 assert_contains "fat32: bootstrapped" "fat32-server completed bootstrap"
