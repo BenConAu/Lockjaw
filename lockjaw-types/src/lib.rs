@@ -31,6 +31,7 @@ pub mod thread;
 pub mod display;
 pub mod virtio;
 pub mod block;
+pub mod dma;
 pub mod sdhci;
 pub mod clock;
 pub mod clock_handle_table;

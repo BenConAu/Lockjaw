@@ -129,6 +129,7 @@ test: test-unit test-qemu-gicv3 test-qemu-gicv2
 
 test-unit:
 	cargo test -p lockjaw-types --target aarch64-apple-darwin
+	cargo test --manifest-path user/lockjaw-mmio/Cargo.toml --target aarch64-apple-darwin
 
 test-qemu-gicv3: build test-img
 	GIC_VERSION=3 bash tests/qemu_integration.sh
