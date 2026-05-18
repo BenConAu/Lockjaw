@@ -315,6 +315,100 @@ fn put_error_int_status(bits: u16) {
 }
 
 // ---------------------------------------------------------------------------
+// Emmc2Error — typed failure enum for ADMA transfers and engine init.
+//
+// Replaces the old `Result<_, &'static str>` returns: the inner code
+// constructs a variant (possibly carrying SDHCI status registers, bad
+// physical addresses, etc.) and returns it. The caller decides what to
+// log via `put_emmc2_error`. No inner code calls `puts` for error
+// formatting — that's the caller's job, so errors that propagate
+// silently get one canonical line at the top of the chain.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum Emmc2Error {
+    /// Buffer physical address exceeds the 32-bit ADMA2-32 limit.
+    BufferPhysAbove4Gib(u64),
+    /// Descriptor table physical address exceeds the 32-bit ADMA2-32 limit.
+    DescPhysAbove4Gib(u64),
+    /// Descriptor segment length exceeds 65535-byte single-descriptor cap.
+    DescriptorLengthOverflow(u32),
+    /// CMD or DAT inhibit didn't clear within the 100ms pre-poll deadline.
+    InhibitStuck { present_state: u32 },
+    /// Controller-reported error during command phase (CMD17/CMD18/CMD25).
+    /// Status word from SDHCI_ERROR_INT_STATUS is attached for decoding.
+    CmdError { err_int_status: u16 },
+    /// Controller-reported error during data phase.
+    DataError { err_int_status: u16 },
+    /// CMD_COMPLETE never arrived within the 1-second deadline.
+    CmdCompleteTimeout,
+    /// TRANSFER_COMPLETE never arrived within the 100ms deadline.
+    TransferCompleteTimeout,
+    /// sys_alloc_dma_pages for the descriptor table failed.
+    DescAllocFailed,
+    /// sys_query_pageset_phys for the descriptor table failed.
+    DescPhysQueryFailed,
+    /// VMEM.alloc(1) for the descriptor table VA returned None.
+    DescVaExhausted,
+    /// sys_map_pages for the descriptor table failed.
+    DescMapFailed,
+}
+
+impl Emmc2Error {
+    /// Short stable identifier — same string for every instance of a
+    /// variant, ignoring attached data. Useful when you just want a
+    /// label without the per-instance details.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::BufferPhysAbove4Gib(_)       => "buffer phys > 4GiB",
+            Self::DescPhysAbove4Gib(_)         => "desc phys > 4GiB",
+            Self::DescriptorLengthOverflow(_)  => "descriptor length > 65535",
+            Self::InhibitStuck { .. }          => "inhibit stuck",
+            Self::CmdError { .. }              => "cmd phase error",
+            Self::DataError { .. }             => "data phase error",
+            Self::CmdCompleteTimeout           => "cmd_complete timeout",
+            Self::TransferCompleteTimeout      => "transfer_complete timeout",
+            Self::DescAllocFailed              => "desc alloc failed",
+            Self::DescPhysQueryFailed          => "desc phys query failed",
+            Self::DescVaExhausted              => "desc VA exhausted",
+            Self::DescMapFailed                => "desc map NC failed",
+        }
+    }
+}
+
+/// Print an Emmc2Error: the as_str() label followed by any attached
+/// detail (status bits, physical addresses). Does not add a trailing
+/// newline — caller decides.
+fn put_emmc2_error(err: &Emmc2Error) {
+    puts(err.as_str());
+    match err {
+        Emmc2Error::BufferPhysAbove4Gib(pa) | Emmc2Error::DescPhysAbove4Gib(pa) => {
+            puts(" pa=");
+            put_hex(*pa);
+        }
+        Emmc2Error::DescriptorLengthOverflow(len) => {
+            puts(" len=");
+            put_decimal(*len as u64);
+        }
+        Emmc2Error::InhibitStuck { present_state } => {
+            puts(" present_state=");
+            put_hex(*present_state as u64);
+        }
+        Emmc2Error::CmdError { err_int_status }
+        | Emmc2Error::DataError { err_int_status } => {
+            puts(" ");
+            put_error_int_status(*err_int_status);
+        }
+        Emmc2Error::CmdCompleteTimeout
+        | Emmc2Error::TransferCompleteTimeout
+        | Emmc2Error::DescAllocFailed
+        | Emmc2Error::DescPhysQueryFailed
+        | Emmc2Error::DescVaExhausted
+        | Emmc2Error::DescMapFailed => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -908,7 +1002,12 @@ pub extern "C" fn _start() -> ! {
     let capacity_sectors = capacity_bytes / 512;
     let engine = match unsafe { Emmc2BlockEngine::new(mmio_va, capacity_sectors) } {
         Ok(e) => e,
-        Err(msg) => { puts("[EMMC2:BLK] engine init FAILED: "); puts(msg); puts("\n"); halt(); }
+        Err(err) => {
+            puts("[EMMC2:BLK] engine init FAILED: ");
+            put_emmc2_error(&err);
+            puts("\n");
+            halt();
+        }
     };
     let mut engine = engine;
 
@@ -1008,9 +1107,9 @@ unsafe fn adma2_single_block_read(
     buf_phys: u64,
     desc_va: u64,
     desc_phys: u64,
-) -> Result<(), &'static str> {
+) -> Result<(), Emmc2Error> {
     if buf_phys >= (1u64 << 32) {
-        return Err("phys > 4GiB");
+        return Err(Emmc2Error::BufferPhysAbove4Gib(buf_phys));
     }
     // One descriptor covers the whole 512-byte transfer. Same shape
     // as the M6 sub-commit 2b inline block: desc write → dsb sy →
@@ -1037,7 +1136,9 @@ unsafe fn adma2_single_block_read(
         SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
         Nanos::from_millis(100),
     ).is_err() {
-        return Err("inhibit stuck");
+        return Err(Emmc2Error::InhibitStuck {
+            present_state: sdhci_read32(mmio_va, SDHCI_PRESENT_STATE),
+        });
     }
     sdhci_write16(mmio_va, SDHCI_BLOCK_SIZE, 512);
     sdhci_write16(mmio_va, SDHCI_BLOCK_COUNT, 1);
@@ -1055,20 +1156,19 @@ unsafe fn adma2_single_block_read(
     loop {
         let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
         if status & SDHCI_INT_ERROR != 0 {
-            let err = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
+            let err_int_status = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
             sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
             sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
                 SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
-            puts("    CMD17 controller error: ");
-            put_error_int_status(err);
-            puts("\n");
-            return Err("cmd error");
+            return Err(Emmc2Error::CmdError { err_int_status });
         }
         if status & SDHCI_INT_CMD_COMPLETE != 0 {
             sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
             break;
         }
-        if monotonic_now() >= cmd_deadline { return Err("cmd_complete timeout"); }
+        if monotonic_now() >= cmd_deadline {
+            return Err(Emmc2Error::CmdCompleteTimeout);
+        }
         core::hint::spin_loop();
     }
 
@@ -1078,20 +1178,19 @@ unsafe fn adma2_single_block_read(
     loop {
         let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
         if status & SDHCI_INT_ERROR != 0 {
-            let err = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
+            let err_int_status = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
             sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
             sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
                 SDHCI_INT_ERROR | SDHCI_INT_DATA_COMPLETE);
-            puts("    CMD17 data error: ");
-            put_error_int_status(err);
-            puts("\n");
-            return Err("data error");
+            return Err(Emmc2Error::DataError { err_int_status });
         }
         if status & SDHCI_INT_DATA_COMPLETE != 0 {
             sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
             break;
         }
-        if monotonic_now() >= xfer_deadline { return Err("transfer_complete timeout"); }
+        if monotonic_now() >= xfer_deadline {
+            return Err(Emmc2Error::TransferCompleteTimeout);
+        }
         core::hint::spin_loop();
     }
     Ok(())
@@ -1127,13 +1226,13 @@ unsafe fn adma2_transfer(
     buf_phys: u64,
     desc_va: u64,
     desc_phys: u64,
-) -> Result<AdmaTiming, &'static str> {
+) -> Result<AdmaTiming, Emmc2Error> {
     if buf_phys >= (1u64 << 32) {
-        return Err("phys > 4GiB");
+        return Err(Emmc2Error::BufferPhysAbove4Gib(buf_phys));
     }
     let bytes = (n_blocks as u32) * 512;
     if bytes > 65535 {
-        return Err("descriptor length > 65535");
+        return Err(Emmc2Error::DescriptorLengthOverflow(bytes));
     }
 
     // One descriptor covers the whole multi-block transfer. Descriptor
@@ -1151,7 +1250,9 @@ unsafe fn adma2_transfer(
         SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
         Nanos::from_millis(100),
     ).is_err() {
-        return Err("inhibit stuck");
+        return Err(Emmc2Error::InhibitStuck {
+            present_state: sdhci_read32(mmio_va, SDHCI_PRESENT_STATE),
+        });
     }
     sdhci_write16(mmio_va, SDHCI_BLOCK_SIZE, 512);
     sdhci_write16(mmio_va, SDHCI_BLOCK_COUNT, n_blocks);
@@ -1182,20 +1283,19 @@ unsafe fn adma2_transfer(
     loop {
         let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
         if status & SDHCI_INT_ERROR != 0 {
-            let err = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
+            let err_int_status = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
             sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
             sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
                 SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
-            puts("    CMD18/25 controller error: ");
-            put_error_int_status(err);
-            puts("\n");
-            return Err("cmd error");
+            return Err(Emmc2Error::CmdError { err_int_status });
         }
         if status & SDHCI_INT_CMD_COMPLETE != 0 {
             sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
             break;
         }
-        if monotonic_now() >= cmd_deadline { return Err("cmd_complete timeout"); }
+        if monotonic_now() >= cmd_deadline {
+            return Err(Emmc2Error::CmdCompleteTimeout);
+        }
         core::hint::spin_loop();
     }
     let t_cmd = monotonic_now();
@@ -1206,20 +1306,19 @@ unsafe fn adma2_transfer(
     loop {
         let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
         if status & SDHCI_INT_ERROR != 0 {
-            let err = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
+            let err_int_status = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
             sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
             sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
                 SDHCI_INT_ERROR | SDHCI_INT_DATA_COMPLETE);
-            puts("    ADMA2 multi data error: ");
-            put_error_int_status(err);
-            puts("\n");
-            return Err("data error");
+            return Err(Emmc2Error::DataError { err_int_status });
         }
         if status & SDHCI_INT_DATA_COMPLETE != 0 {
             sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
             break;
         }
-        if monotonic_now() >= xfer_deadline { return Err("transfer_complete timeout"); }
+        if monotonic_now() >= xfer_deadline {
+            return Err(Emmc2Error::TransferCompleteTimeout);
+        }
         core::hint::spin_loop();
     }
     let t1 = monotonic_now();
@@ -1299,17 +1398,18 @@ impl Emmc2BlockEngine {
     /// `mmio_va` and is responsible for keeping the controller
     /// initialized through enumeration before calling this.
     unsafe fn new(mmio_va: u64, capacity_sectors: u64)
-        -> Result<Self, &'static str>
+        -> Result<Self, Emmc2Error>
     {
         // Descriptor table: 1 page from the DMA pool, NormalNonCacheable.
-        let desc_ps = sys_alloc_dma_pages(1).map_err(|_| "desc alloc")?;
-        let desc_phys = sys_query_pageset_phys(desc_ps, 0).map_err(|_| "desc phys")?;
-        let desc_va = VMEM.alloc(1).ok_or("desc VA")?;
+        let desc_ps = sys_alloc_dma_pages(1).map_err(|_| Emmc2Error::DescAllocFailed)?;
+        let desc_phys = sys_query_pageset_phys(desc_ps, 0)
+            .map_err(|_| Emmc2Error::DescPhysQueryFailed)?;
+        let desc_va = VMEM.alloc(1).ok_or(Emmc2Error::DescVaExhausted)?;
         if !sys_map_pages(desc_ps, desc_va, MapMemoryAttribute::NormalNonCacheable).is_ok() {
-            return Err("desc map NC");
+            return Err(Emmc2Error::DescMapFailed);
         }
         if desc_phys >= (1u64 << 32) {
-            return Err("desc phys > 4GiB");
+            return Err(Emmc2Error::DescPhysAbove4Gib(desc_phys));
         }
         // Switch HOST_CONTROL_1.DMA_SEL to ADMA2-32; preserve the
         // 4-bit bus width from ACMD6.
@@ -1403,11 +1503,29 @@ impl BlockEngine for Emmc2BlockEngine {
         // validated end-to-end with the partition-manager layer.
         for i in 0..count {
             let buf_sector_pa = buf.pa + i * 512;
-            unsafe {
+            let res = unsafe {
                 adma2_single_block_read(
                     self.mmio_va, sector + i, buf_sector_pa,
                     self.desc_va, self.desc_phys,
-                ).map_err(|_| BlockError::IoError)?;
+                )
+            };
+            if let Err(err) = res {
+                // Surface the typed Emmc2Error so silent-return cases
+                // (inhibit stuck / cmd or xfer timeout) aren't lost behind
+                // the BlockError::IoError facade. One canonical log line
+                // per failure, identifying which sector in the loop died.
+                puts("[EMMC2:READ] iter=");
+                put_decimal(i);
+                puts("/");
+                put_decimal(count);
+                puts(" sector=");
+                put_decimal(sector + i);
+                puts(" buf_pa=");
+                put_hex(buf_sector_pa);
+                puts(" FAILED: ");
+                put_emmc2_error(&err);
+                puts("\n");
+                return Err(BlockError::IoError);
             }
         }
         Ok(())
