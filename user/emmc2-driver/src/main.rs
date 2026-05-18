@@ -1042,19 +1042,6 @@ pub extern "C" fn _start() -> ! {
         puts("[EMMC2:BLK] selftest read FAILED\n");
         halt();
     }
-    // Dump the first 32 bytes of the buffer post-read. If they're all
-    // zero, DMA didn't touch this page. If they look like sector data,
-    // we have the right page but the signature decode is wrong.
-    puts("[EMMC2:DIAG] first 32 bytes after read:");
-    unsafe {
-        for i in 0..32usize {
-            if i % 16 == 0 { puts("\n  "); }
-            let b = ptr::read_volatile((selftest_va as *const u8).add(i));
-            put_hex(b as u64);
-            puts(" ");
-        }
-    }
-    puts("\n");
     // MBR boot signature lives at bytes 510-511 = 0x55 0xAA (little-endian).
     let sig = unsafe {
         let p = selftest_va as *const u8;
