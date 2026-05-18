@@ -981,25 +981,22 @@ pub extern "C" fn _start() -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// ADMA2 transfer primitives. Two flavours kept side-by-side so the M7
-// selftest can A/B test cold-boot behaviour:
+// ADMA2 transfer primitives. The CMD17 single-block path is the only
+// one currently wired into BlockEngine reads:
 //
 //   * `adma2_single_block_read` — CMD17 + plain TRNS_READ|TRNS_DMA.
-//     Mirrors the M6 sub-commit 2b sequence that was proven on Pi
-//     under the perf-sweep path (after M4 PIO + M5 PIO primer). No
-//     Auto-CMD23, no BLK_CNT_EN, no MULTI. Used for `count == 1`
-//     reads in `Emmc2BlockEngine::read`.
-//   * `adma2_transfer`         — CMD18 (read) / CMD25 (write) +
-//     Auto-CMD23. Used for `count > 1` reads and all writes.
-//
-// These were briefly collapsed into a single `adma2_transfer(MULTI |
-// AUTO_CMD23)` even for `count == 1` in M7 itself — that bundled a
-// mechanical IPC refactor with a protocol change (CMD17 → CMD18+
-// Auto-CMD23 from cold). The Pi 4B selftest came back with
-// signature=0x0 on first flash (no preceding PIO primer to mask any
-// CMD18-from-cold issue). Restoring the dual path so the next flash
-// discriminates `IPC wrapper broke something` from `CMD18+Auto-CMD23
-// from cold doesn't work`.
+//     Mirrors the M6 sub-commit 2b sequence proven on Pi under the
+//     perf-sweep path. No Auto-CMD23, no BLK_CNT_EN, no MULTI.
+//     `Emmc2BlockEngine::read` loops this one block at a time for
+//     multi-sector reads.
+//   * `adma2_transfer`          — CMD18 (read) / CMD25 (write) +
+//     Auto-CMD23. **Dead code, do not call.** The cold-boot CMD18 +
+//     Auto-CMD23 path returned signature=0x0 on first Pi flash with
+//     no preceding PIO primer to mask the issue. Until that's
+//     diagnosed (see docs/tech-debt.md: "CMD18+Auto-CMD23 cold-boot
+//     validation"), no production path may dispatch through it.
+//     `#[allow(dead_code)]` keeps it as a reference but the compiler
+//     enforces no callers.
 // ---------------------------------------------------------------------------
 
 /// Single-block ADMA2 read of `sector`. CMD17 + READ|DMA only. No
@@ -1121,6 +1118,7 @@ pub enum AdmaDirection {
     Write,
 }
 
+#[allow(dead_code)]  // Disabled until CMD18+Auto-CMD23 cold-boot is validated. See doc/tech-debt.md.
 unsafe fn adma2_transfer(
     mmio_va: u64,
     direction: AdmaDirection,
@@ -1265,8 +1263,10 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 // ---------------------------------------------------------------------------
 // Emmc2BlockEngine — implements lockjaw_userlib::block::BlockEngine
-// against the SDHCI controller. Wraps `adma2_transfer` for both read
-// and write, plus per-buffer PageSet tracking.
+// against the SDHCI controller. `read` loops `adma2_single_block_read`
+// (CMD17) one block at a time. `write` returns `Unsupported` until the
+// CMD18+Auto-CMD23 cold-boot issue is diagnosed (see docs/tech-debt.md).
+// Plus per-buffer PageSet tracking.
 // ---------------------------------------------------------------------------
 
 const MAX_DMA_BUFFERS: usize = 8;
@@ -1391,45 +1391,39 @@ impl BlockEngine for Emmc2BlockEngine {
         {
             return Err(BlockError::InvalidParameter);
         }
-        // Single-block reads use the CMD17 path (matches M6
-        // sub-commit 2b's working sequence on Pi). Multi-block reads
-        // use CMD18 + Auto-CMD23 via `adma2_transfer`. See the
-        // commentary above `adma2_single_block_read` for why both
-        // paths exist.
-        if count == 1 {
+        // Reads always use CMD17 (single-block). Multi-sector reads
+        // loop one block at a time, advancing buf.pa by 512 bytes per
+        // sector. The CMD18+Auto-CMD23 path in adma2_transfer is dead
+        // for reads until the cold-boot CMD18 question is settled;
+        // we want every fat32 / partition-manager read to exercise
+        // the proven M6 sub-commit 2b sequence.
+        //
+        // Performance cost on Pi: one CMD17 round-trip per sector for
+        // multi-sector reads. Acceptable while the read path is being
+        // validated end-to-end with the partition-manager layer.
+        for i in 0..count {
+            let buf_sector_pa = buf.pa + i * 512;
             unsafe {
                 adma2_single_block_read(
-                    self.mmio_va, sector, buf.pa,
+                    self.mmio_va, sector + i, buf_sector_pa,
                     self.desc_va, self.desc_phys,
-                ).map_err(|_| BlockError::IoError)
-            }
-        } else {
-            unsafe {
-                adma2_transfer(
-                    self.mmio_va, AdmaDirection::Read,
-                    sector, count as u16, buf.pa,
-                    self.desc_va, self.desc_phys,
-                ).map(|_timing| ()).map_err(|_| BlockError::IoError)
+                ).map_err(|_| BlockError::IoError)?;
             }
         }
+        Ok(())
     }
 
-    fn write(&mut self, sector: u64, count: u64, buffer: PageSetHandle)
+    fn write(&mut self, _sector: u64, _count: u64, _buffer: PageSetHandle)
         -> Result<(), BlockError>
     {
-        let buf = self.find_buf(buffer)?;
-        if count == 0 || count > buf.sector_count
-            || sector.saturating_add(count) > self.capacity_sectors
-        {
-            return Err(BlockError::InvalidParameter);
-        }
-        unsafe {
-            adma2_transfer(
-                self.mmio_va, AdmaDirection::Write,
-                sector, count as u16, buf.pa,
-                self.desc_va, self.desc_phys,
-            ).map(|_timing| ()).map_err(|_| BlockError::IoError)
-        }
+        // Writes are disabled until CMD18+Auto-CMD23 (read) and
+        // CMD25+Auto-CMD23 (write) are validated on cold boot — see
+        // docs/tech-debt.md "CMD18+Auto-CMD23 cold-boot validation".
+        // The Pi 4B end-to-end target (#131) is FAT32 read through
+        // POSIX, which does not write; rejecting writes prevents
+        // accidental dispatch through the multi-block path while the
+        // cold-boot diagnosis is open.
+        Err(BlockError::Unsupported)
     }
 
     fn free_buffer(&mut self, buffer: PageSetHandle) {

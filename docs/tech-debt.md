@@ -363,3 +363,21 @@ The QEMU MBR test would be a defense-in-depth middle layer, not unique coverage.
 **Fix:** When a future regression in the sector-translation path makes us want the middle-layer test:
 1. Extend `test-img` target with the `partitioned.img` recipe (regular-file ops — `dd` zeros, `printf | dd seek=446` writes the MBR bytes, `mformat -i partitioned.img@@1M` formats the FAT32 partition).
 2. Add `test-qemu-gicv3-partitioned` Makefile target running a second QEMU instance with `partitioned.img` and a parameterized version of the integration script that asserts `partmgr: MBR FAT32 partition found` plus the fat32 read.
+
+---
+
+## emmc2: CMD18+Auto-CMD23 cold-boot validation
+
+**Where:** `user/emmc2-driver/src/main.rs::adma2_transfer` (the CMD18 read / CMD25 write + Auto-CMD23 path). Currently `#[allow(dead_code)]`. `Emmc2BlockEngine::read` loops CMD17 one block at a time instead; `Emmc2BlockEngine::write` returns `Err(Unsupported)`.
+
+**What:** The M7 implementation collapsed CMD17 and CMD18+Auto-CMD23 into a single multi-block path. First Pi 4B flash with that code returned `signature=0x0` on the selftest read — no preceding PIO primer was running ahead to mask any CMD18-from-cold issue. The cause is unidentified: could be Auto-CMD23 specifically, could be CMD18 from cold without prior CMD17, could be a controller state-machine gap on BCM2711 BCM2711 emmc2 that the QEMU virtio path hides.
+
+Until that's diagnosed, all reads use CMD17 single-block (validated on Pi as M6 sub-commit 2b sequence), looped for multi-sector requests. Writes are off entirely. The CMD18 dispatch path is removed from production callers; the function is kept as a reference for re-enablement.
+
+**Why bootstrap:** Pi 4B end-to-end target (task #131) is FAT32 read through POSIX. That's all single-block reads in a loop; writes aren't on the critical path; multi-block throughput isn't on the critical path. Disabling CMD18/CMD25 takes the cold-boot question off the table for #131 while still proving the partition-manager → fat32 → POSIX chain works on real hardware.
+
+**Fix:**
+1. Establish a controlled A/B test on Pi: same M7 selftest, one flash with CMD17 (current state), one flash with CMD18+Auto-CMD23. Compare the diagnostic output (`buf_phys`, `desc_phys`, first 32 bytes after read) between them to localise where the data is dropped.
+2. If CMD18-from-cold is the issue, prepend a CMD17 primer at driver init (read LBA 0 single-block, discard) before declaring the controller ready. Then re-enable CMD18 for multi-block.
+3. If Auto-CMD23 specifically is broken, switch to explicit CMD23 (SET_BLOCK_COUNT) before CMD18/CMD25 — same hardware sequence, separate controller register write.
+4. Performance impact of CMD17-per-sector: worth measuring once #131 is green. If it's significant (likely on cold-boot bulk reads), re-enabling CMD18 becomes higher priority.
