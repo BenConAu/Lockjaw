@@ -37,4 +37,5 @@ pub mod clock_handle_table;
 pub mod dtb_layout;
 pub mod fat32;
 pub mod fs;
+pub mod partition;
 pub mod time;
