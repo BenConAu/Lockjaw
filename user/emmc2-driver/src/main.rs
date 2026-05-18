@@ -924,12 +924,38 @@ pub extern "C" fn _start() -> ! {
         puts("[EMMC2:BLK] selftest map FAILED\n");
         halt();
     }
+    // Diagnostic: print buf_phys (queried via the handle) and desc_phys
+    // so the post-read buffer contents can be correlated with the
+    // descriptor wire encoding the controller saw. Same handle was
+    // queried in alloc_buffer to stash buf.pa; if these differ, that
+    // would explain a silent zero-data read (DMA goes to a different
+    // PA than the CPU's mapping).
+    let buf_phys_check = sys_query_pageset_phys(selftest_buf, 0)
+        .unwrap_or(0xDEAD_BEEF);
+    puts("[EMMC2:DIAG] buf_phys=");
+    put_hex(buf_phys_check);
+    puts(" desc_phys=");
+    put_hex(engine.desc_phys);
+    puts("\n");
     // Zero the buffer to distinguish read data from any prior content.
     unsafe { ptr::write_bytes(selftest_va as *mut u8, 0, 512); }
     if engine.read(0, 1, selftest_buf).is_err() {
         puts("[EMMC2:BLK] selftest read FAILED\n");
         halt();
     }
+    // Dump the first 32 bytes of the buffer post-read. If they're all
+    // zero, DMA didn't touch this page. If they look like sector data,
+    // we have the right page but the signature decode is wrong.
+    puts("[EMMC2:DIAG] first 32 bytes after read:");
+    unsafe {
+        for i in 0..32usize {
+            if i % 16 == 0 { puts("\n  "); }
+            let b = ptr::read_volatile((selftest_va as *const u8).add(i));
+            put_hex(b as u64);
+            puts(" ");
+        }
+    }
+    puts("\n");
     // MBR boot signature lives at bytes 510-511 = 0x55 0xAA (little-endian).
     let sig = unsafe {
         let p = selftest_va as *const u8;
@@ -955,8 +981,125 @@ pub extern "C" fn _start() -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// ADMA2 transfer primitive (used by Emmc2BlockEngine for both read + write).
+// ADMA2 transfer primitives. Two flavours kept side-by-side so the M7
+// selftest can A/B test cold-boot behaviour:
+//
+//   * `adma2_single_block_read` — CMD17 + plain TRNS_READ|TRNS_DMA.
+//     Mirrors the M6 sub-commit 2b sequence that was proven on Pi
+//     under the perf-sweep path (after M4 PIO + M5 PIO primer). No
+//     Auto-CMD23, no BLK_CNT_EN, no MULTI. Used for `count == 1`
+//     reads in `Emmc2BlockEngine::read`.
+//   * `adma2_transfer`         — CMD18 (read) / CMD25 (write) +
+//     Auto-CMD23. Used for `count > 1` reads and all writes.
+//
+// These were briefly collapsed into a single `adma2_transfer(MULTI |
+// AUTO_CMD23)` even for `count == 1` in M7 itself — that bundled a
+// mechanical IPC refactor with a protocol change (CMD17 → CMD18+
+// Auto-CMD23 from cold). The Pi 4B selftest came back with
+// signature=0x0 on first flash (no preceding PIO primer to mask any
+// CMD18-from-cold issue). Restoring the dual path so the next flash
+// discriminates `IPC wrapper broke something` from `CMD18+Auto-CMD23
+// from cold doesn't work`.
 // ---------------------------------------------------------------------------
+
+/// Single-block ADMA2 read of `sector`. CMD17 + READ|DMA only. No
+/// MULTI, no BLK_CNT_EN, no Auto-CMD23 — those belong to the
+/// multi-block path. Mirrors the M6 sub-commit 2b sequence.
+unsafe fn adma2_single_block_read(
+    mmio_va: u64,
+    sector: u64,
+    buf_phys: u64,
+    desc_va: u64,
+    desc_phys: u64,
+) -> Result<(), &'static str> {
+    if buf_phys >= (1u64 << 32) {
+        return Err("phys > 4GiB");
+    }
+    // One descriptor covers the whole 512-byte transfer. Same shape
+    // as the M6 sub-commit 2b inline block: desc write → dsb sy →
+    // HOST_CONTROL DMA_SEL re-write → ADMA_ADDRESS → inhibit poll →
+    // BLOCK_SIZE/COUNT/MODE/ARG → CMD17. The DMA_SEL re-write is
+    // idempotent (engine.new already sets it) but kept here to make
+    // this function byte-equivalent to the proven-on-Pi M6 sequence.
+    let desc = adma2_tran_end_descriptor(buf_phys as u32, 512);
+    ptr::write_volatile(desc_va as *mut u64, desc);
+    asm!("dsb sy", options(nomem, nostack));
+
+    // Re-select ADMA2-32 in HOST_CONTROL_1. Preserve the 4-bit bus
+    // width bit (set during M3 ACMD6); replace the DMA_SEL field
+    // bits only.
+    let hc = sdhci_read8(mmio_va, SDHCI_HOST_CONTROL);
+    let hc_new = (hc & !SDHCI_HOST_CTRL_DMA_SEL_MASK)
+        | SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32;
+    sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc_new);
+
+    sdhci_write32(mmio_va, SDHCI_ADMA_ADDRESS, desc_phys as u32);
+
+    if poll_until_clear_32(
+        mmio_va, SDHCI_PRESENT_STATE,
+        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
+        Nanos::from_millis(100),
+    ).is_err() {
+        return Err("inhibit stuck");
+    }
+    sdhci_write16(mmio_va, SDHCI_BLOCK_SIZE, 512);
+    sdhci_write16(mmio_va, SDHCI_BLOCK_COUNT, 1);
+    sdhci_write16(mmio_va, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ | SDHCI_TRNS_DMA);
+    sdhci_write32(mmio_va, SDHCI_ARGUMENT, sector as u32);
+
+    let cmd17 = sd_command_word(
+        SdCommand::ReadSingleBlock.index(),
+        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
+    );
+    let freq = cntfreq_hz();
+    sdhci_write16(mmio_va, SDHCI_COMMAND, cmd17);
+
+    let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
+    loop {
+        let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
+        if status & SDHCI_INT_ERROR != 0 {
+            let err = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
+                SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
+            puts("    CMD17 controller error: ");
+            put_error_int_status(err);
+            puts("\n");
+            return Err("cmd error");
+        }
+        if status & SDHCI_INT_CMD_COMPLETE != 0 {
+            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+            break;
+        }
+        if monotonic_now() >= cmd_deadline { return Err("cmd_complete timeout"); }
+        core::hint::spin_loop();
+    }
+
+    // M6 used a 100ms TRANSFER_COMPLETE deadline for single-block;
+    // matched here so the function is byte-equivalent.
+    let xfer_deadline = monotonic_now().deadline_in(Nanos::from_millis(100), freq);
+    loop {
+        let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
+        if status & SDHCI_INT_ERROR != 0 {
+            let err = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
+                SDHCI_INT_ERROR | SDHCI_INT_DATA_COMPLETE);
+            puts("    CMD17 data error: ");
+            put_error_int_status(err);
+            puts("\n");
+            return Err("data error");
+        }
+        if status & SDHCI_INT_DATA_COMPLETE != 0 {
+            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
+            break;
+        }
+        if monotonic_now() >= xfer_deadline { return Err("transfer_complete timeout"); }
+        core::hint::spin_loop();
+    }
+    Ok(())
+}
+
 /// Result of an ADMA2 multi-block read with phase-split timing.
 /// `cmd_to_complete` is the controller's response latency; the rest
 /// is card-side data delivery. Useful for distinguishing controller
@@ -1248,12 +1391,26 @@ impl BlockEngine for Emmc2BlockEngine {
         {
             return Err(BlockError::InvalidParameter);
         }
-        unsafe {
-            adma2_transfer(
-                self.mmio_va, AdmaDirection::Read,
-                sector, count as u16, buf.pa,
-                self.desc_va, self.desc_phys,
-            ).map(|_timing| ()).map_err(|_| BlockError::IoError)
+        // Single-block reads use the CMD17 path (matches M6
+        // sub-commit 2b's working sequence on Pi). Multi-block reads
+        // use CMD18 + Auto-CMD23 via `adma2_transfer`. See the
+        // commentary above `adma2_single_block_read` for why both
+        // paths exist.
+        if count == 1 {
+            unsafe {
+                adma2_single_block_read(
+                    self.mmio_va, sector, buf.pa,
+                    self.desc_va, self.desc_phys,
+                ).map_err(|_| BlockError::IoError)
+            }
+        } else {
+            unsafe {
+                adma2_transfer(
+                    self.mmio_va, AdmaDirection::Read,
+                    sector, count as u16, buf.pa,
+                    self.desc_va, self.desc_phys,
+                ).map(|_timing| ()).map_err(|_| BlockError::IoError)
+            }
         }
     }
 

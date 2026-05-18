@@ -345,3 +345,21 @@ Likely candidates to investigate:
 - A small ring buffer of `(timestamp, elapsed_cycles, current_thread_name)` for the worst N ticks since boot.
 
 After the worst tick is identified, the candidate-list above points at where to look.
+
+---
+
+## QEMU partitioned-image integration test (task #130 deferred)
+
+**Where:** `tests/qemu_integration.sh` + `Makefile test-img` target. Would add a second image `partitioned.img` (MBR + FAT32 partition at LBA 2048) and a second QEMU run asserting the MBR code path.
+
+**What:** The `PartitionBlockEngine::read/write` sector translation (`start_lba + sector` via `checked_add`) is exercised only when `start_lba != 0`. Bare-FAT QEMU runs use `start_lba=0` so the translation is a no-op and a regression in that line would not fail QEMU. The MBR partitioned image would catch the bug class on QEMU without needing a Pi reflash.
+
+**Why bootstrap:** The bug class is already covered from two other angles:
+- Host parser tests (`lockjaw-types::partition` — 15 cases) cover the MBR parsing logic.
+- Pi 4B flash (task #131) exercises the real path with real `start_lba=2048` against actual SD-card hardware.
+
+The QEMU MBR test would be a defense-in-depth middle layer, not unique coverage. Skipped to avoid spending the file-format setup (printf/dd of a 16-byte MBR partition entry + 2-byte signature into a regular file, plus `mformat -i partitioned.img@@1M`) on a test whose value is mostly redundant once #131 passes.
+
+**Fix:** When a future regression in the sector-translation path makes us want the middle-layer test:
+1. Extend `test-img` target with the `partitioned.img` recipe (regular-file ops — `dd` zeros, `printf | dd seek=446` writes the MBR bytes, `mformat -i partitioned.img@@1M` formats the FAT32 partition).
+2. Add `test-qemu-gicv3-partitioned` Makefile target running a second QEMU instance with `partitioned.img` and a parameterized version of the integration script that asserts `partmgr: MBR FAT32 partition found` plus the fat32 read.
