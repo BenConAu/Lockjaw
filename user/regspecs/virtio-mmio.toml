@@ -1,53 +1,228 @@
-# SKELETAL spec for VirtIO MMIO transport. Filled out and emitted in
-# Phase 3 (virtio-blk-driver conversion). For Phase 2 it exists so the
-# parser/--check validates the schema features virtio needs:
-# - plain `rw` access (most regs)
-# - `trigger` access (QueueNotify; write-only, command-style)
-# - `w1c` access (InterruptAck)
-# - enum-valued multi-bit field (DeviceStatus is a flags set; modeled
-#   here as `flags` to test the flags shape)
+# VirtIO MMIO transport (modern spec — virtio v1.x).
+#
+# Generates user/lockjaw-regs/src/virtio_mmio.rs via `cargo xtask gen-regs`.
+# Driver: user/virtio-blk-driver (Phase 3 convert target).
+#
+# Reference: VirtIO 1.2 spec section 4.2.2.
+#
+# Phase 3 scope: this file covers the transport registers plus the
+# virtio-blk-specific config-space capacity registers at offset 0x100.
+# That keeps the typed surface a single MappedRegs<VirtioMmio> instead
+# of two MappedRegs at adjacent offsets. When Phase X converts another
+# virtio device type (net, gpu), we either rename the config block or
+# split into per-device-type specs.
 
 [device]
 name = "VirtioMmio"
-description = "VirtIO MMIO transport"
-emit = false
+description = "VirtIO MMIO transport registers + virtio-blk config space"
+emit = true
+
+# ---------------------------------------------------------------------------
+# Read-only identification (spec 4.2.2.1)
+# ---------------------------------------------------------------------------
 
 [[registers]]
 name = "magic_value"
 offset = 0x000
 width = 32
 access = "ro"
-description = "0x74726976 ('virt' little-endian)"
+description = "Magic 0x74726976 ('virt' LE) — bad value = not a virtio device"
 
 [[registers]]
-name = "device_status"
-offset = 0x070
+name = "version"
+offset = 0x004
+width = 32
+access = "ro"
+description = "Transport version (2 for modern devices)"
+
+[[registers]]
+name = "device_id"
+offset = 0x008
+width = 32
+access = "ro"
+description = "DeviceID (1=net, 2=block, 16=gpu, 0=no device)"
+
+[[registers]]
+name = "vendor_id"
+offset = 0x00c
+width = 32
+access = "ro"
+description = "VendorID"
+
+# ---------------------------------------------------------------------------
+# Feature negotiation (windowed — sel picks the 32-bit window).
+# Driver writes sel, then reads device_features or writes driver_features.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "device_features"
+offset = 0x010
+width = 32
+access = "ro"
+description = "Device features (window selected by device_features_sel)"
+
+[[registers]]
+name = "device_features_sel"
+offset = 0x014
+width = 32
+access = "wo"
+description = "Window selector for device_features (0 = low 32, 1 = high 32)"
+
+[[registers]]
+name = "driver_features"
+offset = 0x020
+width = 32
+access = "wo"
+description = "Accepted driver features (window selected by driver_features_sel)"
+
+[[registers]]
+name = "driver_features_sel"
+offset = 0x024
+width = 32
+access = "wo"
+description = "Window selector for driver_features"
+
+# ---------------------------------------------------------------------------
+# Virtqueue setup (spec 4.2.2.2)
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "queue_sel"
+offset = 0x030
+width = 32
+access = "wo"
+description = "Select virtqueue index for subsequent queue_* operations"
+
+[[registers]]
+name = "queue_num_max"
+offset = 0x034
+width = 32
+access = "ro"
+description = "Maximum queue size for the selected virtqueue (0 = unavailable)"
+
+[[registers]]
+name = "queue_num"
+offset = 0x038
+width = 32
+access = "wo"
+description = "Negotiated queue size for the selected virtqueue"
+
+[[registers]]
+name = "queue_ready"
+offset = 0x044
 width = 32
 access = "rw"
-description = "Device status register (state machine)"
-flags = [
-    { name = "acknowledge", bit = 0 },
-    { name = "driver", bit = 1 },
-    { name = "driver_ok", bit = 2 },
-    { name = "features_ok", bit = 3 },
-    { name = "needs_reset", bit = 6 },
-    { name = "failed", bit = 7 },
-]
+description = "1 = queue armed; write 0 to reset (driver-controlled)"
 
 [[registers]]
 name = "queue_notify"
 offset = 0x050
 width = 32
 access = "trigger"
-description = "Write to notify a virtqueue (value = queue index)"
+description = "Notify the device of new descriptors (value = queue index)"
+
+# ---------------------------------------------------------------------------
+# Interrupts (spec 4.2.2.3)
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "interrupt_status"
+offset = 0x060
+width = 32
+access = "ro"
+description = "Pending interrupt cause bits (bit 0 = used-buffer, bit 1 = config-change)"
 
 [[registers]]
 name = "interrupt_ack"
 offset = 0x064
 width = 32
 access = "w1c"
-description = "Acknowledge interrupts (write 1 to clear bits)"
+description = "Acknowledge bits set in interrupt_status (write the same value back)"
+
+# ---------------------------------------------------------------------------
+# Device status state machine (spec 3.1.1)
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "status"
+offset = 0x070
+width = 32
+access = "rw"
+description = "Device status flags — drives the init state machine"
 flags = [
-    { name = "used_buffer", bit = 0 },
-    { name = "config_change", bit = 1 },
+    { name = "acknowledge", bit = 0, description = "Driver has noticed the device" },
+    { name = "driver", bit = 1, description = "Driver knows how to drive the device" },
+    { name = "driver_ok", bit = 2, description = "Driver is ready to drive" },
+    { name = "features_ok", bit = 3, description = "Features negotiation complete" },
+    { name = "needs_reset", bit = 6, description = "Device wants reset" },
+    { name = "failed", bit = 7, description = "Fatal init error" },
 ]
+
+# ---------------------------------------------------------------------------
+# Queue physical-address registers (spec 4.2.2.2).
+# 64-bit PAs are split into low/high 32-bit halves. Future phase: model
+# as `kind = "combined_trigger"` on a 64-bit logical address so the
+# spec carries the "write both halves" semantic. Phase 3 keeps it
+# explicit: driver shifts and writes two 32-bit registers.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "queue_desc_low"
+offset = 0x080
+width = 32
+access = "wo"
+description = "Descriptor table PA, low 32 bits"
+
+[[registers]]
+name = "queue_desc_high"
+offset = 0x084
+width = 32
+access = "wo"
+description = "Descriptor table PA, high 32 bits"
+
+[[registers]]
+name = "queue_driver_low"
+offset = 0x090
+width = 32
+access = "wo"
+description = "Available ring PA, low 32 bits (driver-area)"
+
+[[registers]]
+name = "queue_driver_high"
+offset = 0x094
+width = 32
+access = "wo"
+description = "Available ring PA, high 32 bits"
+
+[[registers]]
+name = "queue_device_low"
+offset = 0x0a0
+width = 32
+access = "wo"
+description = "Used ring PA, low 32 bits (device-area)"
+
+[[registers]]
+name = "queue_device_high"
+offset = 0x0a4
+width = 32
+access = "wo"
+description = "Used ring PA, high 32 bits"
+
+# ---------------------------------------------------------------------------
+# virtio-blk config space (offset 0x100, spec 5.2.4).
+# Capacity is a le64 split across two 32-bit reads.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "blk_capacity_low"
+offset = 0x100
+width = 32
+access = "ro"
+description = "Block device capacity, low 32 bits (sectors of 512 bytes)"
+
+[[registers]]
+name = "blk_capacity_high"
+offset = 0x104
+width = 32
+access = "ro"
+description = "Block device capacity, high 32 bits"

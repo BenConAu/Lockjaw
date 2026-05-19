@@ -19,3 +19,4 @@
 #![deny(missing_docs)]
 
 pub mod pl011;
+pub mod virtio_mmio;

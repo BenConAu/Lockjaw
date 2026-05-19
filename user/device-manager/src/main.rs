@@ -11,7 +11,7 @@ use core::ptr;
 use lockjaw_userlib::*;
 use lockjaw_types::fdt::{parse_fdt_into, FdtDevices};
 use lockjaw_types::device::{
-    CMD_PROBE_DEVICE, CMD_CLAIM_BY_ADDR, CLAIM_OK, CLAIM_ERR,
+    CMD_PROBE_DEVICE, CMD_CLAIM_BY_ADDR, CMD_RELEASE_BY_ADDR, CLAIM_OK, CLAIM_ERR,
     BCM2711_CPRMAN_HASH, pack_clock_ref,
 };
 use lockjaw_types::clock::{
@@ -224,6 +224,7 @@ pub extern "C" fn _start() -> ! {
                         }
                     };
                     devices.devices[i].claimed = true;
+                    devices.devices[i].claim_token = sys_query_caller_token();
                     puts("devmgr: claimed device at ");
                     put_hex(dev.mmio_addr);
                     puts("\n");
@@ -252,6 +253,8 @@ pub extern "C" fn _start() -> ! {
             handle_probe_device(&mut devices, &msg);
         } else if cmd == CMD_CLAIM_BY_ADDR {
             handle_claim_by_addr(&mut devices, msg[1]);
+        } else if cmd == CMD_RELEASE_BY_ADDR {
+            handle_release_by_addr(&mut devices, msg[1]);
         } else if cmd == CMD_GET_CLOCK_HANDLE {
             handle_get_clock_handle(cprman_phandle, &msg);
         } else if cmd == CLOCK_OP_SET_RATE
@@ -545,8 +548,16 @@ fn handle_claim_by_addr(devices: &mut lockjaw_types::fdt::FdtDevices, mmio_addr:
             return;
         }
     };
+    // sys_export_handle DUPLICATES into the caller's table (refcounts
+    // the underlying object); close our local reference so the only
+    // surviving handle is the driver's. Otherwise transient claim
+    // failures + retries via CMD_RELEASE_BY_ADDR would accumulate
+    // one leaked manager-side handle per retry.
+    sys_close_handle(mmio_ps);
 
     devices.devices[idx].claimed = true;
+    // Record the caller's IPC token so only this caller can release.
+    devices.devices[idx].claim_token = sys_query_caller_token();
     puts("devmgr: claimed device at ");
     put_hex(dev.mmio_addr);
     puts("\n");
@@ -562,6 +573,41 @@ fn handle_claim_by_addr(devices: &mut lockjaw_types::fdt::FdtDevices, mmio_addr:
         0
     };
     sys_reply(CLAIM_OK, exported, dev.intid as u64, clock_ref);
+}
+
+/// Release a previously claimed device so the same `mmio_addr` becomes
+/// claimable again. Verifies the caller's IPC token matches the one
+/// recorded on claim — otherwise any process that knew an address
+/// could steal another driver's claim. Drivers call this when local
+/// setup fails AFTER `CMD_CLAIM_BY_ADDR` succeeded (e.g., VA
+/// exhaustion during typed claim). The exported MMIO pageset handle
+/// is the caller's responsibility to close separately — this RPC
+/// only clears the device-manager's `claimed` bit. Replies CLAIM_OK
+/// on success; CLAIM_ERR if no matching device was found OR the
+/// caller token does not match the claimant.
+fn handle_release_by_addr(devices: &mut lockjaw_types::fdt::FdtDevices, mmio_addr: u64) {
+    let caller = sys_query_caller_token();
+    for i in 0..devices.count {
+        if devices.devices[i].mmio_addr == mmio_addr && devices.devices[i].claimed {
+            if devices.devices[i].claim_token != caller {
+                // Refuse to release someone else's claim.
+                puts("devmgr: release rejected (token mismatch) at ");
+                put_hex(mmio_addr);
+                puts("\n");
+                sys_reply(CLAIM_ERR, 0, 0, 0);
+                return;
+            }
+            devices.devices[i].claimed = false;
+            devices.devices[i].claim_token = 0;
+            puts("devmgr: released device at ");
+            put_hex(mmio_addr);
+            puts("\n");
+            sys_reply(CLAIM_OK, 0, 0, 0);
+            return;
+        }
+    }
+    // No matching claimed device.
+    sys_reply(CLAIM_ERR, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------

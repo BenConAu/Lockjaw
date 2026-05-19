@@ -3,13 +3,6 @@
 version = 4
 
 [[package]]
-name = "lockjaw-hello"
-version = "0.1.0"
-dependencies = [
- "lockjaw-userlib",
-]
-
-[[package]]
 name = "lockjaw-mmio"
 version = "0.1.0"
 dependencies = [

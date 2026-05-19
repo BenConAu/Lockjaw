@@ -74,6 +74,12 @@ pub struct DeviceInfo {
     pub intid: u32,
     /// Whether this device has been claimed by a driver.
     pub claimed: bool,
+    /// IPC caller-token of the driver that claimed this device
+    /// (0 if unclaimed). The device-manager uses this to enforce
+    /// that only the original claimant can issue `CMD_RELEASE_BY_ADDR`
+    /// — otherwise any process that knew the MMIO address could
+    /// steal another driver's claim.
+    pub claim_token: u64,
     /// Resolved `clocks = <&phandle id ...>` references, in DTB
     /// declaration order. Empty if the node had no `clocks` property
     /// or the controller's `#clock-cells` was unresolvable.
@@ -165,6 +171,26 @@ pub const CMD_CLAIM_BY_ADDR: u64 = 3;
 /// Claim response status codes.
 pub const CLAIM_OK:  u64 = 0;
 pub const CLAIM_ERR: u64 = 1;
+
+/// Release a previously claimed device, clearing the device-manager's
+/// `claimed` bit so the same `mmio_addr` becomes claimable again.
+/// Intended exclusively for the `claim_typed` error path today.
+///
+/// **Caller obligation:** the exported MMIO pageset handle MUST be
+/// closed BEFORE issuing this RPC. The device-manager has no
+/// kernel-side reference tracking, so it cannot itself verify the
+/// driver has actually relinquished the mapping. If a release fires
+/// while the original claimant still holds the exported handle, a
+/// second driver can reclaim and map the same device — a real race.
+/// `claim_typed` enforces the ordering (drops the guard, then
+/// releases); other callers must follow the same discipline.
+///
+/// The verified release path is tracked in `docs/tech-debt.md`.
+/// Request:  msg = [CMD_RELEASE_BY_ADDR, mmio_addr, 0, 0]
+/// Response: msg = [status, 0, 0, 0] where status = CLAIM_OK if the
+///   address matched a claimed device whose claim_token matches the
+///   caller's IPC token (now released), CLAIM_ERR otherwise.
+pub const CMD_RELEASE_BY_ADDR: u64 = 4;
 
 // ---------------------------------------------------------------------------
 // Packed clock-reference encoding for claim replies

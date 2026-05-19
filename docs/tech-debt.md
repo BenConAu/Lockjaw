@@ -381,3 +381,20 @@ Until that's diagnosed, all reads use CMD17 single-block (validated on Pi as M6 
 2. If CMD18-from-cold is the issue, prepend a CMD17 primer at driver init (read LBA 0 single-block, discard) before declaring the controller ready. Then re-enable CMD18 for multi-block.
 3. If Auto-CMD23 specifically is broken, switch to explicit CMD23 (SET_BLOCK_COUNT) before CMD18/CMD25 — same hardware sequence, separate controller register write.
 4. Performance impact of CMD17-per-sector: worth measuring once #131 is green. If it's significant (likely on cold-boot bulk reads), re-enabling CMD18 becomes higher priority.
+
+---
+
+## device-manager: incomplete release coverage
+
+**Where:** `user/device-manager/src/main.rs`. Phase 3 added `CMD_RELEASE_BY_ADDR` (paired with `CMD_CLAIM_BY_ADDR`) and `claim_typed` calls it on error paths. Three gaps remain:
+
+1. `CMD_CLAIM_DEVICE` (the older skip-count-based claim) still has no release counterpart. Callers that use that path leak the claim on error.
+2. Driver-process exit doesn't notify the device manager. A driver that successfully claims a device, then panics or exits without calling release, leaves the `claimed` bit stuck until device-manager restart.
+3. `CMD_RELEASE_BY_ADDR` trusts the caller to have closed the exported MMIO pageset handle BEFORE issuing the release. `claim_typed` enforces this ordering by dropping the guard first, but direct callers could race: clear `claimed`, second driver claims, both ends up mapped. The device-manager has no kernel-side handle-reference visibility today and cannot enforce the discipline itself.
+
+**Fix:**
+1. Add `CMD_RELEASE_DEVICE` mirroring `CMD_CLAIM_DEVICE`.
+2. Plumb a kernel-side "process exit" hook into device-manager so it can sweep its `claimed[]` table when a driver dies. This needs new kernel surface (likely a notification queue the device manager subscribes to).
+3. Add a "release if no references remain" path: either pass the pageset handle in the release RPC so device-manager can ask the kernel about outstanding references, or build a typed `Drop` on `ClaimedDevice` that performs `close-then-release` atomically so direct misuse becomes impossible.
+
+**Why bootstrap:** all current drivers either use `CMD_CLAIM_BY_ADDR` via `claim_typed` (which enforces the ordering) or halt on failure. The leaks only matter for graceful-restart flows that the kernel doesn't yet expose, and the race only manifests if a future caller bypasses `claim_typed`.

@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "lockjaw-mmio"
+version = "0.1.0"
+dependencies = [
+ "lockjaw-types",
+]
+
+[[package]]
 name = "lockjaw-sleep-test"
 version = "0.1.0"
 dependencies = [
@@ -17,5 +24,6 @@ version = "0.1.0"
 name = "lockjaw-userlib"
 version = "0.1.0"
 dependencies = [
+ "lockjaw-mmio",
  "lockjaw-types",
 ]

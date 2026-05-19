@@ -6,6 +6,8 @@ pub mod process;
 pub mod virtual_memory;
 pub mod block;
 pub mod clock;
+pub mod devmgr;
+pub mod dma;
 pub mod display;
 pub mod fs;
 pub mod handle;

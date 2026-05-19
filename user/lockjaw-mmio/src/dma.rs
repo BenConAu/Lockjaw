@@ -134,6 +134,63 @@ impl<T: DmaValue, const N: usize> DmaSlice<T, N> {
     }
 }
 
+/// Bounded-length DMA slice with **runtime** length. Same shape as
+/// `DmaSlice<T, N>` but the length is fixed at construction time
+/// rather than compile time. Use this when the bound comes from
+/// device-reported state (e.g. virtio's `QUEUE_NUM_MAX` clamps the
+/// virtqueue ring length at runtime).
+pub struct DmaSliceDyn<T: DmaValue> {
+    ptr: *mut T,
+    len: usize,
+    _phantom: PhantomData<T>,
+}
+
+impl<T: DmaValue> DmaSliceDyn<T> {
+    /// Construct a `DmaSliceDyn` at a given virtual address.
+    ///
+    /// # Safety
+    ///
+    /// Caller asserts:
+    /// - `va` points to a writable, properly-aligned region of at
+    ///   least `len * size_of::<T>()` bytes.
+    /// - Mapping attribute appropriate for the device's access pattern.
+    /// - No other `DmaSliceDyn<T>` instance aliases this region.
+    /// - The mapping outlives this slice.
+    #[inline]
+    pub const unsafe fn at(va: u64, len: usize) -> Self {
+        Self {
+            ptr: va as *mut T,
+            len,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Volatile write at index `idx`. Panics if `idx >= len`.
+    #[inline(always)]
+    pub fn write(&self, idx: usize, value: T) {
+        assert!(idx < self.len, "DmaSliceDyn write OOB: idx={} >= len={}", idx, self.len);
+        // SAFETY: bounds checked; `self.ptr.add(idx)` is within the
+        // mapped region per `at()`'s precondition.
+        unsafe { ptr::write_volatile(self.ptr.add(idx), value) }
+    }
+
+    /// Volatile read at index `idx`. Panics if `idx >= len`.
+    #[inline(always)]
+    pub fn read(&self, idx: usize) -> T {
+        assert!(idx < self.len, "DmaSliceDyn read OOB: idx={} >= len={}", idx, self.len);
+        // SAFETY: bounds checked; `T: DmaValue` per the trait bound.
+        unsafe { ptr::read_volatile(self.ptr.add(idx)) }
+    }
+
+    /// Length of the slice (runtime).
+    #[inline(always)]
+    pub const fn len(&self) -> usize { self.len }
+
+    /// Whether the slice has zero length.
+    #[inline(always)]
+    pub const fn is_empty(&self) -> bool { self.len == 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +240,37 @@ mod tests {
         let mut backing: [u32; 2] = [0; 2];
         let slice = unsafe { DmaSlice::<u32, 2>::at(backing.as_mut_ptr() as u64) };
         let _ = slice.read(2);
+    }
+
+    #[test]
+    fn dma_slice_dyn_roundtrip() {
+        let mut backing: [u16; 6] = [0; 6];
+        // SAFETY: backing lives for the duration of this test.
+        let slice = unsafe { DmaSliceDyn::<u16>::at(backing.as_mut_ptr() as u64, 6) };
+        assert_eq!(slice.len(), 6);
+        assert!(!slice.is_empty());
+        for i in 0..6 {
+            slice.write(i, 0x1000 | (i as u16));
+        }
+        for i in 0..6 {
+            assert_eq!(slice.read(i), 0x1000 | (i as u16));
+            assert_eq!(backing[i], 0x1000 | (i as u16));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "DmaSliceDyn write OOB")]
+    fn dma_slice_dyn_write_oob_panics() {
+        let mut backing: [u32; 3] = [0; 3];
+        let slice = unsafe { DmaSliceDyn::<u32>::at(backing.as_mut_ptr() as u64, 3) };
+        slice.write(3, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "DmaSliceDyn read OOB")]
+    fn dma_slice_dyn_read_oob_panics() {
+        let mut backing: [u32; 3] = [0; 3];
+        let slice = unsafe { DmaSliceDyn::<u32>::at(backing.as_mut_ptr() as u64, 3) };
+        let _ = slice.read(3);
     }
 }

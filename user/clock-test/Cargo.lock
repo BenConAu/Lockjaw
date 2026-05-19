@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "lockjaw-hello"
+name = "lockjaw-clock-test"
 version = "0.1.0"
 dependencies = [
  "lockjaw-userlib",

@@ -7,5 +7,6 @@ edition = "2021"
 
 [dependencies]
 lockjaw-types = { path = "../../lockjaw-types" }
+lockjaw-mmio = { path = "../lockjaw-mmio" }
 
 [lib]

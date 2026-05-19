@@ -1,73 +1,40 @@
-/// Split virtqueue runtime for VirtIO MMIO transport.
-///
-/// Operates on a contiguous physical allocation mapped to a VA.
-/// All shared-memory accesses are volatile (device reads/writes via DMA).
-/// AArch64 barriers enforce ordering between descriptor writes, ring
-/// updates, MMIO notify, and completion polling.
-///
-/// Reusable across any VirtIO device (block, net, gpu).
+//! Split virtqueue runtime for VirtIO MMIO transport.
+//!
+//! Operates on a contiguous physical allocation supplied via a
+//! `DmaPage`. All shared-memory accesses go through `lockjaw-mmio`'s
+//! `DmaCell` / `DmaSliceDyn` (wrapped in userlib's lifetime-bound
+//! `CellRef` / `SliceRef`) so the virtqueue protocol logic is
+//! `unsafe`-free in this crate and the driver crate above. AArch64
+//! barriers come from `lockjaw_mmio::barrier::*` and order
+//! descriptor writes against avail/used ring updates and MMIO notify.
+//!
+//! Reusable across any VirtIO device (block, net, gpu).
+//!
+//! Structurally, the Virtqueue stores ONLY the backing `DmaPage` +
+//! layout + free-list state. Typed views are computed on each
+//! access via tiny inline accessors (`desc()`, `avail_header()`,
+//! etc.) so each view borrows `&self` and cannot outlive the
+//! backing page. Storing owned views would require self-referential
+//! types and would also let view lifetimes escape the page's.
 
-use core::arch::asm;
-use core::ptr;
+use crate::dma::{CellRef, DmaPage, SliceRef};
+use lockjaw_mmio::barrier::{dmb_ish, dmb_ishld, dmb_ishst};
 use lockjaw_types::virtio::{
-    VirtqDesc, VirtqueueLayout, virtqueue_layout,
-    VIRTQ_DESC_F_NEXT,
+    VirtqAvail, VirtqDesc, VirtqUsed, VirtqUsedElem, VirtqueueLayout,
+    virtqueue_layout, VIRTQ_DESC_F_NEXT,
 };
 
-// ---------------------------------------------------------------------------
-// AArch64 memory barriers
-// ---------------------------------------------------------------------------
-
-/// Store-store barrier: descriptor writes visible before avail ring update.
-#[inline(always)]
-fn dmb_ishst() {
-    unsafe { asm!("dmb ishst", options(nostack, preserves_flags)); }
-}
-
-/// Full barrier: avail ring update visible before MMIO notify.
-#[inline(always)]
-fn dmb_ish() {
-    unsafe { asm!("dmb ish", options(nostack, preserves_flags)); }
-}
-
-/// Load-load barrier: used.idx read before used.ring[] reads.
-#[inline(always)]
-fn dmb_ishld() {
-    unsafe { asm!("dmb ishld", options(nostack, preserves_flags)); }
-}
-
-// ---------------------------------------------------------------------------
-// MMIO register helpers (volatile, for transport registers)
-// ---------------------------------------------------------------------------
-
-/// Read a 32-bit VirtIO MMIO register.
-#[inline(always)]
-pub unsafe fn mmio_read32(base: u64, offset: u64) -> u32 {
-    ptr::read_volatile((base + offset) as *const u32)
-}
-
-/// Write a 32-bit VirtIO MMIO register.
-#[inline(always)]
-pub unsafe fn mmio_write32(base: u64, offset: u64, val: u32) {
-    ptr::write_volatile((base + offset) as *mut u32, val);
-}
-
-// ---------------------------------------------------------------------------
-// Virtqueue
-// ---------------------------------------------------------------------------
-
-/// A split virtqueue backed by a contiguous physical allocation.
+/// A split virtqueue backed by a contiguous DMA region.
 ///
-/// The caller allocates contiguous pages, maps them, and provides
-/// both the VA (for CPU access) and PA (for programming device
-/// registers). The Virtqueue manages descriptors, available ring,
-/// and used ring within that region.
+/// The caller allocates a `DmaPage` of the right size (see
+/// `virtqueue_layout(queue_size).total_size`) and hands it to
+/// `Virtqueue::new`. The Virtqueue takes ownership of the backing
+/// region so the mapping outlives the typed views computed on each
+/// access.
 pub struct Virtqueue {
-    /// Virtual address of the allocation base.
-    base_va: u64,
-    /// Physical address of the allocation base (for device registers).
-    base_phys: u64,
-    /// Layout offsets computed from queue_size.
+    /// Owns the backing DMA region; keeps the mapping alive.
+    backing: DmaPage,
+    /// Cached layout for the device-register PAs.
     layout: VirtqueueLayout,
     /// Head of the free descriptor chain.
     free_head: u16,
@@ -78,54 +45,93 @@ pub struct Virtqueue {
 }
 
 impl Virtqueue {
-    /// Initialize a virtqueue from a contiguous allocation.
-    ///
-    /// `va`: virtual address of the mapped region (must be zeroed).
-    /// `phys`: physical address (for programming QUEUE_DESC/DRIVER/DEVICE).
-    /// `queue_size`: number of descriptors (must match device's QUEUE_NUM_MAX
-    ///   or be <= it).
-    pub fn new(va: u64, phys: u64, queue_size: u16) -> Self {
+    /// Initialize a virtqueue inside `backing`. Panics if `backing`
+    /// is too small for the layout of `queue_size`.
+    pub fn new(backing: DmaPage, queue_size: u16) -> Self {
         let layout = virtqueue_layout(queue_size);
+        assert!(
+            layout.total_size <= backing.size_bytes(),
+            "DmaPage size {} bytes too small for virtqueue_layout({}).total_size = {}",
+            backing.size_bytes(), queue_size, layout.total_size
+        );
 
-        // Build the free descriptor chain: each descriptor's `next`
-        // points to the following one, forming a linked list.
-        for i in 0..queue_size {
-            let desc_ptr = (va + layout.desc_offset as u64
-                + i as u64 * core::mem::size_of::<VirtqDesc>() as u64)
-                as *mut VirtqDesc;
-            unsafe {
-                ptr::write_volatile(desc_ptr, VirtqDesc {
-                    addr: 0,
-                    len: 0,
-                    flags: if i + 1 < queue_size { VIRTQ_DESC_F_NEXT } else { 0 },
-                    next: if i + 1 < queue_size { i + 1 } else { 0 },
-                });
-            }
-        }
-
-        Virtqueue {
-            base_va: va,
-            base_phys: phys,
+        let mut vq = Virtqueue {
+            backing,
             layout,
             free_head: 0,
             num_free: queue_size,
             last_used_idx: 0,
+        };
+        vq.init_free_chain();
+        vq
+    }
+
+    // -----------------------------------------------------------------
+    // Typed view accessors. Each computes a fresh lifetime-bound view
+    // over the backing page; inlining means the resulting machine code
+    // is the same pointer arithmetic that the original raw pointers did.
+    // -----------------------------------------------------------------
+
+    #[inline(always)]
+    fn desc(&self) -> SliceRef<'_, VirtqDesc> {
+        self.backing.slice(
+            self.layout.desc_offset as u64,
+            self.layout.queue_size as usize,
+        )
+    }
+
+    #[inline(always)]
+    fn avail_header(&self) -> CellRef<'_, VirtqAvail> {
+        self.backing.cell(self.layout.avail_offset as u64)
+    }
+
+    #[inline(always)]
+    fn avail_ring(&self) -> SliceRef<'_, u16> {
+        self.backing.slice(
+            self.layout.avail_offset as u64 + core::mem::size_of::<VirtqAvail>() as u64,
+            self.layout.queue_size as usize,
+        )
+    }
+
+    #[inline(always)]
+    fn used_header(&self) -> CellRef<'_, VirtqUsed> {
+        self.backing.cell(self.layout.used_offset as u64)
+    }
+
+    #[inline(always)]
+    fn used_ring(&self) -> SliceRef<'_, VirtqUsedElem> {
+        self.backing.slice(
+            self.layout.used_offset as u64 + core::mem::size_of::<VirtqUsed>() as u64,
+            self.layout.queue_size as usize,
+        )
+    }
+
+    fn init_free_chain(&mut self) {
+        let n = self.layout.queue_size;
+        let desc = self.desc();
+        for i in 0..n {
+            desc.write(i as usize, VirtqDesc {
+                addr: 0,
+                len: 0,
+                flags: if i + 1 < n { VIRTQ_DESC_F_NEXT } else { 0 },
+                next: if i + 1 < n { i + 1 } else { 0 },
+            });
         }
     }
 
     /// Physical address of the descriptor table (for QUEUE_DESC_LOW/HIGH).
     pub fn desc_phys(&self) -> u64 {
-        self.base_phys + self.layout.desc_offset as u64
+        self.backing.pa_offset(self.layout.desc_offset as u64)
     }
 
     /// Physical address of the available ring (for QUEUE_DRIVER_LOW/HIGH).
     pub fn avail_phys(&self) -> u64 {
-        self.base_phys + self.layout.avail_offset as u64
+        self.backing.pa_offset(self.layout.avail_offset as u64)
     }
 
     /// Physical address of the used ring (for QUEUE_DEVICE_LOW/HIGH).
     pub fn used_phys(&self) -> u64 {
-        self.base_phys + self.layout.used_offset as u64
+        self.backing.pa_offset(self.layout.used_offset as u64)
     }
 
     /// Allocate a 3-descriptor chain for a block I/O request.
@@ -146,39 +152,40 @@ impl Virtqueue {
             return None;
         }
 
-        // Pop 3 descriptors from the free list.
         let head = self.free_head;
-        let mut idx = head;
         let descs = [
             (buf0_pa, len0, flags0),
             (buf1_pa, len1, flags1),
             (buf2_pa, len2, flags2),
         ];
+        // Scope the desc borrow so we can write back free_head after.
+        let new_free_head = {
+            let desc = self.desc();
+            let mut idx = head;
+            let mut last_next = 0u16;
+            for (i, &(pa, len, user_flags)) in descs.iter().enumerate() {
+                let next = desc.read(idx as usize).next;
 
-        for (i, &(pa, len, user_flags)) in descs.iter().enumerate() {
-            let desc_ptr = self.desc_ptr(idx);
-            let next = unsafe { ptr::read_volatile(desc_ptr) }.next;
+                let is_last = i == 2;
+                let flags = user_flags | if is_last { 0 } else { VIRTQ_DESC_F_NEXT };
 
-            let is_last = i == 2;
-            let flags = user_flags | if is_last { 0 } else { VIRTQ_DESC_F_NEXT };
-
-            unsafe {
-                ptr::write_volatile(desc_ptr, VirtqDesc {
+                desc.write(idx as usize, VirtqDesc {
                     addr: pa,
                     len,
                     flags,
                     next: if is_last { 0 } else { next },
                 });
-            }
 
-            if !is_last {
-                idx = next;
-            } else {
-                // Advance free_head past the chain.
-                self.free_head = next;
+                if is_last {
+                    last_next = next;
+                } else {
+                    idx = next;
+                }
             }
-        }
+            last_next
+        };
 
+        self.free_head = new_free_head;
         self.num_free -= 3;
         Some(head)
     }
@@ -189,26 +196,18 @@ impl Virtqueue {
     /// so the device sees completed descriptor writes before the
     /// index bump.
     pub fn submit(&mut self, head: u16) {
-        let avail_va = self.base_va + self.layout.avail_offset as u64;
-
-        // Read current avail.idx.
-        let avail_idx = unsafe {
-            ptr::read_volatile((avail_va + 2) as *const u16) // offset 2 = idx
-        };
-
-        // Write the head index into avail.ring[avail_idx % queue_size].
-        let ring_offset = 4 + (avail_idx % self.layout.queue_size) as u64 * 2;
-        unsafe {
-            ptr::write_volatile((avail_va + ring_offset) as *mut u16, head);
-        }
+        let header = self.avail_header();
+        let avail = header.read();
+        let ring_idx = (avail.idx % self.layout.queue_size) as usize;
+        self.avail_ring().write(ring_idx, head);
 
         // Barrier: descriptor + ring entry writes visible before idx bump.
         dmb_ishst();
 
-        // Bump avail.idx.
-        unsafe {
-            ptr::write_volatile((avail_va + 2) as *mut u16, avail_idx.wrapping_add(1));
-        }
+        header.write(VirtqAvail {
+            flags: avail.flags,
+            idx: avail.idx.wrapping_add(1),
+        });
 
         // Barrier: avail.idx visible before MMIO notify.
         dmb_ish();
@@ -219,13 +218,7 @@ impl Virtqueue {
     /// Returns `Some((head_idx, bytes_written))` if a new completion
     /// is available, `None` otherwise.
     pub fn poll_used(&mut self) -> Option<(u16, u32)> {
-        let used_va = self.base_va + self.layout.used_offset as u64;
-
-        // Read used.idx.
-        let used_idx = unsafe {
-            ptr::read_volatile((used_va + 2) as *const u16) // offset 2 = idx
-        };
-
+        let used_idx = self.used_header().read().idx;
         if used_idx == self.last_used_idx {
             return None;
         }
@@ -233,18 +226,11 @@ impl Virtqueue {
         // Barrier: used.idx read before ring element reads.
         dmb_ishld();
 
-        // Read used.ring[last_used_idx % queue_size].
-        // Each element is 8 bytes: id(u32) + len(u32).
-        let elem_offset = 4 + (self.last_used_idx % self.layout.queue_size) as u64 * 8;
-        let id = unsafe {
-            ptr::read_volatile((used_va + elem_offset) as *const u32)
-        };
-        let len = unsafe {
-            ptr::read_volatile((used_va + elem_offset + 4) as *const u32)
-        };
+        let ring_idx = (self.last_used_idx % self.layout.queue_size) as usize;
+        let elem = self.used_ring().read(ring_idx);
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
-        Some((id as u16, len))
+        Some((elem.id as u16, elem.len))
     }
 
     /// Free a 3-descriptor chain back to the free list.
@@ -252,39 +238,36 @@ impl Virtqueue {
     /// Walks the chain via `next` pointers and returns all descriptors
     /// to the head of the free list.
     pub fn free_chain(&mut self, head: u16) {
-        let mut idx = head;
-        let mut count = 0u16;
+        // Snapshot pre-loop self state because the desc borrow below
+        // pins `&self` for its scope. We update self.free_head /
+        // self.num_free once the desc borrow drops.
+        let prev_free_head = self.free_head;
+        let prev_num_free = self.num_free;
+        let count = {
+            let desc = self.desc();
+            let mut idx = head;
+            let mut count = 0u16;
+            loop {
+                let entry = desc.read(idx as usize);
+                count += 1;
 
-        loop {
-            let desc_ptr = self.desc_ptr(idx);
-            let desc = unsafe { ptr::read_volatile(desc_ptr) };
-            count += 1;
-
-            if desc.flags & VIRTQ_DESC_F_NEXT == 0 {
-                // Last descriptor — point its next to current free_head.
-                unsafe {
-                    ptr::write_volatile(desc_ptr, VirtqDesc {
+                if entry.flags & VIRTQ_DESC_F_NEXT == 0 {
+                    // Last descriptor — point its next to prev free_head.
+                    desc.write(idx as usize, VirtqDesc {
                         addr: 0,
                         len: 0,
-                        flags: if self.num_free > 0 { VIRTQ_DESC_F_NEXT } else { 0 },
-                        next: self.free_head,
+                        flags: if prev_num_free > 0 { VIRTQ_DESC_F_NEXT } else { 0 },
+                        next: prev_free_head,
                     });
+                    break;
                 }
-                break;
-            }
 
-            idx = desc.next;
-        }
+                idx = entry.next;
+            }
+            count
+        };
 
         self.free_head = head;
         self.num_free += count;
-    }
-
-    // --- private helpers ---
-
-    fn desc_ptr(&self, idx: u16) -> *mut VirtqDesc {
-        (self.base_va + self.layout.desc_offset as u64
-            + idx as u64 * core::mem::size_of::<VirtqDesc>() as u64)
-            as *mut VirtqDesc
     }
 }

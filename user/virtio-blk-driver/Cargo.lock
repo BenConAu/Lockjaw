@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "lockjaw-mmio"
+version = "0.1.0"
+dependencies = [
+ "lockjaw-types",
+]
+
+[[package]]
+name = "lockjaw-regs"
+version = "0.1.0"
+dependencies = [
+ "lockjaw-mmio",
+ "lockjaw-types",
+]
+
+[[package]]
 name = "lockjaw-types"
 version = "0.1.0"
 
@@ -10,6 +25,7 @@ version = "0.1.0"
 name = "lockjaw-userlib"
 version = "0.1.0"
 dependencies = [
+ "lockjaw-mmio",
  "lockjaw-types",
 ]
 
@@ -17,6 +33,8 @@ dependencies = [
 name = "lockjaw-virtio-blk-driver"
 version = "0.1.0"
 dependencies = [
+ "lockjaw-mmio",
+ "lockjaw-regs",
  "lockjaw-types",
  "lockjaw-userlib",
 ]
