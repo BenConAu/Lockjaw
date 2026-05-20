@@ -464,19 +464,19 @@ mod tests {
             Ok(())
         }
         fn alloc_buffer(&mut self, _session: u32, _w: u32, _h: u32, _fmt: u32)
-            -> Result<(u64, u32, u32), DisplayError>
+            -> Result<(PageSetHandle, u32, u32), DisplayError>
         {
             if self.alloc_fail { return Err(DisplayError::AllocFailed); }
-            Ok((0x1000, 1280, 307200))
+            Ok((PageSetHandle(0x1000), 1280, 307200))
         }
-        fn set_mode(&mut self, _session: u32, _mode: u32, _buf: u64) -> Result<(), DisplayError> {
+        fn set_mode(&mut self, _session: u32, _mode: u32, _buf: PageSetHandle) -> Result<(), DisplayError> {
             Ok(())
         }
-        fn set_scanout(&mut self, _session: u32, _buf: u64) -> Result<(), DisplayError> {
+        fn set_scanout(&mut self, _session: u32, _buf: PageSetHandle) -> Result<(), DisplayError> {
             Ok(())
         }
-        fn free_buffer(&mut self, handle: u64) {
-            self.freed.borrow_mut().push(handle);
+        fn free_buffer(&mut self, handle: PageSetHandle) {
+            self.freed.borrow_mut().push(handle.0);
         }
         fn release_session(&mut self, _session: u32) -> Result<(), DisplayError> {
             if self.release_fail { return Err(DisplayError::InvalidSession); }
@@ -539,8 +539,8 @@ mod tests {
     #[test]
     fn tracker_track_and_translate() {
         let mut t = BufferTracker::new();
-        assert!(t.track(3, 0xA000));
-        assert_eq!(t.translate(3), Some(0xA000));
+        assert!(t.track(3, PageSetHandle(0xA000)));
+        assert_eq!(t.translate(3), Some(PageSetHandle(0xA000)));
     }
 
     #[test]
@@ -554,19 +554,19 @@ mod tests {
         let mut t = BufferTracker::new();
         for i in 0..MAX_BUFFERS {
             assert!(t.has_capacity());
-            assert!(t.track(i as u32, i as u64 * 0x1000));
+            assert!(t.track(i as u32, PageSetHandle(i as u64 * 0x1000)));
         }
         assert!(!t.has_capacity());
-        assert!(!t.track(99, 0xFFFF));
+        assert!(!t.track(99, PageSetHandle(0xFFFF)));
     }
 
     #[test]
     fn tracker_release_all_calls_free_buffer() {
         let mut t = BufferTracker::new();
         let mut engine = MockEngine::new();
-        t.track(0, 0xA000);
-        t.track(1, 0xB000);
-        t.track(2, 0xC000);
+        t.track(0, PageSetHandle(0xA000));
+        t.track(1, PageSetHandle(0xB000));
+        t.track(2, PageSetHandle(0xC000));
 
         t.release_all(&mut engine);
 

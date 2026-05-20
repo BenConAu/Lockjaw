@@ -6,19 +6,19 @@
 /// boundary.
 
 /// PageSet handle — from sys_alloc_pages, used with sys_map_pages.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageSetHandle(pub u64);
 
 /// Endpoint handle — from sys_create_endpoint, used with sys_call/receive.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EndpointHandle(pub u64);
 
 /// Notification handle — from sys_create_notification.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotificationHandle(pub u64);
 
 /// Reply handle — from sys_create_reply, used with sys_call.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplyHandle(pub u64);
 
 /// Any handle that can be exported via sys_export_handle or closed
