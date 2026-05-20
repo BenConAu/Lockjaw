@@ -29,3 +29,11 @@ pub mod barrier;
 pub mod cell;
 pub mod dma;
 pub mod region;
+
+// Host-side test substrate: memory-backed mock MMIO region for codegen
+// tests. Gated behind `#[cfg(any(test, feature = "mock"))]` so the
+// no_std target build does not pull `alloc` into production driver
+// crates. `lockjaw-regs` enables the `mock` feature for its codegen
+// tests.
+#[cfg(any(test, feature = "mock"))]
+pub mod mock;

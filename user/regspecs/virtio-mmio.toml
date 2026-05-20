@@ -16,6 +16,11 @@
 name = "VirtioMmio"
 description = "VirtIO MMIO transport registers + virtio-blk config space"
 emit = true
+# Phase 4A.4: cross-check generated register offsets against the
+# hand-written constants in lockjaw_types::virtio. Bindings below
+# (in [[verify_offsets]]) connect register names to const names;
+# moving a constant breaks the generated module's test build.
+verify_against = "lockjaw_types::virtio"
 
 # ---------------------------------------------------------------------------
 # Read-only identification (spec 4.2.2.1)
@@ -226,3 +231,146 @@ offset = 0x104
 width = 32
 access = "ro"
 description = "Block device capacity, high 32 bits"
+
+# ---------------------------------------------------------------------------
+# Phase 4A.2 — synthesized 64-bit accessors for register pairs.
+# Replaces driver-side `low | (high << 32)` composition.
+# ---------------------------------------------------------------------------
+
+[[u64_pairs]]
+name = "blk_capacity"
+low = "blk_capacity_low"
+high = "blk_capacity_high"
+
+[[u64_pairs]]
+name = "queue_desc"
+low = "queue_desc_low"
+high = "queue_desc_high"
+
+[[u64_pairs]]
+name = "queue_driver"
+low = "queue_driver_low"
+high = "queue_driver_high"
+
+[[u64_pairs]]
+name = "queue_device"
+low = "queue_device_low"
+high = "queue_device_high"
+
+# ---------------------------------------------------------------------------
+# Phase 4A.3 — synthesized 64-bit accessors for windowed registers
+# (selector + value pair). Replaces driver-side sel-write/value-access
+# choreography during feature negotiation.
+# ---------------------------------------------------------------------------
+
+[[windowed]]
+name = "device_features"
+selector = "device_features_sel"
+value = "device_features"
+chunk_width = 32
+chunk_count = 2
+direction = "read"
+
+[[windowed]]
+name = "driver_features"
+selector = "driver_features_sel"
+value = "driver_features"
+chunk_width = 32
+chunk_count = 2
+direction = "write"
+
+# ---------------------------------------------------------------------------
+# Phase 4A.4 — verify_against bindings: cross-check generated offsets
+# against lockjaw_types::virtio constants at test-build time. Bindings
+# omit blk_capacity_* (no per-half constants in lockjaw-types — only
+# VIRTIO_BLK_CFG_CAPACITY at 0x100). Coverage report in the generated
+# file's header surfaces unmatched registers.
+# ---------------------------------------------------------------------------
+
+[[verify_offsets]]
+reg = "magic_value"
+const = "VIRTIO_MMIO_MAGIC"
+
+[[verify_offsets]]
+reg = "version"
+const = "VIRTIO_MMIO_VERSION"
+
+[[verify_offsets]]
+reg = "device_id"
+const = "VIRTIO_MMIO_DEVICE_ID"
+
+[[verify_offsets]]
+reg = "vendor_id"
+const = "VIRTIO_MMIO_VENDOR_ID"
+
+[[verify_offsets]]
+reg = "device_features"
+const = "VIRTIO_MMIO_DEVICE_FEATURES"
+
+[[verify_offsets]]
+reg = "device_features_sel"
+const = "VIRTIO_MMIO_DEVICE_FEATURES_SEL"
+
+[[verify_offsets]]
+reg = "driver_features"
+const = "VIRTIO_MMIO_DRIVER_FEATURES"
+
+[[verify_offsets]]
+reg = "driver_features_sel"
+const = "VIRTIO_MMIO_DRIVER_FEATURES_SEL"
+
+[[verify_offsets]]
+reg = "queue_sel"
+const = "VIRTIO_MMIO_QUEUE_SEL"
+
+[[verify_offsets]]
+reg = "queue_num_max"
+const = "VIRTIO_MMIO_QUEUE_NUM_MAX"
+
+[[verify_offsets]]
+reg = "queue_num"
+const = "VIRTIO_MMIO_QUEUE_NUM"
+
+[[verify_offsets]]
+reg = "queue_ready"
+const = "VIRTIO_MMIO_QUEUE_READY"
+
+[[verify_offsets]]
+reg = "queue_notify"
+const = "VIRTIO_MMIO_QUEUE_NOTIFY"
+
+[[verify_offsets]]
+reg = "interrupt_status"
+const = "VIRTIO_MMIO_INTERRUPT_STATUS"
+
+[[verify_offsets]]
+reg = "interrupt_ack"
+const = "VIRTIO_MMIO_INTERRUPT_ACK"
+
+[[verify_offsets]]
+reg = "status"
+const = "VIRTIO_MMIO_STATUS"
+
+[[verify_offsets]]
+reg = "queue_desc_low"
+const = "VIRTIO_MMIO_QUEUE_DESC_LOW"
+
+[[verify_offsets]]
+reg = "queue_desc_high"
+const = "VIRTIO_MMIO_QUEUE_DESC_HIGH"
+
+[[verify_offsets]]
+reg = "queue_driver_low"
+const = "VIRTIO_MMIO_QUEUE_DRIVER_LOW"
+
+[[verify_offsets]]
+reg = "queue_driver_high"
+const = "VIRTIO_MMIO_QUEUE_DRIVER_HIGH"
+
+[[verify_offsets]]
+reg = "queue_device_low"
+const = "VIRTIO_MMIO_QUEUE_DEVICE_LOW"
+
+[[verify_offsets]]
+reg = "queue_device_high"
+const = "VIRTIO_MMIO_QUEUE_DEVICE_HIGH"

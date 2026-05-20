@@ -97,6 +97,21 @@ struct Spec {
     registers: Vec<Register>,
     #[serde(default)]
     descriptors: Vec<Descriptor>,
+    // Phase 4A.2: paired 32-bit low/high registers exposed as a
+    // synthesized u64 accessor. Avoids manual driver-side composition.
+    #[serde(default)]
+    u64_pairs: Vec<U64Pair>,
+    // Phase 4A.3: selector + value register pair. Generated helper
+    // sequences write-sel + read/write-value internally so the driver
+    // never sees the windowed protocol directly.
+    #[serde(default)]
+    windowed: Vec<Windowed>,
+    // Phase 4A.4: per-register binding of generated offset to a
+    // hand-written constant in `verify_against` module. Emitter
+    // produces `static_assertions::const_assert_eq!` so moving the
+    // constant breaks the generated module's build.
+    #[serde(default)]
+    verify_offsets: Vec<VerifyOffset>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -107,11 +122,86 @@ struct DeviceMeta {
     #[serde(default = "default_true")]
     emit: bool,
     // Optional pointer at a lockjaw-types module whose constants the
-    // emitter should cross-check offsets against. Reserved for a later
-    // phase; parsing it now keeps specs forward-compatible.
+    // emitter cross-checks offsets against via [[verify_offsets]]
+    // bindings. Phase 4A.4: parsed AND consumed.
     #[serde(default)]
-    #[allow(dead_code)]
     verify_against: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct U64Pair {
+    /// Logical name for the pair (e.g. `blk_capacity` for the
+    /// `blk_capacity_low`/`blk_capacity_high` pair). Synthesized
+    /// accessor names use this stem: `read_<name>() -> u64` and
+    /// `write_<name>(u64)`.
+    name: String,
+    /// Existing register name supplying the least-significant 32 bits.
+    low: String,
+    /// Existing register name supplying the most-significant 32 bits.
+    high: String,
+    /// Reserved for future big-endian halves. Today only `"little"` is
+    /// supported; the field exists so per-pair endian travels with the
+    /// spec when Phase 6 lands big-endian.
+    #[serde(default = "default_endian_little")]
+    #[allow(dead_code)]
+    endian: U64PairEndian,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum U64PairEndian {
+    Little,
+    // Big — adds in Phase 6 alongside ramfb/fwcfg endian work.
+}
+
+fn default_endian_little() -> U64PairEndian { U64PairEndian::Little }
+
+#[derive(Deserialize, Debug)]
+struct Windowed {
+    /// Logical name for the windowed pair (e.g. `device_features`).
+    /// Synthesized accessor uses this stem: `read_<name>_64()` for
+    /// `direction = "read"` or `write_<name>_64(u64)` for `direction
+    /// = "write"`.
+    name: String,
+    /// Register that the synthesized helper writes to before each
+    /// access to set the window index.
+    selector: String,
+    /// Register the synthesized helper reads from or writes to once
+    /// the selector is set.
+    value: String,
+    /// Width of each chunk. Today only 32 (driver_features /
+    /// device_features both u32). Other widths reserved for future
+    /// devices.
+    chunk_width: u8,
+    /// Number of chunks the synthesized accessor walks. Today 2
+    /// produces a 64-bit accessor; other counts are reserved.
+    chunk_count: u8,
+    /// Either `"read"` (synthesize `read_<name>_<64*count>()`) or
+    /// `"write"` (synthesize `write_<name>_<64*count>(value)`).
+    direction: WindowedDirection,
+    /// When `true`, the emitter inserts a `dmb_ish` between selector
+    /// write and value access. Defaults `false` — virtio doesn't need
+    /// it; some chips (cprman, ?) will.
+    #[serde(default)]
+    requires_barrier: bool,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum WindowedDirection {
+    Read,
+    Write,
+}
+
+#[derive(Deserialize, Debug)]
+struct VerifyOffset {
+    /// Register name on this device (must exist in `[[registers]]`).
+    reg: String,
+    /// Constant name in the `verify_against` module that should equal
+    /// the register's offset. Emitter produces:
+    ///   const_assert_eq!(offset_of!(Dev, reg), <verify_against>::<const>);
+    #[serde(rename = "const")]
+    const_name: String,
 }
 
 fn default_true() -> bool { true }
@@ -313,6 +403,116 @@ fn validate(spec: &Spec, path: &Path) {
             }
         }
     }
+    // Phase 4A.2: u64_pairs cross-reference registers and require both
+    // halves to be plain 32-bit, same access direction. Names must
+    // not collide with existing register names (synthesized accessor
+    // would shadow).
+    for pair in &spec.u64_pairs {
+        let low = spec.registers.iter().find(|r| r.name == pair.low)
+            .unwrap_or_else(|| panic!(
+                "{}: u64_pair `{}` low register `{}` not found in [[registers]]",
+                path.display(), pair.name, pair.low
+            ));
+        let high = spec.registers.iter().find(|r| r.name == pair.high)
+            .unwrap_or_else(|| panic!(
+                "{}: u64_pair `{}` high register `{}` not found in [[registers]]",
+                path.display(), pair.name, pair.high
+            ));
+        if low.width != 32 || high.width != 32 {
+            panic!(
+                "{}: u64_pair `{}` requires both halves to be 32 bits (got low={}, high={})",
+                path.display(), pair.name, low.width, high.width
+            );
+        }
+        if low.access != high.access {
+            panic!(
+                "{}: u64_pair `{}` halves disagree on access ({:?} vs {:?}); \
+                 a u64 helper must be uniformly readable or uniformly writable",
+                path.display(), pair.name, low.access, high.access
+            );
+        }
+        if !matches!(low.access, Access::Ro | Access::Rw | Access::Wo) {
+            panic!(
+                "{}: u64_pair `{}` access {:?} not supported (must be ro/rw/wo)",
+                path.display(), pair.name, low.access
+            );
+        }
+        if spec.registers.iter().any(|r| r.name == pair.name) {
+            panic!(
+                "{}: u64_pair `{}` collides with a register of the same name",
+                path.display(), pair.name
+            );
+        }
+    }
+    // Phase 4A.3: windowed pairs cross-reference selector + value; both
+    // must exist; selector must be writable; value's access matches the
+    // declared direction; chunk_width must match the value register's
+    // width.
+    for win in &spec.windowed {
+        let sel = spec.registers.iter().find(|r| r.name == win.selector)
+            .unwrap_or_else(|| panic!(
+                "{}: windowed `{}` selector `{}` not found",
+                path.display(), win.name, win.selector
+            ));
+        let val = spec.registers.iter().find(|r| r.name == win.value)
+            .unwrap_or_else(|| panic!(
+                "{}: windowed `{}` value `{}` not found",
+                path.display(), win.name, win.value
+            ));
+        if !matches!(sel.access, Access::Wo | Access::Rw) {
+            panic!(
+                "{}: windowed `{}` selector `{}` must be writable (got {:?})",
+                path.display(), win.name, win.selector, sel.access
+            );
+        }
+        if win.chunk_width != val.width {
+            panic!(
+                "{}: windowed `{}` chunk_width {} doesn't match value register `{}` width {}",
+                path.display(), win.name, win.chunk_width, win.value, val.width
+            );
+        }
+        match win.direction {
+            WindowedDirection::Read => {
+                if !matches!(val.access, Access::Ro | Access::Rw) {
+                    panic!(
+                        "{}: windowed `{}` direction=read but value `{}` is not readable ({:?})",
+                        path.display(), win.name, win.value, val.access
+                    );
+                }
+            }
+            WindowedDirection::Write => {
+                if !matches!(val.access, Access::Wo | Access::Rw) {
+                    panic!(
+                        "{}: windowed `{}` direction=write but value `{}` is not writable ({:?})",
+                        path.display(), win.name, win.value, val.access
+                    );
+                }
+            }
+        }
+        if win.chunk_count == 0 {
+            panic!(
+                "{}: windowed `{}` chunk_count must be > 0",
+                path.display(), win.name
+            );
+        }
+    }
+    // Phase 4A.4: verify_offsets reference real registers AND the spec
+    // declares the verify_against module. (Cannot validate the const's
+    // value here — that's the const_assert_eq! at compile time.)
+    if !spec.verify_offsets.is_empty() && spec.device.verify_against.is_none() {
+        panic!(
+            "{}: [[verify_offsets]] requires [device].verify_against to be set",
+            path.display()
+        );
+    }
+    for vo in &spec.verify_offsets {
+        if !spec.registers.iter().any(|r| r.name == vo.reg) {
+            panic!(
+                "{}: verify_offset register `{}` not found",
+                path.display(), vo.reg
+            );
+        }
+    }
     // Descriptor sections (Phase 7 SDHCI ADMA2): bit ranges within the
     // descriptor's declared width. Validated even when emit=false so future
     // descriptor specs catch out-of-range bits at `gen-regs --check` time.
@@ -413,6 +613,7 @@ fn emit_device(spec: &Spec) -> String {
 
     let mut out = String::new();
     emit_header(&mut out, spec);
+    emit_verify_coverage_comment(&mut out, spec);
     emit_layout(&mut out, spec);
     for reg in &spec.registers {
         if !reg.flags.is_empty() {
@@ -424,6 +625,8 @@ fn emit_device(spec: &Spec) -> String {
     }
     emit_reserved_bits(&mut out, spec);
     emit_accessors(&mut out, spec);
+    emit_u64_pairs(&mut out, spec);
+    emit_windowed(&mut out, spec);
     emit_tests(&mut out, spec);
     out
 }
@@ -556,6 +759,150 @@ fn emit_flags_newtype(out: &mut String, reg: &Register) {
     writeln!(out, "    type Output = Self;").unwrap();
     writeln!(out, "    fn not(self) -> Self {{ Self(!self.0) }}").unwrap();
     writeln!(out, "}}").unwrap();
+    // Phase 4A.1: insert/remove are common bitflags ergonomics. `insert`
+    // returns `self | other`; `remove` returns `self & !other`. Both
+    // const and take `Self` to fit the operator family.
+    writeln!(out, "impl {ty} {{").unwrap();
+    writeln!(out, "    /// Return a copy of `self` with every bit set in `other` also set.").unwrap();
+    writeln!(out, "    pub const fn insert(self, other: Self) -> Self {{ Self(self.0 | other.0) }}").unwrap();
+    writeln!(out, "    /// Return a copy of `self` with every bit set in `other` cleared.").unwrap();
+    writeln!(out, "    pub const fn remove(self, other: Self) -> Self {{ Self(self.0 & !other.0) }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4A.2 — paired 32-bit registers exposed as synthesized u64.
+// ---------------------------------------------------------------------------
+
+fn emit_u64_pairs(out: &mut String, spec: &Spec) {
+    if spec.u64_pairs.is_empty() {
+        return;
+    }
+    let dev = &spec.device.name;
+    writeln!(out, "// ---------- {} u64-pair accessors ----------", dev).unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "impl {dev} {{").unwrap();
+    for pair in &spec.u64_pairs {
+        let low_reg = spec.registers.iter().find(|r| r.name == pair.low).expect("validated");
+        // Both halves share access by validation.
+        match low_reg.access {
+            Access::Ro | Access::Rw => {
+                writeln!(out, "    /// Composed read of `{}` (low={}, high={}, le).",
+                    pair.name, pair.low, pair.high).unwrap();
+                writeln!(out, "    #[inline(always)]").unwrap();
+                writeln!(out, "    pub fn read_{}(&self) -> u64 {{", pair.name).unwrap();
+                writeln!(out, "        self.read_{}() as u64 | ((self.read_{}() as u64) << 32)",
+                    pair.low, pair.high).unwrap();
+                writeln!(out, "    }}").unwrap();
+            }
+            _ => {}
+        }
+        match low_reg.access {
+            Access::Wo | Access::Rw => {
+                writeln!(out, "    /// Composed write of `{}` (writes low first, then high; le).",
+                    pair.name).unwrap();
+                writeln!(out, "    #[inline(always)]").unwrap();
+                writeln!(out, "    pub fn write_{}(&self, v: u64) {{", pair.name).unwrap();
+                writeln!(out, "        self.write_{}(v as u32);", pair.low).unwrap();
+                writeln!(out, "        self.write_{}((v >> 32) as u32);", pair.high).unwrap();
+                writeln!(out, "    }}").unwrap();
+            }
+            _ => {}
+        }
+    }
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4A.3 — windowed selector+value access synthesized as one helper.
+// ---------------------------------------------------------------------------
+
+fn emit_windowed(out: &mut String, spec: &Spec) {
+    if spec.windowed.is_empty() {
+        return;
+    }
+    let dev = &spec.device.name;
+    writeln!(out, "// ---------- {} windowed accessors ----------", dev).unwrap();
+    writeln!(out).unwrap();
+    let needs_barrier = spec.windowed.iter().any(|w| w.requires_barrier);
+    if needs_barrier {
+        writeln!(out, "use lockjaw_mmio::barrier::dmb_ish;").unwrap();
+        writeln!(out).unwrap();
+    }
+    writeln!(out, "impl {dev} {{").unwrap();
+    for win in &spec.windowed {
+        let bits = win.chunk_width as u32 * win.chunk_count as u32;
+        match win.direction {
+            WindowedDirection::Read => {
+                writeln!(out, "    /// Walk `{}` (selector={}, value={}) across {} chunks of {} bits;",
+                    win.name, win.selector, win.value, win.chunk_count, win.chunk_width).unwrap();
+                writeln!(out, "    /// compose into a u{} (chunk 0 supplies the least-significant bits).",
+                    bits.max(64)).unwrap();
+                writeln!(out, "    #[inline(always)]").unwrap();
+                writeln!(out, "    pub fn read_{}_{}(&self) -> u{} {{", win.name, bits, bits.max(64)).unwrap();
+                writeln!(out, "        let mut acc: u{} = 0;", bits.max(64)).unwrap();
+                writeln!(out, "        for i in 0..{} {{", win.chunk_count).unwrap();
+                writeln!(out, "            self.write_{}(i as u32);", win.selector).unwrap();
+                if win.requires_barrier {
+                    writeln!(out, "            dmb_ish();").unwrap();
+                }
+                writeln!(out, "            let chunk = self.read_{}() as u{};", win.value, bits.max(64)).unwrap();
+                writeln!(out, "            acc |= chunk << (i * {});", win.chunk_width).unwrap();
+                writeln!(out, "        }}").unwrap();
+                writeln!(out, "        acc").unwrap();
+                writeln!(out, "    }}").unwrap();
+            }
+            WindowedDirection::Write => {
+                writeln!(out, "    /// Walk `{}` writing {} chunks of {} bits;",
+                    win.name, win.chunk_count, win.chunk_width).unwrap();
+                writeln!(out, "    /// chunk 0 carries the least-significant bits of `v`.").unwrap();
+                writeln!(out, "    #[inline(always)]").unwrap();
+                writeln!(out, "    pub fn write_{}_{}(&self, v: u{}) {{", win.name, bits, bits.max(64)).unwrap();
+                writeln!(out, "        for i in 0..{} {{", win.chunk_count).unwrap();
+                writeln!(out, "            self.write_{}(i as u32);", win.selector).unwrap();
+                if win.requires_barrier {
+                    writeln!(out, "            dmb_ish();").unwrap();
+                }
+                writeln!(out, "            let chunk = (v >> (i * {})) as u{};", win.chunk_width, win.chunk_width).unwrap();
+                writeln!(out, "            self.write_{}(chunk);", win.value).unwrap();
+                writeln!(out, "        }}").unwrap();
+                writeln!(out, "    }}").unwrap();
+            }
+        }
+    }
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4A.4 — verify_against coverage comment header.
+// ---------------------------------------------------------------------------
+
+fn emit_verify_coverage_comment(out: &mut String, spec: &Spec) {
+    let Some(against) = &spec.device.verify_against else {
+        return;
+    };
+    let total = spec.registers.len();
+    let bound: std::collections::BTreeSet<&str> =
+        spec.verify_offsets.iter().map(|v| v.reg.as_str()).collect();
+    let matched = bound.len();
+    let unmatched: Vec<&str> = spec.registers.iter()
+        .map(|r| r.name.as_str())
+        .filter(|n| !bound.contains(n))
+        .collect();
+    writeln!(out, "//").unwrap();
+    writeln!(out, "// verify_against: {}", against).unwrap();
+    writeln!(out, "// Coverage: {}/{} registers cross-checked against constants.",
+        matched, total).unwrap();
+    if !unmatched.is_empty() {
+        writeln!(out, "// Unmatched (no constant binding in [[verify_offsets]]):").unwrap();
+        for name in &unmatched {
+            writeln!(out, "//   - {}", name).unwrap();
+        }
+    }
+    writeln!(out, "//").unwrap();
     writeln!(out).unwrap();
 }
 
@@ -807,10 +1154,14 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
 
 fn emit_tests(out: &mut String, spec: &Spec) {
     let dev = &spec.device.name;
+    let needs_mock = !spec.u64_pairs.is_empty() || !spec.windowed.is_empty();
     writeln!(out, "#[cfg(test)]").unwrap();
     writeln!(out, "mod tests {{").unwrap();
     writeln!(out, "    use super::*;").unwrap();
     writeln!(out, "    use core::mem::offset_of;").unwrap();
+    if needs_mock {
+        writeln!(out, "    use lockjaw_mmio::mock::MockMmioRegion;").unwrap();
+    }
     writeln!(out).unwrap();
 
     writeln!(out, "    #[test]").unwrap();
@@ -970,6 +1321,118 @@ fn emit_tests(out: &mut String, spec: &Spec) {
                     "        assert_eq!({enum_ty}::from_bits(0x{:x}), Err(ReservedBits(0x{:x})));",
                     r, r
                 ).unwrap();
+            }
+            writeln!(out, "    }}").unwrap();
+            writeln!(out).unwrap();
+        }
+    }
+
+    // Phase 4A.2 — u64_pair cross-validation: synthesized read_X()
+    // must equal manual composition of the two halves; synthesized
+    // write_X(v) must land low at the low register and high at the
+    // high register.
+    for pair in &spec.u64_pairs {
+        let low_reg = spec.registers.iter().find(|r| r.name == pair.low).expect("validated");
+        let low_off = low_reg.offset;
+        let high_off = spec.registers.iter().find(|r| r.name == pair.high).expect("validated").offset;
+
+        writeln!(out, "    #[test]").unwrap();
+        writeln!(out, "    fn {}_pair_roundtrip() {{", pair.name).unwrap();
+        writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+        writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+        writeln!(out, "        let dev_ref = regs.regs();").unwrap();
+        match low_reg.access {
+            Access::Ro | Access::Rw => {
+                // Seed both halves at the device side and verify the
+                // composed read matches manual composition.
+                writeln!(out, "        region.poke_u32(0x{:x}, 0x1122_3344);", low_off).unwrap();
+                writeln!(out, "        region.poke_u32(0x{:x}, 0xAABB_CCDD);", high_off).unwrap();
+                writeln!(out, "        let composed = dev_ref.read_{}();", pair.name).unwrap();
+                writeln!(out, "        let manual = dev_ref.read_{}() as u64 | ((dev_ref.read_{}() as u64) << 32);", pair.low, pair.high).unwrap();
+                writeln!(out, "        assert_eq!(composed, manual);").unwrap();
+                writeln!(out, "        assert_eq!(composed, 0xAABB_CCDD_1122_3344);").unwrap();
+            }
+            _ => {}
+        }
+        match low_reg.access {
+            Access::Wo | Access::Rw => {
+                writeln!(out, "        dev_ref.write_{}(0xDEAD_BEEF_CAFE_BABE);", pair.name).unwrap();
+                writeln!(out, "        assert_eq!(region.peek_u32(0x{:x}), 0xCAFE_BABE);", low_off).unwrap();
+                writeln!(out, "        assert_eq!(region.peek_u32(0x{:x}), 0xDEAD_BEEF);", high_off).unwrap();
+            }
+            _ => {}
+        }
+        writeln!(out, "    }}").unwrap();
+        writeln!(out).unwrap();
+    }
+
+    // Phase 4A.3 — windowed accessor cross-validation. End-state
+    // assertions only (no per-call sequence log; see mock.rs).
+    for win in &spec.windowed {
+        let sel_off = spec.registers.iter().find(|r| r.name == win.selector).expect("validated").offset;
+        let val_off = spec.registers.iter().find(|r| r.name == win.value).expect("validated").offset;
+        let bits = win.chunk_width as u32 * win.chunk_count as u32;
+        match win.direction {
+            WindowedDirection::Read => {
+                // Trick: the value register is RO from the driver side
+                // but writable from device side via poke. The test
+                // changes the poked value between window indices to
+                // simulate the device's response, asserting that the
+                // synthesized helper visits every index in order.
+                //
+                // The mock is non-reactive (writing the selector does
+                // not auto-swap the value), so we cannot script a
+                // multi-step sequence in one call. Instead test the
+                // single-chunk case: when both chunks return the same
+                // value, the composed value equals that value
+                // replicated in both halves. This validates the helper
+                // reads chunks 0 AND 1 (not just chunk 0).
+                writeln!(out, "    #[test]").unwrap();
+                writeln!(out, "    fn {}_windowed_read_visits_all_chunks() {{", win.name).unwrap();
+                writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+                writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+                writeln!(out, "        region.poke_u32(0x{:x}, 0xDEAD_BEEF);", val_off).unwrap();
+                writeln!(out, "        let composed = regs.regs().read_{}_{}();", win.name, bits).unwrap();
+                writeln!(out, "        // Both chunks read the same value -> composed value has it in every position.").unwrap();
+                writeln!(out, "        let expected = (0xDEAD_BEEFu64) | (0xDEAD_BEEFu64 << 32);").unwrap();
+                writeln!(out, "        assert_eq!(composed, expected);").unwrap();
+                writeln!(out, "        // Selector ended at chunk_count - 1 (proves helper walked all chunks).").unwrap();
+                writeln!(out, "        assert_eq!(region.peek_u32(0x{:x}), {});", sel_off, win.chunk_count as u32 - 1).unwrap();
+                writeln!(out, "    }}").unwrap();
+                writeln!(out).unwrap();
+            }
+            WindowedDirection::Write => {
+                // Write helper: write a 64-bit value; verify selector
+                // ended at the last chunk index AND the value cell
+                // holds the most-significant chunk (last write wins).
+                writeln!(out, "    #[test]").unwrap();
+                writeln!(out, "    fn {}_windowed_write_visits_all_chunks() {{", win.name).unwrap();
+                writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+                writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+                writeln!(out, "        regs.regs().write_{}_{}(0xDEAD_BEEF_CAFE_BABE);", win.name, bits).unwrap();
+                writeln!(out, "        // Selector ended at chunk_count - 1 (proves helper walked all chunks).").unwrap();
+                writeln!(out, "        assert_eq!(region.peek_u32(0x{:x}), {});", sel_off, win.chunk_count as u32 - 1).unwrap();
+                writeln!(out, "        // Value register holds the most-significant chunk (last write wins).").unwrap();
+                writeln!(out, "        assert_eq!(region.peek_u32(0x{:x}), 0xDEAD_BEEF);", val_off).unwrap();
+                writeln!(out, "    }}").unwrap();
+                writeln!(out).unwrap();
+            }
+        }
+    }
+
+    // Phase 4A.4 — verify_against const_assert_eq! per binding. Lives
+    // in a nested #[cfg(test)] module so the import path resolves at
+    // test compile time.
+    if let Some(against) = &spec.device.verify_against {
+        if !spec.verify_offsets.is_empty() {
+            writeln!(out, "    mod _verify {{").unwrap();
+            writeln!(out, "        use super::*;").unwrap();
+            writeln!(out, "        use static_assertions::const_assert_eq;").unwrap();
+            for vo in &spec.verify_offsets {
+                writeln!(out, "        const_assert_eq!(").unwrap();
+                writeln!(out, "            offset_of!({dev}, {}) as u64,", vo.reg).unwrap();
+                writeln!(out, "            {}::{}", against, vo.const_name).unwrap();
+                writeln!(out, "        );").unwrap();
             }
             writeln!(out, "    }}").unwrap();
             writeln!(out).unwrap();

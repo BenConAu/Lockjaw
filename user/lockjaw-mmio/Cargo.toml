@@ -10,6 +10,11 @@ edition = "2021"
 [dependencies]
 lockjaw-types = { path = "../../lockjaw-types" }
 
+[features]
+# Host-only test substrate: MockMmioRegion uses `alloc`. Off by default
+# so production driver builds (no_std) don't pull alloc in.
+mock = []
+
 [dev-dependencies]
 static_assertions = "1.1"
 

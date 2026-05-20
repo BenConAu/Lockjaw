@@ -11,6 +11,13 @@ edition = "2021"
 lockjaw-mmio = { path = "../lockjaw-mmio" }
 lockjaw-types = { path = "../../lockjaw-types" }
 
+[dev-dependencies]
+# Phase 4A: codegen tests need MockMmioRegion (gated behind `mock`
+# feature in lockjaw-mmio so production no_std builds don't pull
+# `alloc`) and `static_assertions` for verify_against const_assert_eq!.
+lockjaw-mmio = { path = "../lockjaw-mmio", features = ["mock"] }
+static_assertions = "1.1"
+
 [profile.release]
 panic = "abort"
 opt-level = 2

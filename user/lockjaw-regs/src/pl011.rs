@@ -70,6 +70,12 @@ impl core::ops::Not for Flag {
     type Output = Self;
     fn not(self) -> Self { Self(!self.0) }
 }
+impl Flag {
+    /// Return a copy of `self` with every bit set in `other` also set.
+    pub const fn insert(self, other: Self) -> Self { Self(self.0 | other.0) }
+    /// Return a copy of `self` with every bit set in `other` cleared.
+    pub const fn remove(self, other: Self) -> Self { Self(self.0 & !other.0) }
+}
 
 // ---------- Lcrh ----------
 
@@ -208,6 +214,12 @@ impl core::ops::Not for Control {
     type Output = Self;
     fn not(self) -> Self { Self(!self.0) }
 }
+impl Control {
+    /// Return a copy of `self` with every bit set in `other` also set.
+    pub const fn insert(self, other: Self) -> Self { Self(self.0 | other.0) }
+    /// Return a copy of `self` with every bit set in `other` cleared.
+    pub const fn remove(self, other: Self) -> Self { Self(self.0 & !other.0) }
+}
 
 // ---------- Imsc ----------
 
@@ -243,6 +255,12 @@ impl core::ops::Not for Imsc {
     type Output = Self;
     fn not(self) -> Self { Self(!self.0) }
 }
+impl Imsc {
+    /// Return a copy of `self` with every bit set in `other` also set.
+    pub const fn insert(self, other: Self) -> Self { Self(self.0 | other.0) }
+    /// Return a copy of `self` with every bit set in `other` cleared.
+    pub const fn remove(self, other: Self) -> Self { Self(self.0 & !other.0) }
+}
 
 // ---------- Icr ----------
 
@@ -275,6 +293,12 @@ impl core::ops::BitAnd for Icr {
 impl core::ops::Not for Icr {
     type Output = Self;
     fn not(self) -> Self { Self(!self.0) }
+}
+impl Icr {
+    /// Return a copy of `self` with every bit set in `other` also set.
+    pub const fn insert(self, other: Self) -> Self { Self(self.0 | other.0) }
+    /// Return a copy of `self` with every bit set in `other` cleared.
+    pub const fn remove(self, other: Self) -> Self { Self(self.0 & !other.0) }
 }
 
 /// Returned when an enum decode sees a bit pattern that does not

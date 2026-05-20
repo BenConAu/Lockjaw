@@ -9,6 +9,14 @@
 
 use lockjaw_mmio::cell::{Ro, Rw, W1c, Wo};
 
+//
+// verify_against: lockjaw_types::virtio
+// Coverage: 22/24 registers cross-checked against constants.
+// Unmatched (no constant binding in [[verify_offsets]]):
+//   - blk_capacity_low
+//   - blk_capacity_high
+//
+
 /// VirtIO MMIO transport registers + virtio-blk config space
 #[repr(C)]
 pub struct VirtioMmio {
@@ -114,6 +122,12 @@ impl core::ops::Not for Status {
     type Output = Self;
     fn not(self) -> Self { Self(!self.0) }
 }
+impl Status {
+    /// Return a copy of `self` with every bit set in `other` also set.
+    pub const fn insert(self, other: Self) -> Self { Self(self.0 | other.0) }
+    /// Return a copy of `self` with every bit set in `other` cleared.
+    pub const fn remove(self, other: Self) -> Self { Self(self.0 & !other.0) }
+}
 
 /// Returned when an enum decode sees a bit pattern that does not
 /// correspond to any declared variant.
@@ -213,10 +227,66 @@ impl VirtioMmio {
     pub fn read_blk_capacity_high(&self) -> u32 { self.blk_capacity_high.read() }
 }
 
+// ---------- VirtioMmio u64-pair accessors ----------
+
+impl VirtioMmio {
+    /// Composed read of `blk_capacity` (low=blk_capacity_low, high=blk_capacity_high, le).
+    #[inline(always)]
+    pub fn read_blk_capacity(&self) -> u64 {
+        self.read_blk_capacity_low() as u64 | ((self.read_blk_capacity_high() as u64) << 32)
+    }
+    /// Composed write of `queue_desc` (writes low first, then high; le).
+    #[inline(always)]
+    pub fn write_queue_desc(&self, v: u64) {
+        self.write_queue_desc_low(v as u32);
+        self.write_queue_desc_high((v >> 32) as u32);
+    }
+    /// Composed write of `queue_driver` (writes low first, then high; le).
+    #[inline(always)]
+    pub fn write_queue_driver(&self, v: u64) {
+        self.write_queue_driver_low(v as u32);
+        self.write_queue_driver_high((v >> 32) as u32);
+    }
+    /// Composed write of `queue_device` (writes low first, then high; le).
+    #[inline(always)]
+    pub fn write_queue_device(&self, v: u64) {
+        self.write_queue_device_low(v as u32);
+        self.write_queue_device_high((v >> 32) as u32);
+    }
+}
+
+// ---------- VirtioMmio windowed accessors ----------
+
+impl VirtioMmio {
+    /// Walk `device_features` (selector=device_features_sel, value=device_features) across 2 chunks of 32 bits;
+    /// compose into a u64 (chunk 0 supplies the least-significant bits).
+    #[inline(always)]
+    pub fn read_device_features_64(&self) -> u64 {
+        let mut acc: u64 = 0;
+        for i in 0..2 {
+            self.write_device_features_sel(i as u32);
+            let chunk = self.read_device_features() as u64;
+            acc |= chunk << (i * 32);
+        }
+        acc
+    }
+    /// Walk `driver_features` writing 2 chunks of 32 bits;
+    /// chunk 0 carries the least-significant bits of `v`.
+    #[inline(always)]
+    pub fn write_driver_features_64(&self, v: u64) {
+        for i in 0..2 {
+            self.write_driver_features_sel(i as u32);
+            let chunk = (v >> (i * 32)) as u32;
+            self.write_driver_features(chunk);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::mem::offset_of;
+    use lockjaw_mmio::mock::MockMmioRegion;
 
     #[test]
     fn layout_offsets() {
@@ -262,6 +332,166 @@ mod tests {
         assert!(v.contains(Status::ACKNOWLEDGE));
         assert!(v.contains(Status::DRIVER));
         assert!(!Status::ACKNOWLEDGE.contains(Status::DRIVER));
+    }
+
+    #[test]
+    fn blk_capacity_pair_roundtrip() {
+        let region = MockMmioRegion::for_layout::<VirtioMmio>();
+        let regs = region.as_mapped_regs::<VirtioMmio>();
+        let dev_ref = regs.regs();
+        region.poke_u32(0x100, 0x1122_3344);
+        region.poke_u32(0x104, 0xAABB_CCDD);
+        let composed = dev_ref.read_blk_capacity();
+        let manual = dev_ref.read_blk_capacity_low() as u64 | ((dev_ref.read_blk_capacity_high() as u64) << 32);
+        assert_eq!(composed, manual);
+        assert_eq!(composed, 0xAABB_CCDD_1122_3344);
+    }
+
+    #[test]
+    fn queue_desc_pair_roundtrip() {
+        let region = MockMmioRegion::for_layout::<VirtioMmio>();
+        let regs = region.as_mapped_regs::<VirtioMmio>();
+        let dev_ref = regs.regs();
+        dev_ref.write_queue_desc(0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(region.peek_u32(0x80), 0xCAFE_BABE);
+        assert_eq!(region.peek_u32(0x84), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn queue_driver_pair_roundtrip() {
+        let region = MockMmioRegion::for_layout::<VirtioMmio>();
+        let regs = region.as_mapped_regs::<VirtioMmio>();
+        let dev_ref = regs.regs();
+        dev_ref.write_queue_driver(0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(region.peek_u32(0x90), 0xCAFE_BABE);
+        assert_eq!(region.peek_u32(0x94), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn queue_device_pair_roundtrip() {
+        let region = MockMmioRegion::for_layout::<VirtioMmio>();
+        let regs = region.as_mapped_regs::<VirtioMmio>();
+        let dev_ref = regs.regs();
+        dev_ref.write_queue_device(0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(region.peek_u32(0xa0), 0xCAFE_BABE);
+        assert_eq!(region.peek_u32(0xa4), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn device_features_windowed_read_visits_all_chunks() {
+        let region = MockMmioRegion::for_layout::<VirtioMmio>();
+        let regs = region.as_mapped_regs::<VirtioMmio>();
+        region.poke_u32(0x10, 0xDEAD_BEEF);
+        let composed = regs.regs().read_device_features_64();
+        // Both chunks read the same value -> composed value has it in every position.
+        let expected = (0xDEAD_BEEFu64) | (0xDEAD_BEEFu64 << 32);
+        assert_eq!(composed, expected);
+        // Selector ended at chunk_count - 1 (proves helper walked all chunks).
+        assert_eq!(region.peek_u32(0x14), 1);
+    }
+
+    #[test]
+    fn driver_features_windowed_write_visits_all_chunks() {
+        let region = MockMmioRegion::for_layout::<VirtioMmio>();
+        let regs = region.as_mapped_regs::<VirtioMmio>();
+        regs.regs().write_driver_features_64(0xDEAD_BEEF_CAFE_BABE);
+        // Selector ended at chunk_count - 1 (proves helper walked all chunks).
+        assert_eq!(region.peek_u32(0x24), 1);
+        // Value register holds the most-significant chunk (last write wins).
+        assert_eq!(region.peek_u32(0x20), 0xDEAD_BEEF);
+    }
+
+    mod _verify {
+        use super::*;
+        use static_assertions::const_assert_eq;
+        const_assert_eq!(
+            offset_of!(VirtioMmio, magic_value) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_MAGIC
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, version) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_VERSION
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, device_id) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_DEVICE_ID
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, vendor_id) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_VENDOR_ID
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, device_features) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_DEVICE_FEATURES
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, device_features_sel) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_DEVICE_FEATURES_SEL
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, driver_features) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_DRIVER_FEATURES
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, driver_features_sel) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_DRIVER_FEATURES_SEL
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, queue_sel) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_QUEUE_SEL
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, queue_num_max) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_QUEUE_NUM_MAX
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, queue_num) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_QUEUE_NUM
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, queue_ready) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_QUEUE_READY
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, queue_notify) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_QUEUE_NOTIFY
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, interrupt_status) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_INTERRUPT_STATUS
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, interrupt_ack) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_INTERRUPT_ACK
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, status) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_STATUS
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, queue_desc_low) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_QUEUE_DESC_LOW
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, queue_desc_high) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_QUEUE_DESC_HIGH
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, queue_driver_low) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_QUEUE_DRIVER_LOW
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, queue_driver_high) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_QUEUE_DRIVER_HIGH
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, queue_device_low) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_QUEUE_DEVICE_LOW
+        );
+        const_assert_eq!(
+            offset_of!(VirtioMmio, queue_device_high) as u64,
+            lockjaw_types::virtio::VIRTIO_MMIO_QUEUE_DEVICE_HIGH
+        );
     }
 
 }
