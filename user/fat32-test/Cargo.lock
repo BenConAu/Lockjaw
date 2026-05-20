@@ -18,6 +18,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lockjaw-regs"
+version = "0.1.0"
+dependencies = [
+ "lockjaw-mmio",
+ "lockjaw-types",
+]
+
+[[package]]
 name = "lockjaw-types"
 version = "0.1.0"
 
@@ -26,5 +34,6 @@ name = "lockjaw-userlib"
 version = "0.1.0"
 dependencies = [
  "lockjaw-mmio",
+ "lockjaw-regs",
  "lockjaw-types",
 ]

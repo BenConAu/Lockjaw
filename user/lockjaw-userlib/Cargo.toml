@@ -8,5 +8,11 @@ edition = "2021"
 [dependencies]
 lockjaw-types = { path = "../../lockjaw-types" }
 lockjaw-mmio = { path = "../lockjaw-mmio" }
+# lockjaw-userlib::virtio depends on the generated VirtioMmio layout
+# (the typed init builder wraps MappedRegs<VirtioMmio>). Adding this
+# couples the userlib to the regspec, which is intentional: the
+# generated semantic helpers (read_*_64, write_*_64) ARE the building
+# blocks for the typed transport.
+lockjaw-regs = { path = "../lockjaw-regs" }
 
 [lib]

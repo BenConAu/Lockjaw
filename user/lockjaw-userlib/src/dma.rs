@@ -1,28 +1,44 @@
-//! `DmaPage` — typed handle over a DMA-coherent page region.
+//! Ownership-typed DMA mapping handles.
 //!
-//! Bundles `(pageset, va, pa)` and a region size, then hands out
-//! `DmaCell<T>` / `DmaSliceDyn<T>` views at byte offsets within the
-//! region. The DmaPage owns the mapping (the underlying `unsafe`
-//! `DmaCell::at` / `DmaSliceDyn::at` calls are concentrated here),
-//! so driver crates with `#![forbid(unsafe_code)]` can build typed
-//! DMA structures without writing `unsafe` themselves.
+//! Two concrete types replace the earlier `DmaPage`:
 //!
-//! Two construction paths:
-//! - `alloc[_contiguous]` — driver-owned mapping (request headers,
-//!   virtqueue allocations).
-//! - `map_existing` — adopt a pageset already produced elsewhere
-//!   (e.g. `BlockEngine::alloc_buffer` returns a PageSetHandle that
-//!   the driver can locally map for self-test inspection).
+//! - `OwnedDmaMapping` — produced by `alloc()` / `alloc_contiguous()`.
+//!   Owns the underlying pageset. `Drop` unmaps, returns VA, AND
+//!   closes the pageset handle.
+//! - `BorrowedDmaMapping` — produced by `map_existing(pageset, pages)`.
+//!   Adopts the mapping but the caller retains the pageset handle.
+//!   `Drop` unmaps and returns VA only; the pageset is NOT closed.
 //!
-//! **Caller contract on `cell`/`slice`:** byte offsets across calls
-//! must not overlap. The aliasing rule is documented, not type-
-//! enforced; bounds-checking ensures each view fits in the page
-//! region, but mutual disjointness is the caller's responsibility.
+//! The type IS the ownership story: a reader can tell at field
+//! declaration whether the wrapper will release the underlying
+//! pageset. Both types share the same view-construction surface
+//! (`cell<T>(off)`, `slice<T>(off, n)`, `pa()`, `va()`,
+//! `size_bytes()`, `pa_offset(o)`, `zero()`) via the
+//! `DmaMappingView` trait.
+//!
+//! The trait deliberately covers only view methods. Per reviewer
+//! discipline: NO ownership transfer methods, NO sub-mapping
+//! creation, NO blanket impls beyond these two structs. If a future
+//! need pushes against this, add the method to both structs directly
+//! rather than expanding the trait surface.
+//!
+//! `Drop` errors from `sys_unmap_pages` / `sys_close_handle` cannot
+//! propagate — drop functions don't return — so they are swallowed.
+//! Callers that want the error use the explicit `unmap(self) ->
+//! Result<(), SyscallError>` consumer instead; calling it disarms
+//! the Drop.
+//!
+//! **Caller contract on `cell` / `slice`:** byte offsets across
+//! calls must not overlap when mixing distinct `T`s. The aliasing
+//! rule is documented, not type-enforced; bounds-checking ensures
+//! each view fits in the region, but mutual disjointness is the
+//! caller's responsibility. (Two overlapping cells over the SAME
+//! `T` are harmless — they alias to the same volatile cell.)
 
 use crate::handle::{PageSetGuard, PageSetHandle};
 use crate::syscall::{
-    sys_alloc_pages, sys_alloc_pages_contiguous, sys_map_pages,
-    sys_query_pageset_phys, sys_unmap_pages,
+    sys_alloc_pages, sys_alloc_pages_contiguous, sys_close_handle,
+    sys_map_pages, sys_query_pageset_phys, sys_unmap_pages,
 };
 use crate::virtual_memory::VMEM;
 use core::marker::PhantomData;
@@ -32,22 +48,26 @@ use lockjaw_types::syscall::SyscallError;
 use lockjaw_types::vmem::MapMemoryAttribute;
 
 // ---------------------------------------------------------------------------
-// Lifetime-bound DMA views
+// Lifetime-bound DMA views.
 //
 // The raw `DmaCell` / `DmaSliceDyn` from lockjaw-mmio are owned values
 // with no lifetime parameter — that's appropriate for the substrate.
 // At the userlib layer we wrap them in `CellRef` / `SliceRef` that
-// borrow `&DmaPage`, so:
-// - the typed view can never outlive its backing page (no
-//   use-after-unmap in safe code, since `DmaPage::unmap(self)` would
-//   conflict with an outstanding `&self`-bound view);
-// - the substrate-level cell types stay unchanged.
+// borrow `&self` of whatever mapping handed them out, so:
+// - the typed view can never outlive its backing mapping (no
+//   use-after-unmap in safe code, since `unmap(self)` would conflict
+//   with an outstanding `&self`-bound view, and Drop runs only after
+//   the last borrow ends);
+// - the substrate-level cell types stay unchanged;
+// - PhantomData carries the lifetime only (no concrete owner type),
+//   so both `OwnedDmaMapping` and `BorrowedDmaMapping` produce the
+//   same view wrappers.
 // ---------------------------------------------------------------------------
 
-/// A typed cell view borrowed from a `DmaPage`.
+/// A typed cell view borrowed from a DMA mapping.
 pub struct CellRef<'a, T: DmaValue> {
     inner: DmaCell<T>,
-    _life: PhantomData<&'a DmaPage>,
+    _life: PhantomData<&'a ()>,
 }
 
 impl<'a, T: DmaValue> CellRef<'a, T> {
@@ -59,10 +79,10 @@ impl<'a, T: DmaValue> CellRef<'a, T> {
     pub fn read(&self) -> T { self.inner.read() }
 }
 
-/// A typed runtime-length slice view borrowed from a `DmaPage`.
+/// A typed runtime-length slice view borrowed from a DMA mapping.
 pub struct SliceRef<'a, T: DmaValue> {
     inner: DmaSliceDyn<T>,
-    _life: PhantomData<&'a DmaPage>,
+    _life: PhantomData<&'a ()>,
 }
 
 impl<'a, T: DmaValue> SliceRef<'a, T> {
@@ -80,15 +100,140 @@ impl<'a, T: DmaValue> SliceRef<'a, T> {
     pub fn is_empty(&self) -> bool { self.inner.is_empty() }
 }
 
-/// A DMA-coherent page region with typed cell/slice access.
-pub struct DmaPage {
+// ---------------------------------------------------------------------------
+// View trait — minimal surface; default implementations only.
+// ---------------------------------------------------------------------------
+
+/// Shared view-construction surface for DMA mappings.
+///
+/// Required methods are the three primitive accessors the view default
+/// impls need (`va`, `pa`, `size_bytes`). Everything else is a default
+/// implementation so the two concrete mapping types share one body.
+///
+/// **Discipline:** this trait covers VIEW methods only. No allocation,
+/// no mapping-lifecycle methods (unmap, close_pageset), no sub-mapping
+/// creation, no blanket impls. If a future need pushes against this —
+/// add the method to each struct directly rather than expanding the
+/// trait surface.
+pub trait DmaMappingView {
+    /// First-page virtual address.
+    fn va(&self) -> u64;
+    /// First-page physical address.
+    fn pa(&self) -> u64;
+    /// Total bytes in the region.
+    fn size_bytes(&self) -> usize;
+
+    /// PA at a byte offset within the region (for device-register
+    /// programming on multi-page allocations).
+    fn pa_offset(&self, byte_offset: u64) -> u64 {
+        let bytes = self.size_bytes() as u64;
+        assert!(
+            byte_offset < bytes,
+            "DMA mapping pa_offset OOB: offset 0x{:x} >= region 0x{:x}",
+            byte_offset, bytes
+        );
+        self.pa() + byte_offset
+    }
+
+    /// View a typed cell at `byte_offset`. Bounds-checked AND
+    /// alignment-checked: `byte_offset` must be a multiple of
+    /// `align_of::<T>()` (else volatile load/store would be UB) and
+    /// `byte_offset + size_of::<T>()` must fit in the region.
+    /// Callers must keep cell offsets mutually disjoint within the
+    /// region (docs invariant, not type-enforced).
+    ///
+    /// The returned `CellRef<'_, T>` borrows `&self`, so it cannot
+    /// outlive this mapping.
+    fn cell<T: DmaValue>(&self, byte_offset: u64) -> CellRef<'_, T> {
+        let region_bytes = self.size_bytes() as u64;
+        let size = core::mem::size_of::<T>() as u64;
+        let align = core::mem::align_of::<T>() as u64;
+        assert!(
+            byte_offset % align == 0,
+            "DMA cell misaligned: offset 0x{:x} not a multiple of align {} for {}",
+            byte_offset, align, core::any::type_name::<T>()
+        );
+        let end = byte_offset
+            .checked_add(size)
+            .expect("DMA cell offset+size overflow");
+        assert!(
+            end <= region_bytes,
+            "DMA cell OOB: end 0x{:x} > region 0x{:x}",
+            end, region_bytes
+        );
+        // SAFETY: alloc/map gave us exclusive ownership of the VA
+        // range; offset is bounds-checked AND alignment-checked.
+        // T: DmaValue makes volatile load/store sound. Lifetime
+        // binding via CellRef prevents use-after-unmap (the
+        // mapping's Drop runs only after every &self-borrowed view
+        // has ended).
+        CellRef {
+            inner: unsafe { DmaCell::<T>::at(self.va() + byte_offset) },
+            _life: PhantomData,
+        }
+    }
+
+    /// View a runtime-length typed slice at `byte_offset`. Same
+    /// alignment + bounds discipline as `cell()`. Returned
+    /// `SliceRef<'_, T>` is lifetime-bound to `&self`.
+    fn slice<T: DmaValue>(&self, byte_offset: u64, len: usize) -> SliceRef<'_, T> {
+        let region_bytes = self.size_bytes() as u64;
+        let size = core::mem::size_of::<T>() as u64;
+        let align = core::mem::align_of::<T>() as u64;
+        assert!(
+            byte_offset % align == 0,
+            "DMA slice misaligned: offset 0x{:x} not a multiple of align {} for {}",
+            byte_offset, align, core::any::type_name::<T>()
+        );
+        let total = (len as u64)
+            .checked_mul(size)
+            .expect("DMA slice len*size_of::<T>() overflow");
+        let end = byte_offset
+            .checked_add(total)
+            .expect("DMA slice offset+total overflow");
+        assert!(
+            end <= region_bytes,
+            "DMA slice OOB: end 0x{:x} > region 0x{:x}",
+            end, region_bytes
+        );
+        // SAFETY: as `cell()` above.
+        SliceRef {
+            inner: unsafe { DmaSliceDyn::<T>::at(self.va() + byte_offset, len) },
+            _life: PhantomData,
+        }
+    }
+
+    /// Zero the entire region via 64-bit volatile DMA writes.
+    fn zero(&self) {
+        let words = (self.size_bytes() / 8) as usize;
+        let view = self.slice::<u64>(0, words);
+        for i in 0..words {
+            view.write(i, 0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OwnedDmaMapping — alloc-backed; Drop closes the pageset.
+// ---------------------------------------------------------------------------
+
+/// A DMA-coherent mapping that owns its pageset.
+///
+/// `Drop` unmaps the VA range, returns it to the allocator, AND
+/// closes the underlying pageset handle. Use for driver-owned
+/// allocations (request headers, virtqueue backing).
+pub struct OwnedDmaMapping {
     pageset: PageSetHandle,
     va: u64,
     pa: u64,
     pages: u64,
+    // Set to false by .unmap(self) so Drop is a no-op (the explicit
+    // consumer already released the resources). Internal flag, not
+    // exposed on the API.
+    armed: bool,
 }
 
-impl DmaPage {
+impl OwnedDmaMapping {
     /// Allocate one Normal-mapped page (DMA-coherent on the platforms
     /// Lockjaw targets), map it, and return the handle.
     pub fn alloc() -> Result<Self, SyscallError> {
@@ -104,34 +249,107 @@ impl DmaPage {
     }
 
     fn finish_alloc(pageset: PageSetHandle, pages: u64) -> Result<Self, SyscallError> {
-        // Guard closes the pageset if any subsequent step fails;
-        // `take()` on the success path passes ownership to DmaPage.
+        // PageSetGuard closes the pageset on early return; .take() on
+        // the success path passes ownership into the mapping (whose
+        // Drop is the new owner).
         let guard = PageSetGuard::new(pageset);
         let pa = sys_query_pageset_phys(guard.handle(), 0)?;
         let va = VMEM.alloc(pages as usize).ok_or(SyscallError::OUT_OF_MEMORY)?;
         let err = sys_map_pages(guard.handle(), va, MapMemoryAttribute::Normal);
         if !err.is_ok() {
-            // Reserved-but-unmapped VA range must go back to the pool.
             VMEM.free(va, pages as usize);
             return Err(err);
         }
         let pageset = guard.take();
-        let page = Self { pageset, va, pa, pages };
-        page.zero();
-        Ok(page)
+        let m = Self { pageset, va, pa, pages, armed: true };
+        m.zero();
+        Ok(m)
     }
 
-    /// Map an existing pageset (e.g. produced by an external
-    /// allocator) Normal and adopt it for typed access. Does NOT
-    /// zero the page — the existing contents are preserved. Caller
-    /// retains ownership of the pageset handle on failure; on
-    /// success ownership moves into the returned DmaPage (released
-    /// by `unmap()` or when the DmaPage is forgotten at process
-    /// exit).
-    pub fn map_existing(pageset: PageSetHandle, pages: u64) -> Result<Self, SyscallError> {
-        // Reserve VA + map. On failure we MUST NOT close the caller's
-        // pageset (we didn't allocate it), but we DO release any VA we
-        // reserved.
+    /// Underlying pageset handle (for export, IRQ binding, etc.).
+    pub fn pageset(&self) -> PageSetHandle { self.pageset }
+
+    /// Consume the mapping, unmapping and freeing VA, AND closing the
+    /// pageset. Returns the unmap error (if any).
+    ///
+    /// **VA-leak-on-unmap-failure invariant:** if `sys_unmap_pages`
+    /// fails, the page tables may still map this VA — returning the
+    /// range to VMEM would risk handing it back to a future
+    /// allocator caller while the old mapping is still live (an
+    /// aliasing bug, worse than a leak). On unmap failure we
+    /// therefore LEAK the VA. The pageset is still closed because
+    /// (a) closing is independent of the mapping state and (b)
+    /// leaking the pageset compounds the failure without helping.
+    ///
+    /// After this returns, Drop is a no-op (`armed = false`).
+    pub fn unmap(mut self) -> Result<(), SyscallError> {
+        self.armed = false;
+        let err = sys_unmap_pages(self.pageset, self.va);
+        if !err.is_ok() {
+            // Leak VMEM range; close the pageset.
+            sys_close_handle(self.pageset);
+            return Err(err);
+        }
+        VMEM.free(self.va, self.pages as usize);
+        sys_close_handle(self.pageset);
+        Ok(())
+    }
+}
+
+impl DmaMappingView for OwnedDmaMapping {
+    fn va(&self) -> u64 { self.va }
+    fn pa(&self) -> u64 { self.pa }
+    fn size_bytes(&self) -> usize {
+        region_bytes(self.pages) as usize
+    }
+}
+
+impl Drop for OwnedDmaMapping {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // VA-leak-on-unmap-failure invariant (see `unmap`): only
+        // return the VA to VMEM if sys_unmap_pages succeeded.
+        // Otherwise the page tables may still map it; reusing the
+        // VA would create an aliasing bug. Leaking VMEM is the
+        // safer failure mode. Pageset close is unconditional.
+        let unmap_err = sys_unmap_pages(self.pageset, self.va);
+        if unmap_err.is_ok() {
+            VMEM.free(self.va, self.pages as usize);
+        }
+        sys_close_handle(self.pageset);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BorrowedDmaMapping — adopts an existing pageset; Drop does NOT close.
+// ---------------------------------------------------------------------------
+
+/// A DMA-coherent mapping that adopts an existing pageset.
+///
+/// The caller retains ownership of the pageset handle's lifetime.
+/// `Drop` unmaps the VA range and returns it to the allocator; the
+/// pageset is NOT closed. Use for adopting a pageset produced by
+/// another subsystem (e.g. `BlockEngine::alloc_buffer` hands a
+/// PageSetHandle to the driver that the driver locally maps for
+/// inspection).
+pub struct BorrowedDmaMapping {
+    pageset: PageSetHandle,
+    va: u64,
+    pa: u64,
+    pages: u64,
+    armed: bool,
+}
+
+impl BorrowedDmaMapping {
+    /// Map an existing pageset Normal and adopt it for typed access.
+    /// Does NOT zero the page — existing contents are preserved.
+    /// Caller retains the pageset handle and is responsible for
+    /// closing it independently.
+    pub fn map_existing(pageset: PageSetHandle, pages: u64)
+        -> Result<Self, SyscallError>
+    {
         let pa = sys_query_pageset_phys(pageset, 0)?;
         let va = VMEM.alloc(pages as usize).ok_or(SyscallError::OUT_OF_MEMORY)?;
         let err = sys_map_pages(pageset, va, MapMemoryAttribute::Normal);
@@ -139,132 +357,68 @@ impl DmaPage {
             VMEM.free(va, pages as usize);
             return Err(err);
         }
-        Ok(Self { pageset, va, pa, pages })
+        Ok(Self { pageset, va, pa, pages, armed: true })
     }
 
-    /// Unmap and release the VA. Does NOT close the underlying
-    /// pageset — caller owns the handle's lifetime. Use this for
-    /// pages adopted via `map_existing`; for `alloc`-allocated pages
-    /// process-lifetime is normal.
-    pub fn unmap(self) -> Result<(), SyscallError> {
+    /// Underlying pageset handle. Caller owns its lifetime.
+    pub fn pageset(&self) -> PageSetHandle { self.pageset }
+
+    /// Consume the mapping, unmapping and freeing VA. Returns the
+    /// unmap error if any. Does NOT close the pageset.
+    ///
+    /// **VA-leak-on-unmap-failure invariant:** same as
+    /// `OwnedDmaMapping::unmap` — if `sys_unmap_pages` fails, the
+    /// VA range is LEAKED rather than returned to VMEM, because the
+    /// page tables may still map it and reusing the VA would
+    /// alias. (The caller's pageset handle is unaffected either way.)
+    ///
+    /// After this returns, Drop is a no-op.
+    pub fn unmap(mut self) -> Result<(), SyscallError> {
+        self.armed = false;
         let err = sys_unmap_pages(self.pageset, self.va);
-        if !err.is_ok() { return Err(err); }
+        if !err.is_ok() {
+            // Leak VMEM range; do NOT close caller's pageset.
+            return Err(err);
+        }
         VMEM.free(self.va, self.pages as usize);
         Ok(())
     }
+}
 
-    /// Underlying pageset handle (for export, IRQ binding, etc.).
-    pub fn pageset(&self) -> PageSetHandle { self.pageset }
-    /// First-page virtual address.
-    pub fn va(&self) -> u64 { self.va }
-    /// First-page physical address.
-    pub fn pa(&self) -> u64 { self.pa }
-    /// Total bytes in the region.
-    pub fn size_bytes(&self) -> usize { self.region_bytes() as usize }
-
-    /// PA at a byte offset within the region (for device-register
-    /// programming on multi-page allocations).
-    pub fn pa_offset(&self, byte_offset: u64) -> u64 {
-        assert!(
-            byte_offset < self.region_bytes(),
-            "DmaPage pa_offset OOB: offset 0x{:x} >= region 0x{:x}",
-            byte_offset, self.region_bytes()
-        );
-        self.pa + byte_offset
+impl DmaMappingView for BorrowedDmaMapping {
+    fn va(&self) -> u64 { self.va }
+    fn pa(&self) -> u64 { self.pa }
+    fn size_bytes(&self) -> usize {
+        region_bytes(self.pages) as usize
     }
+}
 
-    /// View a typed cell at `byte_offset`. Bounds-checked AND
-    /// alignment-checked: `byte_offset` must be a multiple of
-    /// `align_of::<T>()` (else volatile load/store would be UB) and
-    /// `byte_offset + size_of::<T>()` must fit in the region.
-    /// Callers must keep cell offsets mutually disjoint within the
-    /// page (this is a docs invariant, not type-enforced — two
-    /// overlapping cells over the SAME `T` is harmless; mixing types
-    /// at overlapping offsets is not).
-    ///
-    /// The returned `CellRef<'_, T>` borrows `&self`, so it cannot
-    /// outlive this `DmaPage` — `DmaPage::unmap(self)` would not
-    /// compile while any `CellRef` is live.
-    pub fn cell<T: DmaValue>(&self, byte_offset: u64) -> CellRef<'_, T> {
-        let region_bytes = self.region_bytes();
-        let size = core::mem::size_of::<T>() as u64;
-        let align = core::mem::align_of::<T>() as u64;
-        assert!(
-            byte_offset % align == 0,
-            "DmaPage cell misaligned: offset 0x{:x} not a multiple of align {} for {}",
-            byte_offset, align, core::any::type_name::<T>()
-        );
-        let end = byte_offset
-            .checked_add(size)
-            .expect("DmaPage cell offset+size overflow");
-        assert!(
-            end <= region_bytes,
-            "DmaPage cell OOB: end 0x{:x} > region 0x{:x}",
-            end, region_bytes
-        );
-        // SAFETY: alloc + map gave us exclusive ownership of the VA
-        // range; offset is bounds-checked AND alignment-checked.
-        // T: DmaValue makes volatile load/store sound. Lifetime
-        // binding via CellRef prevents use-after-unmap.
-        CellRef {
-            inner: unsafe { DmaCell::<T>::at(self.va + byte_offset) },
-            _life: PhantomData,
+impl Drop for BorrowedDmaMapping {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // VA-leak-on-unmap-failure invariant (see `unmap`): only
+        // return the VA to VMEM if sys_unmap_pages succeeded.
+        // Pageset is NOT closed (caller still owns it).
+        let unmap_err = sys_unmap_pages(self.pageset, self.va);
+        if unmap_err.is_ok() {
+            VMEM.free(self.va, self.pages as usize);
         }
     }
+}
 
-    /// View a runtime-length typed slice at `byte_offset`. Same
-    /// alignment + bounds discipline as `cell()`. Uses checked
-    /// arithmetic for `byte_offset + len * size_of::<T>()` so a
-    /// pathological `len` cannot wrap the bound check. Returned
-    /// `SliceRef<'_, T>` is lifetime-bound to `&self`.
-    pub fn slice<T: DmaValue>(&self, byte_offset: u64, len: usize) -> SliceRef<'_, T> {
-        let region_bytes = self.region_bytes();
-        let size = core::mem::size_of::<T>() as u64;
-        let align = core::mem::align_of::<T>() as u64;
-        assert!(
-            byte_offset % align == 0,
-            "DmaPage slice misaligned: offset 0x{:x} not a multiple of align {} for {}",
-            byte_offset, align, core::any::type_name::<T>()
-        );
-        let total = (len as u64)
-            .checked_mul(size)
-            .expect("DmaPage slice len*size_of::<T>() overflow");
-        let end = byte_offset
-            .checked_add(total)
-            .expect("DmaPage slice offset+total overflow");
-        assert!(
-            end <= region_bytes,
-            "DmaPage slice OOB: end 0x{:x} > region 0x{:x}",
-            end, region_bytes
-        );
-        // SAFETY: as `cell()` above.
-        SliceRef {
-            inner: unsafe { DmaSliceDyn::<T>::at(self.va + byte_offset, len) },
-            _life: PhantomData,
-        }
-    }
+// ---------------------------------------------------------------------------
+// Internal helper.
+// ---------------------------------------------------------------------------
 
-    #[inline]
-    fn region_bytes(&self) -> u64 {
-        // self.pages was created from a successful alloc; the kernel
-        // bounds the page count well below u64::MAX / PAGE_SIZE, so
-        // the multiplication is fine. Use checked_mul anyway as a
-        // belt-and-braces invariant — overflow here would be a
-        // catastrophic substrate bug.
-        self.pages
-            .checked_mul(PAGE_SIZE)
-            .expect("DmaPage region size overflow (pages * PAGE_SIZE)")
-    }
-
-    /// Zero the entire region. Called automatically by `alloc[_contiguous]`.
-    pub fn zero(&self) {
-        // 64-bit volatile stores via DmaCell — keeps the substrate
-        // contract that all writes go through the audited path. Slow
-        // compared to a raw bzero but only runs once per allocation.
-        let words = (self.region_bytes() / 8) as usize;
-        let view = self.slice::<u64>(0, words);
-        for i in 0..words {
-            view.write(i, 0);
-        }
-    }
+#[inline]
+fn region_bytes(pages: u64) -> u64 {
+    // `pages` originated in a successful alloc/map; kernel bounds
+    // page count well below u64::MAX / PAGE_SIZE. checked_mul as
+    // belt-and-braces — overflow would be a catastrophic substrate
+    // bug.
+    pages
+        .checked_mul(PAGE_SIZE)
+        .expect("DMA mapping region size overflow (pages * PAGE_SIZE)")
 }

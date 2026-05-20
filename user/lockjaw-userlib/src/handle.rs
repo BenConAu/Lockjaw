@@ -73,3 +73,36 @@ impl Drop for PageSetGuard {
         }
     }
 }
+
+/// RAII guard for a NotificationHandle. Mirrors `PageSetGuard` for
+/// the create-then-bind sequence: `bind_irq` allocates a pageset,
+/// converts it to a notification, then binds the IRQ. If the bind
+/// step fails, the unbound notification handle must be closed.
+pub struct NotificationGuard {
+    handle: Option<NotificationHandle>,
+}
+
+impl NotificationGuard {
+    /// Wrap a freshly created NotificationHandle.
+    pub fn new(n: NotificationHandle) -> Self {
+        Self { handle: Some(n) }
+    }
+
+    /// Access the handle without consuming the guard.
+    pub fn handle(&self) -> NotificationHandle {
+        self.handle.expect("NotificationGuard already taken")
+    }
+
+    /// Take ownership of the handle, disarming the drop guard.
+    pub fn take(mut self) -> NotificationHandle {
+        self.handle.take().expect("NotificationGuard already taken")
+    }
+}
+
+impl Drop for NotificationGuard {
+    fn drop(&mut self) {
+        if let Some(n) = self.handle {
+            crate::syscall::sys_close_handle(n);
+        }
+    }
+}

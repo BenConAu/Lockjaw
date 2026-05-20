@@ -1,39 +1,87 @@
 //! Split virtqueue runtime for VirtIO MMIO transport.
 //!
-//! Operates on a contiguous physical allocation supplied via a
-//! `DmaPage`. All shared-memory accesses go through `lockjaw-mmio`'s
-//! `DmaCell` / `DmaSliceDyn` (wrapped in userlib's lifetime-bound
-//! `CellRef` / `SliceRef`) so the virtqueue protocol logic is
-//! `unsafe`-free in this crate and the driver crate above. AArch64
-//! barriers come from `lockjaw_mmio::barrier::*` and order
+//! Operates on a contiguous physical allocation supplied via an
+//! `OwnedDmaMapping`. All shared-memory accesses go through
+//! `lockjaw-mmio`'s `DmaCell` / `DmaSliceDyn` (wrapped in userlib's
+//! lifetime-bound `CellRef` / `SliceRef`) so the virtqueue protocol
+//! logic is `unsafe`-free in this crate and the driver crate above.
+//! AArch64 barriers come from `lockjaw_mmio::barrier::*` and order
 //! descriptor writes against avail/used ring updates and MMIO notify.
 //!
 //! Reusable across any VirtIO device (block, net, gpu).
 //!
-//! Structurally, the Virtqueue stores ONLY the backing `DmaPage` +
-//! layout + free-list state. Typed views are computed on each
-//! access via tiny inline accessors (`desc()`, `avail_header()`,
-//! etc.) so each view borrows `&self` and cannot outlive the
-//! backing page. Storing owned views would require self-referential
-//! types and would also let view lifetimes escape the page's.
+//! Structurally, the Virtqueue stores ONLY the backing
+//! `OwnedDmaMapping` + layout + free-list state. Typed views are
+//! computed on each access via tiny inline accessors (`desc()`,
+//! `avail_header()`, etc.) so each view borrows `&self` and cannot
+//! outlive the backing mapping. Storing owned views inside the
+//! Virtqueue would require self-referential types (the views borrow
+//! the same struct that owns them) and would also let view lifetimes
+//! escape the mapping's. Computing per-access is the same machine
+//! code after inlining and avoids both problems.
 
-use crate::dma::{CellRef, DmaPage, SliceRef};
+use crate::dma::{CellRef, DmaMappingView, OwnedDmaMapping, SliceRef};
+use crate::handle::NotificationHandle;
+use crate::syscall::sys_wait_notification;
+use crate::virtio::VirtioTransport;
 use lockjaw_mmio::barrier::{dmb_ish, dmb_ishld, dmb_ishst};
 use lockjaw_types::virtio::{
     VirtqAvail, VirtqDesc, VirtqUsed, VirtqUsedElem, VirtqueueLayout,
-    virtqueue_layout, VIRTQ_DESC_F_NEXT,
+    virtqueue_layout, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
 };
+
+/// One segment of a virtqueue chain — a single buffer the device
+/// either reads from or writes to.
+#[derive(Clone, Copy)]
+pub struct Segment {
+    /// Physical address the device should access.
+    pub pa: u64,
+    /// Length in bytes.
+    pub len: u32,
+    /// Whether the device reads (driver wrote first) or writes
+    /// (device fills, driver reads).
+    pub direction: Direction,
+}
+
+/// Buffer direction from the device's point of view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Device READS from this buffer (driver pre-filled).
+    DeviceReadable,
+    /// Device WRITES to this buffer (driver later reads).
+    DeviceWritable,
+}
+
+impl Segment {
+    /// Shorthand for a device-readable segment (driver-side payload).
+    pub const fn readable(pa: u64, len: u32) -> Self {
+        Self { pa, len, direction: Direction::DeviceReadable }
+    }
+    /// Shorthand for a device-writable segment (response buffer).
+    pub const fn writable(pa: u64, len: u32) -> Self {
+        Self { pa, len, direction: Direction::DeviceWritable }
+    }
+}
+
+/// Errors `wait_for_completion` can return.
+#[derive(Debug, Clone, Copy)]
+pub enum VirtqueueError {
+    /// IRQ-notification wait failed at the kernel boundary.
+    IrqWaitFailed,
+}
 
 /// A split virtqueue backed by a contiguous DMA region.
 ///
-/// The caller allocates a `DmaPage` of the right size (see
+/// The caller allocates an `OwnedDmaMapping` of the right size (see
 /// `virtqueue_layout(queue_size).total_size`) and hands it to
-/// `Virtqueue::new`. The Virtqueue takes ownership of the backing
+/// `Virtqueue::new`. The virtqueue takes ownership of the backing
 /// region so the mapping outlives the typed views computed on each
-/// access.
+/// access; when the virtqueue is dropped, the mapping's Drop releases
+/// the underlying pageset.
 pub struct Virtqueue {
-    /// Owns the backing DMA region; keeps the mapping alive.
-    backing: DmaPage,
+    /// Owns the backing DMA region; keeps the mapping alive and
+    /// closes the pageset on Drop.
+    backing: OwnedDmaMapping,
     /// Cached layout for the device-register PAs.
     layout: VirtqueueLayout,
     /// Head of the free descriptor chain.
@@ -47,11 +95,11 @@ pub struct Virtqueue {
 impl Virtqueue {
     /// Initialize a virtqueue inside `backing`. Panics if `backing`
     /// is too small for the layout of `queue_size`.
-    pub fn new(backing: DmaPage, queue_size: u16) -> Self {
+    pub fn new(backing: OwnedDmaMapping, queue_size: u16) -> Self {
         let layout = virtqueue_layout(queue_size);
         assert!(
             layout.total_size <= backing.size_bytes(),
-            "DmaPage size {} bytes too small for virtqueue_layout({}).total_size = {}",
+            "OwnedDmaMapping size {} bytes too small for virtqueue_layout({}).total_size = {}",
             backing.size_bytes(), queue_size, layout.total_size
         );
 
@@ -66,10 +114,17 @@ impl Virtqueue {
         vq
     }
 
+    /// Queue size negotiated at construction time.
+    #[inline]
+    pub fn queue_size(&self) -> u16 { self.layout.queue_size }
+
     // -----------------------------------------------------------------
     // Typed view accessors. Each computes a fresh lifetime-bound view
-    // over the backing page; inlining means the resulting machine code
-    // is the same pointer arithmetic that the original raw pointers did.
+    // over the backing mapping; inlining means the resulting machine
+    // code is the same pointer arithmetic that the original raw
+    // pointers did. The views borrow `&self`, so they cannot outlive
+    // the Virtqueue and the field updates below (`self.free_head =
+    // ...`) can re-borrow `&mut self` once a view's scope ends.
     // -----------------------------------------------------------------
 
     #[inline(always)]
@@ -119,63 +174,64 @@ impl Virtqueue {
         }
     }
 
-    /// Physical address of the descriptor table (for QUEUE_DESC_LOW/HIGH).
+    /// Physical address of the descriptor table (for QUEUE_DESC).
     pub fn desc_phys(&self) -> u64 {
         self.backing.pa_offset(self.layout.desc_offset as u64)
     }
 
-    /// Physical address of the available ring (for QUEUE_DRIVER_LOW/HIGH).
+    /// Physical address of the available ring (for QUEUE_DRIVER).
     pub fn avail_phys(&self) -> u64 {
         self.backing.pa_offset(self.layout.avail_offset as u64)
     }
 
-    /// Physical address of the used ring (for QUEUE_DEVICE_LOW/HIGH).
+    /// Physical address of the used ring (for QUEUE_DEVICE).
     pub fn used_phys(&self) -> u64 {
         self.backing.pa_offset(self.layout.used_offset as u64)
     }
 
-    /// Allocate a 3-descriptor chain for a block I/O request.
+    /// Submit a chain of segments. Returns the head descriptor index
+    /// on success, or `None` if not enough free descriptors.
     ///
-    /// Returns the head descriptor index, or None if not enough free
-    /// descriptors.
+    /// Descriptor flag computation (VIRTQ_DESC_F_NEXT,
+    /// VIRTQ_DESC_F_WRITE) is internal — drivers express I/O as
+    /// `Segment::readable(...)` / `Segment::writable(...)` and never
+    /// see the flag constants. Scales to any chain length (block
+    /// drivers use 3, future virtio drivers may differ).
     ///
-    /// Each (pa, len, flags) tuple describes one buffer. Flags should
-    /// include VIRTQ_DESC_F_WRITE for device-writable buffers.
-    /// The chain is linked via VIRTQ_DESC_F_NEXT automatically.
-    pub fn alloc_chain3(
-        &mut self,
-        buf0_pa: u64, len0: u32, flags0: u16,
-        buf1_pa: u64, len1: u32, flags1: u16,
-        buf2_pa: u64, len2: u32, flags2: u16,
-    ) -> Option<u16> {
-        if self.num_free < 3 {
+    /// Inserts a store-store barrier before bumping `avail.idx` so
+    /// the device observes descriptor + ring writes in the right
+    /// order; final store-any barrier ensures `avail.idx` is visible
+    /// before the driver's MMIO notify.
+    pub fn submit_chain(&mut self, segments: &[Segment]) -> Option<u16> {
+        let n = segments.len();
+        if n == 0 || (n as u16) > self.num_free {
             return None;
         }
 
         let head = self.free_head;
-        let descs = [
-            (buf0_pa, len0, flags0),
-            (buf1_pa, len1, flags1),
-            (buf2_pa, len2, flags2),
-        ];
-        // Scope the desc borrow so we can write back free_head after.
+        // Scope the desc borrow so we can write back free_head /
+        // num_free after — the desc view holds &self for its scope,
+        // and the field assignments below need &mut self.
         let new_free_head = {
             let desc = self.desc();
             let mut idx = head;
             let mut last_next = 0u16;
-            for (i, &(pa, len, user_flags)) in descs.iter().enumerate() {
+            for (i, seg) in segments.iter().enumerate() {
                 let next = desc.read(idx as usize).next;
-
-                let is_last = i == 2;
-                let flags = user_flags | if is_last { 0 } else { VIRTQ_DESC_F_NEXT };
-
+                let is_last = i + 1 == n;
+                let mut flags = 0u16;
+                if seg.direction == Direction::DeviceWritable {
+                    flags |= VIRTQ_DESC_F_WRITE;
+                }
+                if !is_last {
+                    flags |= VIRTQ_DESC_F_NEXT;
+                }
                 desc.write(idx as usize, VirtqDesc {
-                    addr: pa,
-                    len,
+                    addr: seg.pa,
+                    len: seg.len,
                     flags,
                     next: if is_last { 0 } else { next },
                 });
-
                 if is_last {
                     last_next = next;
                 } else {
@@ -186,16 +242,9 @@ impl Virtqueue {
         };
 
         self.free_head = new_free_head;
-        self.num_free -= 3;
-        Some(head)
-    }
+        self.num_free -= n as u16;
 
-    /// Push a descriptor chain head into the available ring.
-    ///
-    /// Inserts a store-store barrier before updating the avail index
-    /// so the device sees completed descriptor writes before the
-    /// index bump.
-    pub fn submit(&mut self, head: u16) {
+        // Push head into the available ring and advance avail.idx.
         let header = self.avail_header();
         let avail = header.read();
         let ring_idx = (avail.idx % self.layout.queue_size) as usize;
@@ -209,31 +258,62 @@ impl Virtqueue {
             idx: avail.idx.wrapping_add(1),
         });
 
-        // Barrier: avail.idx visible before MMIO notify.
+        // Barrier: avail.idx visible before MMIO notify the caller issues.
         dmb_ish();
+
+        Some(head)
     }
 
     /// Poll the used ring for completed requests.
     ///
     /// Returns `Some((head_idx, bytes_written))` if a new completion
-    /// is available, `None` otherwise.
+    /// is available, `None` otherwise. Most callers should prefer
+    /// `wait_for_completion`, which bakes the IRQ + ack + poll loop.
     pub fn poll_used(&mut self) -> Option<(u16, u32)> {
         let used_idx = self.used_header().read().idx;
         if used_idx == self.last_used_idx {
             return None;
         }
-
-        // Barrier: used.idx read before ring element reads.
         dmb_ishld();
-
         let ring_idx = (self.last_used_idx % self.layout.queue_size) as usize;
         let elem = self.used_ring().read(ring_idx);
-
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
         Some((elem.id as u16, elem.len))
     }
 
-    /// Free a 3-descriptor chain back to the free list.
+    /// Wait for the next completion, handling the IRQ + ack + poll
+    /// loop internally.
+    ///
+    /// Order matters: poll the used ring FIRST in case completion
+    /// already arrived (e.g. a previous IRQ delivered multiple
+    /// completions), then wait for the IRQ notification, ACK the
+    /// transport interrupt (W1C semantics), then re-poll. Every
+    /// virtio driver needs this loop; baking it into the substrate
+    /// stops drivers from accidentally reordering the ack and the
+    /// poll (a known virtio race shape).
+    ///
+    /// `irq_threshold` is the caller's monotonic counter, incremented
+    /// once per successful IRQ wait. Caller passes a `&mut u64` so
+    /// the threshold survives across calls.
+    pub fn wait_for_completion(
+        &mut self,
+        irq_notif: NotificationHandle,
+        irq_threshold: &mut u64,
+        transport: &VirtioTransport,
+    ) -> Result<(u16, u32), VirtqueueError> {
+        loop {
+            if let Some(c) = self.poll_used() {
+                return Ok(c);
+            }
+            sys_wait_notification(irq_notif, *irq_threshold)
+                .map_err(|_| VirtqueueError::IrqWaitFailed)?;
+            *irq_threshold += 1;
+            let pending = transport.read_interrupt_status();
+            transport.clear_interrupt_ack(pending);
+        }
+    }
+
+    /// Free a descriptor chain back to the free list.
     ///
     /// Walks the chain via `next` pointers and returns all descriptors
     /// to the head of the free list.
@@ -250,9 +330,7 @@ impl Virtqueue {
             loop {
                 let entry = desc.read(idx as usize);
                 count += 1;
-
                 if entry.flags & VIRTQ_DESC_F_NEXT == 0 {
-                    // Last descriptor — point its next to prev free_head.
                     desc.write(idx as usize, VirtqDesc {
                         addr: 0,
                         len: 0,
@@ -261,12 +339,10 @@ impl Virtqueue {
                     });
                     break;
                 }
-
                 idx = entry.next;
             }
             count
         };
-
         self.free_head = head;
         self.num_free += count;
     }

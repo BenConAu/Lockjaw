@@ -9,9 +9,12 @@ pub mod clock;
 pub mod devmgr;
 pub mod dma;
 pub mod display;
+pub mod driver_runtime;
 pub mod fs;
 pub mod handle;
 pub mod time;
+pub mod virtio;
+pub mod virtio_blk;
 pub mod virtqueue;
 
 // Re-export the ELF parser and load planner from lockjaw-types

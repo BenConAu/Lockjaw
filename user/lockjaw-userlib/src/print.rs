@@ -49,6 +49,28 @@ pub fn put_hex(mut n: u64) {
     sys_debug_puts(&buf[..2 + digits]);
 }
 
+/// Emit `prefix` immediately followed by `suffix` as one atomic
+/// syscall so concurrent debug output cannot interleave between
+/// them. Use for "name: message" log lines where both parts arrive
+/// at runtime (e.g. driver_runtime's phase logs).
+///
+/// Combined output is truncated to the 256-byte stack buffer.
+/// A log helper that PANICKED on overflow would be the worst
+/// failure mode — a driver could lose its IRQ handler over a long
+/// log message. Truncation preserves the syscall's atomicity and
+/// keeps the visible message intact for the common cases.
+pub fn puts2(prefix: &str, suffix: &str) {
+    let mut buf = [0u8; 256];
+    let p = prefix.as_bytes();
+    let s = suffix.as_bytes();
+    let plen = p.len().min(buf.len());
+    buf[..plen].copy_from_slice(&p[..plen]);
+    let remaining = buf.len() - plen;
+    let slen = s.len().min(remaining);
+    buf[plen..plen + slen].copy_from_slice(&s[..slen]);
+    sys_debug_puts(&buf[..plen + slen]);
+}
+
 /// Print via IPC to a UART server endpoint. Each character is a sys_call,
 /// which binds/releases the given Reply object once per byte.
 pub fn ipc_puts(ep: EndpointHandle, reply: ReplyHandle, s: &str) {

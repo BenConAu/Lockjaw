@@ -398,3 +398,39 @@ Until that's diagnosed, all reads use CMD17 single-block (validated on Pi as M6 
 3. Add a "release if no references remain" path: either pass the pageset handle in the release RPC so device-manager can ask the kernel about outstanding references, or build a typed `Drop` on `ClaimedDevice` that performs `close-then-release` atomically so direct misuse becomes impossible.
 
 **Why bootstrap:** all current drivers either use `CMD_CLAIM_BY_ADDR` via `claim_typed` (which enforces the ordering) or halt on failure. The leaks only matter for graceful-restart flows that the kernel doesn't yet expose, and the race only manifests if a future caller bypasses `claim_typed`.
+
+---
+
+## Phase 4B follow-ups (deferred from the paired review)
+
+These are remnants of the Phase 4B paired-review punchlist that didn't gate the commit. Tracked here so they don't quietly drift past the drivers that would surface them.
+
+### Compiled `escape_valve_cprman` example before Phase 7
+
+**Where:** `user/lockjaw-userlib/examples/escape_valve_cprman.rs` (does not yet exist) or an equivalent doctest on `driver_runtime::boot_stub!`.
+
+**What:** The Phase 4B docs chapter promises a compiled example demonstrating the Tier-A escape-valve composition (`boot_stub!` + `driver_bootstrap` + `probe_by_hash` + `claim_typed`) for the no-IRQ cprman shape. Today the pattern only exists as a markdown snippet in the docs chapter. Without a compiled artifact, `cargo check --examples` cannot catch when an API change to Tier-A breaks the documented pattern.
+
+**Fix:** Add `user/lockjaw-userlib/examples/escape_valve_cprman.rs` (or a doctest on `boot_stub!`) that compiles the cprman-style flow against a placeholder layout struct. Land before Phase 7 (cprman conversion) so the actual driver picks up a known-compiling reference.
+
+**Why bootstrap:** the markdown snippet matches reality today; Phase 5 (uart) and Phase 6 (ramfb) use the standard `driver_main!` path and don't exercise the escape valve. The drift risk is real but lags the actual driver conversion that needs the pattern.
+
+### `Status::insert` rename
+
+**Where:** `xtask/src/gen_regs.rs::emit_flags_newtype` emits a `pub const fn insert(self, other: Self)` method on every generated flags newtype. Used throughout `user/lockjaw-userlib/src/virtio.rs` (state transitions in `acknowledge`, `driver`, `features_ok`, `driver_ok`).
+
+**What:** `Status::ACKNOWLEDGE.insert(Status::DRIVER)` reads like `BTreeSet::insert` (mutating in place) but actually returns a new value (`Self(self.0 | other.0)`). The misleading mental model is harmless when there's only one device using it; once the third device's flags land it will start confusing readers (and Codex / Claude reviewers picking up driver code).
+
+**Fix:** Rename `insert` → `union` in the codegen emitter (and add the corresponding `intersection` for the `&`-shaped operation if a use case appears). Regenerate every device's `lockjaw-regs/src/*.rs` and update the `lockjaw-userlib::virtio` callsites. Or — if the bitwise operator-style reads better at every callsite — replace `insert/remove` with plain `BitOr | / BitAnd &` and drop the named methods entirely.
+
+**Why bootstrap:** cosmetic; the current code is correct; no future bug is gated. Driver authors who reach for the flags newtype today have only `Status` to deal with and the call site is obvious in context.
+
+### `bind_irq` returning the initial threshold
+
+**Where:** `user/lockjaw-userlib/src/driver_runtime.rs::bind_irq` returns `Result<NotificationHandle, IrqBindError>`. The caller (today: `user/virtio-blk-driver/src/main.rs:296-302`) hard-codes `irq_threshold: 1` and documents the kernel's notification-counter semantics inline.
+
+**What:** The "first-IRQ-arrives-at-counter-1" contract is doc-level (a comment on the initialization), not type-level. The next IRQ-driven driver author may pick `0` and silently miss the first interrupt; the comment is only at one callsite.
+
+**Fix:** Change `bind_irq` to return `(NotificationHandle, u64 /* initial_threshold */)` (or a small `BoundIrq { notif, initial_threshold }` struct). The threshold contract becomes type-level — the second IRQ-driven driver gets the right starting value by construction. Callers `let (notif, threshold) = bind_irq(...)?;`.
+
+**Why bootstrap:** only virtio-blk uses an IRQ today via the standard path; the comment at the single use site is a workable substitute. Revisit when the second IRQ-driven driver lands (likely virtio-net or virtio-gpu).
