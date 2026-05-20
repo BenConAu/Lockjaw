@@ -174,8 +174,12 @@ assert_contains "devmgr: claimed device at 0x9020000" "Device manager claim-by-a
 assert_contains "devmgr: serving" "Device manager IPC loop running"
 
 echo "Phase 10 — UART Driver:"
-assert_contains "uart-driver: claimed PL011" "UART driver claimed PL011 from devmgr"
-assert_contains "uart-driver: MMIO mapped" "UART driver mapped MMIO PageSet"
+# Phase 5 conversion replaced the bespoke claim+map sequence with
+# driver_main!'s standard_driver_init. The probe + claim_typed +
+# MMIO map are internal substrate now; assertions cover the visible
+# phase milestones — start, bootstrap+claim done, IRQ bound, loop up.
+assert_contains "uart-driver: starting" "UART driver started"
+assert_contains "uart-driver: bootstrapped" "UART driver bootstrapped + claimed PL011 via driver_main"
 assert_contains "uart-driver: IRQ bound" "UART driver bound IRQ → notification"
 assert_contains "uart-driver: server ready" "UART driver server loop entered"
 

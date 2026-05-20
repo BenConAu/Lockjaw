@@ -7,7 +7,6 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::cell::UnsafeCell;
-use core::ptr;
 use lockjaw_userlib::*;
 use lockjaw_types::fdt::{parse_fdt_into, FdtDevices};
 use lockjaw_types::device::{
@@ -456,49 +455,23 @@ fn handle_probe_device(devices: &mut lockjaw_types::fdt::FdtDevices, msg: &[u64;
         return;
     }
 
-    // Unclaimed: register + map MMIO page temporarily to read device_id.
-    let mmio_ps = match sys_register_device_page(dev.mmio_addr) {
-        Ok(id) => id,
-        Err(_) => {
-            puts("devmgr: probe register FAILED\n");
-            sys_reply(PROBE_ERR, dev.mmio_addr, dev.intid as u64, 0);
-            return;
-        }
-    };
-
-    let probe_va = VMEM.alloc(1).expect("VA exhausted for probe");
-    if !sys_map_pages(mmio_ps, probe_va, MapMemoryAttribute::Device).is_ok() {
-        puts("devmgr: probe map FAILED\n");
-        VMEM.free(probe_va, 1);
-        sys_close_handle(mmio_ps);
-        sys_reply(PROBE_ERR, dev.mmio_addr, dev.intid as u64, 0);
-        return;
-    }
-
-    // Read magic (offset 0) and device_id (offset 8) within the device's
-    // sub-page region. Multiple virtio-mmio devices share a single 4K page
-    // (each device is 512 bytes), so we must add the intra-page offset.
-    let intra_page = dev.mmio_addr & 0xFFF;
-    let dev_base = probe_va + intra_page;
-    let magic = unsafe { ptr::read_volatile(dev_base as *const u32) };
-    let device_id = unsafe { ptr::read_volatile((dev_base + 8) as *const u32) };
-
-    // Teardown: unmap first, then close handle, then free VA.
-    // Ordering matters: VA must not be freed while still mapped.
-    let unmap_ok = sys_unmap_pages(mmio_ps, probe_va).is_ok();
-    sys_close_handle(mmio_ps);
-    if unmap_ok {
-        VMEM.free(probe_va, 1);
-    }
-
-    // Validate magic internally — bad magic means the device is not
-    // a valid virtio-mmio transport.
-    if magic != 0x74726976 {
-        sys_reply(PROBE_ERR, dev.mmio_addr, dev.intid as u64, 0);
-        return;
-    }
-
-    sys_reply(PROBE_OK, dev.mmio_addr, dev.intid as u64, device_id as u64);
+    // Probe is purely structural: return DTB-derived identity only
+    // (mmio_addr + intid). No MMIO mapping, no register peek. The
+    // earlier shape — map page, read magic at +0, read device_id at +8 —
+    // baked virtio-specific knowledge into a supposedly generic handler:
+    //   - the magic check rejected non-virtio devices (PL011's DATA
+    //     register at +0 is not a magic sentinel), which Phase 5
+    //     surfaced; and
+    //   - returning `*(addr+8)` as `device_id` is a virtio convention
+    //     leaking into the probe protocol, harmless for other families
+    //     today only because the only consumer (virtio-blk) happens to
+    //     filter on it.
+    //
+    // Driver-side validation: per-family helpers in lockjaw-userlib
+    // (e.g. `virtio::probe_and_claim_virtio_device`) loop probe →
+    // claim_typed → validate (magic, DeviceID) → release-if-wrong →
+    // try next. This keeps device-manager device-family-agnostic.
+    sys_reply(PROBE_OK, dev.mmio_addr, dev.intid as u64, 0);
 }
 
 // ---------------------------------------------------------------------------

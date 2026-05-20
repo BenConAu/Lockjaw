@@ -1,189 +1,133 @@
 #![no_std]
 #![no_main]
+// Driver-crate body writes zero `unsafe` blocks AND zero
+// `#[allow(unsafe_code)]` attributes. The macro-generated boot
+// stubs in `lockjaw_userlib::boot_stub!` are the single audited
+// location for the boot-entry attributes; the macro's expansion is
+// the only place `#[allow(unsafe_code)]` appears for this build.
+//
+// `#![deny]` (not `#![forbid]`) so the macro-emitted per-item
+// allows on `#[no_mangle]` and `#[link_section]` are honoured.
+// Acceptance grep:
+// `grep -rn 'allow(unsafe_code)' user/uart-driver/src/`
+// MUST return nothing.
+#![deny(unsafe_code)]
 
-const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash.rs"));
-
-#[used]
-#[link_section = ".lockjaw_hash"]
-static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
-use core::ptr;
-use lockjaw_userlib::*;
-
-// ---------------------------------------------------------------------------
-// PL011 UART register offsets
-// ---------------------------------------------------------------------------
-
-const UARTDR: u64 = 0x00;    // Data register (read = RX, write = TX)
-const UARTFR: u64 = 0x18;    // Flag register
-const UARTIMSC: u64 = 0x38;  // Interrupt mask set/clear
-
-const UARTFR_TXFF: u32 = 1 << 5;  // TX FIFO full
-const UARTFR_RXFE: u32 = 1 << 4;  // RX FIFO empty
-const UARTIMSC_RXIM: u32 = 1 << 4; // RX interrupt mask
+use lockjaw_userlib::driver_runtime::{run_event_server, DriverCtx, EventEngine};
+use lockjaw_userlib::{driver_main, puts, sys_exit, PL011_HASH};
+use lockjaw_mmio::region::MappedRegs;
+use lockjaw_regs::pl011::{Flag, Imsc, Pl011};
 
 // ---------------------------------------------------------------------------
-// Constants
+// PL011 helpers (the only "device behaviour" the driver expresses —
+// the rest of the register surface is the generated lockjaw_regs::pl011).
 // ---------------------------------------------------------------------------
 
-
-// ---------------------------------------------------------------------------
-// UART MMIO helpers
-// ---------------------------------------------------------------------------
-
-unsafe fn uart_read32(base: u64, offset: u64) -> u32 {
-    ptr::read_volatile((base + offset) as *const u32)
-}
-
-unsafe fn uart_write32(base: u64, offset: u64, val: u32) {
-    ptr::write_volatile((base + offset) as *mut u32, val);
-}
-
-/// Write a byte to the UART, spinning while TX FIFO is full.
-unsafe fn uart_putc(base: u64, c: u8) {
-    while uart_read32(base, UARTFR) & UARTFR_TXFF != 0 {
+/// Write a byte to the UART, spinning while the TX FIFO is full.
+fn uart_putc(regs: &Pl011, c: u8) {
+    while regs.flag().contains(Flag::TXFF) {
         core::hint::spin_loop();
     }
-    uart_write32(base, UARTDR, c as u32);
+    regs.write_data(c as u32);
 }
 
-/// Write a string to the UART, converting \n to \r\n.
-unsafe fn uart_puts(base: u64, s: &str) {
+/// Write a string to the UART, converting `\n` to `\r\n` (PL011 expects
+/// the explicit CR for terminals that don't auto-translate).
+fn uart_puts(regs: &Pl011, s: &str) {
     for b in s.bytes() {
         if b == b'\n' {
-            uart_putc(base, b'\r');
+            uart_putc(regs, b'\r');
         }
-        uart_putc(base, b);
+        uart_putc(regs, b);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Entry point
+// Event engine — implements the canonical event-loop driver shape.
+// Owns the typed MMIO region; on_ipc forwards a byte to TX, on_irq
+// drains the RX FIFO. The framework owns the sys_wait_any loop, the
+// IRQ-threshold bookkeeping, the IPC receive/reply syscalls, and the
+// bit-mask constants — this driver has ZERO raw `sys_*` calls outside
+// `sys_exit` in the panic handler.
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
-    // Print early banner via sys_debug_putc (kernel UART, known to work)
-    puts("uart-driver: starting\n");
+struct UartEngine {
+    regs: MappedRegs<Pl011>,
+}
 
-    // Allocate our Reply object for outbound sys_call (bootstrap + claim).
-    let reply_obj = match sys_alloc_pages(1).and_then(sys_create_reply) {
-        Ok(h) => h,
-        Err(_) => { puts("uart-driver: create reply FAILED\n"); halt() }
-    };
+impl UartEngine {
+    fn regs(&self) -> &Pl011 { self.regs.regs() }
+}
 
-    // Bootstrap: call init on handle 0 to receive our handles.
-    puts("uart-driver: bootstrapping...\n");
-    let reply = match sys_call_ret4(bootstrap_endpoint(), reply_obj, 0, 0, 0, 0) {
-        Ok(r) => r,
-        Err(_) => { puts("uart-driver: bootstrap FAILED\n"); halt() }
-    };
-    // Bootstrap reply words are raw handle indices exported by init.
-    let uart_srv_ep = EndpointHandle(reply[0]);
-    let devmgr_client = EndpointHandle(reply[1]);
-    puts("uart-driver: bootstrapped\n");
-
-    // Claim a PL011 device from the device manager.
-    let claim = match sys_call_ret4(devmgr_client, reply_obj, CMD_CLAIM_DEVICE, PL011_HASH, 0, 0) {
-        Ok(r) => r,
-        Err(_) => { puts("uart-driver: claim call FAILED\n"); halt() }
-    };
-    if claim[0] != CLAIM_OK {
-        puts("uart-driver: no PL011 available\n");
-        halt()
-    }
-    let mmio_pageset = PageSetHandle(claim[1]);
-    let uart_intid = claim[2];
-    puts("uart-driver: claimed PL011\n");
-
-    // Step 1: Map UART MMIO page into our address space
-    let uart_va = VMEM.alloc(1).expect("VA exhausted for UART MMIO");
-    if !sys_map_pages(mmio_pageset, uart_va, MapMemoryAttribute::Device).is_ok() {
-        puts("uart-driver: map MMIO FAILED\n");
-        halt()
-    }
-    puts("uart-driver: MMIO mapped\n");
-
-    // Step 2: Create a notification for the UART RX interrupt
-    let notif_handle = match sys_alloc_pages(1).and_then(sys_create_notification) {
-        Ok(h) => h,
-        Err(_) => { puts("uart-driver: create notif FAILED\n"); halt() }
-    };
-    puts("uart-driver: notification created\n");
-
-    // Step 3: Bind UART IRQ to the notification
-    if !sys_bind_irq(uart_intid, notif_handle).is_ok() {
-        puts("uart-driver: bind IRQ FAILED\n");
-        halt()
-    }
-    puts("uart-driver: IRQ bound\n");
-
-    // Step 4: Enable PL011 RX interrupt via mapped MMIO
-    unsafe {
-        let imsc = uart_read32(uart_va, UARTIMSC);
-        uart_write32(uart_va, UARTIMSC, imsc | UARTIMSC_RXIM);
+impl EventEngine for UartEngine {
+    fn on_ipc(&mut self, msg: u64) -> u64 {
+        // IPC TX request: the message word is the byte to send.
+        uart_putc(self.regs(), msg as u8);
+        0
     }
 
-    // Print banner via UART1 (our own mapped UART)
-    unsafe { uart_puts(uart_va, "uart-driver: UART1 active\n"); }
-    // Also confirm via kernel UART0
+    fn on_irq(&mut self) {
+        // Drain the RX FIFO; echo each character (CR also produces LF).
+        while !self.regs().flag().contains(Flag::RXFE) {
+            let ch = (self.regs().read_data() & 0xFF) as u8;
+            uart_putc(self.regs(), ch);
+            if ch == b'\r' {
+                uart_putc(self.regs(), b'\n');
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Driver main — invoked by the driver_main! macro after boot, probe,
+// claim, IRQ bind. Enables PL011's RX interrupt, prints a UART1 banner,
+// then hands off to `run_event_server`.
+// ---------------------------------------------------------------------------
+
+fn uart_main(ctx: DriverCtx<Pl011>) -> ! {
+    let mut engine = UartEngine { regs: ctx.regs };
+
+    // Enable PL011 RX interrupt. Bit ops over Imsc (BitOr is emitted
+    // by the generated flags newtype); we OR RXIM into the current
+    // mask, preserving TXIM and any future bits the spec adds.
+    engine.regs().set_imsc(engine.regs().imsc() | Imsc::RXIM);
+
+    // Kernel-debug-channel confirmation FIRST: proves driver code
+    // reached this point regardless of UART1 state. Only AFTER that
+    // do we write the UART1 banner through `uart_putc`'s unbounded
+    // TXFF spin-loop. On a board with a marginal PL011 (or any TX-
+    // broken state) the spin would otherwise hang the driver here
+    // and the "server ready" log line would never appear, leading
+    // to a misdiagnosis as init failure. See docs/tech-debt.md
+    // ("PL011 TX wait is unbounded") for the deadline-bounded
+    // follow-up that makes the spin itself fail-fast.
     puts("uart-driver: server ready\n");
+    uart_puts(engine.regs(), "uart-driver: UART1 active\n");
 
-    // Step 5: Event-driven server loop using sys_wait_any.
-    // uart_srv_ep = IPC endpoint for character requests from init.
-    // notif_handle = notification bound to the UART RX IRQ.
-    // The thread sleeps until either an IPC message or an IRQ arrives.
-    // WaitEntry.handle is raw u64 because wait_any accepts mixed types.
-    let mut irq_threshold: u64 = 1;
-    let mut entries = [
-        WaitEntry { handle: uart_srv_ep.0, threshold: 0 },
-        WaitEntry { handle: notif_handle.0, threshold: irq_threshold },
-    ];
-
-    loop {
-        let mask = match sys_wait_any(&entries) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        // Bit 0: endpoint ready — IPC TX request
-        if mask & 1 != 0 {
-            if let Ok(ch) = sys_receive(uart_srv_ep) {
-                unsafe { uart_putc(uart_va, ch as u8); }
-            }
-            sys_reply(0, 0, 0, 0);
-        }
-
-        // Bit 1: notification ready — UART RX interrupt fired
-        if mask & 2 != 0 {
-            unsafe {
-                // Drain the RX FIFO
-                while uart_read32(uart_va, UARTFR) & UARTFR_RXFE == 0 {
-                    let ch = (uart_read32(uart_va, UARTDR) & 0xFF) as u8;
-                    // Echo the character back
-                    uart_putc(uart_va, ch);
-                    // Echo newline as \r\n
-                    if ch == b'\r' {
-                        uart_putc(uart_va, b'\n');
-                    }
-                }
-            }
-            // Advance threshold for the next IRQ
-            irq_threshold += 1;
-            entries[1].threshold = irq_threshold;
-        }
-    }
-}
-
-/// Terminate the process. EL0 `wfi`-loops keep the thread `Running`
-/// from the scheduler's POV — they don't block; they spin a
-/// tick-period each iteration. Use sys_exit so the scheduler removes
-/// us from rotation.
-fn halt() -> ! {
-    sys_exit();
+    run_event_server(
+        &mut engine,
+        ctx.server_ep,
+        ctx.irq_notif,
+        ctx.irq_initial_threshold,
+    )
 }
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     puts("uart-driver: PANIC\n");
     sys_exit();
+}
+
+// ---------------------------------------------------------------------------
+// Driver boot — generated by the macro. The macro's expansion site
+// is the single location where the driver build carries
+// `#[allow(unsafe_code)]`; the driver crate body is unsafe-free.
+// ---------------------------------------------------------------------------
+
+driver_main! {
+    name = "uart-driver",
+    hash = LOCKJAW_SOURCE_HASH,
+    probe_hash = PL011_HASH,
+    layout = Pl011,
+    main = uart_main,
 }

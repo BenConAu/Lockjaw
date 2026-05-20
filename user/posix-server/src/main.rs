@@ -429,7 +429,9 @@ fn handle_file_open(
     };
     if !sys_map_pages(opened.pageset, buffer_va, MapMemoryAttribute::Normal).is_ok() {
         let _ = sys_close_handle(opened.pageset);
-        VMEM.free(buffer_va, 1);
+        // No mapping ever established — return VA via the
+        // alloc-but-never-mapped path.
+        VMEM.free_unused_allocation(buffer_va, 1);
         close_remote_or_defer(fs, deferred, opened.handle);
         sys_reply(neg_errno(ENOMEM), 0, 0, 0);
         return;
@@ -438,9 +440,13 @@ fn handle_file_open(
     let fd = match fd_table.alloc(FdEntry::file(opened.handle, flags as u32)) {
         Ok(fd) => fd,
         Err(_) => {
-            let _ = sys_unmap_pages(opened.pageset, buffer_va);
+            // Mapping was established; tear it down via the
+            // proof-token path. VA leaks on unmap failure (the safer
+            // failure mode vs. aliasing on reuse).
+            if let Ok(p) = unmap_pages_tracked(opened.pageset, buffer_va, 1) {
+                VMEM.free_unmapped(p);
+            }
             let _ = sys_close_handle(opened.pageset);
-            VMEM.free(buffer_va, 1);
             close_remote_or_defer(fs, deferred, opened.handle);
             sys_reply(neg_errno(EMFILE), 0, 0, 0);
             return;
@@ -539,9 +545,12 @@ fn handle_file_close(
             // or BadFd (we just looked it up). Either is unreachable.
             let _ = fd_table.close(fd as u32);
             if let Some(r) = file_resources[fd as usize].take() {
-                let _ = sys_unmap_pages(r.buffer_pageset, r.buffer_va);
+                // Construction-safe teardown: VA returns to VMEM only
+                // if unmap succeeded (VaUnmapped proof).
+                if let Ok(p) = unmap_pages_tracked(r.buffer_pageset, r.buffer_va, 1) {
+                    VMEM.free_unmapped(p);
+                }
                 let _ = sys_close_handle(r.buffer_pageset);
-                VMEM.free(r.buffer_va, 1);
             }
             sys_reply(0, 0, 0, 0);
         }

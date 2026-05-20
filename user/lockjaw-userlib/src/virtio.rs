@@ -18,11 +18,24 @@
 //! I/O take `&VirtioTransport`, so the type system enforces "no
 //! I/O before init complete."
 
+use crate::devmgr::{claim_typed, ClaimError};
+use crate::driver_runtime::{
+    bind_irq, driver_bootstrap, probe_by_hash, BootstrapError, DriverCtx,
+    IrqBindError, ProbeError,
+};
+use crate::print::puts2;
+use crate::syscall::IRQ_FLAG_EDGE;
 use crate::virtqueue::Virtqueue;
 use core::marker::PhantomData;
 use lockjaw_mmio::region::MappedRegs;
-use lockjaw_regs::virtio_mmio::{Status, VirtioMmio};
+use lockjaw_regs::virtio_mmio::Status;
+use lockjaw_types::device::VIRTIO_MMIO_HASH;
 use lockjaw_types::virtio::VIRTIO_MMIO_MAGIC_VALUE;
+
+// Re-export the generated layout struct so `virtio_driver_main!`
+// (and per-family device wrappers) can name it via $crate::virtio::VirtioMmio
+// without forcing every consumer to take a lockjaw-regs import.
+pub use lockjaw_regs::virtio_mmio::VirtioMmio;
 
 /// Errors a VirtIO init step can produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +128,7 @@ impl VirtioTransportInit<Reset> {
 impl VirtioTransportInit<Acknowledged> {
     /// Spec step 3: assert we have a driver.
     pub fn driver(self) -> VirtioTransportInit<DriverSelected> {
-        self.regs.regs().set_status(Status::ACKNOWLEDGE.insert(Status::DRIVER));
+        self.regs.regs().set_status(Status::ACKNOWLEDGE | Status::DRIVER);
         VirtioTransportInit { regs: self.regs, _state: PhantomData }
     }
 }
@@ -148,7 +161,7 @@ impl VirtioTransportInit<FeaturesWritten> {
         -> Result<VirtioTransportInit<FeaturesAccepted>, VirtioInitError>
     {
         let cur = self.regs.regs().status();
-        self.regs.regs().set_status(cur.insert(Status::FEATURES_OK));
+        self.regs.regs().set_status(cur | Status::FEATURES_OK);
         if !self.regs.regs().status().contains(Status::FEATURES_OK) {
             self.regs.regs().set_status(Status::FAILED);
             return Err(VirtioInitError::DeviceRejectedFeatures);
@@ -210,10 +223,7 @@ impl VirtioTransportInit<QueuesReady> {
     /// returned `VirtioTransport`.
     pub fn driver_ok(self) -> VirtioTransport {
         self.regs.regs().set_status(
-            Status::ACKNOWLEDGE
-                .insert(Status::DRIVER)
-                .insert(Status::FEATURES_OK)
-                .insert(Status::DRIVER_OK)
+            Status::ACKNOWLEDGE | Status::DRIVER | Status::FEATURES_OK | Status::DRIVER_OK
         );
         VirtioTransport { regs: self.regs }
     }
@@ -291,4 +301,148 @@ impl VirtioTransport {
     pub(crate) fn regs(&self) -> &VirtioMmio {
         self.regs.regs()
     }
+}
+
+// ---------------------------------------------------------------------------
+// virtio-family driver init (the analogue of `standard_driver_init` for the
+// virtio device family).
+//
+// Generic probe is now purely structural — devmgr returns DTB-derived
+// identity only, no MMIO peek (see Phase 5 devmgr changes). Virtio-specific
+// validation (magic value + DeviceID match) lives HERE, in the virtio
+// family helper, where it belongs. The helper loops:
+//   probe (next match by VIRTIO_MMIO_HASH)
+//   → claim_typed::<VirtioMmio>
+//   → validate magic + DeviceID
+//   → if mismatch, release back to devmgr and try next
+//   → if match, bind IRQ and return DriverCtx<VirtioMmio>
+//
+// This means even phantom empty virtio-mmio slots (QEMU populates a few
+// extra slots that all read zeros) get correctly skipped: their magic
+// value is 0, not 0x74726976, so VirtioTransportInit::reset rejects
+// them. Without this helper, virtio-blk relied on the empty-slot
+// device_id being 0 — a QEMU convention, not a guarantee.
+// ---------------------------------------------------------------------------
+
+/// Errors `virtio_driver_init` can produce.
+#[derive(Debug, Clone, Copy)]
+pub enum VirtioDriverInitError {
+    Bootstrap(BootstrapError),
+    Probe(ProbeError),
+    Claim(ClaimError),
+    IrqBind(IrqBindError),
+    NoServerEndpoint,
+    /// Walked every matching virtio-mmio slot in the DTB and none had
+    /// the expected DeviceID. Phantom empty slots count toward the
+    /// walk but never match.
+    NoMatchingDeviceId(u32),
+}
+
+/// Initialize a virtio-family driver: probe + claim + validate
+/// (magic + DeviceID) + bind IRQ. Drop-in replacement for
+/// `standard_driver_init` for virtio-mmio devices.
+///
+/// The `expected_device_id` is the per-class DeviceID from the virtio
+/// spec (block = 2, network = 1, gpu = 16, console = 3, ...). Slots
+/// with the wrong DeviceID or with no valid virtio magic are
+/// released back to devmgr; the helper keeps trying until a match
+/// or until devmgr runs out of matching slots.
+///
+/// Returns the standard `DriverCtx<VirtioMmio>`; the driver then
+/// runs `VirtioTransportInit::reset(ctx.regs)` to start the typed
+/// init chain. (The validation read consumed the regs ephemerally;
+/// the returned ctx contains a fresh `MappedRegs<VirtioMmio>` for
+/// the matched device.)
+pub fn virtio_driver_init(
+    name: &str,
+    expected_device_id: u32,
+) -> Result<DriverCtx<VirtioMmio>, VirtioDriverInitError> {
+    let boot = driver_bootstrap().map_err(VirtioDriverInitError::Bootstrap)?;
+    puts2(name, ": bootstrapped\n");
+    let server_ep = boot.server_ep.ok_or(VirtioDriverInitError::NoServerEndpoint)?;
+
+    let mut skip: u64 = 0;
+    loop {
+        let probe = match probe_by_hash(&boot, VIRTIO_MMIO_HASH, skip) {
+            Ok(p) => p,
+            Err(ProbeError::NotFound) => {
+                return Err(VirtioDriverInitError::NoMatchingDeviceId(expected_device_id));
+            }
+            Err(e) => return Err(VirtioDriverInitError::Probe(e)),
+        };
+        let claimed = claim_typed::<VirtioMmio>(boot.devmgr_ep, boot.reply_obj, probe.mmio_addr)
+            .map_err(VirtioDriverInitError::Claim)?;
+
+        // Validate: magic value first (filters phantom empty slots),
+        // then DeviceID (filters non-matching virtio device classes).
+        // Both reads go through the typed register accessors so no
+        // raw MMIO touches a non-virtio device.
+        let magic = claimed.regs.regs().read_magic_value();
+        let device_id = claimed.regs.regs().read_device_id();
+        if magic == VIRTIO_MMIO_MAGIC_VALUE && device_id == expected_device_id {
+            // Match. Bind IRQ and return.
+            let bound = bind_irq(claimed.irq_intid, IRQ_FLAG_EDGE)
+                .map_err(VirtioDriverInitError::IrqBind)?;
+            puts2(name, ": IRQ bound\n");
+            return Ok(DriverCtx {
+                regs: claimed.regs,
+                irq_intid: claimed.irq_intid,
+                irq_notif: bound.notif,
+                irq_initial_threshold: bound.initial_threshold,
+                server_ep,
+                devmgr_ep: boot.devmgr_ep,
+                reply_obj: boot.reply_obj,
+                mmio_pageset: claimed.mmio_pageset,
+            });
+        }
+
+        // Wrong family (NotVirtio — phantom slot) or right family but
+        // wrong DeviceID (e.g. virtio-net while we wanted virtio-blk).
+        // Release back to devmgr so a future driver can claim it.
+        claimed.release(boot.devmgr_ep, boot.reply_obj);
+        skip += 1;
+    }
+}
+
+/// `driver_main!`'s virtio-family sibling: same boot stub + ceremony,
+/// but uses `virtio_driver_init` instead of `standard_driver_init`
+/// so phantom empty virtio-mmio slots are correctly skipped and the
+/// DeviceID match lives in the virtio family layer (not the generic
+/// probe path).
+///
+/// Driver crate body becomes:
+/// ```ignore
+/// virtio_driver_main! {
+///     name = "blk",
+///     hash = MY_SOURCE_HASH,
+///     device_id = DEVICE_ID_BLOCK,
+///     main = virtio_blk_main,
+/// }
+/// fn virtio_blk_main(ctx: DriverCtx<VirtioMmio>) -> ! { ... }
+/// ```
+#[macro_export]
+macro_rules! virtio_driver_main {
+    (
+        name = $name:literal,
+        hash = $hash:ident,
+        device_id = $dev_id:expr,
+        main = $main:ident $(,)?
+    ) => {
+        $crate::boot_stub! {
+            hash = $hash,
+            main = __lockjaw_virtio_driver_entry,
+        }
+        fn __lockjaw_virtio_driver_entry() -> ! {
+            $crate::puts(concat!($name, ": starting\n"));
+            let ctx: $crate::driver_runtime::DriverCtx<
+                $crate::virtio::VirtioMmio
+            > = match $crate::virtio::virtio_driver_init($name, $dev_id) {
+                Ok(c) => c,
+                Err(_) => $crate::driver_runtime::boot_puts_and_halt(
+                    concat!($name, ": init failed\n")
+                ),
+            };
+            $main(ctx)
+        }
+    };
 }

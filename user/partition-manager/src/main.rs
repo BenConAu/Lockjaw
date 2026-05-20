@@ -41,11 +41,16 @@ impl BootstrapBuf {
 
     /// Full 4-step teardown. Must be called on the normal (non-halt) path.
     /// Order matches docs/partition-manager-plan.md §6 and fat32-server:
-    ///   sys_unmap → VMEM.free → upstream.free_buffer → sys_close_handle
+    ///   sys_unmap → VMEM.free_unmapped → upstream.free_buffer → sys_close_handle
+    ///
+    /// Type-level VA-leak-on-unmap-failure invariant: VMEM accepts
+    /// the freed VA only via `VaUnmapped` proof; on unmap failure the
+    /// VA stays leaked (safer than aliasing on reuse).
     fn teardown(self, upstream: &mut BlockClient) {
         if self.va != 0 {
-            sys_unmap_pages(self.pageset, self.va);
-            VMEM.free(self.va, 1);
+            if let Ok(p) = unmap_pages_tracked(self.pageset, self.va, 1) {
+                VMEM.free_unmapped(p);
+            }
         }
         upstream.free_buffer(self.buffer_id).ok();
         sys_close_handle(self.pageset);

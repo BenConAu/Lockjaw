@@ -37,7 +37,7 @@ pub use syscall::*;
 pub use print::*;
 pub use process::{ProcessMapping, FLAG_EXECUTABLE};
 pub use lockjaw_types::process::PROCESS_MAPPINGS_PER_PAGE;
-pub use virtual_memory::VMEM;
+pub use virtual_memory::{unmap_pages_tracked, VaUnmapped, VMEM};
 pub use handle::*;
 
 /// Zero a page at the given virtual address.

@@ -87,11 +87,13 @@ pub extern "C" fn _start() -> ! {
     }
     sys_debug_puts(&out[..len]);
 
-    // Cleanup.
+    // Cleanup. Proof-token teardown: VA returns to VMEM only on
+    // successful unmap (the safer failure mode vs. aliasing on reuse).
     let _ = fs.close(opened.handle);
-    let _ = sys_unmap_pages(opened.pageset, buf_va);
+    if let Ok(p) = unmap_pages_tracked(opened.pageset, buf_va, 1) {
+        VMEM.free_unmapped(p);
+    }
     let _ = sys_close_handle(opened.pageset);
-    VMEM.free(buf_va, 1);
 
     puts("[FAT32-TEST] done\n");
     sys_exit();

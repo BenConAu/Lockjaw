@@ -12,8 +12,8 @@
 //! still doing the raw `CMD_CLAIM_BY_ADDR` dance.
 
 use crate::handle::{EndpointHandle, PageSetGuard, PageSetHandle, ReplyHandle};
-use crate::syscall::{sys_call_ret4, sys_map_pages};
-use crate::virtual_memory::VMEM;
+use crate::syscall::{sys_call_ret4, sys_close_handle, sys_map_pages};
+use crate::virtual_memory::{unmap_pages_tracked, VMEM};
 use lockjaw_mmio::region::MappedRegs;
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_types::device::{CMD_CLAIM_BY_ADDR, CMD_RELEASE_BY_ADDR, CLAIM_OK};
@@ -30,6 +30,42 @@ pub struct ClaimedDevice<T: 'static> {
     /// this; it's exposed for callers that want to participate in
     /// later revocation flows.
     pub mmio_pageset: PageSetHandle,
+    /// Original MMIO physical address — needed by `release()` to
+    /// send `CMD_RELEASE_BY_ADDR`. Crate-private so the driver-facing
+    /// surface stays narrow.
+    pub(crate) mmio_addr: u64,
+    /// Allocator-side virtual address (page-aligned). `regs` exposes
+    /// `va + intra-page-offset`; release needs `page_va` to call
+    /// `sys_unmap_pages` and `VMEM.free`. Crate-private.
+    pub(crate) page_va: u64,
+}
+
+impl<T: 'static> ClaimedDevice<T> {
+    /// Tear down a claim: unmap, free the VA (if unmap succeeded),
+    /// close the pageset, and notify the device manager via
+    /// `CMD_RELEASE_BY_ADDR` so the same `mmio_addr` becomes
+    /// claimable again.
+    ///
+    /// Used by per-family probe helpers (e.g.
+    /// `lockjaw_userlib::virtio::probe_and_claim_virtio_device`)
+    /// that need to claim, validate, and release-on-mismatch.
+    ///
+    /// Type-level VA-leak-on-unmap-failure invariant: `VMEM.free_unmapped`
+    /// requires a `VaUnmapped` proof token that only
+    /// `unmap_pages_tracked` produces on success. If unmap fails the
+    /// VA leaks by construction (the alternative — return to VMEM
+    /// while page tables still map it — is an aliasing bug strictly
+    /// worse than a leak). The pageset close and the
+    /// `CMD_RELEASE_BY_ADDR` RPC are unconditional: the device
+    /// manager's claim bit must be cleared regardless of mapping
+    /// state, otherwise the device stays unclaimable forever.
+    pub fn release(self, devmgr_ep: EndpointHandle, reply_obj: ReplyHandle) {
+        if let Ok(proof) = unmap_pages_tracked(self.mmio_pageset, self.page_va, 1) {
+            VMEM.free_unmapped(proof);
+        }
+        sys_close_handle(self.mmio_pageset);
+        release_quietly(devmgr_ep, reply_obj, self.mmio_addr);
+    }
 }
 
 /// Errors `claim_typed` can return.
@@ -124,10 +160,12 @@ pub fn claim_typed<T: 'static>(
     };
     let map_err = sys_map_pages(guard.handle(), page_va, MapMemoryAttribute::Device);
     if !map_err.is_ok() {
-        // Return the reserved VA to the pool, close the exported
-        // pageset (drop guard), THEN release the device-manager
-        // claim. Same ordering rationale as above.
-        VMEM.free(page_va, 1);
+        // No mapping was ever established — safe to return the VA
+        // via the alloc-but-never-mapped path (distinct from the
+        // proof-token path used after a successful unmap). Close
+        // the exported pageset (drop guard), THEN release the
+        // device-manager claim — same ordering as the OOM branch.
+        VMEM.free_unused_allocation(page_va, 1);
         drop(guard);
         release_quietly(devmgr_ep, reply_obj, mmio_addr);
         return Err(ClaimError::MapFailed);
@@ -142,13 +180,13 @@ pub fn claim_typed<T: 'static>(
     // owns the pageset for its whole lifetime.
     let regs = unsafe { MappedRegs::<T>::new(mmio_va) };
 
-    Ok(ClaimedDevice { regs, irq_intid, mmio_pageset })
+    Ok(ClaimedDevice { regs, irq_intid, mmio_pageset, mmio_addr, page_va })
 }
 
 /// Fire-and-forget `CMD_RELEASE_BY_ADDR`. Used on `claim_typed`
-/// error paths to free the device-manager's claim so retries work.
-/// We ignore the IPC reply because there's nothing useful to do if
-/// release itself fails (we're already on an error path).
-fn release_quietly(devmgr_ep: EndpointHandle, reply_obj: ReplyHandle, mmio_addr: u64) {
+/// error paths and `ClaimedDevice::release` to free the device-
+/// manager's claim so retries work. We ignore the IPC reply because
+/// there's nothing useful to do if release itself fails.
+pub(crate) fn release_quietly(devmgr_ep: EndpointHandle, reply_obj: ReplyHandle, mmio_addr: u64) {
     let _ = sys_call_ret4(devmgr_ep, reply_obj, CMD_RELEASE_BY_ADDR, mmio_addr, 0, 0);
 }

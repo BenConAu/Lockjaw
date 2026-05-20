@@ -25,6 +25,8 @@ version = "0.1.0"
 name = "lockjaw-uart-driver"
 version = "0.1.0"
 dependencies = [
+ "lockjaw-mmio",
+ "lockjaw-regs",
  "lockjaw-userlib",
 ]
 

@@ -15,6 +15,7 @@
 - Use drop guards for resource cleanup on failure paths, not manual rollback in each error branch.
 - Push pure state and logic into lockjaw-types where possible so it can be tested on the host.
 - QEMU requires dual UARTs + GICv3. Use the Makefile, not bare `-nographic`.
+- **User-mode drivers consume `lockjaw-userlib`, period.** No raw `sys_*` calls in driver source except `sys_exit` (panic-handler termination) and `sys_debug_puts` (diagnostic puts). Boot ceremony goes through `driver_main!` / `virtio_driver_main!` (or composed Tier-A pieces for escape valves). DMA goes through `OwnedDmaMapping` / `BorrowedDmaMapping` / `alloc_dma_backing`. Event loops go through `run_event_server` / `run_block_server`. IPC framing is the framework's job. If a driver wants to do something the framework doesn't expose, fix the framework — copying raw syscalls into a driver is debt accrual that the next driver author will inherit.
 
 # Prioritization: correctness over speed
 

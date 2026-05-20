@@ -13,6 +13,9 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_types::constants::{USER_VA_END, USER_STACK_BASE};
+use lockjaw_types::syscall::SyscallError;
+use crate::handle::PageSetHandle;
+use crate::syscall::sys_unmap_pages;
 
 /// ELF image base address (ABI anchor, matches linker scripts).
 const IMAGE_BASE: u64 = 0x0040_0000;
@@ -153,8 +156,32 @@ impl VirtualMemory {
         None
     }
 
-    /// Free a previously allocated VA range back to the free pool.
-    pub fn free(&self, va: u64, page_count: usize) {
+    /// Return a previously-mapped + now-unmapped VA range to the
+    /// allocator. The proof token can only come from a successful
+    /// `unmap_pages_tracked` — caller cannot construct one without
+    /// actually unmapping. Type-level guarantee against the
+    /// "page tables still map X, allocator hands X out again"
+    /// aliasing bug class.
+    pub fn free_unmapped(&self, proof: VaUnmapped) {
+        self.free_internal(proof.va, proof.pages);
+    }
+
+    /// Return a VA range that was allocated but NEVER mapped (e.g.
+    /// `sys_map_pages` failed, or `sys_register_device_page` failed
+    /// before the map step, or the caller reserved-then-bailed
+    /// before mapping). Distinct path because there is no "did the
+    /// unmap succeed" question — no mapping was ever established,
+    /// so returning the VA cannot create an aliasing bug.
+    pub fn free_unused_allocation(&self, va: u64, page_count: usize) {
+        self.free_internal(va, page_count);
+    }
+
+    /// Raw free — crate-private. The two public free methods above
+    /// are the only sanctioned entry points; both prove (by type or
+    /// by name) that no mapping currently uses the VA. Tests inside
+    /// this module call `free_internal` directly because they
+    /// exercise the allocator without involving the kernel.
+    pub(crate) fn free_internal(&self, va: u64, page_count: usize) {
         if page_count == 0 {
             return;
         }
@@ -307,6 +334,75 @@ impl VirtualMemory {
 /// Global VM allocator instance. All programs link against this.
 pub static VMEM: VirtualMemory = VirtualMemory::new();
 
+// ---------------------------------------------------------------------------
+// Construction-safe VA reclaim — the unmap-then-free invariant as a type.
+//
+// Calling `sys_unmap_pages` and then `VMEM.free` independently was the
+// recurring bug shape: if unmap failed, the page tables could still map
+// the VA while the allocator thought it was free, and a future caller
+// could be handed an already-mapped range (an aliasing bug strictly
+// worse than a leak). The discipline "only free after successful unmap"
+// failed twice in 100 LOC during Phase 5 review.
+//
+// The fix: encode the discipline as a type. `unmap_pages_tracked`
+// returns a `VaUnmapped` proof token ONLY on success; `VMEM.free_unmapped`
+// requires the token. Code that ignores the unmap result cannot
+// construct the token; the aliasing-bug pattern is unrepresentable.
+// `VMEM.free_unused_allocation` is the audited path for the orthogonal
+// alloc-but-never-mapped case (e.g. `sys_map_pages` failed).
+// ---------------------------------------------------------------------------
+
+/// Proof that `sys_unmap_pages` succeeded for a specific (va, pages)
+/// range. The only way to construct one is via `unmap_pages_tracked`;
+/// the fields are private. Required by `VirtualMemory::free_unmapped`
+/// so it is statically impossible to return a still-mapped VA range
+/// to the allocator.
+///
+/// # Compile-fail soundness guarantee
+///
+/// Construction outside this module is rejected by the privacy of
+/// the fields. The doctest below MUST fail to compile; the
+/// `compile_fail` annotation runs it as a `cargo test --doc` check.
+///
+/// ```compile_fail
+/// use lockjaw_userlib::virtual_memory::VaUnmapped;
+/// // Field-level construction is rejected: `va` and `pages` are
+/// // private to `lockjaw_userlib::virtual_memory`.
+/// let p = VaUnmapped { va: 0, pages: 1 };
+/// ```
+pub struct VaUnmapped {
+    va: u64,
+    pages: usize,
+}
+
+impl VaUnmapped {
+    /// First-page VA of the unmapped range.
+    pub fn va(&self) -> u64 { self.va }
+    /// Page count of the unmapped range.
+    pub fn pages(&self) -> usize { self.pages }
+}
+
+/// Unmap a previously-mapped VA range. On success returns a
+/// `VaUnmapped` proof token that the VA is safe to return to VMEM.
+/// On failure, returns the error AND the VA stays leaked (page
+/// tables may still map it; reusing the VA would create an aliasing
+/// bug — leaking is the safer failure mode).
+///
+/// Pageset close is the caller's responsibility — different release
+/// paths have different pageset-ownership semantics (owned vs
+/// borrowed mapping; claimed device vs DMA backing).
+pub fn unmap_pages_tracked(
+    pageset: PageSetHandle,
+    va: u64,
+    pages: usize,
+) -> Result<VaUnmapped, SyscallError> {
+    let err = sys_unmap_pages(pageset, va);
+    if !err.is_ok() {
+        return Err(err);
+    }
+    Ok(VaUnmapped { va, pages })
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -443,9 +539,9 @@ mod tests {
         let v1 = a.alloc(10).unwrap(); // takes [0x100000, 0x10A000)
         let v2 = a.alloc(10).unwrap(); // takes [0x10A000, 0x114000)
         // Free v1 — should create new region before the remaining free
-        a.free(v1, 10);
+        a.free_internal(v1, 10);
         // Free v2 — should merge with v1's freed region
-        a.free(v2, 10);
+        a.free_internal(v2, 10);
         let regions = free_regions(&a);
         // Should be one contiguous region again
         assert_eq!(regions, vec![(0x10_0000, 100)]);
@@ -457,7 +553,7 @@ mod tests {
         let v1 = a.alloc(10).unwrap();
         let _v2 = a.alloc(10).unwrap();
         // Free v1 — creates [0x100000, 10 pages], existing [0x114000, 80 pages]
-        a.free(v1, 10);
+        a.free_internal(v1, 10);
         let regions = free_regions(&a);
         assert_eq!(regions.len(), 2);
         assert_eq!(regions[0], (0x10_0000, 10));
@@ -469,7 +565,7 @@ mod tests {
         let v1 = a.alloc(10).unwrap();
         let _v2 = a.alloc(10).unwrap();
         assert_eq!(a.alloc(1), None); // full
-        a.free(v1, 10);
+        a.free_internal(v1, 10);
         let v3 = a.alloc(5).unwrap();
         assert_eq!(v3, v1); // reuses freed space
     }
@@ -488,9 +584,9 @@ mod tests {
     fn double_free_is_rejected() {
         let a = make_with_region(0x10_0000, 20);
         let v1 = a.alloc(10).unwrap();
-        a.free(v1, 10);
+        a.free_internal(v1, 10);
         // Double free — should be silently ignored, not corrupt state
-        a.free(v1, 10);
+        a.free_internal(v1, 10);
         let regions = free_regions(&a);
         // Should still have the original freed region + remainder, merged
         assert_eq!(regions, vec![(0x10_0000, 20)]);
@@ -501,10 +597,10 @@ mod tests {
         let a = make_with_region(0x10_0000, 20);
         let v1 = a.alloc(10).unwrap(); // [0x100000, 0x10A000)
         let _v2 = a.alloc(10).unwrap(); // [0x10A000, 0x114000)
-        a.free(v1, 10); // free first block
+        a.free_internal(v1, 10); // free first block
         // Try to free a range that overlaps the now-free first block
         // [0x105000, 0x10F000) overlaps [0x100000, 0x10A000)
-        a.free(0x10_5000, 10);
+        a.free_internal(0x10_5000, 10);
         // Should be rejected — free-list should be unchanged
         let regions = free_regions(&a);
         assert_eq!(regions, vec![(0x10_0000, 10)]);

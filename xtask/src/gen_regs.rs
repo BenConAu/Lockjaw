@@ -759,15 +759,14 @@ fn emit_flags_newtype(out: &mut String, reg: &Register) {
     writeln!(out, "    type Output = Self;").unwrap();
     writeln!(out, "    fn not(self) -> Self {{ Self(!self.0) }}").unwrap();
     writeln!(out, "}}").unwrap();
-    // Phase 4A.1: insert/remove are common bitflags ergonomics. `insert`
-    // returns `self | other`; `remove` returns `self & !other`. Both
-    // const and take `Self` to fit the operator family.
-    writeln!(out, "impl {ty} {{").unwrap();
-    writeln!(out, "    /// Return a copy of `self` with every bit set in `other` also set.").unwrap();
-    writeln!(out, "    pub const fn insert(self, other: Self) -> Self {{ Self(self.0 | other.0) }}").unwrap();
-    writeln!(out, "    /// Return a copy of `self` with every bit set in `other` cleared.").unwrap();
-    writeln!(out, "    pub const fn remove(self, other: Self) -> Self {{ Self(self.0 & !other.0) }}").unwrap();
-    writeln!(out, "}}").unwrap();
+    // Phase 5 design decision: NO named `insert`/`remove`/`union`
+    // methods. The bit-operator family (`|`, `&`, `!`) above is enough
+    // and reads as the operation it actually performs. `insert` read
+    // as a BTreeSet-style mutation when it actually returned a new
+    // value — wrong mental model, would have propagated as more
+    // device families used it. Drivers compose with `a | b` and clear
+    // bits with `a & !b`. If a future use case wants a method-style
+    // surface, add it deliberately at that point — not speculatively.
     writeln!(out).unwrap();
 }
 

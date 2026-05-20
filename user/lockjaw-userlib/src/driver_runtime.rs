@@ -37,10 +37,11 @@ use crate::handle::{
 use crate::print::{puts, puts2};
 use crate::syscall::{
     sys_alloc_pages, sys_bind_irq_flags, sys_call_ret4, sys_create_notification,
-    sys_create_reply, sys_exit, IRQ_FLAG_EDGE,
+    sys_create_reply, sys_exit, sys_receive, sys_reply, sys_wait_any, IRQ_FLAG_EDGE,
 };
 use lockjaw_mmio::region::MappedRegs;
 use lockjaw_types::device::{CMD_PROBE_DEVICE, PROBE_END, PROBE_OK};
+use lockjaw_types::wait::WaitEntry;
 
 // ---------------------------------------------------------------------------
 // Tier A — primitive helpers.
@@ -108,9 +109,6 @@ pub struct MmioProbe {
     pub mmio_addr: u64,
     /// Allocated IRQ INTID for the device.
     pub intid: u32,
-    /// Device-type discriminator (per-class meaning — for virtio-mmio
-    /// this is the DeviceID, e.g. 2 for block).
-    pub device_id: u32,
 }
 
 /// Errors `probe_by_hash` can produce.
@@ -118,23 +116,28 @@ pub struct MmioProbe {
 pub enum ProbeError {
     /// IPC to the device manager failed.
     IpcFailed,
-    /// Walked the entire device list with no match.
+    /// Walked the entire device list with no match at `skip`.
     NotFound,
 }
 
-/// Probe the device manager for a device matching `compatible_hash`.
+/// Probe the device manager for the `skip`-th unclaimed device
+/// matching `compatible_hash`. Returns DTB-derived identity only —
+/// no MMIO peek. Per-family discriminators (e.g. virtio's DeviceID)
+/// are the responsibility of family helpers in lockjaw-userlib (see
+/// `virtio::probe_and_claim_virtio_device`).
 ///
-/// Walks index 0, 1, 2, ... until either `PROBE_END` (not found) or
-/// the optional `device_id_filter` matches. For drivers that need
-/// finer-grained match (e.g. virtio-blk wants device_id == 2 among
-/// virtio-mmio matches), pass `Some(id)`; pass `None` to take the
-/// first matching hash.
+/// Skipping protocol: probe returns `PROBE_OK` for unclaimed,
+/// `PROBE_CLAIMED` for already-claimed (transparent skip), `PROBE_ERR`
+/// for register/map failures (also skipped — devices that fail to
+/// register are typically transient), `PROBE_END` when no more
+/// matches at this skip index. The helper walks indices internally
+/// and returns the first unclaimed match.
 pub fn probe_by_hash(
     boot: &DriverBootstrap,
     compatible_hash: u64,
-    device_id_filter: Option<u32>,
+    initial_skip: u64,
 ) -> Result<MmioProbe, ProbeError> {
-    let mut skip: u64 = 0;
+    let mut skip = initial_skip;
     loop {
         let probe = sys_call_ret4(
             boot.devmgr_ep,
@@ -152,16 +155,7 @@ pub fn probe_by_hash(
             skip += 1;
             continue;
         }
-        let mmio_addr = probe[1];
-        let intid = probe[2] as u32;
-        let device_id = probe[3] as u32;
-        if let Some(want) = device_id_filter {
-            if device_id != want {
-                skip += 1;
-                continue;
-            }
-        }
-        return Ok(MmioProbe { mmio_addr, intid, device_id });
+        return Ok(MmioProbe { mmio_addr: probe[1], intid: probe[2] as u32 });
     }
 }
 
@@ -176,8 +170,24 @@ pub enum IrqBindError {
     BindFailed,
 }
 
+/// A freshly-bound IRQ notification — pair of the notification
+/// handle and the initial wait-threshold the caller must use on the
+/// first `sys_wait_notification` (or pass to `run_event_server`).
+///
+/// The kernel's notification counter starts at 0 and the first IRQ
+/// delivery bumps it to 1; the first wait must therefore use
+/// threshold = 1 (waiting for threshold = 0 returns immediately and
+/// misses the first interrupt). Pairing the handle with its initial
+/// threshold makes the contract type-level rather than doc-level.
+pub struct BoundIrq {
+    pub notif: NotificationHandle,
+    pub initial_threshold: u64,
+}
+
 /// Create a notification handle and bind it to `intid` with `flags`
-/// (default `IRQ_FLAG_EDGE` for level-triggered platforms).
+/// (default `IRQ_FLAG_EDGE` for level-triggered platforms). Returns
+/// the bound notification AND the initial wait-threshold so the
+/// caller cannot accidentally start at 0 and miss the first IRQ.
 ///
 /// Resource lifetime: two intermediate handles are guarded.
 /// 1. PageSetHandle between `sys_alloc_pages` and
@@ -186,7 +196,7 @@ pub enum IrqBindError {
 /// 2. NotificationHandle between `sys_create_notification` and
 ///    `sys_bind_irq_flags` — failure of bind must close the unbound
 ///    notification.
-pub fn bind_irq(intid: u32, flags: u64) -> Result<NotificationHandle, IrqBindError> {
+pub fn bind_irq(intid: u32, flags: u64) -> Result<BoundIrq, IrqBindError> {
     let ps_guard = PageSetGuard::new(
         sys_alloc_pages(1).map_err(|_| IrqBindError::AllocFailed)?
     );
@@ -202,7 +212,7 @@ pub fn bind_irq(intid: u32, flags: u64) -> Result<NotificationHandle, IrqBindErr
         // notif_guard drops here and closes the unbound notification.
         return Err(IrqBindError::BindFailed);
     }
-    Ok(notif_guard.take())
+    Ok(BoundIrq { notif: notif_guard.take(), initial_threshold: 1 })
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +235,11 @@ pub struct DriverCtx<T: 'static> {
     pub irq_intid: u32,
     /// Notification handle bound to the IRQ.
     pub irq_notif: NotificationHandle,
+    /// Initial wait-threshold for the IRQ notification — pass to
+    /// `run_event_server` or to the first `sys_wait_notification`.
+    /// Type-level contract (was a hard-coded `1` with an inline doc
+    /// comment in driver code).
+    pub irq_initial_threshold: u64,
     /// Server endpoint the driver receives requests on.
     pub server_ep: EndpointHandle,
     /// Device-manager endpoint, exposed so drivers can issue
@@ -273,22 +288,22 @@ pub enum DriverInitError {
 pub fn standard_driver_init<T: 'static>(
     name: &str,
     compatible_hash: u64,
-    device_id_filter: Option<u32>,
 ) -> Result<DriverCtx<T>, DriverInitError> {
     let boot = driver_bootstrap().map_err(DriverInitError::Bootstrap)?;
     puts2(name, ": bootstrapped\n");
     let server_ep = boot.server_ep.ok_or(DriverInitError::NoServerEndpoint)?;
-    let probe = probe_by_hash(&boot, compatible_hash, device_id_filter)
+    let probe = probe_by_hash(&boot, compatible_hash, 0)
         .map_err(DriverInitError::Probe)?;
     let claimed = claim_typed::<T>(boot.devmgr_ep, boot.reply_obj, probe.mmio_addr)
         .map_err(DriverInitError::Claim)?;
-    let irq_notif = bind_irq(claimed.irq_intid, IRQ_FLAG_EDGE)
+    let bound = bind_irq(claimed.irq_intid, IRQ_FLAG_EDGE)
         .map_err(DriverInitError::IrqBind)?;
     puts2(name, ": IRQ bound\n");
     Ok(DriverCtx {
         regs: claimed.regs,
         irq_intid: claimed.irq_intid,
-        irq_notif,
+        irq_notif: bound.notif,
+        irq_initial_threshold: bound.initial_threshold,
         server_ep,
         devmgr_ep: boot.devmgr_ep,
         reply_obj: boot.reply_obj,
@@ -368,7 +383,6 @@ macro_rules! driver_main {
         name = $name:literal,
         hash = $hash:ident,
         probe_hash = $probe_hash:expr,
-        device_id_filter = $filter:expr,
         layout = $layout:ty,
         main = $main:ident $(,)?
     ) => {
@@ -382,7 +396,6 @@ macro_rules! driver_main {
                 match $crate::driver_runtime::standard_driver_init::<$layout>(
                     $name,
                     $probe_hash,
-                    $filter,
                 ) {
                     Ok(c) => c,
                     Err(_) => $crate::driver_runtime::boot_puts_and_halt(
@@ -392,4 +405,84 @@ macro_rules! driver_main {
             $main(ctx)
         }
     };
+}
+
+// ---------------------------------------------------------------------------
+// Event-loop server (the second canonical driver shape — server endpoint +
+// IRQ notification multiplexed via sys_wait_any).
+//
+// First canonical shape: block-style request/response (`run_block_server`,
+// virtio-blk, future ramfb / emmc2 / fat32 etc.).
+// Second canonical shape: input device + IPC TX (uart-driver, future
+// console / keyboard / serial / polled-but-async devices).
+//
+// The two named bit constants and the IRQ-threshold increment used to
+// live in every event-loop driver as bare `mask & 1` / `mask & 2` magic
+// numbers. Baking them into the framework means a third event-loop
+// driver inherits the right shape automatically and cannot silently
+// reorder the IPC and IRQ branches.
+// ---------------------------------------------------------------------------
+
+/// Canonical event-loop driver — implementations get an IPC callback
+/// and an IRQ callback. The framework owns the `sys_wait_any` loop,
+/// the IRQ-threshold bookkeeping, the IPC receive/reply syscalls, and
+/// the bit-mask constants.
+///
+/// Drivers using this trait have ZERO raw `sys_*` calls in driver
+/// source (except `sys_exit` and panic-handler diagnostics).
+pub trait EventEngine {
+    /// Called when an IPC message arrives on the server endpoint.
+    /// `msg` is the first message word (matches `sys_receive`'s
+    /// return shape). Return the reply word; the framework calls
+    /// `sys_reply(reply_word, 0, 0, 0)` automatically. Drivers that
+    /// don't need to reply with data return `0`.
+    fn on_ipc(&mut self, msg: u64) -> u64;
+
+    /// Called when the bound IRQ fires. Implementation drains FIFOs
+    /// / advances state / clears device interrupt status — the
+    /// framework owns IRQ-threshold bookkeeping.
+    fn on_irq(&mut self);
+}
+
+/// Run the canonical event-loop server for a single-IPC + single-IRQ
+/// driver. Diverging — calls `engine.on_ipc` and `engine.on_irq` as
+/// events fire on `server_ep` / `irq_notif`.
+///
+/// `irq_initial_threshold` should come from `DriverCtx.irq_initial_threshold`
+/// (or the `BoundIrq` returned by `bind_irq`); see `BoundIrq` for the
+/// kernel-counter-vs-threshold contract.
+pub fn run_event_server<E: EventEngine>(
+    engine: &mut E,
+    server_ep: EndpointHandle,
+    irq_notif: NotificationHandle,
+    irq_initial_threshold: u64,
+) -> ! {
+    const SERVER_BIT: u64 = 1 << 0;
+    const IRQ_BIT: u64 = 1 << 1;
+    let mut irq_threshold = irq_initial_threshold;
+    let mut entries = [
+        WaitEntry { handle: server_ep.0, threshold: 0 },
+        WaitEntry { handle: irq_notif.0, threshold: irq_threshold },
+    ];
+    loop {
+        let mask = match sys_wait_any(&entries) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if mask & SERVER_BIT != 0 {
+            let reply = if let Ok(msg) = sys_receive(server_ep) {
+                engine.on_ipc(msg)
+            } else {
+                // Receive failed: still reply to unblock the caller
+                // (matches the pre-Phase-5 ad-hoc loop behaviour).
+                0
+            };
+            sys_reply(reply, 0, 0, 0);
+        }
+        if mask & IRQ_BIT != 0 {
+            engine.on_irq();
+            irq_threshold += 1;
+            entries[1].threshold = irq_threshold;
+        }
+    }
 }

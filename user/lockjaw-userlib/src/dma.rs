@@ -38,9 +38,9 @@
 use crate::handle::{PageSetGuard, PageSetHandle};
 use crate::syscall::{
     sys_alloc_pages, sys_alloc_pages_contiguous, sys_close_handle,
-    sys_map_pages, sys_query_pageset_phys, sys_unmap_pages,
+    sys_map_pages, sys_query_pageset_phys,
 };
-use crate::virtual_memory::VMEM;
+use crate::virtual_memory::{unmap_pages_tracked, VMEM};
 use core::marker::PhantomData;
 use lockjaw_mmio::dma::{DmaCell, DmaSliceDyn, DmaValue};
 use lockjaw_types::addr::PAGE_SIZE;
@@ -257,7 +257,9 @@ impl OwnedDmaMapping {
         let va = VMEM.alloc(pages as usize).ok_or(SyscallError::OUT_OF_MEMORY)?;
         let err = sys_map_pages(guard.handle(), va, MapMemoryAttribute::Normal);
         if !err.is_ok() {
-            VMEM.free(va, pages as usize);
+            // No mapping was ever established — safe to return the
+            // VA via the alloc-but-never-mapped path.
+            VMEM.free_unused_allocation(va, pages as usize);
             return Err(err);
         }
         let pageset = guard.take();
@@ -272,27 +274,30 @@ impl OwnedDmaMapping {
     /// Consume the mapping, unmapping and freeing VA, AND closing the
     /// pageset. Returns the unmap error (if any).
     ///
-    /// **VA-leak-on-unmap-failure invariant:** if `sys_unmap_pages`
-    /// fails, the page tables may still map this VA — returning the
-    /// range to VMEM would risk handing it back to a future
-    /// allocator caller while the old mapping is still live (an
-    /// aliasing bug, worse than a leak). On unmap failure we
-    /// therefore LEAK the VA. The pageset is still closed because
-    /// (a) closing is independent of the mapping state and (b)
-    /// leaking the pageset compounds the failure without helping.
+    /// Type-level VA-leak-on-unmap-failure invariant: VMEM returns the
+    /// VA range to the allocator only via `free_unmapped(VaUnmapped)`,
+    /// and the `VaUnmapped` proof token is only constructible by a
+    /// successful `unmap_pages_tracked`. On unmap failure we cannot
+    /// construct the proof, so the VA is leaked by construction. The
+    /// pageset is still closed because (a) closing is independent of
+    /// the mapping state and (b) leaking the pageset compounds the
+    /// failure without helping.
     ///
     /// After this returns, Drop is a no-op (`armed = false`).
     pub fn unmap(mut self) -> Result<(), SyscallError> {
         self.armed = false;
-        let err = sys_unmap_pages(self.pageset, self.va);
-        if !err.is_ok() {
-            // Leak VMEM range; close the pageset.
-            sys_close_handle(self.pageset);
-            return Err(err);
+        match unmap_pages_tracked(self.pageset, self.va, self.pages as usize) {
+            Ok(proof) => {
+                VMEM.free_unmapped(proof);
+                sys_close_handle(self.pageset);
+                Ok(())
+            }
+            Err(e) => {
+                // VA leaked by construction — no proof, no free.
+                sys_close_handle(self.pageset);
+                Err(e)
+            }
         }
-        VMEM.free(self.va, self.pages as usize);
-        sys_close_handle(self.pageset);
-        Ok(())
     }
 }
 
@@ -309,14 +314,11 @@ impl Drop for OwnedDmaMapping {
         if !self.armed {
             return;
         }
-        // VA-leak-on-unmap-failure invariant (see `unmap`): only
-        // return the VA to VMEM if sys_unmap_pages succeeded.
-        // Otherwise the page tables may still map it; reusing the
-        // VA would create an aliasing bug. Leaking VMEM is the
-        // safer failure mode. Pageset close is unconditional.
-        let unmap_err = sys_unmap_pages(self.pageset, self.va);
-        if unmap_err.is_ok() {
-            VMEM.free(self.va, self.pages as usize);
+        // Same construction-safe pattern as `unmap`: no proof →
+        // no free. The unmap-failure branch leaks the VA, which is
+        // the safer failure mode (vs. aliasing on reuse).
+        if let Ok(proof) = unmap_pages_tracked(self.pageset, self.va, self.pages as usize) {
+            VMEM.free_unmapped(proof);
         }
         sys_close_handle(self.pageset);
     }
@@ -354,7 +356,10 @@ impl BorrowedDmaMapping {
         let va = VMEM.alloc(pages as usize).ok_or(SyscallError::OUT_OF_MEMORY)?;
         let err = sys_map_pages(pageset, va, MapMemoryAttribute::Normal);
         if !err.is_ok() {
-            VMEM.free(va, pages as usize);
+            // No mapping was ever established — safe to return the
+            // VA via the alloc-but-never-mapped path. Pageset not
+            // closed (caller owns it).
+            VMEM.free_unused_allocation(va, pages as usize);
             return Err(err);
         }
         Ok(Self { pageset, va, pa, pages, armed: true })
@@ -364,24 +369,24 @@ impl BorrowedDmaMapping {
     pub fn pageset(&self) -> PageSetHandle { self.pageset }
 
     /// Consume the mapping, unmapping and freeing VA. Returns the
-    /// unmap error if any. Does NOT close the pageset.
+    /// unmap error if any. Does NOT close the pageset (caller owns).
     ///
-    /// **VA-leak-on-unmap-failure invariant:** same as
-    /// `OwnedDmaMapping::unmap` — if `sys_unmap_pages` fails, the
-    /// VA range is LEAKED rather than returned to VMEM, because the
-    /// page tables may still map it and reusing the VA would
-    /// alias. (The caller's pageset handle is unaffected either way.)
+    /// Type-level VA-leak-on-unmap-failure invariant: same as
+    /// `OwnedDmaMapping::unmap` — `VMEM.free_unmapped` requires a
+    /// `VaUnmapped` proof that only `unmap_pages_tracked` produces
+    /// on success. The unmap-failure branch leaks the VA by
+    /// construction.
     ///
     /// After this returns, Drop is a no-op.
     pub fn unmap(mut self) -> Result<(), SyscallError> {
         self.armed = false;
-        let err = sys_unmap_pages(self.pageset, self.va);
-        if !err.is_ok() {
-            // Leak VMEM range; do NOT close caller's pageset.
-            return Err(err);
+        match unmap_pages_tracked(self.pageset, self.va, self.pages as usize) {
+            Ok(proof) => {
+                VMEM.free_unmapped(proof);
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
-        VMEM.free(self.va, self.pages as usize);
-        Ok(())
     }
 }
 
@@ -398,14 +403,56 @@ impl Drop for BorrowedDmaMapping {
         if !self.armed {
             return;
         }
-        // VA-leak-on-unmap-failure invariant (see `unmap`): only
-        // return the VA to VMEM if sys_unmap_pages succeeded.
-        // Pageset is NOT closed (caller still owns it).
-        let unmap_err = sys_unmap_pages(self.pageset, self.va);
-        if unmap_err.is_ok() {
-            VMEM.free(self.va, self.pages as usize);
+        // Construction-safe: no proof → no free. Pageset is NOT
+        // closed (caller still owns it).
+        if let Ok(proof) = unmap_pages_tracked(self.pageset, self.va, self.pages as usize) {
+            VMEM.free_unmapped(proof);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DMA backing allocation without local mapping.
+//
+// Used when a driver allocates a DMA-coherent region to hand to a
+// CLIENT (not to access locally). The client maps the pageset; the
+// driver only needs the PA to program the device. The caller takes
+// ownership of the returned pageset handle — typically tracking it
+// in a slot table — and is responsible for closing it via
+// `close_dma_backing`.
+//
+// Concrete users: virtio-blk-driver's `alloc_buffer` /
+// `free_buffer` (block-engine helpers that allocate DMA buffers
+// requested by the FAT32 filesystem server). Without these helpers
+// the driver crate would have to call `sys_alloc_pages_contiguous`,
+// `sys_query_pageset_phys`, and `sys_close_handle` directly —
+// violating the "drivers don't touch the kernel syscall surface"
+// gate.
+// ---------------------------------------------------------------------------
+
+/// Result of `alloc_dma_backing`: the pageset handle (caller owns)
+/// and the first-page physical address (for device programming).
+pub struct DmaBacking {
+    pub pageset: PageSetHandle,
+    pub pa: u64,
+    pub pages: u64,
+}
+
+/// Allocate a contiguous DMA-coherent backing region without
+/// mapping it locally. Returns the pageset handle (transfer of
+/// ownership to caller) and the first-page PA.
+pub fn alloc_dma_backing(pages: u64) -> Result<DmaBacking, SyscallError> {
+    let pageset = sys_alloc_pages_contiguous(pages)?;
+    let guard = PageSetGuard::new(pageset);
+    let pa = sys_query_pageset_phys(pageset, 0)?;
+    let pageset = guard.take();
+    Ok(DmaBacking { pageset, pa, pages })
+}
+
+/// Close a `DmaBacking`'s pageset handle. Use when the caller is
+/// done with the buffer (no client still holds it). Errors swallowed.
+pub fn close_dma_backing(pageset: PageSetHandle) {
+    sys_close_handle(pageset);
 }
 
 // ---------------------------------------------------------------------------

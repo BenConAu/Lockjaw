@@ -15,19 +15,17 @@
 
 use core::mem::size_of;
 use lockjaw_userlib::block::{BlockEngine, BlockError, BlockInfo, run_block_server};
-use lockjaw_userlib::dma::{BorrowedDmaMapping, DmaMappingView, OwnedDmaMapping};
-use lockjaw_userlib::driver_runtime::DriverCtx;
-use lockjaw_userlib::driver_main;
-use lockjaw_userlib::handle::{NotificationHandle, PageSetHandle};
-use lockjaw_userlib::syscall::{
-    sys_alloc_pages_contiguous, sys_close_handle, sys_query_pageset_phys,
+use lockjaw_userlib::dma::{
+    alloc_dma_backing, close_dma_backing, BorrowedDmaMapping, DmaMappingView,
+    OwnedDmaMapping,
 };
-use lockjaw_userlib::virtio::VirtioTransportInit;
+use lockjaw_userlib::driver_runtime::DriverCtx;
+use lockjaw_userlib::handle::{NotificationHandle, PageSetHandle};
+use lockjaw_userlib::virtio::{VirtioMmio, VirtioTransportInit};
 use lockjaw_userlib::virtio_blk::VirtioBlkDevice;
+use lockjaw_userlib::virtio_driver_main;
 use lockjaw_userlib::virtqueue::{Segment, Virtqueue};
-use lockjaw_userlib::{handle, put_decimal, puts, sys_debug_puts, MapMemoryAttribute, PAGE_SIZE};
-use lockjaw_regs::virtio_mmio::VirtioMmio;
-use lockjaw_types::device::VIRTIO_MMIO_HASH;
+use lockjaw_userlib::{put_decimal, puts, sys_debug_puts, sys_exit, MapMemoryAttribute, PAGE_SIZE};
 use lockjaw_types::virtio::{
     virtqueue_layout, BLK_DRIVER_WANTED, DEVICE_ID_BLOCK, VirtioBlkReqHeader,
     VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,
@@ -97,24 +95,19 @@ impl BlockEngine for VirtioBlkEngine {
             return Err(BlockError::AllocFailed);
         }
         let pages = (sector_count * 512 + PAGE_SIZE - 1) / PAGE_SIZE;
-        // Guard closes the handle on drop if any subsequent step fails;
-        // `take()` on the success path passes ownership to the slot
-        // table.
-        let guard = handle::PageSetGuard::new(
-            sys_alloc_pages_contiguous(pages).map_err(|_| BlockError::AllocFailed)?,
-        );
-        let pa = sys_query_pageset_phys(guard.handle(), 0)
-            .map_err(|_| BlockError::AllocFailed)?;
-        // Track this buffer, then disarm the guard.
+        let backing = alloc_dma_backing(pages).map_err(|_| BlockError::AllocFailed)?;
+        // Track this buffer in the slot table; on success the slot
+        // takes ownership of the pageset (close happens in free_buffer).
+        // On failure (table full) we close immediately so the
+        // allocation doesn't leak.
         for slot in self.dma_buffers.iter_mut() {
             if slot.pa == 0 {
-                let ps = guard.take();
-                *slot = DmaBuffer { ps, pa, sector_count };
+                *slot = DmaBuffer { ps: backing.pageset, pa: backing.pa, sector_count };
                 self.dma_count += 1;
-                return Ok(ps);
+                return Ok(backing.pageset);
             }
         }
-        // Table full — guard drops here and closes the handle.
+        close_dma_backing(backing.pageset);
         Err(BlockError::AllocFailed)
     }
 
@@ -141,7 +134,7 @@ impl BlockEngine for VirtioBlkEngine {
     fn free_buffer(&mut self, buffer: PageSetHandle) {
         for slot in self.dma_buffers.iter_mut() {
             if slot.ps.0 == buffer.0 && slot.pa != 0 {
-                sys_close_handle(slot.ps);
+                close_dma_backing(slot.ps);
                 *slot = DMA_BUFFER_EMPTY;
                 self.dma_count -= 1;
                 return;
@@ -236,7 +229,7 @@ fn virtio_blk_main(ctx: DriverCtx<VirtioMmio>) -> ! {
     // device.
     let init = match VirtioTransportInit::reset(ctx.regs) {
         Ok(i) => i,
-        Err(_) => { puts("blk: not virtio\n"); halt(); }
+        Err(_) => { puts("blk: not virtio\n"); sys_exit(); }
     };
 
     // Linear init: each step returns the next state's type, so
@@ -244,11 +237,11 @@ fn virtio_blk_main(ctx: DriverCtx<VirtioMmio>) -> ! {
     let init = init.acknowledge().driver();
     let init = match init.negotiate(BLK_DRIVER_WANTED) {
         Ok(i) => i,
-        Err(_) => { puts("blk: feature negotiation FAILED\n"); halt(); }
+        Err(_) => { puts("blk: feature negotiation FAILED\n"); sys_exit(); }
     };
     let init = match init.features_ok() {
         Ok(i) => i,
-        Err(_) => { puts("blk: FEATURES_OK rejected\n"); halt(); }
+        Err(_) => { puts("blk: FEATURES_OK rejected\n"); sys_exit(); }
     };
 
     // setup_queue inverts the dependency: it knows queue_num_max
@@ -269,7 +262,7 @@ fn virtio_blk_main(ctx: DriverCtx<VirtioMmio>) -> ! {
         Ok(Virtqueue::new(backing, qs))
     }) {
         Ok(pair) => pair,
-        Err(_) => { puts("blk: setup_queue FAILED\n"); halt(); }
+        Err(_) => { puts("blk: setup_queue FAILED\n"); sys_exit(); }
     };
 
     let device = VirtioBlkDevice::new(init.driver_ok());
@@ -284,7 +277,7 @@ fn virtio_blk_main(ctx: DriverCtx<VirtioMmio>) -> ! {
     // Allocate a page for request headers + status bytes (reused per I/O).
     let req_page = match OwnedDmaMapping::alloc() {
         Ok(p) => p,
-        Err(_) => { puts("blk: alloc req page FAILED\n"); halt(); }
+        Err(_) => { puts("blk: alloc req page FAILED\n"); sys_exit(); }
     };
 
     let mut engine = VirtioBlkEngine {
@@ -293,14 +286,9 @@ fn virtio_blk_main(ctx: DriverCtx<VirtioMmio>) -> ! {
         capacity,
         req_page,
         irq_notif: ctx.irq_notif,
-        // sys_wait_notification waits for the notification counter to
-        // reach the threshold. The kernel's first IRQ delivery bumps
-        // the counter from 0 to 1; starting our threshold at 1 means
-        // the first wait blocks until that first IRQ arrives. Starting
-        // at 0 would return immediately (the device hasn't fired yet
-        // but the counter already satisfies the threshold), missing
-        // the actual first interrupt.
-        irq_threshold: 1,
+        // Initial threshold contract owned by BoundIrq's docstring;
+        // ctx.irq_initial_threshold is its type-level surface here.
+        irq_threshold: ctx.irq_initial_threshold,
         dma_buffers: [DMA_BUFFER_EMPTY; MAX_DMA_BUFFERS],
         dma_count: 0,
     };
@@ -309,7 +297,7 @@ fn virtio_blk_main(ctx: DriverCtx<VirtioMmio>) -> ! {
     let test_buf = engine.alloc_buffer(1).expect("blk: selftest alloc");
     let test_page = match BorrowedDmaMapping::map_existing(test_buf, 1) {
         Ok(p) => p,
-        Err(_) => { puts("blk: selftest map FAILED\n"); halt(); }
+        Err(_) => { puts("blk: selftest map FAILED\n"); sys_exit(); }
     };
     test_page.zero();
     match engine.read(0, 1, test_buf) {
@@ -346,31 +334,28 @@ fn virtio_blk_main(ctx: DriverCtx<VirtioMmio>) -> ! {
     run_block_server(&mut engine, ctx.server_ep)
 }
 
-/// Terminate the driver process. EL0 wfi-loops keep the thread in
-/// `Running` state from the scheduler's POV — they don't block,
-/// they spin a tick-period each iteration after the next IRQ wakes
-/// the CPU. Use `sys_exit` so the scheduler removes us from rotation.
-fn halt() -> ! {
-    lockjaw_userlib::sys_exit();
-}
-
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     puts("blk: PANIC\n");
-    halt();
+    sys_exit();
 }
 
 // ---------------------------------------------------------------------------
-// Driver boot — generated by the macro. The macro's expansion site
-// is the single location where the driver build carries
-// `#[allow(unsafe_code)]`; the driver crate body is unsafe-free.
+// Driver boot — generated by the macro. `virtio_driver_main!` is the
+// virtio-family analogue of `driver_main!`: it uses
+// `virtio::virtio_driver_init` instead of `standard_driver_init`,
+// which loops probe → claim → validate-magic-and-DeviceID →
+// release-if-wrong → try next. This correctly skips phantom empty
+// virtio-mmio slots in QEMU (whose magic is 0, not 0x74726976) AND
+// puts the DeviceID match in the virtio family layer instead of the
+// generic probe path. The macro expansion is the single location
+// where the driver build carries `#[allow(unsafe_code)]`; the
+// driver crate body is unsafe-free.
 // ---------------------------------------------------------------------------
 
-driver_main! {
+virtio_driver_main! {
     name = "blk",
     hash = LOCKJAW_SOURCE_HASH,
-    probe_hash = VIRTIO_MMIO_HASH,
-    device_id_filter = Some(DEVICE_ID_BLOCK),
-    layout = VirtioMmio,
+    device_id = DEVICE_ID_BLOCK,
     main = virtio_blk_main,
 }

@@ -275,7 +275,8 @@ fn handle_open(
     };
     if !sys_map_pages(buffer_ps, buffer_va, MapMemoryAttribute::Normal).is_ok() {
         let _ = sys_close_handle(buffer_ps);
-        VMEM.free(buffer_va, buffer_pages as usize);
+        // No mapping was ever established — alloc-but-never-mapped path.
+        VMEM.free_unused_allocation(buffer_va, buffer_pages as usize);
         sys_reply(FS_ERR_ALLOC, 0, 0, 0);
         return;
     }
@@ -296,9 +297,12 @@ fn handle_open(
     let handle = match table.insert(of) {
         Some(h) => h,
         None => {
-            let _ = sys_unmap_pages(buffer_ps, buffer_va);
+            // Mapping was established; tear it down through the
+            // proof-token path. VA leaks on unmap failure.
+            if let Ok(p) = unmap_pages_tracked(buffer_ps, buffer_va, buffer_pages as usize) {
+                VMEM.free_unmapped(p);
+            }
             let _ = sys_close_handle(buffer_ps);
-            VMEM.free(buffer_va, buffer_pages as usize);
             sys_reply(FS_ERR_TOO_MANY_OPEN, 0, 0, 0);
             return;
         }
@@ -311,9 +315,10 @@ fn handle_open(
             // Roll back the table insert. We just inserted under
             // `caller_token`, so removing under the same token succeeds.
             let removed = table.remove(handle, caller_token).unwrap();
-            let _ = sys_unmap_pages(removed.buffer_ps, removed.buffer_va);
+            if let Ok(p) = unmap_pages_tracked(removed.buffer_ps, removed.buffer_va, removed.buffer_pages as usize) {
+                VMEM.free_unmapped(p);
+            }
             let _ = sys_close_handle(removed.buffer_ps);
-            VMEM.free(removed.buffer_va, removed.buffer_pages as usize);
             sys_reply(FS_ERR_ALLOC, 0, 0, 0);
             return;
         }
@@ -409,9 +414,11 @@ fn handle_close(table: &mut OpenTable, caller_token: u64, handle: u32) {
         Some(of) => of,
         None => { sys_reply(FS_ERR_INVALID, 0, 0, 0); return; }
     };
-    let _ = sys_unmap_pages(of.buffer_ps, of.buffer_va);
+    // Proof-token teardown: VA returns to VMEM only on successful unmap.
+    if let Ok(p) = unmap_pages_tracked(of.buffer_ps, of.buffer_va, of.buffer_pages as usize) {
+        VMEM.free_unmapped(p);
+    }
     let _ = sys_close_handle(of.buffer_ps);
-    VMEM.free(of.buffer_va, of.buffer_pages as usize);
     sys_reply(FS_OK, 0, 0, 0);
 }
 
@@ -470,10 +477,12 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("fat32: BPB parse FAILED\n"); halt(); }
     };
     // Done with the BPB buffer. Free it back to the block driver's pool.
-    let _ = sys_unmap_pages(bpb_buf.pageset, bpb_va);
+    // Proof-token teardown: VA returns to VMEM only on successful unmap.
+    if let Ok(p) = unmap_pages_tracked(bpb_buf.pageset, bpb_va, 1) {
+        VMEM.free_unmapped(p);
+    }
     let _ = blk.free_buffer(bpb_buf.buffer_id);
     let _ = sys_close_handle(bpb_buf.pageset);
-    VMEM.free(bpb_va, 1);
 
     // Allocate the per-mount cluster scratch (sized to the actual cluster).
     let cluster_sectors = geom.sectors_per_cluster as u64;

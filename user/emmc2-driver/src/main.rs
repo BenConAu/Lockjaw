@@ -15,7 +15,6 @@ use lockjaw_userlib::block::{
     BlockEngine, BlockError, BlockInfo, run_block_server,
 };
 use lockjaw_userlib::handle::PageSetGuard;
-use lockjaw_userlib::sys_unmap_pages;
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, sleep_for, Nanos};
 // `monotonic_now` returns `MonoTicks`, which is `Ord`; the comparisons in the
@@ -1055,8 +1054,10 @@ pub extern "C" fn _start() -> ! {
         puts(" BAD (expected 0xAA55)\n");
         halt();
     }
-    let _ = sys_unmap_pages(selftest_buf, selftest_va);
-    VMEM.free(selftest_va, 1);
+    // Proof-token teardown: VA returns to VMEM only on successful unmap.
+    if let Ok(p) = unmap_pages_tracked(selftest_buf, selftest_va, 1) {
+        VMEM.free_unmapped(p);
+    }
     engine.free_buffer(selftest_buf);
 
     puts("[BLOCKDEV] /dev/sd0 ready: 512B x ");

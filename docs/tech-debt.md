@@ -401,11 +401,7 @@ Until that's diagnosed, all reads use CMD17 single-block (validated on Pi as M6 
 
 ---
 
-## Phase 4B follow-ups (deferred from the paired review)
-
-These are remnants of the Phase 4B paired-review punchlist that didn't gate the commit. Tracked here so they don't quietly drift past the drivers that would surface them.
-
-### Compiled `escape_valve_cprman` example before Phase 7
+## Phase 5 follow-up: compiled `escape_valve_cprman` example before Phase 7
 
 **Where:** `user/lockjaw-userlib/examples/escape_valve_cprman.rs` (does not yet exist) or an equivalent doctest on `driver_runtime::boot_stub!`.
 
@@ -413,24 +409,35 @@ These are remnants of the Phase 4B paired-review punchlist that didn't gate the 
 
 **Fix:** Add `user/lockjaw-userlib/examples/escape_valve_cprman.rs` (or a doctest on `boot_stub!`) that compiles the cprman-style flow against a placeholder layout struct. Land before Phase 7 (cprman conversion) so the actual driver picks up a known-compiling reference.
 
-**Why bootstrap:** the markdown snippet matches reality today; Phase 5 (uart) and Phase 6 (ramfb) use the standard `driver_main!` path and don't exercise the escape valve. The drift risk is real but lags the actual driver conversion that needs the pattern.
+**Why bootstrap:** the markdown snippet matches reality today; Phase 5 (uart) and Phase 6 (ramfb) use the standard `driver_main!` / `virtio_driver_main!` paths and don't exercise the escape valve. The drift risk is real but lags the actual driver conversion that needs the pattern.
 
-### `Status::insert` rename
+---
 
-**Where:** `xtask/src/gen_regs.rs::emit_flags_newtype` emits a `pub const fn insert(self, other: Self)` method on every generated flags newtype. Used throughout `user/lockjaw-userlib/src/virtio.rs` (state transitions in `acknowledge`, `driver`, `features_ok`, `driver_ok`).
+## Phase 9 prerequisite: widen `check-driver-unsafe` to also forbid raw `sys_*`
 
-**What:** `Status::ACKNOWLEDGE.insert(Status::DRIVER)` reads like `BTreeSet::insert` (mutating in place) but actually returns a new value (`Self(self.0 | other.0)`). The misleading mental model is harmless when there's only one device using it; once the third device's flags land it will start confusing readers (and Codex / Claude reviewers picking up driver code).
+**Where:** `xtask/src/check_driver_unsafe.rs` (Phase 9 deliverable). The Phase 5 audit established the principle in `CLAUDE.md`: "User-mode drivers consume `lockjaw-userlib`, period. No raw `sys_*` calls in driver source except `sys_exit` and `sys_debug_puts`."
 
-**Fix:** Rename `insert` → `union` in the codegen emitter (and add the corresponding `intersection` for the `&`-shaped operation if a use case appears). Regenerate every device's `lockjaw-regs/src/*.rs` and update the `lockjaw-userlib::virtio` callsites. Or — if the bitwise operator-style reads better at every callsite — replace `insert/remove` with plain `BitOr | / BitAnd &` and drop the named methods entirely.
+**What:** Today the principle is in `CLAUDE.md` and the two converted drivers (uart, virtio-blk) pass it by manual audit (`grep -rEn 'sys_[a-z]' user/<driver>/src/`). Phase 9's `check-driver-unsafe` xtask currently checks only `#![forbid(unsafe_code)]` + `#[allow(unsafe_code)]` absence; it does not enforce the no-raw-`sys_*` rule. Without enforcement, a future driver (Phase 6/7/8 conversions, or a new device-family driver) can quietly re-introduce raw `sys_*` calls.
 
-**Why bootstrap:** cosmetic; the current code is correct; no future bug is gated. Driver authors who reach for the flags newtype today have only `Status` to deal with and the call site is obvious in context.
+**Fix:** Extend `check_driver_unsafe.rs` to also walk every `user/<driver>/src/**/*.rs`, parse for `sys_[a-z_]+\(` identifiers, and fail if any appear outside the `sys_exit` / `sys_debug_puts` allowlist. Same shape as the `#[allow(unsafe_code)]` check — one regex per file, allowlist as a Vec<&str>. Wire into `make build` alongside the existing checks.
 
-### `bind_irq` returning the initial threshold
+**Why bootstrap:** the rule exists today; only two drivers exist today; both already pass the manual grep. The xtask enforcement is best added in Phase 9 alongside the other lockdown checks rather than introducing a partial enforcement now.
 
-**Where:** `user/lockjaw-userlib/src/driver_runtime.rs::bind_irq` returns `Result<NotificationHandle, IrqBindError>`. The caller (today: `user/virtio-blk-driver/src/main.rs:296-302`) hard-codes `irq_threshold: 1` and documents the kernel's notification-counter semantics inline.
+---
 
-**What:** The "first-IRQ-arrives-at-counter-1" contract is doc-level (a comment on the initialization), not type-level. The next IRQ-driven driver author may pick `0` and silently miss the first interrupt; the comment is only at one callsite.
+## PL011 TX wait is unbounded
 
-**Fix:** Change `bind_irq` to return `(NotificationHandle, u64 /* initial_threshold */)` (or a small `BoundIrq { notif, initial_threshold }` struct). The threshold contract becomes type-level — the second IRQ-driven driver gets the right starting value by construction. Callers `let (notif, threshold) = bind_irq(...)?;`.
+**Where:** `user/uart-driver/src/main.rs::uart_putc` (and the parallel pattern any future serial / console / device-with-a-FIFO driver will copy).
 
-**Why bootstrap:** only virtio-blk uses an IRQ today via the standard path; the comment at the single use site is a workable substitute. Revisit when the second IRQ-driven driver lands (likely virtio-net or virtio-gpu).
+**What:** `uart_putc` spins on `Flag::TXFF` with `core::hint::spin_loop` and no timeout. If the PL011 ever stops draining its TX FIFO (marginal board, clock misconfiguration, controller wedge), the driver hangs in this loop forever — not crashes, not reports an error, hangs. Phase 5 deliberately did NOT extend `make illegal states unrepresentable` to "wait forever for the device to maybe respond"; the principle stops at safety, not liveness. But every future driver author who copies `uart_putc` as a template inherits the unbounded-wait pattern, and by the third copy it's the de facto idiom.
+
+The Phase 5 banner-ordering fix in `uart_main` (kernel-debug puts BEFORE UART1 banner) mitigates the symptom for THIS driver — a TX-broken board now shows "uart-driver: server ready" on the kernel UART before the spin engages, so a person can diagnose. But the spin still hangs the server thread; the driver is dead in the water for IPC TX requests.
+
+**Fix:** Introduce a deadline-bounded wait primitive in `lockjaw-userlib`:
+- `spin_until_or_deadline<F: FnMut() -> bool>(check: F, deadline: MonoTicks) -> Result<(), TimeoutError>` — wraps the `core::hint::spin_loop` pattern with a `MonoTicks` deadline cap.
+- `uart_putc(regs, c, deadline) -> Result<(), TxError>` — propagates the deadline; callers must hold one.
+- Then update the EventEngine `on_ipc` contract to either (a) accept a per-IPC deadline derived from a server-default, or (b) document that on_ipc implementations are responsible for deadline discipline.
+
+The bigger architectural move: `uart_putc` is one instance of "poll a hardware bit until it changes or we give up." The same shape appears in SDHCI (`poll_until_clear` / `poll_until_set` in emmc2-driver), in virtio (config-status readback after FEATURES_OK), in any device with a busy bit. A shared `poll_until_deadline` primitive belongs in `lockjaw-userlib` alongside the barriers.
+
+**Why bootstrap:** today's two converted drivers run in QEMU where TX always drains; the hang is only theoretical. Adding deadline plumbing without a concrete liveness failure to debug against would be speculative. Revisit when (a) the first Pi-hardware bring-up surfaces a real spin-forever incident, or (b) the second event-loop driver lands (probably a console for posix) — whichever comes first.
