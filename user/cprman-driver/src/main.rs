@@ -18,8 +18,7 @@ use lockjaw_userlib::clock::{
     CLOCK_OP_SET_RATE, CLOCK_OP_GET_RATE, CLOCK_OP_ENABLE, CLOCK_OP_DISABLE,
     cprman::{ClockId, compute_divider, PLLD_PER_CORE_HZ},
 };
-use lockjaw_userlib::devmgr::claim_typed;
-use lockjaw_userlib::driver_runtime::{driver_bootstrap, probe_by_hash};
+use lockjaw_userlib::driver_runtime::{standard_init_no_irq, ProbeClaimError};
 use lockjaw_userlib::{boot_stub, put_decimal, puts, sys_exit};
 use lockjaw_mmio::region::MappedRegs;
 use lockjaw_regs::cprman::{CmEmmc2Ctl, CmEmmc2CtlSrc, CmEmmc2Div, Cprman};
@@ -183,41 +182,37 @@ impl ClockEngine for CprmanEngine {
 fn cprman_entry() -> ! {
     puts("cprman: starting\n");
 
-    let boot = match driver_bootstrap() {
-        Ok(b) => b,
+    // Tier-B no-IRQ helper: bootstrap → server_ep check → probe + claim.
+    // cprman's failure policy differs from ramfb's: probe/claim
+    // failures degrade to `None` regs and serve `NotSupported` for
+    // every clock op (clock-test harness still exercises the IPC
+    // plumbing end-to-end on QEMU virt where the DTB has no
+    // brcm,bcm2711-cprman entry). Only a true bootstrap failure
+    // halts the driver.
+    let init = match standard_init_no_irq::<Cprman>("cprman", BCM2711_CPRMAN_HASH) {
+        Ok(i) => i,
         Err(_) => { puts("cprman: bootstrap FAILED\n"); sys_exit(); }
     };
-    puts("cprman: bootstrapped\n");
-    let server_ep = match boot.server_ep {
-        Some(ep) => ep,
-        None => { puts("cprman: no server endpoint\n"); sys_exit(); }
-    };
-
-    // Probe + claim the CPRMAN device. Both Err paths are graceful:
-    // on QEMU virt the DTB has no brcm,bcm2711-cprman entry, so
-    // probe returns NotFound and the engine serves NotSupported for
-    // every clock op (clock-test harness still exercises the IPC
-    // plumbing end-to-end). On Pi 4B the claim succeeds and the
-    // self-test prints the M0b success lines.
-    let regs = match probe_by_hash(&boot, BCM2711_CPRMAN_HASH, 0) {
-        Ok(probe) => match claim_typed::<Cprman>(boot.devmgr_ep, boot.reply_obj, probe.mmio_addr) {
-            Ok(claimed) => {
-                self_test(claimed.regs.regs());
-                Some(claimed.regs)
-            }
-            Err(_) => {
-                puts("[CPRMAN] claim FAILED; serving NotSupported for all clock ops\n");
-                None
-            }
-        },
-        Err(_) => {
+    // Two-arm match preserves the diagnostic distinction between
+    // "no device on this platform" (QEMU virt has no
+    // brcm,bcm2711-cprman) and "device present but claim failed"
+    // (Pi-side device-manager state issue). Collapsing both into
+    // one Err arm would mislabel a real claim failure as "wrong
+    // platform" on hardware where the device actually exists.
+    let regs = match init.regs {
+        Ok(r) => { self_test(r.regs()); Some(r) }
+        Err(ProbeClaimError::Probe(_)) => {
             puts("[CPRMAN] no BCM2711 CPRMAN on this platform (QEMU); serving NotSupported for all clock ops\n");
+            None
+        }
+        Err(ProbeClaimError::Claim(_)) => {
+            puts("[CPRMAN] CPRMAN claim FAILED; serving NotSupported for all clock ops\n");
             None
         }
     };
 
     let mut engine = CprmanEngine { regs };
-    run_clock_server(&mut engine, server_ep)
+    run_clock_server(&mut engine, init.server_ep)
 }
 
 #[panic_handler]

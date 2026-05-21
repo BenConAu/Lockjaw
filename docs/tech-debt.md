@@ -444,34 +444,6 @@ The bigger architectural move: `uart_putc` is one instance of "poll a hardware b
 
 ---
 
-## Tier-A no-IRQ bootstrap boilerplate duplicated across drivers
-
-**Where:** `user/ramfb-driver/src/main.rs::ramfb_entry` and `user/cprman-driver/src/main.rs::cprman_entry`. Both call `driver_bootstrap()` → check `boot.server_ep` → `probe_by_hash()` → `claim_typed::<T>()` with the same control-flow shape; only the failure policy differs (ramfb halts on probe-fail; cprman degrades to `None` and serves NotSupported).
-
-**What:** Phase 6 (ramfb) introduced the Tier-A escape-valve composition for drivers without IRQs — those that can't use `driver_main!`'s `standard_driver_init` because that helper unconditionally calls `bind_irq`. Phase 8 (cprman) is the second Tier-A driver. The bootstrap → server_ep → probe → claim chain is now duplicated verbatim, with one of the two failure-policy axes (halt vs degrade) being the only real per-driver difference. Rule-of-two threshold passed — first instance was the escape-valve example; second instance is the framework gap.
-
-**Fix:** Add `standard_init_no_irq<T>(name: &str, hash: u64) -> Result<DriverCtxNoIrq<T>, BootstrapInitError>` to `lockjaw_userlib::driver_runtime`. Mirror of `standard_driver_init` minus the `bind_irq` step. Returns a stripped `DriverCtxNoIrq<T>` exposing `regs: MappedRegs<T>` + `server_ep` + `devmgr_ep` + `reply_obj` (no `irq_*` fields). Both call sites collapse to one match arm + one log line:
-
-```rust
-// cprman — graceful fallback to NotSupported
-let regs = match standard_init_no_irq::<Cprman>("cprman", BCM2711_CPRMAN_HASH) {
-    Ok(ctx) => { self_test(ctx.regs.regs()); Some(ctx.regs) }
-    Err(_) => { puts("[CPRMAN] no device; serving NotSupported\n"); None }
-};
-
-// ramfb — hard halt on missing fw_cfg
-let ctx = standard_init_no_irq::<FwCfg>("ramfb", FW_CFG_HASH)
-    .unwrap_or_else(|_| { puts("ramfb: init FAILED\n"); sys_exit() });
-```
-
-~10 lines saved per Tier-A driver. The third Tier-A driver (whenever it appears) inherits the right shape automatically rather than copying boilerplate from one of the existing two.
-
-**Why bootstrap:** Phase 6 had exactly one Tier-A driver (ramfb), so the boilerplate was its example. Phase 8 (cprman) crossed the rule-of-two line; the right move is to extract before the third driver makes the pattern entrenched. emmc2 (Phase 9) won't be that driver — it has IRQs and uses `driver_main!` — so there's no urgency from Phase 9, but landing the helper before any future no-IRQ driver appears is the discipline.
-
-**Fix order:** Land as a Phase 8 follow-up commit or as Phase 9 prep work, before Phase 9 merges. Migrate ramfb + cprman in the same commit so neither version of the boilerplate stays in tree.
-
----
-
 ## Regspec/wirespec lacks per-field access mode
 
 **Where:** `xtask/src/gen_regs.rs` field emission (`with_<field>` setter for every field regardless of hardware writability). Surfaces concretely as `lockjaw_regs::cprman::CmEmmc2Ctl::with_busy(bool)` — BUSY is a hardware-set RO status bit that drivers should never construct, but the codegen emits a setter for it anyway. Equivalent shape applies to wirespec fields the device writes (driver-readable, not driver-writable).

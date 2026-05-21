@@ -312,6 +312,117 @@ pub fn standard_driver_init<T: 'static>(
 }
 
 // ---------------------------------------------------------------------------
+// Tier B (no-IRQ variant) — NoIrqInit + standard_init_no_irq.
+//
+// Mirror of `DriverCtx` + `standard_driver_init`, minus the IRQ-bind
+// step. Tier-A drivers that have no MMIO IRQ (cprman, ramfb) share
+// the same boot → probe → claim chain — they only differ in failure
+// policy (cprman degrades to `None` regs and serves `NotSupported`
+// on QEMU virt; ramfb halts on missing fw_cfg). Extracting after
+// the second such driver appeared in Phase 8 — rule-of-two threshold
+// passed, land the helper before the third no-IRQ driver makes the
+// boilerplate entrenched.
+//
+// Shape choice: separating "could we bootstrap?" (fatal, halt-only)
+// from "did the device probe + claim succeed?" (recoverable —
+// cprman's degrade case). The IPC pieces (server_ep, devmgr_ep,
+// reply_obj) are always returned on bootstrap success so a driver
+// that wants to serve `NotSupported` for every op (cprman on QEMU)
+// still has the endpoint to receive on.
+// ---------------------------------------------------------------------------
+
+/// Errors that prevent the driver from running at all. Returned by
+/// `standard_init_no_irq` when bootstrap itself failed or init didn't
+/// hand the driver a server endpoint — neither is recoverable.
+#[derive(Debug, Clone, Copy)]
+pub enum NoIrqBootstrapError {
+    /// `driver_bootstrap` failed.
+    Bootstrap(BootstrapError),
+    /// Bootstrap succeeded but init didn't pass a server endpoint.
+    /// Drivers that don't expect a server use the Tier-A pieces
+    /// directly; this helper assumes one.
+    NoServerEndpoint,
+}
+
+/// Probe + claim failure. Recoverable — the caller still has a valid
+/// `NoIrqInit` with bootstrap pieces and can choose to halt or
+/// degrade (serve `NotSupported`, run a software-only server, etc.).
+#[derive(Debug, Clone, Copy)]
+pub enum ProbeClaimError {
+    /// `probe_by_hash` failed (most commonly `NotFound` — the device
+    /// isn't on this platform's DTB).
+    Probe(ProbeError),
+    /// `claim_typed` failed.
+    Claim(ClaimError),
+}
+
+/// Public surface produced by `standard_init_no_irq`. Always carries
+/// bootstrap IPC pieces (a successful bootstrap is a precondition);
+/// `regs` is `Result` because probe + claim can fail recoverably.
+///
+/// Callers handle `regs.is_ok()` with full functionality and
+/// `regs.is_err()` with a degraded server (cprman pattern) or `?` /
+/// `unwrap_or_else(sys_exit)` for halt-on-failure (ramfb pattern).
+pub struct NoIrqInit<T: 'static> {
+    /// Server endpoint the driver receives requests on. Always
+    /// present — bootstrap returning no server is a `NoIrqBootstrapError`,
+    /// not an `Ok` outcome.
+    pub server_ep: EndpointHandle,
+    /// Device-manager endpoint, exposed so drivers can issue
+    /// follow-on operations (clock acquisition, multi-MMIO claims).
+    pub devmgr_ep: EndpointHandle,
+    /// Reply object for outbound IPC.
+    pub reply_obj: ReplyHandle,
+    /// Typed MMIO registers on success, or the probe/claim error
+    /// the caller can match on to decide between halt and degrade.
+    /// MMIO pageset stays internal — Phase 9 wires the release path.
+    pub regs: Result<MappedRegs<T>, ProbeClaimError>,
+}
+
+/// Standard "boot → check server endpoint → (best-effort) probe →
+/// (best-effort) claim → return init pieces" for drivers WITHOUT an
+/// MMIO IRQ. The no-IRQ analogue of `standard_driver_init`.
+///
+/// Emits the branded `<name>: bootstrapped\n` log line so the
+/// integration harness can gate on init progress identically across
+/// all helper variants.
+///
+/// **Failure model** — split into two error types so the failure
+/// policy can be expressed at the call site without losing
+/// recoverable state:
+///
+/// - `Err(NoIrqBootstrapError::*)` — bootstrap itself failed. No
+///   recovery; caller halts.
+/// - `Ok(NoIrqInit { regs: Err(_), .. })` — bootstrap succeeded but
+///   the device isn't present (or claim failed). Caller still has
+///   `server_ep` + `devmgr_ep` and can choose to serve a degraded
+///   IPC contract instead of halting (cprman's QEMU pattern).
+/// - `Ok(NoIrqInit { regs: Ok(_), .. })` — full success.
+pub fn standard_init_no_irq<T: 'static>(
+    name: &str,
+    compatible_hash: u64,
+) -> Result<NoIrqInit<T>, NoIrqBootstrapError> {
+    let boot = driver_bootstrap().map_err(NoIrqBootstrapError::Bootstrap)?;
+    puts2(name, ": bootstrapped\n");
+    let server_ep = boot.server_ep.ok_or(NoIrqBootstrapError::NoServerEndpoint)?;
+    // Probe + claim are best-effort; on failure we still return the
+    // bootstrap pieces so the caller can run a degraded server.
+    let regs = probe_by_hash(&boot, compatible_hash, 0)
+        .map_err(ProbeClaimError::Probe)
+        .and_then(|probe| {
+            claim_typed::<T>(boot.devmgr_ep, boot.reply_obj, probe.mmio_addr)
+                .map_err(ProbeClaimError::Claim)
+                .map(|c| c.regs)
+        });
+    Ok(NoIrqInit {
+        server_ep,
+        devmgr_ep: boot.devmgr_ep,
+        reply_obj: boot.reply_obj,
+        regs,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tier C — driver_main! and its building blocks.
 // ---------------------------------------------------------------------------
 

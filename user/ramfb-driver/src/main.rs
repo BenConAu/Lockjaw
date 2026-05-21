@@ -12,14 +12,13 @@
 // MUST return nothing.
 #![deny(unsafe_code)]
 
-use lockjaw_userlib::devmgr::claim_typed;
 use lockjaw_userlib::display::{
     run_display_server, DisplayEngine, DisplayError, ModeInfo, PIXEL_FORMAT_XRGB8888,
 };
 use lockjaw_userlib::dma::{
     alloc_dma_backing, close_dma_backing, DmaMappingView, OwnedDmaMapping,
 };
-use lockjaw_userlib::driver_runtime::{driver_bootstrap, probe_by_hash};
+use lockjaw_userlib::driver_runtime::standard_init_no_irq;
 use lockjaw_userlib::fwcfg::{dma_write, find_file};
 use lockjaw_userlib::handle::PageSetHandle;
 use lockjaw_userlib::{boot_stub, puts, sys_exit, FW_CFG_HASH};
@@ -315,26 +314,14 @@ fn self_test(engine: &mut RamfbEngine) {
 fn ramfb_entry() -> ! {
     puts("ramfb: starting\n");
 
-    // Tier-A bootstrap: receive devmgr + display server endpoints
-    // from init via the bootstrap IPC.
-    let boot = match driver_bootstrap() {
-        Ok(b) => b,
+    // Tier-B no-IRQ helper: bootstrap → server_ep check → probe + claim.
+    // ramfb halts on any failure (no fw_cfg means no display surface).
+    let init = match standard_init_no_irq::<FwCfg>("ramfb", FW_CFG_HASH) {
+        Ok(i) => i,
         Err(_) => { puts("ramfb: bootstrap FAILED\n"); sys_exit(); }
     };
-    puts("ramfb: bootstrapped\n");
-    let display_ep = match boot.server_ep {
-        Some(ep) => ep,
-        None => { puts("ramfb: no server endpoint\n"); sys_exit(); }
-    };
-
-    // Tier-A probe + claim. ramfb is fw_cfg-shaped (no DeviceID
-    // discriminator); first match wins.
-    let probe = match probe_by_hash(&boot, FW_CFG_HASH, 0) {
-        Ok(p) => p,
-        Err(_) => { puts("ramfb: probe FAILED\n"); sys_exit(); }
-    };
-    let claimed = match claim_typed::<FwCfg>(boot.devmgr_ep, boot.reply_obj, probe.mmio_addr) {
-        Ok(c) => c,
+    let regs = match init.regs {
+        Ok(r) => r,
         Err(_) => { puts("ramfb: claim FAILED\n"); sys_exit(); }
     };
     puts("ramfb: claimed fw_cfg\n");
@@ -342,7 +329,7 @@ fn ramfb_entry() -> ! {
     // Find the etc/ramfb selector — fail gracefully when running on
     // a QEMU build without ramfb (the test harness asserts this
     // line on the QEMU-virt machine without `-device ramfb`).
-    let ramfb_sel = match find_file(claimed.regs.regs(), b"etc/ramfb") {
+    let ramfb_sel = match find_file(regs.regs(), b"etc/ramfb") {
         Some(s) => s,
         None => {
             puts("ramfb: etc/ramfb not found in fw_cfg\n");
@@ -359,7 +346,7 @@ fn ramfb_entry() -> ! {
     };
 
     let mut engine = RamfbEngine {
-        regs: claimed.regs,
+        regs,
         dma_page,
         ramfb_sel,
         session_active: false,
@@ -372,7 +359,7 @@ fn ramfb_entry() -> ! {
     self_test(&mut engine);
 
     puts("ramfb: entering display server loop\n");
-    run_display_server(&mut engine, display_ep)
+    run_display_server(&mut engine, init.server_ep)
 }
 
 #[panic_handler]
