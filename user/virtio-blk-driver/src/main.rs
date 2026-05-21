@@ -166,12 +166,14 @@ impl VirtioBlkEngine {
         // CLAUDE.md "Types over constants" principle.
         const STATUS_OFFSET: u64 = size_of::<VirtioBlkReqHeader>() as u64;
 
-        // Write request header to the dedicated header page.
-        self.req_page.cell::<VirtioBlkReqHeader>(0).write(VirtioBlkReqHeader {
-            req_type,
-            reserved: 0,
-            sector,
-        });
+        // Write request header to the dedicated header page. The
+        // generated VirtioBlkReqHeader constructor takes (req_type,
+        // sector) — the spec's `reserved` field is mandated zero
+        // and the wirespec marks it `default = 0`, so the constructor
+        // omits it from the signature.
+        self.req_page
+            .cell::<VirtioBlkReqHeader>(0)
+            .write(VirtioBlkReqHeader::new(req_type, sector));
         // Clear status byte before submission so we can distinguish
         // device-set status from leftover bits. Status byte lives
         // after the header in the same page.

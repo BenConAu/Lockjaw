@@ -52,11 +52,13 @@ build-user: clean-all build-hash
 
 build: build-user check-stack check-pointers check-init-size check-linker-symbols
 	cargo xtask gen-regs --check
+	cargo xtask gen-wires --check
 	cargo build
 	cargo xtask check-vtables
 
 build-release: build-user check-stack
 	cargo xtask gen-regs --check
+	cargo xtask gen-wires --check
 	cargo build --release
 
 run: build

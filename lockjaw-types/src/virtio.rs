@@ -1,14 +1,20 @@
-/// VirtIO MMIO transport registers, virtqueue descriptor format,
-/// block device types, and feature negotiation model.
+/// VirtIO MMIO transport constants, feature negotiation, virtqueue
+/// layout calculator, and block-device protocol constants. Pure
+/// types — no MMIO access, no volatile, no barriers. Host-testable.
 ///
-/// All pure types — no MMIO access, no volatile, no barriers.
-/// Host-testable layout and feature logic.
+/// Wire DTOs (VirtqDesc, VirtqAvail, VirtqUsed, VirtqUsedElem,
+/// VirtioBlkReqHeader) live in `crate::wire::virtio`, generated from
+/// `user/wirespecs/virtio.toml` by `cargo xtask gen-wires`. This
+/// module re-exports them so the historical import paths
+/// (`lockjaw_types::virtio::VirtqDesc`, etc.) keep working.
 ///
 /// References: VirtIO spec v1.2
 ///   - Section 2.7: Split virtqueues
 ///   - Section 3.1: Device initialization
 ///   - Section 4.2: Virtio Over MMIO
 ///   - Section 5.2: Block device
+
+pub use crate::wire::virtio::*;
 
 // ---------------------------------------------------------------------------
 // VirtIO MMIO register offsets (spec 4.2.2)
@@ -114,22 +120,11 @@ impl FeatureNegotiation {
 }
 
 // ---------------------------------------------------------------------------
-// Virtqueue descriptor (spec 2.7.5)
+// Descriptor flag constants (spec 2.7.5). The flag bit values live in
+// this module because they are used both by the wire layout
+// (VirtqDesc.flags()) and by virtqueue protocol logic in
+// lockjaw-userlib; both layers reference the SAME constants.
 // ---------------------------------------------------------------------------
-
-/// 16-byte split virtqueue descriptor.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct VirtqDesc {
-    /// Guest-physical address of the buffer.
-    pub addr:  u64,
-    /// Length of the buffer in bytes.
-    pub len:   u32,
-    /// Descriptor flags (NEXT, WRITE, INDIRECT).
-    pub flags: u16,
-    /// Next descriptor index if VIRTQ_DESC_F_NEXT is set.
-    pub next:  u16,
-}
 
 /// Descriptor continues in the next field.
 pub const VIRTQ_DESC_F_NEXT:     u16 = 1;
@@ -137,42 +132,6 @@ pub const VIRTQ_DESC_F_NEXT:     u16 = 1;
 pub const VIRTQ_DESC_F_WRITE:    u16 = 2;
 /// Buffer contains a list of indirect descriptors.
 pub const VIRTQ_DESC_F_INDIRECT: u16 = 4;
-
-// ---------------------------------------------------------------------------
-// Available ring (spec 2.7.6)
-// ---------------------------------------------------------------------------
-
-/// Available ring header (ring entries follow immediately).
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct VirtqAvail {
-    pub flags: u16,
-    pub idx:   u16,
-    // ring: [u16; queue_size] follows in memory
-}
-
-// ---------------------------------------------------------------------------
-// Used ring (spec 2.7.8)
-// ---------------------------------------------------------------------------
-
-/// A single used ring element.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct VirtqUsedElem {
-    /// Descriptor chain head index.
-    pub id:  u32,
-    /// Total bytes written by the device.
-    pub len: u32,
-}
-
-/// Used ring header (ring entries follow immediately).
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct VirtqUsed {
-    pub flags: u16,
-    pub idx:   u16,
-    // ring: [VirtqUsedElem; queue_size] follows in memory
-}
 
 // ---------------------------------------------------------------------------
 // Virtqueue layout calculator
@@ -236,20 +195,8 @@ const fn align_up(val: usize, align: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Block device types (spec 5.2)
+// Block device protocol constants (spec 5.2)
 // ---------------------------------------------------------------------------
-
-/// Block device request header (spec 5.2.6).
-/// Placed in the first descriptor of a request chain.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct VirtioBlkReqHeader {
-    /// Request type: VIRTIO_BLK_T_IN (read) or VIRTIO_BLK_T_OUT (write).
-    pub req_type: u32,
-    pub reserved: u32,
-    /// Starting sector (512-byte units).
-    pub sector:   u64,
-}
 
 pub const VIRTIO_BLK_T_IN:  u32 = 0; // read from device
 pub const VIRTIO_BLK_T_OUT: u32 = 1; // write to device
@@ -263,39 +210,13 @@ pub const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 pub const VIRTIO_BLK_CFG_CAPACITY: u64 = VIRTIO_MMIO_CONFIG;
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests — feature negotiation, layout, constants. DTO layout tests
+// live in the generated `crate::wire::virtio` module.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- struct sizes ---
-
-    #[test]
-    fn virtq_desc_is_16_bytes() {
-        assert_eq!(core::mem::size_of::<VirtqDesc>(), 16);
-    }
-
-    #[test]
-    fn virtq_used_elem_is_8_bytes() {
-        assert_eq!(core::mem::size_of::<VirtqUsedElem>(), 8);
-    }
-
-    #[test]
-    fn virtio_blk_req_header_is_16_bytes() {
-        assert_eq!(core::mem::size_of::<VirtioBlkReqHeader>(), 16);
-    }
-
-    #[test]
-    fn virtq_avail_header_is_4_bytes() {
-        assert_eq!(core::mem::size_of::<VirtqAvail>(), 4);
-    }
-
-    #[test]
-    fn virtq_used_header_is_4_bytes() {
-        assert_eq!(core::mem::size_of::<VirtqUsed>(), 4);
-    }
 
     // --- layout ---
 

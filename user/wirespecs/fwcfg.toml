@@ -1,0 +1,105 @@
+# QEMU fw_cfg DMA-shared wire DTOs. All multi-byte fields are
+# big-endian on the wire — QEMU specifies BE for fw_cfg regardless of
+# host endianness — so the codegen wraps every field accessor in
+# `to_be_bytes` / `from_be_bytes`.
+#
+# Generated to `lockjaw-types/src/wire/fwcfg.rs` by
+# `cargo xtask gen-wires`. Drift caught by `cargo xtask gen-wires --check`.
+
+family = "fwcfg"
+description = "QEMU fw_cfg DMA-shared wire DTOs (BE on the wire)"
+
+# ---------------------------------------------------------------------------
+# FwCfgDmaAccess — 16-byte DMA control header. The driver writes one
+# of these into a scratch page, then triggers the device by writing
+# the scratch page's PA into the FWCFG_DMA MMIO register. The device
+# DMA-reads the header and either reads/writes the buffer at
+# `address` for `length` bytes, or selects a new item if the SELECT
+# bit + selector are set in `control`.
+#
+# Convenience helpers (write_to_selector, is_complete, is_error) live
+# in `lockjaw-types/src/fwcfg.rs` as `impl FwCfgDmaAccess { ... }`
+# blocks on the generated type — they consume the generated
+# `control()` accessor.
+# ---------------------------------------------------------------------------
+
+[[wire]]
+name = "FwCfgDmaAccess"
+description = "fw_cfg DMA control header — driver writes, device acts on it."
+size = 16
+endian = "big"
+
+  [[wire.fields]]
+  name = "control"
+  offset = 0
+  width = 32
+  description = "DMA control word — bitwise OR of DMA_CTRL_* plus selector in bits 16..31 when SELECT is set."
+
+  [[wire.fields]]
+  name = "length"
+  offset = 4
+  width = 32
+  description = "Transfer length in bytes."
+
+  [[wire.fields]]
+  name = "address"
+  offset = 8
+  width = 64
+  description = "Guest-physical address of the payload buffer."
+
+# ---------------------------------------------------------------------------
+# RamfbConfig — 28-byte per-frame ramfb configuration. The driver
+# DMA-writes this through fw_cfg's `etc/ramfb` item; QEMU re-reads
+# it each frame. The middle u32 `flags` is reserved (always 0);
+# constructor omits it via `default = 0`.
+#
+# Why the size matters: a plain `#[repr(C)] { u64, 5×u32 }` would
+# get 4 bytes of trailing padding (alignment 8 from the leading u64
+# forces struct size to be a multiple of 8 → 32). The Phase 6 fix
+# was `#[repr(C, packed)]`. Phase 7's `#[repr(transparent)] over
+# [u8; 28]` makes padding structurally impossible: the size IS 28,
+# alignment IS 1, no field-offset rules to manually maintain.
+# ---------------------------------------------------------------------------
+
+[[wire]]
+name = "RamfbConfig"
+description = "ramfb per-frame configuration (28 bytes, BE)."
+size = 28
+endian = "big"
+
+  [[wire.fields]]
+  name = "addr"
+  offset = 0
+  width = 64
+  description = "Framebuffer guest-physical address."
+
+  [[wire.fields]]
+  name = "fourcc"
+  offset = 8
+  width = 32
+  description = "Pixel format fourcc (e.g. RAMFB_FORMAT_XRGB8888)."
+
+  [[wire.fields]]
+  name = "flags"
+  offset = 12
+  width = 32
+  default = 0
+  description = "Reserved flags (spec mandates 0). Constructor omits this; accessor returns 0."
+
+  [[wire.fields]]
+  name = "width"
+  offset = 16
+  width = 32
+  description = "Width in pixels."
+
+  [[wire.fields]]
+  name = "height"
+  offset = 20
+  width = 32
+  description = "Height in pixels."
+
+  [[wire.fields]]
+  name = "stride"
+  offset = 24
+  width = 32
+  description = "Bytes per row (= width × bytes_per_pixel for packed formats)."

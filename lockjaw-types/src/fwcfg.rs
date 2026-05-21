@@ -1,45 +1,37 @@
-//! QEMU fw_cfg protocol DTOs (shared-memory layouts).
+//! QEMU fw_cfg protocol — well-known selectors, DMA control bits,
+//! ramfb pixel-format constants, and the `FwCfgFile` directory-entry
+//! decoder. Hand-written and host-testable.
 //!
-//! These are the structures the device reads from / writes to in
-//! guest RAM via the DMA interface. They are NOT MMIO registers —
-//! those live in `lockjaw_regs::fw_cfg`. The split:
+//! Wire DTOs (`FwCfgDmaAccess`, `RamfbConfig`) live in
+//! `crate::wire::fwcfg`, generated from `user/wirespecs/fwcfg.toml`
+//! by `cargo xtask gen-wires`. This module re-exports them so the
+//! historical import paths (`lockjaw_types::fwcfg::FwCfgDmaAccess`,
+//! etc.) keep working, and attaches the semantic convenience
+//! methods (`write_to_selector`, `is_complete`, `is_error`) to the
+//! generated types via `impl` blocks. Those methods would belong in
+//! the wirespec if every fw_cfg consumer needed identical helpers,
+//! but they're fw_cfg-protocol-specific layered on top of the raw
+//! wire layout — exactly the kind of helper the codegen excludes.
 //!
-//! - `lockjaw_regs::fw_cfg::FwCfg` — typed MMIO accessors (data
-//!   stream port, BE selector, BE DMA trigger).
-//! - `lockjaw_types::fwcfg` (this module) — DMA-shared structs the
-//!   device reads from a guest-allocated scratch page after the
-//!   driver writes that page's PA to the DMA trigger.
-//!
-//! All multi-byte fields are big-endian on the wire. The helper
-//! constructors take host-order arguments and apply `to_be()` so
-//! callers never hand-pack bytes.
+//! All multi-byte wire fields are big-endian. The generated
+//! constructors and accessors handle byte order; consumers pass and
+//! receive host-order values.
+
+pub use crate::wire::fwcfg::*;
 
 /// Well-known selector for the fw_cfg file directory.
 /// Driver enumerates this to discover dynamic items (e.g. `etc/ramfb`).
 pub const FW_CFG_FILE_DIR: u16 = 0x0019;
 
 // ---------------------------------------------------------------------------
-// FwCfgDmaAccess — DMA control header.
-//
-// Layout (16 bytes, BE on the wire):
-//   u32 control  (bit 0 = ERROR set by device on failure,
-//                 bit 1 = READ  (device -> guest, default),
-//                 bit 2 = SKIP  (skip bytes without R/W),
-//                 bit 3 = SELECT (selector in bits 16..31 of control),
-//                 bit 4 = WRITE (guest -> device),
-//                 bits 16..31 = selector when SELECT is set)
-//   u32 length
-//   u64 address  (guest-phys of the payload buffer)
-//
-// Driver writes the header to a scratch page, then writes that
-// page's PA to FWCFG_DMA (offset 0x10) — the device DMA-reads the
-// header and acts on it. Driver then polls control: when the
-// SELECT/SKIP/WRITE bits clear (and ERROR stays unset), the
-// transfer is complete.
+// DMA control bits — composed into the `control` field of an
+// `FwCfgDmaAccess` (the generated constructor takes a host-order u32
+// and applies `to_be_bytes` internally; consumers compose the bits
+// without thinking about byte order).
 // ---------------------------------------------------------------------------
 
-/// DMA control bits (in the BE u32 `control` field — apply
-/// `from_be` to inspect after a poll read).
+/// Device-set ERROR bit. After polling completion, set means the
+/// device rejected the transfer.
 pub const DMA_CTRL_ERROR:  u32 = 1 << 0;
 /// Read transfer (device -> guest). Implicit (default if none of
 /// SELECT/SKIP/WRITE is set).
@@ -54,46 +46,25 @@ pub const DMA_CTRL_SELECT: u32 = 1 << 3;
 /// a write-only "configuration" item).
 pub const DMA_CTRL_WRITE:  u32 = 1 << 4;
 
-/// `FwCfgDmaAccess` header — `#[repr(C)]` with three BE-on-wire
-/// fields. Constructed via `new()`; readback via `control_raw()`
-/// (returns the BE bits) or `control()` (returns host order).
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FwCfgDmaAccess {
-    /// Control word — BE on the wire. Use `control()` to inspect.
-    pub control_be: u32,
-    /// Length in bytes — BE on the wire.
-    pub length_be: u32,
-    /// Payload buffer guest-phys address — BE on the wire.
-    pub address_be: u64,
-}
+// ---------------------------------------------------------------------------
+// FwCfgDmaAccess convenience methods.
+//
+// The generated `FwCfgDmaAccess::new(control, length, address)` is
+// the raw constructor. `write_to_selector` composes the SELECT +
+// WRITE bits with the selector field in one call — every fw_cfg
+// write-to-named-item path uses this exact pattern.
+//
+// `is_complete` / `is_error` inspect the device-updated `control`
+// word after polling; both fall out of the raw DMA_CTRL_* semantics.
+// ---------------------------------------------------------------------------
 
 impl FwCfgDmaAccess {
-    /// Construct from host-order values. Applies `to_be()` to each
-    /// field so callers never hand-pack bytes.
-    ///
-    /// `control` should be a bitwise-OR of the `DMA_CTRL_*`
-    /// constants plus the selector shifted into bits 16..31 when
-    /// `DMA_CTRL_SELECT` is set.
-    pub fn new(control: u32, length: u32, address: u64) -> Self {
-        Self {
-            control_be: control.to_be(),
-            length_be: length.to_be(),
-            address_be: address.to_be(),
-        }
-    }
-
     /// Convenience builder for a "write payload to selected item"
     /// request (the ramfb case). Combines SELECT + WRITE with the
     /// selector in the top half of the control word.
     pub fn write_to_selector(selector: u16, length: u32, address: u64) -> Self {
         let control = ((selector as u32) << 16) | DMA_CTRL_SELECT | DMA_CTRL_WRITE;
         Self::new(control, length, address)
-    }
-
-    /// Inspect the control bits in host order. Strips `to_be()`.
-    pub fn control(&self) -> u32 {
-        u32::from_be(self.control_be)
     }
 
     /// True if the device set the ERROR bit.
@@ -110,101 +81,22 @@ impl FwCfgDmaAccess {
     }
 }
 
-// FwCfgDmaAccess is #[repr(C)] of u32 + u32 + u64 = 16 bytes.
-// `dma_value_impl!`'s const_assert verifies no padding at compile
-// time — if the struct ever changes shape, the build fails before
-// any DmaCell write can leak undef bytes.
-crate::dma_value_impl!(FwCfgDmaAccess, size = 16);
-
 // ---------------------------------------------------------------------------
-// RAMFBConfig — written by the driver to a guest-RAM buffer that
-// the device reads on each ramfb frame.
-//
-// On-wire layout (28 bytes, BE):
-//   u64 addr      — framebuffer guest-phys
-//   u32 fourcc    — pixel format ("XR24" etc.)
-//   u32 flags     — must be 0
-//   u32 width
-//   u32 height
-//   u32 stride    — bytes per row (= width * bytes_per_pixel for packed
-//                   formats)
-//
-// **`#[repr(C, packed)]` is load-bearing:** a plain `#[repr(C)]` of
-// u64 + 5×u32 gets 4 bytes of trailing padding (struct alignment 8
-// from the leading u64 forces size to be a multiple of 8 = 32).
-// That padding would violate `DmaValue`'s "no padding bytes that
-// could be undef" safety contract — a typed DMA write through
-// `DmaCell::<RamfbConfig>::write` would write 32 bytes including
-// 4 undef bytes into shared memory, technically UB even though
-// QEMU only reads the first 28 per the `length` field. Packing
-// eliminates the trailing padding so `size_of::<RamfbConfig>() = 28
-// = RAMFB_CONFIG_WIRE_SIZE` and the struct is sound as a DmaValue.
-//
-// Field access discipline: packed structs forbid `&self.field`
-// references (alignment isn't guaranteed). All access in this
-// module is by value (`self.addr_be` returns the u64; constructor
-// `Self { addr_be: ..., ... }` writes by value) so the constraint
-// doesn't bite. External code should construct via `new()` and
-// write via `DmaCell::write` — never take field references.
+// RAMFBConfig — pixel-format constants. Constructor + accessors are
+// generated; this module just exports the well-known fourcc.
 // ---------------------------------------------------------------------------
 
 /// Pixel format fourcc for 32-bit XRGB (X in the high byte).
 /// Matches DRM's `DRM_FORMAT_XRGB8888`.
 pub const RAMFB_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 
-/// Number of bytes QEMU reads from the `RamfbConfig` buffer on
-/// each ramfb frame — the value the driver passes as `length` in
-/// the DMA header. Equal to `size_of::<RamfbConfig>()` after the
-/// `#[repr(C, packed)]` fix above. Constant so drivers don't
-/// hand-code 28.
+/// Number of bytes QEMU reads from the `RamfbConfig` buffer on each
+/// ramfb frame — the value the driver passes as `length` in the
+/// FwCfgDmaAccess header. Equal to `size_of::<RamfbConfig>()`. The
+/// constant exists so drivers don't hand-code 28 and so a future
+/// wire-format change shows up in one place rather than spread
+/// across drivers.
 pub const RAMFB_CONFIG_WIRE_SIZE: u32 = 28;
-
-/// `RAMFBConfig` — `#[repr(C, packed)]` with BE-on-wire fields.
-/// Packed so size matches the 28-byte wire layout (no trailing
-/// padding); this is required for soundness of the `DmaValue`
-/// impl below.
-///
-/// Construct via `new()`; write via `DmaCell::<RamfbConfig>::write`.
-/// Do not take field references — packed alignment isn't guaranteed.
-#[derive(Clone, Copy)]
-#[repr(C, packed)]
-pub struct RamfbConfig {
-    /// Framebuffer guest-phys address — BE on the wire.
-    pub addr_be: u64,
-    /// Pixel format fourcc — BE on the wire.
-    pub fourcc_be: u32,
-    /// Reserved flags (must be 0) — BE on the wire.
-    pub flags_be: u32,
-    /// Width in pixels — BE on the wire.
-    pub width_be: u32,
-    /// Height in pixels — BE on the wire.
-    pub height_be: u32,
-    /// Stride in bytes — BE on the wire.
-    pub stride_be: u32,
-}
-
-impl RamfbConfig {
-    /// Construct from host-order values. Applies `to_be()` to each
-    /// field.
-    pub fn new(fb_phys: u64, fourcc: u32, width: u32, height: u32, stride: u32) -> Self {
-        Self {
-            addr_be: fb_phys.to_be(),
-            fourcc_be: fourcc.to_be(),
-            flags_be: 0u32.to_be(),
-            width_be: width.to_be(),
-            height_be: height.to_be(),
-            stride_be: stride.to_be(),
-        }
-    }
-}
-
-// RamfbConfig is #[repr(C, packed)] of u64 + 5 u32s = 28 bytes.
-// Packed eliminates the trailing padding a plain #[repr(C)] would
-// have (alignment 8 from the leading u64 would force size 32).
-// `dma_value_impl!`'s const_assert verifies size == 28 at compile
-// time — if a future edit drops the `packed` attribute, the
-// build fails before any DmaCell write can leak undef bytes.
-crate::dma_value_impl!(RamfbConfig, size = 28);
 
 // ---------------------------------------------------------------------------
 // FwCfgFile — directory entry from FW_CFG_FILE_DIR.
@@ -216,9 +108,10 @@ crate::dma_value_impl!(RamfbConfig, size = 28);
 //   u16 reserved
 //   u8[56] name (NUL-terminated)
 //
-// Read 64 bytes at a time from the data port after writing
-// FW_CFG_FILE_DIR as the selector. The first 4 bytes are a BE u32
-// count of entries.
+// Not a wirespec entry: it's a stream-decode helper (driver reads
+// 64-byte windows off the data port and decodes one at a time) and
+// it bundles a NUL-terminated string field that doesn't fit the
+// wirespec's uniform per-field width model. Hand-written stays.
 // ---------------------------------------------------------------------------
 
 /// Directory entry — driver receives 64 raw bytes from the stream
@@ -260,21 +153,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dma_access_constructs_be() {
-        let h = FwCfgDmaAccess::new(0x1234_5678, 0xabcd, 0x1_0000_0000);
-        assert_eq!(h.control_be, 0x1234_5678u32.to_be());
-        assert_eq!(h.length_be, 0xabcdu32.to_be());
-        assert_eq!(h.address_be, 0x1_0000_0000u64.to_be());
-    }
-
-    #[test]
-    fn dma_access_write_to_selector() {
+    fn dma_access_write_to_selector_sets_expected_bits() {
         let h = FwCfgDmaAccess::write_to_selector(0x1234, 28, 0xabcd_0000);
         let ctl = h.control();
-        assert_eq!(ctl >> 16, 0x1234);
+        assert_eq!(ctl >> 16, 0x1234, "selector lives in bits 16..31");
         assert!(ctl & DMA_CTRL_SELECT != 0);
         assert!(ctl & DMA_CTRL_WRITE != 0);
         assert!(ctl & DMA_CTRL_ERROR == 0);
+        assert_eq!(h.length(), 28);
+        assert_eq!(h.address(), 0xabcd_0000);
     }
 
     #[test]
@@ -283,75 +170,30 @@ mod tests {
         assert!(!busy.is_complete());
         assert!(!busy.is_error());
 
-        // Simulate device clearing the SELECT/WRITE bits but leaving
-        // the selector in bits 16..31 intact.
-        let done = FwCfgDmaAccess {
-            control_be: (0x42_0000u32).to_be(),
-            length_be: 0,
-            address_be: 0,
-        };
-        assert!(done.is_complete());
+        // Device has cleared SELECT + WRITE bits (selector residue
+        // in bits 16..31 doesn't count as "in flight"). `is_complete`
+        // is true once SELECT/SKIP/READ/WRITE are all zero.
+        let done = FwCfgDmaAccess::new(0x42_0000u32, 0, 0);
+        assert!(done.is_complete(), "selector residue should not block completion");
 
-        let failed = FwCfgDmaAccess {
-            control_be: DMA_CTRL_ERROR.to_be(),
-            length_be: 0,
-            address_be: 0,
-        };
+        let failed = FwCfgDmaAccess::new(DMA_CTRL_ERROR, 0, 0);
         assert!(failed.is_error());
     }
 
     #[test]
-    fn ramfb_config_be_layout() {
-        let c = RamfbConfig::new(0x4000_0000, RAMFB_FORMAT_XRGB8888, 320, 240, 1280);
-        // Copy packed fields to locals so the assert_eq! comparisons
-        // don't take field references (packed structs forbid that —
-        // alignment isn't guaranteed). This is the documented access
-        // discipline: read by value, never by reference.
-        let addr = c.addr_be;
-        let fourcc = c.fourcc_be;
-        let flags = c.flags_be;
-        let width = c.width_be;
-        let height = c.height_be;
-        let stride = c.stride_be;
-        assert_eq!(addr, 0x4000_0000u64.to_be());
-        assert_eq!(fourcc, RAMFB_FORMAT_XRGB8888.to_be());
-        assert_eq!(flags, 0u32);
-        assert_eq!(width, 320u32.to_be());
-        assert_eq!(height, 240u32.to_be());
-        assert_eq!(stride, 1280u32.to_be());
-    }
-
-    #[test]
-    fn ramfb_config_layout_offsets_match_wire() {
-        // Field offsets must match QEMU's expected layout exactly.
-        // With #[repr(C, packed)], the struct has no padding so
-        // offsets are the simple field-sum chain.
-        use core::mem::offset_of;
-        assert_eq!(offset_of!(RamfbConfig, addr_be), 0);
-        assert_eq!(offset_of!(RamfbConfig, fourcc_be), 8);
-        assert_eq!(offset_of!(RamfbConfig, flags_be), 12);
-        assert_eq!(offset_of!(RamfbConfig, width_be), 16);
-        assert_eq!(offset_of!(RamfbConfig, height_be), 20);
-        assert_eq!(offset_of!(RamfbConfig, stride_be), 24);
-    }
-
-    // The no-padding invariant on RamfbConfig is enforced at
-    // COMPILE TIME by `dma_value_impl!(RamfbConfig, size = 28)`
-    // above (search for the macro invocation in this file). If a
-    // future edit drops `#[repr(C, packed)]`, the build fails at
-    // the macro invocation — no runtime test needed and no
-    // driver write can leak undef bytes.
-    //
-    // The packed-alignment runtime check moved into the same
-    // place: const_assert size = 28 also implies align = 1
-    // (the only way size matches the field sum for this layout).
-
-    /// The wire size constant matches the actual struct size.
-    /// Used by ramfb-driver as the `length` field of the
-    /// FwCfgDmaAccess header.
-    #[test]
-    fn ramfb_wire_size_constant() {
+    fn ramfb_wire_size_constant_matches_struct_size() {
+        // The driver passes RAMFB_CONFIG_WIRE_SIZE as the DMA header's
+        // `length` field. It must stay aligned with the on-wire layout
+        // of RamfbConfig (the generated struct). If the wirespec grows
+        // the struct, this constant must move in lockstep.
         assert_eq!(RAMFB_CONFIG_WIRE_SIZE as usize, core::mem::size_of::<RamfbConfig>());
+    }
+
+    #[test]
+    fn ramfb_format_xrgb8888_is_xr24_in_le() {
+        // fourcc literals are byte sequences interpreted as LE u32 by
+        // DRM convention; "XR24" decodes to this value.
+        assert_eq!(RAMFB_FORMAT_XRGB8888, u32::from_le_bytes(*b"XR24"));
     }
 
     #[test]

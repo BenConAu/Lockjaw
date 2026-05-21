@@ -114,14 +114,10 @@ dma_value_impl!(i16, size = 2);
 dma_value_impl!(i32, size = 4);
 dma_value_impl!(i64, size = 8);
 
-// ---------------------------------------------------------------------------
-// Virtio DTO impls. Sizes come from `#[repr(C)]` layout of integer
-// fields with natural alignment; verified at compile time by the
-// macro's const_assert.
-// ---------------------------------------------------------------------------
-
-dma_value_impl!(crate::virtio::VirtqDesc,         size = 16);
-dma_value_impl!(crate::virtio::VirtqAvail,        size = 4);
-dma_value_impl!(crate::virtio::VirtqUsedElem,     size = 8);
-dma_value_impl!(crate::virtio::VirtqUsed,         size = 4);
-dma_value_impl!(crate::virtio::VirtioBlkReqHeader, size = 16);
+// Device-DTO impls live next to their generated struct definitions.
+// virtio + fwcfg DTOs (VirtqDesc, VirtqAvail, VirtqUsed, VirtqUsedElem,
+// VirtioBlkReqHeader, FwCfgDmaAccess, RamfbConfig) are emitted by
+// `cargo xtask gen-wires` into `wire::<family>` modules, each with
+// its own `dma_value_impl!` invocation. No hand-written DmaValue
+// impls survive outside this file (primitive integers above) and
+// the generated wire modules. Phase 7 acceptance gate.

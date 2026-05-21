@@ -165,12 +165,9 @@ impl Virtqueue {
         let n = self.layout.queue_size;
         let desc = self.desc();
         for i in 0..n {
-            desc.write(i as usize, VirtqDesc {
-                addr: 0,
-                len: 0,
-                flags: if i + 1 < n { VIRTQ_DESC_F_NEXT } else { 0 },
-                next: if i + 1 < n { i + 1 } else { 0 },
-            });
+            let flags = if i + 1 < n { VIRTQ_DESC_F_NEXT } else { 0 };
+            let next = if i + 1 < n { i + 1 } else { 0 };
+            desc.write(i as usize, VirtqDesc::new(0, 0, flags, next));
         }
     }
 
@@ -217,7 +214,7 @@ impl Virtqueue {
             let mut idx = head;
             let mut last_next = 0u16;
             for (i, seg) in segments.iter().enumerate() {
-                let next = desc.read(idx as usize).next;
+                let next = desc.read(idx as usize).next();
                 let is_last = i + 1 == n;
                 let mut flags = 0u16;
                 if seg.direction == Direction::DeviceWritable {
@@ -226,12 +223,10 @@ impl Virtqueue {
                 if !is_last {
                     flags |= VIRTQ_DESC_F_NEXT;
                 }
-                desc.write(idx as usize, VirtqDesc {
-                    addr: seg.pa,
-                    len: seg.len,
-                    flags,
-                    next: if is_last { 0 } else { next },
-                });
+                desc.write(
+                    idx as usize,
+                    VirtqDesc::new(seg.pa, seg.len, flags, if is_last { 0 } else { next }),
+                );
                 if is_last {
                     last_next = next;
                 } else {
@@ -247,16 +242,13 @@ impl Virtqueue {
         // Push head into the available ring and advance avail.idx.
         let header = self.avail_header();
         let avail = header.read();
-        let ring_idx = (avail.idx % self.layout.queue_size) as usize;
+        let ring_idx = (avail.idx() % self.layout.queue_size) as usize;
         self.avail_ring().write(ring_idx, head);
 
         // Barrier: descriptor + ring entry writes visible before idx bump.
         dmb_ishst();
 
-        header.write(VirtqAvail {
-            flags: avail.flags,
-            idx: avail.idx.wrapping_add(1),
-        });
+        header.write(VirtqAvail::new(avail.flags(), avail.idx().wrapping_add(1)));
 
         // Barrier: avail.idx visible before MMIO notify the caller issues.
         dmb_ish();
@@ -270,7 +262,7 @@ impl Virtqueue {
     /// is available, `None` otherwise. Most callers should prefer
     /// `wait_for_completion`, which bakes the IRQ + ack + poll loop.
     pub fn poll_used(&mut self) -> Option<(u16, u32)> {
-        let used_idx = self.used_header().read().idx;
+        let used_idx = self.used_header().read().idx();
         if used_idx == self.last_used_idx {
             return None;
         }
@@ -278,7 +270,7 @@ impl Virtqueue {
         let ring_idx = (self.last_used_idx % self.layout.queue_size) as usize;
         let elem = self.used_ring().read(ring_idx);
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
-        Some((elem.id as u16, elem.len))
+        Some((elem.id() as u16, elem.len()))
     }
 
     /// Wait for the next completion, handling the IRQ + ack + poll
@@ -330,16 +322,12 @@ impl Virtqueue {
             loop {
                 let entry = desc.read(idx as usize);
                 count += 1;
-                if entry.flags & VIRTQ_DESC_F_NEXT == 0 {
-                    desc.write(idx as usize, VirtqDesc {
-                        addr: 0,
-                        len: 0,
-                        flags: if prev_num_free > 0 { VIRTQ_DESC_F_NEXT } else { 0 },
-                        next: prev_free_head,
-                    });
+                if entry.flags() & VIRTQ_DESC_F_NEXT == 0 {
+                    let flags = if prev_num_free > 0 { VIRTQ_DESC_F_NEXT } else { 0 };
+                    desc.write(idx as usize, VirtqDesc::new(0, 0, flags, prev_free_head));
                     break;
                 }
-                idx = entry.next;
+                idx = entry.next();
             }
             count
         };

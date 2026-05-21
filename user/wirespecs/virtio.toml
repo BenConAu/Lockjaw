@@ -1,0 +1,143 @@
+# VirtIO split-virtqueue wire DTOs (spec 2.7) + virtio-blk request
+# header (spec 5.2.6). All multi-byte fields are little-endian on the
+# wire — AArch64 hosts are LE so the encoding maps cleanly through
+# `to_le_bytes` / `from_le_bytes`.
+#
+# Generated to `lockjaw-types/src/wire/virtio.rs` by
+# `cargo xtask gen-wires`. Drift caught by `cargo xtask gen-wires --check`.
+
+family = "virtio"
+description = "VirtIO split-virtqueue + virtio-blk wire DTOs (spec 2.7, 5.2.6)"
+
+# ---------------------------------------------------------------------------
+# Split descriptor (spec 2.7.5)
+# ---------------------------------------------------------------------------
+
+[[wire]]
+name = "VirtqDesc"
+description = "Split virtqueue descriptor (spec 2.7.5)."
+size = 16
+endian = "little"
+
+  [[wire.fields]]
+  name = "addr"
+  offset = 0
+  width = 64
+  description = "Guest-physical address of the buffer."
+
+  [[wire.fields]]
+  name = "len"
+  offset = 8
+  width = 32
+  description = "Length of the buffer in bytes."
+
+  [[wire.fields]]
+  name = "flags"
+  offset = 12
+  width = 16
+  description = "Descriptor flags (VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE, VIRTQ_DESC_F_INDIRECT)."
+
+  [[wire.fields]]
+  name = "next"
+  offset = 14
+  width = 16
+  description = "Next-descriptor index if VIRTQ_DESC_F_NEXT is set."
+
+# ---------------------------------------------------------------------------
+# Available ring header (spec 2.7.6) — ring entries follow in memory
+# as a separate [u16; queue_size] slice, NOT part of this DTO.
+# ---------------------------------------------------------------------------
+
+[[wire]]
+name = "VirtqAvail"
+description = "Available ring header (spec 2.7.6). Ring entries follow in memory."
+size = 4
+endian = "little"
+
+  [[wire.fields]]
+  name = "flags"
+  offset = 0
+  width = 16
+  description = "Ring flags (VIRTQ_AVAIL_F_NO_INTERRUPT)."
+
+  [[wire.fields]]
+  name = "idx"
+  offset = 2
+  width = 16
+  description = "Index of the next available ring entry to be written."
+
+# ---------------------------------------------------------------------------
+# Used ring header (spec 2.7.8) — ring entries follow in memory as a
+# separate [VirtqUsedElem; queue_size] slice.
+# ---------------------------------------------------------------------------
+
+[[wire]]
+name = "VirtqUsed"
+description = "Used ring header (spec 2.7.8). Ring entries follow in memory."
+size = 4
+endian = "little"
+
+  [[wire.fields]]
+  name = "flags"
+  offset = 0
+  width = 16
+  description = "Ring flags (VIRTQ_USED_F_NO_NOTIFY)."
+
+  [[wire.fields]]
+  name = "idx"
+  offset = 2
+  width = 16
+  description = "Index of the next used ring entry the device will write."
+
+# ---------------------------------------------------------------------------
+# Used ring element (spec 2.7.8) — one entry in the used ring.
+# ---------------------------------------------------------------------------
+
+[[wire]]
+name = "VirtqUsedElem"
+description = "Single used ring element (spec 2.7.8)."
+size = 8
+endian = "little"
+
+  [[wire.fields]]
+  name = "id"
+  offset = 0
+  width = 32
+  description = "Descriptor chain head index that completed."
+
+  [[wire.fields]]
+  name = "len"
+  offset = 4
+  width = 32
+  description = "Total bytes the device wrote into the chain."
+
+# ---------------------------------------------------------------------------
+# Block-device request header (spec 5.2.6) — placed in the first
+# descriptor of a virtio-blk request chain. The middle u32 `reserved`
+# is fixed to 0 by the driver; constructor omits it via `default = 0`.
+# ---------------------------------------------------------------------------
+
+[[wire]]
+name = "VirtioBlkReqHeader"
+description = "virtio-blk request header (spec 5.2.6)."
+size = 16
+endian = "little"
+
+  [[wire.fields]]
+  name = "req_type"
+  offset = 0
+  width = 32
+  description = "Request type (VIRTIO_BLK_T_IN read, VIRTIO_BLK_T_OUT write)."
+
+  [[wire.fields]]
+  name = "reserved"
+  offset = 4
+  width = 32
+  default = 0
+  description = "Reserved field (spec mandates 0). Constructor omits this; accessor returns 0."
+
+  [[wire.fields]]
+  name = "sector"
+  offset = 8
+  width = 64
+  description = "Starting sector in 512-byte units."

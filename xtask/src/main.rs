@@ -3,6 +3,7 @@ use std::env;
 use std::process::{self, Command, Stdio};
 
 mod gen_regs;
+mod gen_wires;
 
 /// Per-function stack frame cap in bytes. Any single function exceeding
 /// this fails immediately — catches large locals before they interact
@@ -38,6 +39,10 @@ fn main() {
             let check = rest.iter().any(|a| a == "--check");
             gen_regs::run(check);
         }
+        Some("gen-wires") => {
+            let check = rest.iter().any(|a| a == "--check");
+            gen_wires::run(check);
+        }
         _ => {
             eprintln!("Usage: cargo xtask <command>");
             eprintln!("Commands:");
@@ -47,6 +52,7 @@ fn main() {
             eprintln!("  check-init-size        Verify init ELF fits in kernel mapping buffer");
             eprintln!("  check-linker-symbols   Enforce docs/linker-symbol-audit.md allowlist");
             eprintln!("  gen-regs [--check]     Generate lockjaw-regs from user/regspecs/*.toml");
+            eprintln!("  gen-wires [--check]    Generate lockjaw-types::wire from user/wirespecs/*.toml");
             process::exit(1);
         }
     }
