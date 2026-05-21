@@ -184,8 +184,27 @@ assert_contains "uart-driver: IRQ bound" "UART driver bound IRQ → notification
 assert_contains "uart-driver: server ready" "UART driver server loop entered"
 
 echo "Phase 10 — ramfb Display Driver:"
+# Phase 6 conversion: ramfb now uses Tier-A boot_stub! +
+# driver_bootstrap + probe_by_hash + claim_typed (no IRQ — display
+# devices don't bind one, so standard_driver_init / driver_main!
+# don't fit; first escape-valve driver in production). The MMIO map
+# step is internal to claim_typed (was a separate "fw_cfg mapped"
+# log line before); assertion on "claimed fw_cfg" proves the typed
+# claim succeeded — map happens inside the same call.
+#
+# Granular phase assertions cover each driver-side failure point —
+# directory walk, DMA program, server-loop entry — so a future
+# regression that breaks any one of them surfaces at that phase
+# instead of falling through to a generic "driver died" diagnosis.
+assert_contains "ramfb: bootstrapped" "ramfb bootstrapped"
 assert_contains "ramfb: claimed fw_cfg" "ramfb claimed fw_cfg from devmgr"
-assert_contains "ramfb: fw_cfg mapped" "ramfb mapped fw_cfg MMIO"
+# QEMU's `virt` machine doesn't include `-device ramfb` by default
+# (Lockjaw's invocation doesn't add it either), so the directory
+# walk finds no etc/ramfb entry and the driver exits gracefully.
+# Asserting the "not found" line proves the directory walk
+# completed cleanly (probe + claim + find_file all worked, just
+# no display device on this QEMU build).
+assert_contains "ramfb: etc/ramfb not found in fw_cfg" "ramfb directory walk completed (etc/ramfb absent on QEMU virt without -device ramfb)"
 
 echo "Phase 10 — Display Test Client:"
 assert_contains "\[DISPLAY-TEST\] starting" "Display test client started"

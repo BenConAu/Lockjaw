@@ -9,21 +9,35 @@
 //! of `size_of::<T>()` bytes is a valid `T`. Rust's stdlib does not
 //! have a marker for this; we define our own.
 //!
-//! # Why a separate crate (lockjaw-types) hosts this trait
+//! # Construction-safe sealing
 //!
-//! `lockjaw-mmio` depends on `lockjaw-types`. The canonical DMA
-//! struct definitions (`VirtqDesc`, `VirtqUsed`, `VirtioBlkReqHeader`,
-//! etc.) already live in `lockjaw-types`; the `unsafe impl DmaValue`
-//! for each lives next to its definition. If `lockjaw-mmio` defined
-//! the trait and `lockjaw-types` tried to impl it, that would create
-//! a dependency cycle.
+//! `DmaValue` requires the crate-private `sealed::Sealed`
+//! supertrait, so it cannot be implemented outside `lockjaw-types`.
+//! The canonical way to add a new `DmaValue` is via the
+//! `dma_value_impl!` macro, which:
 //!
-//! Drivers in `#![forbid(unsafe_code)]` cannot `unsafe impl DmaValue`,
-//! so the audited corpus of DMA-safe types stays in `lockjaw-types`.
-//! New DmaValue impls go through a `lockjaw-types` review.
+//! 1. Emits a compile-time `const _: () = assert!(size_of::<T>() ==
+//!    expected_size)` check — if `T` has any padding (the most
+//!    common DmaValue-safety bug) the build fails at the impl site
+//!    rather than at runtime through a DmaCell read/write of undef
+//!    bytes.
+//! 2. Emits the `impl sealed::Sealed for T` half (the macro is the
+//!    only place this happens; the module is private).
+//! 3. Emits the `unsafe impl DmaValue for T` half.
+//!
+//! Driver crates cannot construct their own `DmaValue` impls
+//! because:
+//! - They cannot impl `Sealed` (private module).
+//! - The macro emits `impl $crate::dma::sealed::Sealed for $t`,
+//!   which fails to compile from outside `lockjaw-types` because
+//!   the `sealed` module is private.
+//!
+//! New DmaValue corpus members go in `lockjaw-types` next to the
+//! struct they describe (`virtio::*`, `fwcfg::*`, etc.) and use
+//! the macro. There is no escape valve from this discipline.
 
 /// Marker for types where every bit pattern of `size_of::<Self>()`
-/// bytes is a valid `Self`.
+/// bytes is a valid `Self` AND the type has no padding.
 ///
 /// # Safety
 ///
@@ -35,41 +49,79 @@
 ///   restricted discriminants, `bool`, `&T`, `NonNull<T>`, etc. do
 ///   NOT qualify).
 ///
-/// The intended uses are integer primitives and `#[repr(C)]` POD
-/// structs composed of `DmaValue` fields with no padding.
-pub unsafe trait DmaValue: Copy + 'static {}
+/// Implementation discipline: use the `dma_value_impl!` macro, which
+/// emits a compile-time padding check via `const_assert!` on
+/// `size_of::<T>() == declared_wire_size`. Manual `unsafe impl` is
+/// blocked by the `Sealed` supertrait (private to this crate).
+pub unsafe trait DmaValue: Copy + 'static + sealed::Sealed {}
 
-// SAFETY: every bit pattern of an unsigned integer is a valid value.
-unsafe impl DmaValue for u8 {}
-unsafe impl DmaValue for u16 {}
-unsafe impl DmaValue for u32 {}
-unsafe impl DmaValue for u64 {}
+pub(crate) mod sealed {
+    /// Crate-private sealing trait. Driver crates cannot name this
+    /// trait (the module is `pub(crate)`), so they cannot impl
+    /// `DmaValue` for their own types.
+    pub trait Sealed {}
+}
 
-// SAFETY: same for signed integers — two's complement, every bit
-// pattern is a valid value.
-unsafe impl DmaValue for i8 {}
-unsafe impl DmaValue for i16 {}
-unsafe impl DmaValue for i32 {}
-unsafe impl DmaValue for i64 {}
+/// Implement `DmaValue` for a type with a compile-time no-padding
+/// check.
+///
+/// Usage: `dma_value_impl!(MyStruct, size = 16);`
+///
+/// The `size = N` literal is the type's expected on-wire size in
+/// bytes. The macro emits `const _: () = assert!(size_of::<T>() ==
+/// N)` — if the type ever gains padding (e.g. someone drops a
+/// `#[repr(C, packed)]` attribute or adds a misaligned field), the
+/// build fails AT THE IMPL SITE with a clear error message,
+/// before any driver write can leak undef bytes through a
+/// DmaCell.
+///
+/// The macro is `#[macro_export]` for completeness, but external
+/// callers cannot use it: the emitted `impl sealed::Sealed for $t`
+/// fails to compile from outside `lockjaw-types` because the
+/// `sealed` module is `pub(crate)`.
+#[macro_export]
+macro_rules! dma_value_impl {
+    ($t:ty, size = $size:literal $(,)?) => {
+        // SAFETY of the const_assert: `size_of::<T>()` is `const`;
+        // panicking in const context fails the build. If $t has
+        // padding (size > sum of field sizes), the assert fires.
+        const _: () = assert!(
+            core::mem::size_of::<$t>() == $size,
+            concat!(
+                stringify!($t),
+                " has size != ", stringify!($size),
+                " bytes — padding violates the DmaValue safety contract.\n",
+                "Either (a) the type gained padding (check #[repr(C, packed)]),\n",
+                "or (b) the `size = N` argument to dma_value_impl! is wrong.",
+            ),
+        );
+        impl $crate::dma::sealed::Sealed for $t {}
+        unsafe impl $crate::dma::DmaValue for $t {}
+    };
+}
 
-// SAFETY: VirtqDesc is #[repr(C)] of u64 + u32 + u16 + u16 = 16 bytes
-// exactly, no padding. All fields are DmaValue primitives; every bit
-// pattern is valid.
-unsafe impl DmaValue for crate::virtio::VirtqDesc {}
+// ---------------------------------------------------------------------------
+// Primitive integer impls. Every bit pattern is valid; sizes are
+// guaranteed by Rust's spec.
+// ---------------------------------------------------------------------------
 
-// SAFETY: VirtqAvail header is #[repr(C)] of u16 + u16 = 4 bytes, no
-// padding. (The ring entries that follow it in memory are not part
-// of this struct.)
-unsafe impl DmaValue for crate::virtio::VirtqAvail {}
+dma_value_impl!(u8,  size = 1);
+dma_value_impl!(u16, size = 2);
+dma_value_impl!(u32, size = 4);
+dma_value_impl!(u64, size = 8);
+dma_value_impl!(i8,  size = 1);
+dma_value_impl!(i16, size = 2);
+dma_value_impl!(i32, size = 4);
+dma_value_impl!(i64, size = 8);
 
-// SAFETY: VirtqUsedElem is #[repr(C)] of u32 + u32 = 8 bytes, no
-// padding. Device-written; the impl is essential for DmaCell reads.
-unsafe impl DmaValue for crate::virtio::VirtqUsedElem {}
+// ---------------------------------------------------------------------------
+// Virtio DTO impls. Sizes come from `#[repr(C)]` layout of integer
+// fields with natural alignment; verified at compile time by the
+// macro's const_assert.
+// ---------------------------------------------------------------------------
 
-// SAFETY: VirtqUsed header is #[repr(C)] of u16 + u16 = 4 bytes, no
-// padding. Device-written.
-unsafe impl DmaValue for crate::virtio::VirtqUsed {}
-
-// SAFETY: VirtioBlkReqHeader is #[repr(C)] of u32 + u32 + u64 = 16
-// bytes, no padding.
-unsafe impl DmaValue for crate::virtio::VirtioBlkReqHeader {}
+dma_value_impl!(crate::virtio::VirtqDesc,         size = 16);
+dma_value_impl!(crate::virtio::VirtqAvail,        size = 4);
+dma_value_impl!(crate::virtio::VirtqUsedElem,     size = 8);
+dma_value_impl!(crate::virtio::VirtqUsed,         size = 4);
+dma_value_impl!(crate::virtio::VirtioBlkReqHeader, size = 16);

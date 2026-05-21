@@ -590,11 +590,30 @@ fn emit_device(spec: &Spec) -> String {
                 );
             }
         }
-        if reg.endian.is_some() {
+        // Phase 6: per-register `endian = "big"` is supported on
+        // u16/u32/u64. The emitter wraps reads with `uN::from_be(...)`
+        // and writes with `v.to_be()`. LE is the default; specs omit
+        // `endian` for LE. BE+u8 is not exercised by any current
+        // device and not tested — if a future spec needs it, add a
+        // codegen test before relying on it.
+        if reg.endian.is_some() && !matches!(reg.access, Access::Ro | Access::Rw | Access::Wo) {
             panic!(
-                "Phase 2 emitter does not support per-register endian (used by `{}` in device `{}`). \
-                 Endian support lands in Phase 5.",
-                reg.name, spec.device.name
+                "{}: register `{}` has endian set but access {:?} is not a plain ro/rw/wo — \
+                 BE+trigger / BE+w1c semantics aren't defined yet",
+                spec.device.name, reg.name, reg.access
+            );
+        }
+        // BE + typed (flags/fields) compound is non-trivial: the typed
+        // accessor's `modify` would need a swap-on-read AND a swap-on-
+        // write inside one closure. No current device combines them
+        // (fwcfg's BE registers are plain scalars; SDHCI/cprman/virtio
+        // are all LE). Defer until a real consumer surfaces — the
+        // alternative is shipping codegen that's never been exercised.
+        if reg.endian.is_some() && (!reg.flags.is_empty() || !reg.fields.is_empty()) {
+            panic!(
+                "{}: register `{}` combines `endian` with `flags`/`fields`; emitter doesn't \
+                 support BE-typed snapshots yet (add when a device needs it)",
+                spec.device.name, reg.name
             );
         }
         if !reg.parts.is_empty() || !reg.aliases.is_empty() {
@@ -1068,15 +1087,37 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
         let wty = format!("u{}", reg.width);
         let has_typed = !reg.flags.is_empty() || !reg.fields.is_empty();
         let ty = if has_typed { to_pascal(&reg.name) } else { wty.clone() };
+        // Phase 6 BE handling: BE registers wrap reads in `uN::from_be`
+        // and writes in `v.to_be()`. LE is the default (no wrap; matches
+        // the AArch64 host byte order Lockjaw runs on). The byte-swap
+        // call site is uniform whether the wrapped expression is on a
+        // raw cell or a typed snapshot — the typed-snapshot accessors
+        // call read_X()/set_X() which apply the conversion exactly once.
+        let is_be = matches!(reg.endian, Some(Endian::Big));
+        let read_expr = if is_be {
+            format!("{wty}::from_be(self.{}.read())", reg.name)
+        } else {
+            format!("self.{}.read()", reg.name)
+        };
+        let write_expr = if is_be {
+            "v.to_be()".to_string()
+        } else {
+            "v".to_string()
+        };
+        let endian_note = if is_be {
+            " (big-endian on the wire)"
+        } else {
+            ""
+        };
         let raw_read = |out: &mut String| {
-            writeln!(out, "    /// Volatile read of `{}` as `{wty}`.", reg.name).unwrap();
+            writeln!(out, "    /// Volatile read of `{}` as `{wty}`{}.", reg.name, endian_note).unwrap();
             writeln!(out, "    #[inline(always)]").unwrap();
-            writeln!(out, "    pub fn read_{}(&self) -> {wty} {{ self.{}.read() }}", reg.name, reg.name).unwrap();
+            writeln!(out, "    pub fn read_{}(&self) -> {wty} {{ {read_expr} }}", reg.name).unwrap();
         };
         let raw_write = |out: &mut String| {
-            writeln!(out, "    /// Volatile write of `{}`.", reg.name).unwrap();
+            writeln!(out, "    /// Volatile write of `{}`{}.", reg.name, endian_note).unwrap();
             writeln!(out, "    #[inline(always)]").unwrap();
-            writeln!(out, "    pub fn write_{}(&self, v: {wty}) {{ self.{}.write(v); }}", reg.name, reg.name).unwrap();
+            writeln!(out, "    pub fn write_{}(&self, v: {wty}) {{ self.{}.write({write_expr}); }}", reg.name, reg.name).unwrap();
         };
         match reg.access {
             Access::Ro => {
@@ -1153,7 +1194,9 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
 
 fn emit_tests(out: &mut String, spec: &Spec) {
     let dev = &spec.device.name;
-    let needs_mock = !spec.u64_pairs.is_empty() || !spec.windowed.is_empty();
+    let has_be = spec.registers.iter().any(|r| matches!(r.endian, Some(Endian::Big)));
+    let needs_mock =
+        !spec.u64_pairs.is_empty() || !spec.windowed.is_empty() || has_be;
     writeln!(out, "#[cfg(test)]").unwrap();
     writeln!(out, "mod tests {{").unwrap();
     writeln!(out, "    use super::*;").unwrap();
@@ -1417,6 +1460,42 @@ fn emit_tests(out: &mut String, spec: &Spec) {
                 writeln!(out).unwrap();
             }
         }
+    }
+
+    // Phase 6 — BE byte-swap roundtrip for big-endian registers.
+    // Writes a host-order value through the typed accessor; peeks
+    // the underlying memory and asserts the bytes are the BE
+    // representation (proves to_be() is applied). Then reads back
+    // through the typed accessor and asserts the host value
+    // matches (proves from_be() is applied on the read side too).
+    // Tests only emit for writable BE registers since the read-back
+    // check requires writing first.
+    for reg in &spec.registers {
+        if !matches!(reg.endian, Some(Endian::Big)) { continue; }
+        if !matches!(reg.access, Access::Rw | Access::Wo) { continue; }
+        let off = reg.offset;
+        // Choose a test value whose BE byte pattern differs visibly
+        // from its LE pattern, so a missing swap shows up clearly.
+        let (test_val, peek_method, expected_raw) = match reg.width {
+            8  => ("0x12u8",                "peek_u8",  "0x12u8".to_string()),
+            16 => ("0x1234u16",             "peek_u16", "0x3412u16".to_string()),
+            32 => ("0x1234_5678u32",        "peek_u32", "0x7856_3412u32".to_string()),
+            64 => ("0x1122_3344_5566_7788u64", "peek_u64", "0x8877_6655_4433_2211u64".to_string()),
+            _ => unreachable!(),
+        };
+        writeln!(out, "    #[test]").unwrap();
+        writeln!(out, "    fn {}_be_roundtrip() {{", reg.name).unwrap();
+        writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+        writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+        writeln!(out, "        regs.regs().write_{}({test_val});", reg.name).unwrap();
+        writeln!(out, "        // Underlying memory holds the BE byte pattern (write applied to_be()).").unwrap();
+        writeln!(out, "        assert_eq!(region.{peek_method}(0x{off:x}), {expected_raw});").unwrap();
+        if matches!(reg.access, Access::Rw) {
+            writeln!(out, "        // Typed read recovers the host value (read applied from_be()).").unwrap();
+            writeln!(out, "        assert_eq!(regs.regs().read_{}(), {test_val});", reg.name).unwrap();
+        }
+        writeln!(out, "    }}").unwrap();
+        writeln!(out).unwrap();
     }
 
     // Phase 4A.4 — verify_against const_assert_eq! per binding. Lives

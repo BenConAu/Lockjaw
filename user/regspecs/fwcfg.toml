@@ -1,35 +1,63 @@
-# SKELETAL spec for QEMU fw_cfg + ramfb. Filled out and emitted in
-# Phase 5 (ramfb-driver conversion). For Phase 2 it exists so the
-# parser/--check validates the schema features fw_cfg needs:
-# - `endian = "big"` per-register (fw_cfg selector and DMA address)
-# - `kind = "stream"` data port (emits accessor methods, not a struct
-#   field — multiple reads/writes hit the same address)
+# QEMU fw_cfg control + DMA. Used by ramfb-driver to discover
+# the etc/ramfb selector via the file directory walk, then
+# program the framebuffer via the DMA interface.
+#
+# Reference: QEMU docs/specs/fw_cfg.rst.
+#
+# Phase 6 surfaced two new spec features:
+#  - `endian = "big"` (selector + dma_addr are big-endian on the wire;
+#    the codegen wraps writes in `v.to_be()`).
+#  - `kind = "stream"` (data port: repeated reads from offset 0 yield
+#    successive bytes of the selected item; codegen emits raw read/write
+#    with NO modify because RMW is incoherent on a stream).
 
 [device]
 name = "FwCfg"
-description = "QEMU fw_cfg control + DMA + ramfb"
-emit = false
+description = "QEMU fw_cfg control + DMA"
+emit = true
 
+# ---------------------------------------------------------------------------
+# Data port (stream). Reads consume bytes of the currently selected item;
+# writes go to the device (for items the platform marks writable). Reads
+# and writes touch different state — codegen MUST NOT emit a `modify_`
+# helper (would corrupt the stream).
+# ---------------------------------------------------------------------------
 [[registers]]
 name = "data"
 offset = 0x000
 width = 8
 access = "rw"
 kind = "stream"
-description = "Selector data port; read/write byte stream"
+description = "Data port — stream of bytes from the selected item"
 
+# ---------------------------------------------------------------------------
+# Selector (big-endian). Picks which fw_cfg item subsequent data-port
+# reads (or DMA transfers) operate on. Well-known selectors include
+# FW_CFG_FILE_DIR (0x0019) for the directory walk; per-file selectors
+# come from the directory entries.
+# ---------------------------------------------------------------------------
 [[registers]]
 name = "selector"
 offset = 0x008
 width = 16
 access = "wo"
 endian = "big"
-description = "Pick a fw_cfg entry"
+description = "Item selector (BE)"
 
+# ---------------------------------------------------------------------------
+# DMA control address (big-endian). Writing the 64-bit guest-physical
+# address of a FWCfgDmaAccess header triggers the DMA transfer. The
+# header lives in guest RAM and contains:
+#   u32 control (BE) — direction, selector, error/skip flags
+#   u32 length  (BE)
+#   u64 address (BE) — guest-phys of the payload buffer
+# Driver-side struct layouts for the header + ramfb config live in
+# lockjaw-types::fwcfg (they're shared-memory DTOs, not MMIO).
+# ---------------------------------------------------------------------------
 [[registers]]
 name = "dma_addr"
 offset = 0x010
 width = 64
 access = "wo"
 endian = "big"
-description = "DMA-mode request control address"
+description = "DMA control header guest-phys address (BE) — write triggers transfer"

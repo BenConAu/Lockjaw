@@ -619,7 +619,11 @@ pub extern "C" fn _start() -> ! {
         Ok(idx) => idx,
         Err(_) => { puts("init: export display_ep to ramfb FAILED\n"); park_forever(); }
     };
-    sys_reply(ramfb_devmgr_idx, ramfb_display_idx, 0, 0);
+    // Order matches driver_bootstrap's expectation: reply[0] = server
+    // endpoint, reply[1] = devmgr endpoint. (Earlier ramfb pre-Phase-6
+    // expected the reversed order; Phase 6 conversion to driver_bootstrap
+    // unified ramfb with the uart/virtio-blk convention.)
+    sys_reply(ramfb_display_idx, ramfb_devmgr_idx, 0, 0);
     puts("[BOOTSTRAP] ramfb\n");
 
     // Bootstrap display-test: export display_ep so it can use the DDI.

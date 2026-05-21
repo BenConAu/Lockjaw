@@ -30,6 +30,7 @@ pub mod rights;
 pub mod thread;
 pub mod display;
 pub mod virtio;
+pub mod fwcfg;
 pub mod block;
 pub mod dma;
 pub mod sdhci;
