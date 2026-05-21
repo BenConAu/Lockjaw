@@ -72,10 +72,6 @@ impl CmEmmc2Ctl {
     pub const BUSY_SHIFT: u32 = 7;
     /// Read `busy` as bool.
     pub const fn busy(self) -> bool { (self.0 & Self::BUSY_MASK) != 0 }
-    /// Return a new value with `busy` set to `v`.
-    pub const fn with_busy(self, v: bool) -> Self {
-        if v { Self(self.0 | Self::BUSY_MASK) } else { Self(self.0 & !Self::BUSY_MASK) }
-    }
 }
 
 /// Enum for the `src` field of `CmEmmc2Ctl`.
@@ -194,11 +190,7 @@ mod tests {
         assert!(on.kill());
         let off = on.with_kill(false);
         assert!(!off.kill());
-        // bool field `busy`
-        let on = CmEmmc2Ctl::default().with_busy(true);
-        assert!(on.busy());
-        let off = on.with_busy(false);
-        assert!(!off.busy());
+        // RO field `busy` — see cm_emmc2_ctl_ro_field_read
     }
 
     #[test]
@@ -213,9 +205,13 @@ mod tests {
         // toggle bool `kill` without disturbing other bits
         let v = CmEmmc2Ctl(all_ones).with_kill(false);
         assert_eq!(v.0 & !CmEmmc2Ctl::KILL_MASK, all_ones & !CmEmmc2Ctl::KILL_MASK);
-        // toggle bool `busy` without disturbing other bits
-        let v = CmEmmc2Ctl(all_ones).with_busy(false);
-        assert_eq!(v.0 & !CmEmmc2Ctl::BUSY_MASK, all_ones & !CmEmmc2Ctl::BUSY_MASK);
+    }
+
+    #[test]
+    fn cm_emmc2_ctl_ro_field_read() {
+        // RO bool `busy` — bit 7 reads as the field state
+        assert!(CmEmmc2Ctl(0x80u32).busy());
+        assert!(!CmEmmc2Ctl(!0x80u32).busy());
     }
 
     #[test]

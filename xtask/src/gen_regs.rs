@@ -272,6 +272,30 @@ struct Field {
     description: Option<String>,
     #[serde(default)]
     enum_values: Vec<EnumValue>,
+    /// Per-field access mode. Defaults to `rw` (driver reads and
+    /// writes). `ro` marks hardware-set status fields like SDHCI's
+    /// `CARD_INSERTED` or cprman's `BUSY` — the emitter skips the
+    /// `with_*` setter and the related test cases so driver code
+    /// literally cannot construct a meaningless write to the field.
+    ///
+    /// Field-level access is independent of the parent register's
+    /// access: a `rw` register can carry RO status fields the
+    /// hardware updates asynchronously (the typical pattern). When
+    /// not specified, behaves as `rw` to keep historical regspecs
+    /// emitting unchanged.
+    #[serde(default)]
+    access: FieldAccess,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+enum FieldAccess {
+    /// Field is hardware-set; driver reads only. Emitter omits the
+    /// `with_*` setter and the related test cases.
+    Ro,
+    /// Field is driver-writable (the default).
+    #[default]
+    Rw,
 }
 
 #[derive(Deserialize, Debug)]
@@ -993,6 +1017,14 @@ fn emit_fields_newtype(out: &mut String, reg: &Register) {
         writeln!(out, "    /// Right-shift to access the `{}` field.", f.name).unwrap();
         writeln!(out, "    pub const {shift_const}: u32 = {shift};").unwrap();
 
+        // RO fields get the reader + MASK/SHIFT constants but NO
+        // `with_*` setter — hardware ignores writes to status bits,
+        // and exposing a constructor that the device silently drops
+        // is the discipline-based pattern the typed codegen exists
+        // to retire. The construction-safety win is structural:
+        // driver code that tries `cm_emmc2_ctl().with_busy(true)`
+        // fails to compile rather than producing a no-op write.
+        let emit_setter = !matches!(f.access, FieldAccess::Ro);
         if field_width == 1 && f.enum_values.is_empty() {
             // Boolean field.
             writeln!(
@@ -1004,20 +1036,22 @@ fn emit_fields_newtype(out: &mut String, reg: &Register) {
                 "    pub const fn {}(self) -> bool {{ (self.0 & Self::{mask_const}) != 0 }}",
                 f.name
             ).unwrap();
-            writeln!(
-                out,
-                "    /// Return a new value with `{}` set to `v`.", f.name
-            ).unwrap();
-            writeln!(
-                out,
-                "    pub const fn with_{}(self, v: bool) -> Self {{",
-                f.name
-            ).unwrap();
-            writeln!(
-                out,
-                "        if v {{ Self(self.0 | Self::{mask_const}) }} else {{ Self(self.0 & !Self::{mask_const}) }}"
-            ).unwrap();
-            writeln!(out, "    }}").unwrap();
+            if emit_setter {
+                writeln!(
+                    out,
+                    "    /// Return a new value with `{}` set to `v`.", f.name
+                ).unwrap();
+                writeln!(
+                    out,
+                    "    pub const fn with_{}(self, v: bool) -> Self {{",
+                    f.name
+                ).unwrap();
+                writeln!(
+                    out,
+                    "        if v {{ Self(self.0 | Self::{mask_const}) }} else {{ Self(self.0 & !Self::{mask_const}) }}"
+                ).unwrap();
+                writeln!(out, "    }}").unwrap();
+            }
         } else if !f.enum_values.is_empty() {
             let enum_ty = format!("{}{}", ty, to_pascal(&f.name));
             writeln!(out, "    /// Decode the `{}` field as `{}`.", f.name, enum_ty).unwrap();
@@ -1031,13 +1065,15 @@ fn emit_fields_newtype(out: &mut String, reg: &Register) {
                 "        {enum_ty}::from_bits((self.0 & Self::{mask_const}) >> Self::{shift_const})"
             ).unwrap();
             writeln!(out, "    }}").unwrap();
-            writeln!(out, "    /// Return a new value with `{}` set to `v`.", f.name).unwrap();
-            writeln!(out, "    pub const fn with_{}(self, v: {enum_ty}) -> Self {{", f.name).unwrap();
-            writeln!(
-                out,
-                "        Self((self.0 & !Self::{mask_const}) | ((v.into_bits() as {wty}) << Self::{shift_const}))"
-            ).unwrap();
-            writeln!(out, "    }}").unwrap();
+            if emit_setter {
+                writeln!(out, "    /// Return a new value with `{}` set to `v`.", f.name).unwrap();
+                writeln!(out, "    pub const fn with_{}(self, v: {enum_ty}) -> Self {{", f.name).unwrap();
+                writeln!(
+                    out,
+                    "        Self((self.0 & !Self::{mask_const}) | ((v.into_bits() as {wty}) << Self::{shift_const}))"
+                ).unwrap();
+                writeln!(out, "    }}").unwrap();
+            }
         } else {
             // Multi-bit scalar.
             writeln!(out, "    /// Read the `{}` field as a scalar.", f.name).unwrap();
@@ -1046,13 +1082,15 @@ fn emit_fields_newtype(out: &mut String, reg: &Register) {
                 "    pub const fn {}(self) -> {wty} {{ (self.0 & Self::{mask_const}) >> Self::{shift_const} }}",
                 f.name
             ).unwrap();
-            writeln!(out, "    /// Return a new value with `{}` set to `v` (truncated to field width).", f.name).unwrap();
-            writeln!(out, "    pub const fn with_{}(self, v: {wty}) -> Self {{", f.name).unwrap();
-            writeln!(
-                out,
-                "        Self((self.0 & !Self::{mask_const}) | ((v << Self::{shift_const}) & Self::{mask_const}))"
-            ).unwrap();
-            writeln!(out, "    }}").unwrap();
+            if emit_setter {
+                writeln!(out, "    /// Return a new value with `{}` set to `v` (truncated to field width).", f.name).unwrap();
+                writeln!(out, "    pub const fn with_{}(self, v: {wty}) -> Self {{", f.name).unwrap();
+                writeln!(
+                    out,
+                    "        Self((self.0 & !Self::{mask_const}) | ((v << Self::{shift_const}) & Self::{mask_const}))"
+                ).unwrap();
+                writeln!(out, "    }}").unwrap();
+            }
         }
     }
     writeln!(out, "}}").unwrap();
@@ -1343,10 +1381,16 @@ fn emit_tests(out: &mut String, spec: &Spec) {
         let ty = to_pascal(&reg.name);
         let wty = format!("u{}", reg.width);
 
-        // Per-field roundtrip.
+        // Per-field roundtrip. RO fields have no `with_*` setter, so
+        // a `with_*().field()` roundtrip is meaningless for them —
+        // they get a dedicated reader test below instead.
         writeln!(out, "    #[test]").unwrap();
         writeln!(out, "    fn {}_field_roundtrip() {{", reg.name).unwrap();
         for f in &reg.fields {
+            if matches!(f.access, FieldAccess::Ro) {
+                writeln!(out, "        // RO field `{}` — see {}_ro_field_read", f.name, reg.name).unwrap();
+                continue;
+            }
             let (hi, lo) = parse_bits(&f.bits).expect("validated");
             let width = (hi - lo + 1) as u32;
             if width == 1 && f.enum_values.is_empty() {
@@ -1388,11 +1432,15 @@ fn emit_tests(out: &mut String, spec: &Spec) {
         writeln!(out).unwrap();
 
         // Reserved-bit preservation: set every bit to 1, modify one field,
-        // verify bits outside the field mask are unchanged.
+        // verify bits outside the field mask are unchanged. RO fields
+        // have no `with_*` to call so they're skipped — their bits
+        // never move via the typed surface, so reserved-bit preservation
+        // is trivially preserved for them.
         writeln!(out, "    #[test]").unwrap();
         writeln!(out, "    fn {}_preserves_reserved_bits() {{", reg.name).unwrap();
         writeln!(out, "        let all_ones: {wty} = !0;").unwrap();
         for f in &reg.fields {
+            if matches!(f.access, FieldAccess::Ro) { continue; }
             let mask_const = format!("{}::{}_MASK", ty, f.name.to_uppercase());
             if (parse_bits(&f.bits).unwrap().0 - parse_bits(&f.bits).unwrap().1 + 1) as u32 == 1
                 && f.enum_values.is_empty()
@@ -1414,6 +1462,45 @@ fn emit_tests(out: &mut String, spec: &Spec) {
         }
         writeln!(out, "    }}").unwrap();
         writeln!(out).unwrap();
+
+        // Per-RO-field read tests. Construct the typed wrapper from
+        // a raw bit pattern that places the field's bits at known
+        // values; verify the accessor decodes to the expected result.
+        // Replaces what the `with_*().field()` roundtrip would cover
+        // for RW fields.
+        let has_ro = reg.fields.iter().any(|f| matches!(f.access, FieldAccess::Ro));
+        if has_ro {
+            writeln!(out, "    #[test]").unwrap();
+            writeln!(out, "    fn {}_ro_field_read() {{", reg.name).unwrap();
+            for f in &reg.fields {
+                if !matches!(f.access, FieldAccess::Ro) { continue; }
+                let (hi, lo) = parse_bits(&f.bits).expect("validated");
+                let width = (hi - lo + 1) as u32;
+                let mask = if width >= reg.width as u32 {
+                    mask_for_width(reg.width)
+                } else {
+                    (((1u64 << width) - 1) << lo) as u64
+                };
+                if width == 1 && f.enum_values.is_empty() {
+                    writeln!(out, "        // RO bool `{}` — bit {} reads as the field state", f.name, lo).unwrap();
+                    writeln!(out, "        assert!({ty}(0x{mask:x}{wty}).{}());", f.name).unwrap();
+                    writeln!(out, "        assert!(!{ty}(!0x{mask:x}{wty}).{}());", f.name).unwrap();
+                } else if !f.enum_values.is_empty() {
+                    let enum_ty = format!("{}{}", ty, to_pascal(&f.name));
+                    let first = &f.enum_values[0];
+                    let placed: u64 = (first.value as u64) << lo;
+                    writeln!(out, "        // RO enum `{}` — decode a known variant placed at bits {}:{}", f.name, hi, lo).unwrap();
+                    writeln!(out, "        assert_eq!({ty}(0x{placed:x}{wty}).{}().unwrap(), {enum_ty}::{});", f.name, first.name).unwrap();
+                } else {
+                    let value: u64 = mask;
+                    let extracted: u64 = (mask >> lo) & (((1u64 << width) - 1) as u64);
+                    writeln!(out, "        // RO scalar `{}` — read extracts bits {}:{}", f.name, hi, lo).unwrap();
+                    writeln!(out, "        assert_eq!({ty}(0x{value:x}{wty}).{}(), 0x{extracted:x}{wty});", f.name).unwrap();
+                }
+            }
+            writeln!(out, "    }}").unwrap();
+            writeln!(out).unwrap();
+        }
 
         // Enum-specific decode/reserved tests.
         for f in &reg.fields {

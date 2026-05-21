@@ -441,22 +441,3 @@ The Phase 5 banner-ordering fix in `uart_main` (kernel-debug puts BEFORE UART1 b
 The bigger architectural move: `uart_putc` is one instance of "poll a hardware bit until it changes or we give up." The same shape appears in SDHCI (`poll_until_clear` / `poll_until_set` in emmc2-driver), in virtio (config-status readback after FEATURES_OK), in any device with a busy bit. A shared `poll_until_deadline` primitive belongs in `lockjaw-userlib` alongside the barriers.
 
 **Why bootstrap:** today's two converted drivers run in QEMU where TX always drains; the hang is only theoretical. Adding deadline plumbing without a concrete liveness failure to debug against would be speculative. Revisit when (a) the first Pi-hardware bring-up surfaces a real spin-forever incident, or (b) the second event-loop driver lands (probably a console for posix) — whichever comes first.
-
----
-
-## Regspec/wirespec lacks per-field access mode
-
-**Where:** `xtask/src/gen_regs.rs` field emission (`with_<field>` setter for every field regardless of hardware writability). Surfaces concretely as `lockjaw_regs::cprman::CmEmmc2Ctl::with_busy(bool)` — BUSY is a hardware-set RO status bit that drivers should never construct, but the codegen emits a setter for it anyway. Equivalent shape applies to wirespec fields the device writes (driver-readable, not driver-writable).
-
-**What:** Phase 4A introduced bit-field codegen (every field gets `<field>()` getter + `with_<field>()` setter + `<FIELD>_MASK` / `<FIELD>_SHIFT` constants). The setter is emitted unconditionally, even for RO fields where construction is semantically meaningless. The hardware silently ignores RO-field writes (or rejects them at the register's access level), so the bug is latent — Phase 8's cprman driver doesn't call `with_busy()`, and the spec's field description says "RO; preserved on writeback" as a discipline note. That's exactly the discipline-based pattern the typed codegen is meant to retire one layer up.
-
-**Fix:** Add `access = "ro"` / `access = "rw"` to the per-field schema in `gen_regs.rs` (defaulting to `rw`). For `ro` fields:
-- Emit the getter (`<field>()`) and the `<FIELD>_MASK` / `<FIELD>_SHIFT` constants.
-- Skip the `with_<field>()` setter — construction of an RO field is meaningless.
-- Skip the field from the `<reg>_preserves_reserved_bits` test (the `with_*` toggle test would have no setter to call).
-
-Same fix applies to wirespec: device-written DTOs (e.g. a hypothetical future `VirtqUsedElem.id` if it were marked RO) should expose the getter without the constructor parameter. Today's wire DTOs all have driver-writable fields, but the next family that adds a device-only-written DTO will hit this.
-
-**Why bootstrap:** Phase 4A's blanket setter emission was the cheapest correct behavior — every regspec field at the time was driver-writable in some sense (drivers do RMW including the RO bit's current value back). The construction-safety gap is small (driver source still won't compile against meaningless setters when the driver doesn't reference them), but it's the kind of pattern Phase 8's PASSWD-wrap codegen is the canonical example of foreclosing — typed surface should permit only meaningful operations.
-
-**Fix order:** Land when the next regspec / wirespec adds a hardware-set RO field that begs the question. cprman is the first regspec with such a field; emmc2 (Phase 9, SDHCI) will add several (`PRESENT_STATE` reg has many RO bits like `CARD_INSERTED`, `WRITE_TRANSFER_ACTIVE`, etc.). Phase 9 is the natural forcing function.

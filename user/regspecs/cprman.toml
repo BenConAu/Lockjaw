@@ -43,7 +43,12 @@ fields = [
     ] },
     { name = "enable", bits = "4:4", description = "Gate enable" },
     { name = "kill",   bits = "5:5", description = "Force-stop the output (used during DIV reconfig)" },
-    { name = "busy",   bits = "7:7", description = "Generator is running (RO; preserved on writeback)" },
+    # `busy` is hardware-set: the controller raises it while the
+    # generator is running. Marking access = "ro" tells the codegen
+    # to emit only the reader — no `with_busy(...)` setter. Driver
+    # code that tries to construct a write to BUSY now fails to
+    # compile (used to silently no-op against the hardware).
+    { name = "busy",   bits = "7:7", access = "ro", description = "Generator is running (RO; hardware-set)" },
 ]
 
 # ---------------------------------------------------------------------------
