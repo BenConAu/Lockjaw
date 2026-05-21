@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod cprman;
 pub mod fw_cfg;
 pub mod pl011;
 pub mod virtio_mmio;

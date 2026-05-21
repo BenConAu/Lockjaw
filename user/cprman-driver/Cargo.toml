@@ -8,6 +8,8 @@ edition = "2021"
 [dependencies]
 lockjaw-userlib = { path = "../lockjaw-userlib" }
 lockjaw-types = { path = "../../lockjaw-types" }
+lockjaw-mmio = { path = "../lockjaw-mmio" }
+lockjaw-regs = { path = "../lockjaw-regs" }
 
 [profile.release]
 panic = "abort"

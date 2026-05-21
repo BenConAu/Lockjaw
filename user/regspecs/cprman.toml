@@ -1,15 +1,32 @@
-# SKELETAL spec for BCM2711 CPRMAN (clock & power manager).
-# Filled out and emitted in Phase 6 (cprman-driver conversion).
-# For Phase 2 it exists so the parser/--check validates the schema
-# features cprman needs:
-# - `kind = "passwd_protected"` — every write must include the
-#   0x5a000000 PASSWD prefix (XOR with 0xff000000 from the read value).
-# - register-level access semantics for the CM_<peripheral>_CTL pattern.
+# BCM2711 CPRMAN — Clock & Power Manager.
+#
+# Filled out and emitted in Phase 8 (cprman-driver conversion).
+# Schema features cprman exercises:
+# - `kind = "passwd_protected"` — every write XORs in the spec-mandated
+#   PASSWD byte (0x5A) in bits[31:24]. Without it the hardware silently
+#   ignores the write. The codegen handles this mechanically: drivers
+#   write field values via typed setters, the generated `set_*` /
+#   `modify_*` accessors compose the PASSWD prefix automatically.
+# - Multi-bit `fields` with enum-valued parent-select.
+# - `verify_against` bridge to `lockjaw_types::clock::cprman` so
+#   register-offset constants stay in sync between the typed handle
+#   and the host-side math/lookup tables.
 
 [device]
 name = "Cprman"
-description = "BCM2711 Clock & Power Manager"
-emit = false
+description = "BCM2711 Clock & Power Manager (Pi 4B clock controller)"
+verify_against = "lockjaw_types::clock::cprman"
+
+# ---------------------------------------------------------------------------
+# CM_EMMC2CTL — control for the EMMC2 (SDHCI) gate clock.
+#
+# Bit layout (32-bit, all writes need PASSWD in bits[31:24]):
+#   [7]    BUSY     RO  — set while the generator is running
+#   [5]    KILL     RW  — force-stop the output (clean teardown
+#                          before changing DIV; clears once BUSY drops)
+#   [4]    ENABLE   RW  — gate enable
+#   [3:0]  SRC      RW  — parent selector (enum-valued)
+# ---------------------------------------------------------------------------
 
 [[registers]]
 name = "cm_emmc2_ctl"
@@ -17,16 +34,30 @@ offset = 0x1d0
 width = 32
 access = "rw"
 kind = "passwd_protected"
-description = "EMMC2 clock control. Writes must include PASSWD = 0x5a"
+description = "EMMC2 clock-gate control. PASSWD-protected."
 fields = [
     { name = "src", bits = "3:0", enum_values = [
-        { name = "Gnd", value = 0 },
-        { name = "Osc", value = 1 },
-        { name = "PllD", value = 6 },
+        { name = "Gnd",           value = 0 },
+        { name = "Osc",           value = 1 },
+        { name = "PllDPerCore",   value = 6 },
     ] },
-    { name = "enable", bits = "4:4" },
-    { name = "busy", bits = "7:7" },
+    { name = "enable", bits = "4:4", description = "Gate enable" },
+    { name = "kill",   bits = "5:5", description = "Force-stop the output (used during DIV reconfig)" },
+    { name = "busy",   bits = "7:7", description = "Generator is running (RO; preserved on writeback)" },
 ]
+
+# ---------------------------------------------------------------------------
+# CM_EMMC2DIV — fixed-point divider for the EMMC2 gate.
+#
+# Bit layout:
+#   [23:12]  DIVI   — integer part of the divider
+#   [11:0]   DIVF   — fractional part (units of 1/4096)
+#
+# Output rate = parent / (DIVI + DIVF/4096). Per Linux's clk-bcm2835.c
+# the divider MUST be reprogrammed only while the gate is killed
+# (BUSY clear). The driver enforces this sequencing — the codegen
+# only mechanises the PASSWD wrap.
+# ---------------------------------------------------------------------------
 
 [[registers]]
 name = "cm_emmc2_div"
@@ -34,4 +65,25 @@ offset = 0x1d4
 width = 32
 access = "rw"
 kind = "passwd_protected"
-description = "EMMC2 clock integer divider (DIV.INT << 12 | DIV.FRAC)"
+description = "EMMC2 clock integer+fractional divider (DIVI<<12 | DIVF). PASSWD-protected."
+fields = [
+    { name = "divf", bits = "11:0",  description = "Fractional part (1/4096 units)" },
+    { name = "divi", bits = "23:12", description = "Integer part" },
+]
+
+# ---------------------------------------------------------------------------
+# verify_against bindings — generated register offsets must match the
+# host-side constants in `lockjaw_types::clock::cprman`. The driver
+# sources its register handle through the generated module; the
+# host-side constants exist so divider math and lookup tables don't
+# duplicate the offset, and the const_assert proves the two stay
+# aligned.
+# ---------------------------------------------------------------------------
+
+[[verify_offsets]]
+reg = "cm_emmc2_ctl"
+const = "CM_EMMC2CTL"
+
+[[verify_offsets]]
+reg = "cm_emmc2_div"
+const = "CM_EMMC2DIV"

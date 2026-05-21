@@ -567,27 +567,65 @@ fn parse_bits(s: &str) -> Option<(u8, u8)> {
 // ---------------------------------------------------------------------------
 
 fn emit_device(spec: &Spec) -> String {
-    // Reject features the Phase 2 emitter doesn't implement yet. Skeletal
-    // specs that need these set emit=false and we never get here for them.
-    // The one exception is `kind = "stream"`, which we implement now
-    // because PL011 DATA needs it: read and write target independent
-    // FIFOs, so `modify_*` would corrupt UART traffic. (fw_cfg in Phase 5
-    // will reuse the same emitter path at u8 width.)
+    // Reject features the emitter doesn't implement yet. Skeletal specs
+    // that need these set emit=false and we never get here for them.
+    //
+    // Allowed compounds:
+    // - `kind = "stream"` (Phase 2): independent FIFOs; no flags/fields,
+    //   no modify_ (RMW is incoherent on a stream).
+    // - `kind = "passwd_protected"` (Phase 8): every write OR-s in the
+    //   spec-mandated password byte in bits[31:24]; supports plain RW/WO
+    //   and typed snapshots (fields). The codegen mechanically enforces
+    //   PASSWD on every write so drivers cannot forget — BCM2711 CPRMAN
+    //   silently drops writes without PASSWD, which is a debugging
+    //   nightmare drivers should never face.
     for reg in &spec.registers {
         if let Some(kind) = &reg.kind {
-            if !matches!(kind, RegisterKind::Stream) {
-                panic!(
-                    "Phase 2 emitter does not support register kind {:?} (used by `{}` in device `{}`). \
-                     Mark the spec emit=false until the corresponding phase lands the emitter extension.",
-                    kind, reg.name, spec.device.name
-                );
-            }
-            if !reg.flags.is_empty() || !reg.fields.is_empty() {
-                panic!(
-                    "stream register `{}` in `{}` cannot have flags or fields: read and write target \
-                     different state, so a typed-snapshot value would be meaningless",
-                    reg.name, spec.device.name
-                );
+            match kind {
+                RegisterKind::Stream => {
+                    if !reg.flags.is_empty() || !reg.fields.is_empty() {
+                        panic!(
+                            "stream register `{}` in `{}` cannot have flags or fields: read and write target \
+                             different state, so a typed-snapshot value would be meaningless",
+                            reg.name, spec.device.name
+                        );
+                    }
+                }
+                RegisterKind::PasswdProtected => {
+                    // CPRMAN's PASSWD lives in bits[31:24] of a 32-bit
+                    // register. Smaller widths have no current consumer
+                    // and the mask/shift logic would need a per-width
+                    // branch in the emitter — defer until a real device
+                    // surfaces.
+                    if reg.width != 32 {
+                        panic!(
+                            "passwd_protected register `{}` in `{}` has width {}; only u32 is supported \
+                             (PASSWD lives in bits[31:24])",
+                            reg.name, spec.device.name, reg.width
+                        );
+                    }
+                    if !matches!(reg.access, Access::Rw | Access::Wo) {
+                        panic!(
+                            "passwd_protected register `{}` in `{}` has access {:?}; only rw/wo are supported \
+                             (passwd is a write-time concern)",
+                            reg.name, spec.device.name, reg.access
+                        );
+                    }
+                    if reg.endian.is_some() {
+                        panic!(
+                            "passwd_protected register `{}` in `{}` combines passwd with `endian`; not supported \
+                             (no current device needs both)",
+                            reg.name, spec.device.name
+                        );
+                    }
+                }
+                _ => {
+                    panic!(
+                        "emitter does not support register kind {:?} (used by `{}` in device `{}`). \
+                         Mark the spec emit=false until the corresponding phase lands the emitter extension.",
+                        kind, reg.name, spec.device.name
+                    );
+                }
             }
         }
         // Phase 6: per-register `endian = "big"` is supported on
@@ -1094,18 +1132,43 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
         // raw cell or a typed snapshot — the typed-snapshot accessors
         // call read_X()/set_X() which apply the conversion exactly once.
         let is_be = matches!(reg.endian, Some(Endian::Big));
+        let is_passwd = matches!(reg.kind, Some(RegisterKind::PasswdProtected));
         let read_expr = if is_be {
             format!("{wty}::from_be(self.{}.read())", reg.name)
         } else {
             format!("self.{}.read()", reg.name)
         };
-        let write_expr = if is_be {
-            "v.to_be()".to_string()
-        } else {
-            "v".to_string()
+        // Passwd-protected write transform: clear bits[31:24] of the
+        // caller-supplied value (which may carry undef/junk from a
+        // prior read) and OR in (CM_PASSWORD << 24). The hardware
+        // silently drops writes without PASSWD, so doing this in
+        // codegen means drivers can never forget. The transform
+        // applies to both raw writes and typed `set_*` / `modify_*`
+        // paths — every byte that reaches the cell goes through it.
+        // BE + passwd is rejected at validation time; only one of
+        // the two transforms fires.
+        let wrap_write = |val: &str| -> String {
+            if is_be {
+                // Method-call syntax: `v.to_be()` parses cleanly without
+                // parens, and so does `f(v).to_be()`. Keep the emitted
+                // shape stable with what pre-Phase-8 codegen produced
+                // so the existing fwcfg/pl011/virtio files don't churn.
+                format!("{val}.to_be()")
+            } else if is_passwd {
+                // 0x00FF_FFFFu32 = (1u32 << 24) - 1; 0x5Au32 = CM_PASSWORD
+                // for BCM2711 CPRMAN. Currently the only passwd_protected
+                // consumer; if another device with a different password
+                // emerges, lift the constants into the spec.
+                format!("(({val}) & 0x00FF_FFFFu32) | (0x5Au32 << 24)")
+            } else {
+                val.to_string()
+            }
         };
+        let write_expr = wrap_write("v");
         let endian_note = if is_be {
             " (big-endian on the wire)"
+        } else if is_passwd {
+            " (PASSWD prefix injected automatically)"
         } else {
             ""
         };
@@ -1134,13 +1197,23 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                     writeln!(out, "    /// Read a typed snapshot of `{}`.", reg.name).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
                     writeln!(out, "    pub fn {}(&self) -> {ty} {{ {ty}(self.{}.read()) }}", reg.name, reg.name).unwrap();
-                    writeln!(out, "    /// Write the value back to `{}`.", reg.name).unwrap();
+                    writeln!(out, "    /// Write the value back to `{}`{}.", reg.name, endian_note).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn set_{}(&self, v: {ty}) {{ self.{}.write(v.0); }}", reg.name, reg.name).unwrap();
-                    writeln!(out, "    /// Read-modify-write `{}` via a typed closure.", reg.name).unwrap();
+                    let set_val = wrap_write("v.0");
+                    writeln!(out, "    pub fn set_{}(&self, v: {ty}) {{ self.{}.write({set_val}); }}", reg.name, reg.name).unwrap();
+                    writeln!(out, "    /// Read-modify-write `{}` via a typed closure{}.", reg.name, endian_note).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
                     writeln!(out, "    pub fn modify_{}<F: FnOnce({ty}) -> {ty}>(&self, f: F) {{", reg.name).unwrap();
-                    writeln!(out, "        self.{}.modify(|v| f({ty}(v)).0);", reg.name).unwrap();
+                    // No-transform path stays direct (`f(...).0`) so the
+                    // generated file doesn't churn for non-passwd / non-BE
+                    // registers. The wrap_write-applied path needs an
+                    // explicit closure to host the transform expression.
+                    if is_passwd || is_be {
+                        let inner = wrap_write("f({ty}(v)).0").replace("{ty}", &ty);
+                        writeln!(out, "        self.{}.modify(|v| {inner});", reg.name).unwrap();
+                    } else {
+                        writeln!(out, "        self.{}.modify(|v| f({ty}(v)).0);", reg.name).unwrap();
+                    }
                     writeln!(out, "    }}").unwrap();
                 } else if matches!(reg.kind, Some(RegisterKind::Stream)) {
                     // Stream port: read and write touch independent state.
@@ -1150,18 +1223,24 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                 } else {
                     raw_read(out);
                     raw_write(out);
-                    writeln!(out, "    /// Read-modify-write `{}`.", reg.name).unwrap();
+                    writeln!(out, "    /// Read-modify-write `{}`{}.", reg.name, endian_note).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
                     writeln!(out, "    pub fn modify_{}<F: FnOnce({wty}) -> {wty}>(&self, f: F) {{", reg.name).unwrap();
-                    writeln!(out, "        self.{}.modify(f);", reg.name).unwrap();
+                    if is_passwd || is_be {
+                        let inner = wrap_write("f(v)");
+                        writeln!(out, "        self.{}.modify(|v| {inner});", reg.name).unwrap();
+                    } else {
+                        writeln!(out, "        self.{}.modify(f);", reg.name).unwrap();
+                    }
                     writeln!(out, "    }}").unwrap();
                 }
             }
             Access::Wo | Access::Trigger => {
                 if has_typed {
-                    writeln!(out, "    /// Write a typed value to `{}`.", reg.name).unwrap();
+                    writeln!(out, "    /// Write a typed value to `{}`{}.", reg.name, endian_note).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn set_{}(&self, v: {ty}) {{ self.{}.write(v.0); }}", reg.name, reg.name).unwrap();
+                    let set_val = wrap_write("v.0");
+                    writeln!(out, "    pub fn set_{}(&self, v: {ty}) {{ self.{}.write({set_val}); }}", reg.name, reg.name).unwrap();
                 } else {
                     raw_write(out);
                 }
@@ -1195,8 +1274,9 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
 fn emit_tests(out: &mut String, spec: &Spec) {
     let dev = &spec.device.name;
     let has_be = spec.registers.iter().any(|r| matches!(r.endian, Some(Endian::Big)));
+    let has_passwd = spec.registers.iter().any(|r| matches!(r.kind, Some(RegisterKind::PasswdProtected)));
     let needs_mock =
-        !spec.u64_pairs.is_empty() || !spec.windowed.is_empty() || has_be;
+        !spec.u64_pairs.is_empty() || !spec.windowed.is_empty() || has_be || has_passwd;
     writeln!(out, "#[cfg(test)]").unwrap();
     writeln!(out, "mod tests {{").unwrap();
     writeln!(out, "    use super::*;").unwrap();
@@ -1496,6 +1576,74 @@ fn emit_tests(out: &mut String, spec: &Spec) {
         }
         writeln!(out, "    }}").unwrap();
         writeln!(out).unwrap();
+    }
+
+    // Phase 8 — passwd_protected: every write must carry the PASSWD
+    // byte in bits[31:24] or the BCM2711 CPRMAN silently drops it. The
+    // test writes 0 through the typed/raw setter and asserts the
+    // underlying memory has 0x5A in the top byte; then writes a
+    // 24-bit payload and asserts both the PASSWD prefix AND the
+    // payload survived. The wrap is mechanical in codegen — once
+    // these tests pass, every register marked passwd_protected
+    // inherits the same guarantee for free.
+    for reg in &spec.registers {
+        if !matches!(reg.kind, Some(RegisterKind::PasswdProtected)) { continue; }
+        let off = reg.offset;
+        let has_typed_w = !reg.flags.is_empty() || !reg.fields.is_empty();
+        let ty = to_pascal(&reg.name);
+        // Two payloads exercise both "preserve zero" and "preserve
+        // a non-trivial 24-bit value"; both expect PASSWD in the top
+        // byte.
+        let write_call_zero = if has_typed_w {
+            format!("regs.regs().set_{}({ty}(0u32))", reg.name)
+        } else {
+            format!("regs.regs().write_{}(0u32)", reg.name)
+        };
+        let write_call_payload = if has_typed_w {
+            format!("regs.regs().set_{}({ty}(0x00AB_CDEFu32))", reg.name)
+        } else {
+            format!("regs.regs().write_{}(0x00AB_CDEFu32)", reg.name)
+        };
+        writeln!(out, "    #[test]").unwrap();
+        writeln!(out, "    fn {}_passwd_wrap_zero_payload() {{", reg.name).unwrap();
+        writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+        writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+        writeln!(out, "        {write_call_zero};").unwrap();
+        writeln!(out, "        // PASSWD (0x5A) must occupy bits[31:24]; low 24 bits stay 0.").unwrap();
+        writeln!(out, "        assert_eq!(region.peek_u32(0x{off:x}), 0x5A00_0000u32);").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    #[test]").unwrap();
+        writeln!(out, "    fn {}_passwd_wrap_preserves_payload() {{", reg.name).unwrap();
+        writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+        writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+        writeln!(out, "        {write_call_payload};").unwrap();
+        writeln!(out, "        // PASSWD prefix AND the 24-bit payload survive intact.").unwrap();
+        writeln!(out, "        assert_eq!(region.peek_u32(0x{off:x}), 0x5AAB_CDEFu32);").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out).unwrap();
+        // Modify (RW only): seed PASSWD-junk-as-if-from-hardware via
+        // poke, run a modify that clears bits[31:24] in the closure,
+        // and assert the resulting memory still has PASSWD intact.
+        // This proves the wrap_write fires INSIDE modify_, not just
+        // raw write_/set_.
+        if matches!(reg.access, Access::Rw) {
+            writeln!(out, "    #[test]").unwrap();
+            writeln!(out, "    fn {}_passwd_wrap_in_modify() {{", reg.name).unwrap();
+            writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+            writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+            writeln!(out, "        // Seed memory with a payload — modify_ must keep low bits, replace top.").unwrap();
+            writeln!(out, "        region.poke_u32(0x{off:x}, 0x0000_00FFu32);").unwrap();
+            if has_typed_w {
+                writeln!(out, "        regs.regs().modify_{}(|v| {ty}(v.0 | 0xFF00u32));", reg.name).unwrap();
+            } else {
+                writeln!(out, "        regs.regs().modify_{}(|v| v | 0xFF00u32);", reg.name).unwrap();
+            }
+            writeln!(out, "        // Closure produced 0x0000_FFFFu32; codegen OR-ed PASSWD on top.").unwrap();
+            writeln!(out, "        assert_eq!(region.peek_u32(0x{off:x}), 0x5A00_FFFFu32);").unwrap();
+            writeln!(out, "    }}").unwrap();
+            writeln!(out).unwrap();
+        }
     }
 
     // Phase 4A.4 — verify_against const_assert_eq! per binding. Lives

@@ -1,49 +1,47 @@
 #![no_std]
 #![no_main]
+// Driver-crate body writes zero `unsafe` blocks AND zero
+// `#[allow(unsafe_code)]` attributes. The macro-generated boot
+// stub in `lockjaw_userlib::boot_stub!` is the single audited
+// location for the boot-entry attributes.
+//
+// `#![deny]` (not `#![forbid]`) so the macro-emitted per-item
+// allows on `#[no_mangle]` and `#[link_section]` are honoured.
+// Acceptance grep:
+// `grep -rn 'allow(unsafe_code)' user/cprman-driver/src/`
+// MUST return nothing — driver source contains zero allows; all
+// allows are in the lockjaw-userlib macro body.
+#![deny(unsafe_code)]
 
-const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash.rs"));
-
-#[used]
-#[link_section = ".lockjaw_hash"]
-static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
-
-use core::ptr;
-use lockjaw_userlib::*;
-use lockjaw_types::clock::{
-    ClockError,
-    CLOCK_OK, CLOCK_ERR_NOT_SUPPORTED,
+use lockjaw_userlib::clock::{
+    run_clock_server, ClockEngine, ClockError,
     CLOCK_OP_SET_RATE, CLOCK_OP_GET_RATE, CLOCK_OP_ENABLE, CLOCK_OP_DISABLE,
-    cprman::*,
+    cprman::{ClockId, compute_divider, PLLD_PER_CORE_HZ},
 };
+use lockjaw_userlib::devmgr::claim_typed;
+use lockjaw_userlib::driver_runtime::{driver_bootstrap, probe_by_hash};
+use lockjaw_userlib::{boot_stub, put_decimal, puts, sys_exit};
+use lockjaw_mmio::region::MappedRegs;
+use lockjaw_regs::cprman::{CmEmmc2Ctl, CmEmmc2CtlSrc, CmEmmc2Div, Cprman};
 use lockjaw_types::device::BCM2711_CPRMAN_HASH;
 
 // ---------------------------------------------------------------------------
-// MMIO helpers
+// EMMC2 leaf operations.
+//
+// PASSWD wrapping is mechanical in the generated `set_*` / `modify_*`
+// accessors — the codegen ORs CM_PASSWORD (0x5A) into bits[31:24] of
+// every write, so the driver expresses field intent (`with_kill(true)`,
+// `with_src(CmEmmc2CtlSrc::PllDPerCore)`) and gets PASSWD for free.
+// Failing to include PASSWD is the BCM2711 CPRMAN's silent-drop bug
+// class; the type system now forecloses it.
 // ---------------------------------------------------------------------------
 
-/// Strip the password byte from a value about to be written to a CM_*
-/// or A2W_* register and OR in the canonical password. Every CPRMAN
-/// register write must carry CM_PASSWORD in bits[31:24] or the write
-/// is silently ignored by the hardware.
-fn pwd(value: u32) -> u32 {
-    (value & 0x00FF_FFFF) | (CM_PASSWORD << 24)
-}
-
-unsafe fn cm_read(base: u64, offset: usize) -> u32 {
-    ptr::read_volatile((base + offset as u64) as *const u32)
-}
-
-unsafe fn cm_write(base: u64, offset: usize, value: u32) {
-    ptr::write_volatile((base + offset as u64) as *mut u32, value);
-}
-
-/// Wait for the BUSY bit to clear in CM_*CTL after a write that
-/// changes a divider or source. Bounded spin to avoid hanging
-/// forever if the hardware never settles; returns Err(Hardware)
-/// on timeout.
-unsafe fn wait_not_busy(base: u64, ctl_offset: usize) -> Result<(), ClockError> {
+/// Bounded spin waiting for BUSY to clear after a CTL write that
+/// changes a divider or source. Returns `Hardware` on timeout so the
+/// caller can surface a typed error instead of hanging the provider.
+fn wait_not_busy(regs: &Cprman) -> Result<(), ClockError> {
     for _ in 0..1_000_000 {
-        if cm_read(base, ctl_offset) & CM_CTL_BUSY == 0 {
+        if !regs.cm_emmc2_ctl().busy() {
             return Ok(());
         }
         core::hint::spin_loop();
@@ -51,78 +49,80 @@ unsafe fn wait_not_busy(base: u64, ctl_offset: usize) -> Result<(), ClockError> 
     Err(ClockError::Hardware)
 }
 
-// ---------------------------------------------------------------------------
-// EMMC2 leaf operations
-// ---------------------------------------------------------------------------
-
 /// Set the EMMC2 clock to `target_hz` (computed against PLLD_PER_CORE).
-/// Disables, programs the divider + source, re-enables. Returns the
-/// actual rate the hardware will produce (may differ from target due
-/// to divider quantization — see `compute_divider`).
-unsafe fn emmc2_set_rate(base: u64, target_hz: u64) -> Result<u64, ClockError> {
+/// Disables → reprograms divider → re-enables. Returns the actual rate
+/// the hardware will produce (may differ from target due to divider
+/// quantization — see `compute_divider`).
+fn emmc2_set_rate(regs: &Cprman, target_hz: u64) -> Result<u64, ClockError> {
     let (divider, actual_hz) = compute_divider(PLLD_PER_CORE_HZ, target_hz)?;
 
-    // 1. Disable the gate (clear ENABLE) and assert KILL to stop the
-    //    output cleanly before changing the divider. Per the BCM
-    //    binding you must not change DIV while the clock is running.
-    cm_write(base, CM_EMMC2CTL,
-        pwd(CM_CTL_KILL | (CM_SRC_PLLD_PER_CORE << CM_CTL_SRC_SHIFT)));
-    // Wait for the clock generator to actually stop (BUSY clears once
-    // the kill takes effect). Only this transition needs a wait — see
-    // step 3.
-    wait_not_busy(base, CM_EMMC2CTL)?;
+    // 1. Kill the output before changing DIV. Per Linux's
+    //    bcm2835_clock_off the SRC selection is preserved across the
+    //    kill so the parent reference counting stays consistent; we
+    //    re-write it explicitly to make the field intent local.
+    regs.set_cm_emmc2_ctl(
+        CmEmmc2Ctl::default()
+            .with_kill(true)
+            .with_src(CmEmmc2CtlSrc::PllDPerCore),
+    );
+    // Wait for the kill to actually stop the generator (BUSY drops).
+    wait_not_busy(regs)?;
 
-    // 2. Program the new divider while the clock is stopped.
-    cm_write(base, CM_EMMC2DIV, pwd(divider));
+    // 2. Program the new divider while the clock is stopped. The 24-bit
+    //    divider splits as DIVI (bits 23:12) and DIVF (bits 11:0). The
+    //    generated `with_divi` / `with_divf` setters mask + shift into
+    //    place; PASSWD goes on top via codegen.
+    let divi = (divider >> 12) & 0xFFF;
+    let divf = divider & 0xFFF;
+    regs.set_cm_emmc2_div(CmEmmc2Div::default().with_divi(divi).with_divf(divf));
 
-    // 3. Re-enable: clear KILL, set ENABLE, keep SRC. Linux's
-    //    bcm2835_clock_on (clk-bcm2835.c) writes ENABLE and returns
-    //    immediately — it does not wait. The hardware sets BUSY once
-    //    the generator starts running, which is the *opposite*
-    //    transition from what wait_not_busy() polls for, so polling
-    //    here would either time out (clock running, BUSY stays set)
-    //    or return immediately on a transient (false success). The
-    //    write itself is enough.
-    cm_write(base, CM_EMMC2CTL,
-        pwd(CM_CTL_ENABLE | (CM_SRC_PLLD_PER_CORE << CM_CTL_SRC_SHIFT)));
+    // 3. Re-enable: drop KILL, set ENABLE, keep SRC. Linux's
+    //    bcm2835_clock_on does NOT wait — the hardware sets BUSY once
+    //    the generator runs, which is the opposite transition from
+    //    what `wait_not_busy` polls for. The write itself is enough.
+    regs.set_cm_emmc2_ctl(
+        CmEmmc2Ctl::default()
+            .with_enable(true)
+            .with_src(CmEmmc2CtlSrc::PllDPerCore),
+    );
 
     Ok(actual_hz)
 }
 
-/// Read the current EMMC2 output rate from the divider register.
-/// Called from the M0c IPC dispatch path (`dispatch_emmc2`).
-unsafe fn emmc2_get_rate(base: u64) -> Result<u64, ClockError> {
-    let divider = cm_read(base, CM_EMMC2DIV) & 0xFF_FFFF;
-    if divider == 0 {
+/// Read the current EMMC2 output rate by reconstructing the 24-bit
+/// divider from the typed DIVI / DIVF accessors.
+fn emmc2_get_rate(regs: &Cprman) -> Result<u64, ClockError> {
+    let div = regs.cm_emmc2_div();
+    // 24-bit divider = (DIVI << 12) | DIVF. Both accessors already
+    // mask + right-shift into their natural u32 range.
+    let combined = ((div.divi() as u64) << 12) | div.divf() as u64;
+    if combined == 0 {
         return Err(ClockError::OutOfRange);
     }
-    Ok((PLLD_PER_CORE_HZ * 4096 + (divider as u64 / 2)) / (divider as u64))
+    Ok((PLLD_PER_CORE_HZ * 4096 + combined / 2) / combined)
 }
 
 // ---------------------------------------------------------------------------
-// Self-test (M0b success-line emitter)
+// Self-test — prints the three M0b success lines so the integration
+// harness can match on them.
 // ---------------------------------------------------------------------------
 
-/// Drive the EMMC2 leaf through set_rate(200 MHz) → get_rate, and
-/// exercise the NotSupported path on UART (id 19, the BCM2711 binding's
-/// CM_UART). Prints the three success lines from the M0b plan.
-unsafe fn self_test(base: u64) {
+fn self_test(regs: &Cprman) {
     puts("[CPRMAN] init: register region mapped, taking ownership\n");
 
-    match emmc2_set_rate(base, 200_000_000) {
+    match emmc2_set_rate(regs, 200_000_000) {
         Ok(actual) => {
             puts("[CPRMAN] EMMC2 set_rate(200_000_000) -> actual=");
             put_decimal(actual);
             puts(" enabled=1\n");
         }
-        Err(_) => {
-            puts("[CPRMAN] EMMC2 set_rate FAILED\n");
-        }
+        Err(_) => puts("[CPRMAN] EMMC2 set_rate FAILED\n"),
     }
 
-    // BCM2711 CM_UART id = 19 per the binding; not implemented this
-    // milestone. Demonstrating that the NotSupported path is reachable
-    // and typed is the M0b scope-discipline gate.
+    // BCM2711 CM_UART id = 19. Not implemented this milestone; the
+    // typed `ClockId::try_from_u32` surfaces unknown ids as
+    // `NotSupported(id)` so the log line carries the offending id
+    // (the M0b scope-discipline gate).
     match ClockId::try_from_u32(19) {
         Ok(_) => puts("[CPRMAN] UART unexpectedly supported (BUG)\n"),
         Err(ClockError::NotSupported(id)) => {
@@ -135,145 +135,106 @@ unsafe fn self_test(base: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Entry point
+// CPRMAN engine — implements ClockEngine for the cprman wire shape.
+//
+// On platforms where the CPRMAN device wasn't present (QEMU virt),
+// `regs` is `None` and every op replies NotSupported with the
+// requested id. The IPC plumbing is still exercised end-to-end so
+// device-manager binding bookkeeping stays meaningful.
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+struct CprmanEngine {
+    regs: Option<MappedRegs<Cprman>>,
+}
+
+impl ClockEngine for CprmanEngine {
+    fn dispatch(&mut self, op: u64, clock_id_raw: u32, arg: u64) -> Result<u64, ClockError> {
+        let regs = match self.regs.as_ref() {
+            Some(r) => r.regs(),
+            // No CPRMAN on this platform — every op surfaces as
+            // NotSupported with the requested id echoed back.
+            None => return Err(ClockError::NotSupported(clock_id_raw)),
+        };
+        match ClockId::try_from_u32(clock_id_raw)? {
+            ClockId::Emmc2 => match op {
+                CLOCK_OP_SET_RATE => emmc2_set_rate(regs, arg),
+                CLOCK_OP_GET_RATE => emmc2_get_rate(regs),
+                // ENABLE / DISABLE are no-ops at M0b: `emmc2_set_rate`
+                // already programs ENABLE as part of the mandatory
+                // disable→divider→enable sequence (per
+                // bcm2835_clock_on). Standalone gating is M2+ work;
+                // accept the op so the IPC contract is complete.
+                CLOCK_OP_ENABLE | CLOCK_OP_DISABLE => Ok(0),
+                _ => Err(ClockError::BadOp),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Driver main — invoked by the boot_stub! macro. Uses Tier-A
+// composable pieces (driver_bootstrap + probe_by_hash + claim_typed)
+// instead of `driver_main!`'s standard_driver_init because cprman
+// has no IRQ — the standard helper would call `bind_irq`
+// unconditionally. Same escape-valve pattern ramfb-driver pioneered
+// in Phase 6.
+// ---------------------------------------------------------------------------
+
+fn cprman_entry() -> ! {
     puts("cprman: starting\n");
 
-    let reply_obj = match sys_alloc_pages(1).and_then(sys_create_reply) {
-        Ok(h) => h,
-        Err(_) => { puts("cprman: create reply FAILED\n"); halt(); }
+    let boot = match driver_bootstrap() {
+        Ok(b) => b,
+        Err(_) => { puts("cprman: bootstrap FAILED\n"); sys_exit(); }
     };
-
-    puts("cprman: bootstrapping...\n");
-    let reply = match sys_call_ret4(bootstrap_endpoint(), reply_obj, 0, 0, 0, 0) {
-        Ok(r) => r,
-        Err(_) => { puts("cprman: bootstrap FAILED\n"); halt(); }
-    };
-    // Reply layout: [server_ep, devmgr_client, _, _]. server_ep is
-    // the endpoint we receive clock-op IPCs on; the only legitimate
-    // caller is device-manager (the proxy / arbiter — see
-    // docs/book-of-lockjaw/03-non-virtualizable-hardware.md).
-    let server_ep = EndpointHandle(reply[0]);
-    let devmgr_client = EndpointHandle(reply[1]);
     puts("cprman: bootstrapped\n");
-
-    // Claim the CPRMAN device. On QEMU virt this fails (no
-    // brcm,bcm2711-cprman); we keep the process alive serving
-    // NotSupported for everything so the broker IPC path is still
-    // exercised end-to-end on QEMU. On Pi 4B the claim returns the
-    // MMIO PageSet handle.
-    let claim = match sys_call_ret4(
-        devmgr_client, reply_obj, CMD_CLAIM_DEVICE, BCM2711_CPRMAN_HASH, 0, 0,
-    ) {
-        Ok(r) => r,
-        Err(_) => { puts("cprman: claim call FAILED\n"); halt(); }
+    let server_ep = match boot.server_ep {
+        Some(ep) => ep,
+        None => { puts("cprman: no server endpoint\n"); sys_exit(); }
     };
-    let mmio_va = if claim[0] == CLAIM_OK {
-        let mmio_pageset = PageSetHandle(claim[1]);
-        // Map the first page of the CPRMAN register region. The DTB
-        // declares the full region as 0x2000 (8 KB / 2 pages), but
-        // the device-manager claim path returns a single-page
-        // PageSet today (`sys_register_device_page` in
-        // src/cap/pageset_table.rs is explicitly one-page). Both
-        // M0b registers we touch (CM_EMMC2CTL = 0x1d0,
-        // CM_EMMC2DIV = 0x1d4) are inside the first 4 KB, so 1 page
-        // is sufficient. When a future clock leaf needs registers
-        // in the second page, the claim-multi-page path will need
-        // to land first.
-        let va = match VMEM.alloc(1) {
-            Some(va) => va,
-            None => { puts("cprman: VA exhausted for MMIO\n"); halt(); }
-        };
-        if !sys_map_pages(mmio_pageset, va, MapMemoryAttribute::Device).is_ok() {
-            puts("cprman: map MMIO FAILED\n");
-            halt();
+
+    // Probe + claim the CPRMAN device. Both Err paths are graceful:
+    // on QEMU virt the DTB has no brcm,bcm2711-cprman entry, so
+    // probe returns NotFound and the engine serves NotSupported for
+    // every clock op (clock-test harness still exercises the IPC
+    // plumbing end-to-end). On Pi 4B the claim succeeds and the
+    // self-test prints the M0b success lines.
+    let regs = match probe_by_hash(&boot, BCM2711_CPRMAN_HASH, 0) {
+        Ok(probe) => match claim_typed::<Cprman>(boot.devmgr_ep, boot.reply_obj, probe.mmio_addr) {
+            Ok(claimed) => {
+                self_test(claimed.regs.regs());
+                Some(claimed.regs)
+            }
+            Err(_) => {
+                puts("[CPRMAN] claim FAILED; serving NotSupported for all clock ops\n");
+                None
+            }
+        },
+        Err(_) => {
+            puts("[CPRMAN] no BCM2711 CPRMAN on this platform (QEMU); serving NotSupported for all clock ops\n");
+            None
         }
-        // Run the self-test (prints the three M0b success lines).
-        unsafe { self_test(va); }
-        Some(va)
-    } else {
-        puts("[CPRMAN] no BCM2711 CPRMAN on this platform (QEMU); serving NotSupported for all clock ops\n");
-        None
     };
 
-    serve(server_ep, mmio_va);
-}
-
-/// Server loop. The only legitimate caller is device-manager, which
-/// has already validated the binding (caller_token → clock_id) on
-/// behalf of the actual driver client. cprman trusts the message
-/// body's `clock_id` and dispatches accordingly.
-///
-/// On platforms where the CPRMAN device wasn't present (QEMU virt),
-/// `mmio_va` is `None` and every op replies NotSupported with the
-/// requested id echoed back. The IPC plumbing is exercised either
-/// way; only the side-effecting MMIO path is conditional.
-fn serve(server_ep: EndpointHandle, mmio_va: Option<u64>) -> ! {
-    loop {
-        let msg = match sys_receive_ret4(server_ep) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let op = msg[0];
-        let clock_id_raw = msg[1] as u32;
-        let arg = msg[2];
-
-        // Translate the raw id into the typed enum. Unknown ids
-        // surface as NotSupported with the offending id echoed —
-        // the caller's log message stays meaningful.
-        let typed = ClockId::try_from_u32(clock_id_raw);
-
-        // If the device wasn't claimed (QEMU), every leaf is
-        // NotSupported regardless of the id. Same wire shape as a
-        // real provider that doesn't model this leaf.
-        let result = match (mmio_va, typed) {
-            (None, _) => Err(ClockError::NotSupported(clock_id_raw)),
-            (_, Err(e)) => Err(e),
-            (Some(base), Ok(ClockId::Emmc2)) => unsafe { dispatch_emmc2(base, op, arg) },
-        };
-
-        // sys_reply returns SyscallError; discard so the match
-        // produces the loop-body unit type.
-        let _ = match result {
-            Ok(value) => sys_reply(CLOCK_OK, value, 0, 0),
-            Err(ClockError::NotSupported(id)) =>
-                sys_reply(CLOCK_ERR_NOT_SUPPORTED, id as u64, 0, 0),
-            Err(e) => sys_reply(e.status_code(), 0, 0, 0),
-        };
-    }
-}
-
-/// Dispatch a clock op to the EMMC2 leaf. SET_RATE / GET_RATE return
-/// the actual rate; ENABLE / DISABLE return 0 on success. Unknown
-/// opcodes surface as `BadOp`.
-unsafe fn dispatch_emmc2(base: u64, op: u64, arg: u64) -> Result<u64, ClockError> {
-    match op {
-        CLOCK_OP_SET_RATE => emmc2_set_rate(base, arg),
-        CLOCK_OP_GET_RATE => emmc2_get_rate(base),
-        // ENABLE / DISABLE are no-ops at this milestone:
-        // emmc2_set_rate already programs ENABLE as part of the
-        // mandatory disable→divider→enable sequence (per
-        // bcm2835_clock_on). Standalone gating is M2+ work; for
-        // now, accept the op so the IPC contract is complete and
-        // return success.
-        CLOCK_OP_ENABLE | CLOCK_OP_DISABLE => Ok(0),
-        _ => Err(ClockError::BadOp),
-    }
-}
-
-/// Terminate the process. EL0 `wfi`-loops keep the thread `Running`
-/// from the scheduler's POV — they don't block; they spin a
-/// tick-period each iteration. Use sys_exit so the scheduler removes
-/// us from rotation.
-fn halt() -> ! {
-    sys_exit();
+    let mut engine = CprmanEngine { regs };
+    run_clock_server(&mut engine, server_ep)
 }
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     puts("cprman: PANIC\n");
-    halt();
+    sys_exit();
+}
+
+// ---------------------------------------------------------------------------
+// Driver boot — Tier-A `boot_stub!` only (not `driver_main!`), because
+// cprman's shape doesn't fit the standard "claim + bind_irq + return
+// ctx" helper (no IRQ). The macro is the single audited site for the
+// boot `#[allow(unsafe_code)]` attributes; the driver crate body
+// itself is `#![deny(unsafe_code)]` with zero allows.
+// ---------------------------------------------------------------------------
+
+boot_stub! {
+    hash = LOCKJAW_SOURCE_HASH,
+    main = cprman_entry,
 }

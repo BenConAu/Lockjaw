@@ -64,13 +64,18 @@ impl ClockId {
 pub const CM_PASSWORD: u32 = 0x5A;
 
 /// CM_EMMC2CTL register offset (Linux: BCM2835_REG_CM_EMMC2CTL).
-/// Bits: 7 ENAB (gate), 4 KILL, 4 BUSY (RO), 4 SRC (parent select).
-pub const CM_EMMC2CTL: usize = 0x1d0;
+/// Bits: 7 BUSY (RO), 5 KILL, 4 ENAB (gate), 3:0 SRC (parent select).
+///
+/// `u64` so the regspec codegen's `verify_against` const_assert
+/// (which casts `offset_of` to u64) compiles cleanly. The constant
+/// is the source of truth that the generated module's register
+/// offset must match.
+pub const CM_EMMC2CTL: u64 = 0x1d0;
 
 /// CM_EMMC2DIV register offset. 24-bit fixed-point divider:
 /// bits[23:12] = integer part (DIVI), bits[11:0] = fractional
 /// part (DIVF, in /4096 units). Output rate = parent / divider.
-pub const CM_EMMC2DIV: usize = 0x1d4;
+pub const CM_EMMC2DIV: u64 = 0x1d4;
 
 /// CTL bit positions.
 pub const CM_CTL_BUSY: u32 = 1 << 7;
