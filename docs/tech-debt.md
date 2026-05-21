@@ -441,3 +441,50 @@ The Phase 5 banner-ordering fix in `uart_main` (kernel-debug puts BEFORE UART1 b
 The bigger architectural move: `uart_putc` is one instance of "poll a hardware bit until it changes or we give up." The same shape appears in SDHCI (`poll_until_clear` / `poll_until_set` in emmc2-driver), in virtio (config-status readback after FEATURES_OK), in any device with a busy bit. A shared `poll_until_deadline` primitive belongs in `lockjaw-userlib` alongside the barriers.
 
 **Why bootstrap:** today's two converted drivers run in QEMU where TX always drains; the hang is only theoretical. Adding deadline plumbing without a concrete liveness failure to debug against would be speculative. Revisit when (a) the first Pi-hardware bring-up surfaces a real spin-forever incident, or (b) the second event-loop driver lands (probably a console for posix) — whichever comes first.
+
+---
+
+## Tier-A no-IRQ bootstrap boilerplate duplicated across drivers
+
+**Where:** `user/ramfb-driver/src/main.rs::ramfb_entry` and `user/cprman-driver/src/main.rs::cprman_entry`. Both call `driver_bootstrap()` → check `boot.server_ep` → `probe_by_hash()` → `claim_typed::<T>()` with the same control-flow shape; only the failure policy differs (ramfb halts on probe-fail; cprman degrades to `None` and serves NotSupported).
+
+**What:** Phase 6 (ramfb) introduced the Tier-A escape-valve composition for drivers without IRQs — those that can't use `driver_main!`'s `standard_driver_init` because that helper unconditionally calls `bind_irq`. Phase 8 (cprman) is the second Tier-A driver. The bootstrap → server_ep → probe → claim chain is now duplicated verbatim, with one of the two failure-policy axes (halt vs degrade) being the only real per-driver difference. Rule-of-two threshold passed — first instance was the escape-valve example; second instance is the framework gap.
+
+**Fix:** Add `standard_init_no_irq<T>(name: &str, hash: u64) -> Result<DriverCtxNoIrq<T>, BootstrapInitError>` to `lockjaw_userlib::driver_runtime`. Mirror of `standard_driver_init` minus the `bind_irq` step. Returns a stripped `DriverCtxNoIrq<T>` exposing `regs: MappedRegs<T>` + `server_ep` + `devmgr_ep` + `reply_obj` (no `irq_*` fields). Both call sites collapse to one match arm + one log line:
+
+```rust
+// cprman — graceful fallback to NotSupported
+let regs = match standard_init_no_irq::<Cprman>("cprman", BCM2711_CPRMAN_HASH) {
+    Ok(ctx) => { self_test(ctx.regs.regs()); Some(ctx.regs) }
+    Err(_) => { puts("[CPRMAN] no device; serving NotSupported\n"); None }
+};
+
+// ramfb — hard halt on missing fw_cfg
+let ctx = standard_init_no_irq::<FwCfg>("ramfb", FW_CFG_HASH)
+    .unwrap_or_else(|_| { puts("ramfb: init FAILED\n"); sys_exit() });
+```
+
+~10 lines saved per Tier-A driver. The third Tier-A driver (whenever it appears) inherits the right shape automatically rather than copying boilerplate from one of the existing two.
+
+**Why bootstrap:** Phase 6 had exactly one Tier-A driver (ramfb), so the boilerplate was its example. Phase 8 (cprman) crossed the rule-of-two line; the right move is to extract before the third driver makes the pattern entrenched. emmc2 (Phase 9) won't be that driver — it has IRQs and uses `driver_main!` — so there's no urgency from Phase 9, but landing the helper before any future no-IRQ driver appears is the discipline.
+
+**Fix order:** Land as a Phase 8 follow-up commit or as Phase 9 prep work, before Phase 9 merges. Migrate ramfb + cprman in the same commit so neither version of the boilerplate stays in tree.
+
+---
+
+## Regspec/wirespec lacks per-field access mode
+
+**Where:** `xtask/src/gen_regs.rs` field emission (`with_<field>` setter for every field regardless of hardware writability). Surfaces concretely as `lockjaw_regs::cprman::CmEmmc2Ctl::with_busy(bool)` — BUSY is a hardware-set RO status bit that drivers should never construct, but the codegen emits a setter for it anyway. Equivalent shape applies to wirespec fields the device writes (driver-readable, not driver-writable).
+
+**What:** Phase 4A introduced bit-field codegen (every field gets `<field>()` getter + `with_<field>()` setter + `<FIELD>_MASK` / `<FIELD>_SHIFT` constants). The setter is emitted unconditionally, even for RO fields where construction is semantically meaningless. The hardware silently ignores RO-field writes (or rejects them at the register's access level), so the bug is latent — Phase 8's cprman driver doesn't call `with_busy()`, and the spec's field description says "RO; preserved on writeback" as a discipline note. That's exactly the discipline-based pattern the typed codegen is meant to retire one layer up.
+
+**Fix:** Add `access = "ro"` / `access = "rw"` to the per-field schema in `gen_regs.rs` (defaulting to `rw`). For `ro` fields:
+- Emit the getter (`<field>()`) and the `<FIELD>_MASK` / `<FIELD>_SHIFT` constants.
+- Skip the `with_<field>()` setter — construction of an RO field is meaningless.
+- Skip the field from the `<reg>_preserves_reserved_bits` test (the `with_*` toggle test would have no setter to call).
+
+Same fix applies to wirespec: device-written DTOs (e.g. a hypothetical future `VirtqUsedElem.id` if it were marked RO) should expose the getter without the constructor parameter. Today's wire DTOs all have driver-writable fields, but the next family that adds a device-only-written DTO will hit this.
+
+**Why bootstrap:** Phase 4A's blanket setter emission was the cheapest correct behavior — every regspec field at the time was driver-writable in some sense (drivers do RMW including the RO bit's current value back). The construction-safety gap is small (driver source still won't compile against meaningless setters when the driver doesn't reference them), but it's the kind of pattern Phase 8's PASSWD-wrap codegen is the canonical example of foreclosing — typed surface should permit only meaningful operations.
+
+**Fix order:** Land when the next regspec / wirespec adds a hardware-set RO field that begs the question. cprman is the first regspec with such a field; emmc2 (Phase 9, SDHCI) will add several (`PRESENT_STATE` reg has many RO bits like `CARD_INSERTED`, `WRITE_TRANSFER_ACTIVE`, etc.). Phase 9 is the natural forcing function.
