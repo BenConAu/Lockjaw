@@ -28,6 +28,7 @@
 pub mod barrier;
 pub mod cell;
 pub mod dma;
+pub mod recorder;
 pub mod region;
 
 // Host-side test substrate: memory-backed mock MMIO region for codegen

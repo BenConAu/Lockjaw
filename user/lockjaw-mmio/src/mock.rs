@@ -31,6 +31,7 @@
 
 use crate::region::MappedRegs;
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
@@ -184,6 +185,75 @@ impl MockMmioRegion {
         // SAFETY: bounds checked.
         unsafe { *self.ptr.as_ptr().add(offset) = value; }
     }
+
+    /// Base address of the backing allocation. Used internally to
+    /// translate recorder-logged absolute addresses into per-region
+    /// offsets; exposed in case tests want it for diagnostics.
+    pub fn base_addr(&self) -> usize {
+        self.ptr.as_ptr() as usize
+    }
+
+    /// Size of the backing allocation in bytes.
+    pub fn size_bytes(&self) -> usize {
+        self.layout.size()
+    }
+
+    /// Drain the thread-local MMIO op log and return the ops that fell
+    /// inside THIS region's backing range, with offsets translated to
+    /// be relative to `self.base_addr()`. Ops outside the region (e.g.
+    /// from a different `MockMmioRegion` created in the same test) are
+    /// dropped from this region's view — they're still drained from
+    /// the global log, so the next `take_ops` on whichever region they
+    /// belong to won't see them either. Test-thread isolation makes
+    /// inter-test contamination a non-issue; intra-test
+    /// multi-region tests should drain per-region in order.
+    ///
+    /// Typical use: call `take_ops()` immediately after the test
+    /// action to capture the ops the action produced. Pre-action
+    /// log entries (e.g. from `as_mapped_regs` construction) get
+    /// drained by a discard call (`let _ = region.take_ops();`)
+    /// before the action.
+    pub fn take_ops(&self) -> Vec<MockedOp> {
+        let base = self.base_addr();
+        let end = base + self.size_bytes();
+        crate::recorder::drain()
+            .into_iter()
+            .filter_map(|op| match op {
+                crate::recorder::MmioOp::Read { addr, width, value } if addr >= base && addr + width <= end => {
+                    Some(MockedOp::Read { offset: addr - base, width, value })
+                }
+                crate::recorder::MmioOp::Write { addr, width, value } if addr >= base && addr + width <= end => {
+                    Some(MockedOp::Write { offset: addr - base, width, value })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// MMIO op as seen by a `MockMmioRegion`, with `offset` relative to
+/// the region's base address (translated from the recorder's
+/// absolute addresses). `width` is in BYTES (1/2/4/8).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MockedOp {
+    /// Volatile read.
+    Read {
+        /// Byte offset within the region.
+        offset: usize,
+        /// Bytes read (1/2/4/8).
+        width: usize,
+        /// Value returned, zero-extended to u64.
+        value: u64,
+    },
+    /// Volatile write.
+    Write {
+        /// Byte offset within the region.
+        offset: usize,
+        /// Bytes written (1/2/4/8).
+        width: usize,
+        /// Value written, zero-extended to u64.
+        value: u64,
+    },
 }
 
 impl Drop for MockMmioRegion {
@@ -308,6 +378,41 @@ mod tests {
         assert_eq!(region.peek_u32(0), 0xfeedface);
         // Borrow ends here when `regs` and `region` both drop in
         // reverse declaration order; no use-after-free is reachable.
+    }
+
+    /// Recorder smoke test: typed cell accesses through
+    /// `MockedRegs<T>` show up in `take_ops()` in order, with the
+    /// right widths, values, and per-region offsets. Pre-action
+    /// drain discards construction-time log entries (if any) so
+    /// the assertion is exact.
+    #[test]
+    fn recorder_logs_typed_cell_ops_in_order() {
+        let region = MockMmioRegion::for_layout::<Layout>();
+        let regs = region.as_mapped_regs::<Layout>();
+        // Pre-action drain — discard anything logged by
+        // construction. Tests must do this if they want exact
+        // counts.
+        let _ = region.take_ops();
+        regs.regs().a.write(0xAAAA_AAAAu32);
+        regs.regs().b.write(0xBBBB_BBBBu32);
+        let _ = regs.regs().c.read();
+        let ops = region.take_ops();
+        assert_eq!(ops.len(), 3, "expected 3 ops, got {ops:?}");
+        match ops[0] {
+            MockedOp::Write { offset: 0, width: 4, value: 0xAAAA_AAAA } => {}
+            ref op => panic!("op[0] expected Write @0, got {op:?}"),
+        }
+        match ops[1] {
+            MockedOp::Write { offset: 4, width: 4, value: 0xBBBB_BBBB } => {}
+            ref op => panic!("op[1] expected Write @4, got {op:?}"),
+        }
+        match ops[2] {
+            MockedOp::Read { offset: 8, width: 4, value: 0 } => {}
+            ref op => panic!("op[2] expected Read @8 of 0, got {op:?}"),
+        }
+        // Second drain after no ops returns empty.
+        let leftover = region.take_ops();
+        assert!(leftover.is_empty(), "log not drained: {leftover:?}");
     }
 }
 

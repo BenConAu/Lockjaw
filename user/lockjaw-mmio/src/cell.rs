@@ -50,14 +50,24 @@ use core::ptr;
 /// write `unsafe impl`, which a `#![forbid(unsafe_code)]` driver
 /// crate cannot do. The audited corpus of MMIO word types is the
 /// four primitive integer widths below.
-pub unsafe trait MmioWord: Copy + 'static {}
+///
+/// `to_log_u64` exists for the op-recorder (`crate::recorder`) so
+/// every cell access can log its value as a width-tagged `u64` in
+/// test/mock builds without the recorder needing a generic API.
+/// Production builds inline the call to a no-op cast and discard
+/// it (the recorder's `log_*` functions are inline no-ops without
+/// the `mock` feature).
+pub unsafe trait MmioWord: Copy + 'static {
+    /// Zero-extend to `u64` for the recorder's value field.
+    fn to_log_u64(self) -> u64;
+}
 
 // SAFETY: each primitive integer has a single matching AArch64 load/
 // store instruction, and every bit pattern is a valid value.
-unsafe impl MmioWord for u8 {}
-unsafe impl MmioWord for u16 {}
-unsafe impl MmioWord for u32 {}
-unsafe impl MmioWord for u64 {}
+unsafe impl MmioWord for u8  { #[inline(always)] fn to_log_u64(self) -> u64 { self as u64 } }
+unsafe impl MmioWord for u16 { #[inline(always)] fn to_log_u64(self) -> u64 { self as u64 } }
+unsafe impl MmioWord for u32 { #[inline(always)] fn to_log_u64(self) -> u64 { self as u64 } }
+unsafe impl MmioWord for u64 { #[inline(always)] fn to_log_u64(self) -> u64 { self } }
 
 /// Read-only MMIO register cell.
 #[repr(transparent)]
@@ -72,7 +82,9 @@ impl<T: MmioWord> Ro<T> {
         // boundary). `read_volatile` is the only legal way to access
         // hardware registers; T: MmioWord restricts the width to an
         // architecture-supported single load.
-        unsafe { ptr::read_volatile(self.0.get()) }
+        let v = unsafe { ptr::read_volatile(self.0.get()) };
+        crate::recorder::log_read(self.0.get() as usize, core::mem::size_of::<T>(), v.to_log_u64());
+        v
     }
 }
 
@@ -85,7 +97,9 @@ impl<T: MmioWord> Rw<T> {
     #[inline(always)]
     pub fn read(&self) -> T {
         // SAFETY: as Ro<T>::read.
-        unsafe { ptr::read_volatile(self.0.get()) }
+        let v = unsafe { ptr::read_volatile(self.0.get()) };
+        crate::recorder::log_read(self.0.get() as usize, core::mem::size_of::<T>(), v.to_log_u64());
+        v
     }
 
     /// Volatile write.
@@ -93,12 +107,14 @@ impl<T: MmioWord> Rw<T> {
     pub fn write(&self, value: T) {
         // SAFETY: as Ro<T>::read; write_volatile is the legal write
         // primitive for hardware registers.
+        crate::recorder::log_write(self.0.get() as usize, core::mem::size_of::<T>(), value.to_log_u64());
         unsafe { ptr::write_volatile(self.0.get(), value) }
     }
 
     /// Read-modify-write. The closure receives the current value and
     /// returns the new value to write. Useful for setting/clearing
-    /// individual fields while preserving the rest.
+    /// individual fields while preserving the rest. The recorder
+    /// observes both ops — a read and a write — at the cell's addr.
     #[inline(always)]
     pub fn modify<F: FnOnce(T) -> T>(&self, f: F) {
         self.write(f(self.read()));
@@ -117,6 +133,7 @@ impl<T: MmioWord> Wo<T> {
     #[inline(always)]
     pub fn write(&self, value: T) {
         // SAFETY: as Rw<T>::write.
+        crate::recorder::log_write(self.0.get() as usize, core::mem::size_of::<T>(), value.to_log_u64());
         unsafe { ptr::write_volatile(self.0.get(), value) }
     }
 }
@@ -135,7 +152,9 @@ impl<T: MmioWord> W1c<T> {
     #[inline(always)]
     pub fn read(&self) -> T {
         // SAFETY: as Ro<T>::read.
-        unsafe { ptr::read_volatile(self.0.get()) }
+        let v = unsafe { ptr::read_volatile(self.0.get()) };
+        crate::recorder::log_read(self.0.get() as usize, core::mem::size_of::<T>(), v.to_log_u64());
+        v
     }
 
     /// Write `mask` to the register, clearing every bit set in `mask`.
@@ -144,7 +163,10 @@ impl<T: MmioWord> W1c<T> {
     pub fn clear(&self, mask: T) {
         // SAFETY: as Wo<T>::write. W1C registers expect this write
         // semantics from the hardware spec; the volatile primitive is
-        // the right way to deliver the write.
+        // the right way to deliver the write. Recorder logs it as a
+        // Write — the W1C nuance ("write clears, doesn't store") is
+        // a hardware spec concern, not a recorder concern.
+        crate::recorder::log_write(self.0.get() as usize, core::mem::size_of::<T>(), mask.to_log_u64());
         unsafe { ptr::write_volatile(self.0.get(), mask) }
     }
 }
