@@ -306,9 +306,9 @@ struct EnumValue {
 
 #[derive(Deserialize, Debug)]
 struct Part {
-    #[allow(dead_code)]
+    /// Part-name suffix in the emitted setter — `set_<reg>(name1, name2)`.
     name: String,
-    #[allow(dead_code)]
+    /// Bit range within the register, "hi:lo" inclusive.
     bits: String,
 }
 
@@ -678,11 +678,101 @@ fn emit_device(spec: &Spec) -> String {
                 spec.device.name, reg.name
             );
         }
-        if !reg.parts.is_empty() || !reg.aliases.is_empty() {
+        // Phase 9 P9.0: `combined_trigger` accepts non-empty `parts`.
+        // Aliases still pending (P9.1).
+        if !reg.aliases.is_empty() {
             panic!(
-                "Phase 2 emitter does not support parts/aliases (used by `{}` in device `{}`).",
+                "Phase 2 emitter does not support aliases (used by `{}` in device `{}`); \
+                 lands in P9.1.",
                 reg.name, spec.device.name
             );
+        }
+        if !reg.parts.is_empty() && !matches!(reg.kind, Some(RegisterKind::CombinedTrigger)) {
+            panic!(
+                "register `{}` in `{}` has `parts` but kind is not `combined_trigger` — \
+                 parts are meaningful only for combined_trigger registers",
+                reg.name, spec.device.name
+            );
+        }
+        // combined_trigger semantics: parts MUST exactly tile the register
+        // width with no gaps and no overlaps. The whole point of the kind
+        // is "two halves fired as one u32 store"; gaps would mean the
+        // emitted set_*() would either drop bits or read-undefined bits.
+        if matches!(reg.kind, Some(RegisterKind::CombinedTrigger)) {
+            if reg.width != 32 {
+                panic!(
+                    "combined_trigger register `{}` in `{}` has width {}; only u32 is supported \
+                     (the M7 ordering fix on BCM2711 specifically requires a single u32 store)",
+                    reg.name, spec.device.name, reg.width
+                );
+            }
+            // Allow wo and trigger — the emitter's
+            // `Access::Wo | Access::Trigger` arm handles both; the
+            // semantic difference between wo and trigger is at the
+            // hardware-spec layer (a trigger is a wo whose write
+            // also kicks an action). For combined_trigger
+            // specifically the whole point is "writing kicks the
+            // command", so either access kind reads as the same
+            // hardware contract.
+            if !matches!(reg.access, Access::Wo | Access::Trigger) {
+                panic!(
+                    "combined_trigger register `{}` in `{}` has access {:?}; only wo or trigger \
+                     are supported (combined_trigger is fire-and-forget; reading is meaningless)",
+                    reg.name, spec.device.name, reg.access
+                );
+            }
+            // A single-part combined_trigger would be just a plain
+            // Wo<u32> with an extra layer of indirection — no value
+            // over the existing emitter. The whole point of the
+            // kind is to fuse two (or more) named halves into one
+            // store, so require at least two.
+            if reg.parts.len() < 2 {
+                panic!(
+                    "combined_trigger register `{}` in `{}` declares {} part(s) — needs at least two \
+                     (a single-part combined_trigger has no value over a plain Wo<u32>)",
+                    reg.name, spec.device.name, reg.parts.len()
+                );
+            }
+            // Tile check: sort parts by lo bit; require continuous coverage of [0..width).
+            let mut spans: Vec<(u8, u8, &str)> = reg.parts.iter()
+                .map(|p| {
+                    let (hi, lo) = parse_bits(&p.bits).expect("validated above");
+                    (hi, lo, p.name.as_str())
+                })
+                .collect();
+            spans.sort_by_key(|s| s.1);
+            let mut expected_lo = 0u8;
+            for (hi, lo, name) in &spans {
+                if *lo != expected_lo {
+                    panic!(
+                        "combined_trigger register `{}` in `{}`: part `{}` starts at bit {} \
+                         but next expected bit is {} (gaps + overlaps not allowed)",
+                        reg.name, spec.device.name, name, lo, expected_lo
+                    );
+                }
+                expected_lo = hi + 1;
+            }
+            if expected_lo as u8 != reg.width {
+                panic!(
+                    "combined_trigger register `{}` in `{}`: parts cover [0..{}) but register \
+                     width is {} (parts must tile the full register)",
+                    reg.name, spec.device.name, expected_lo, reg.width
+                );
+            }
+            // Each part width must match a Rust integer type the codegen can
+            // synthesize: u8/u16/u32. The combined u32 store unconditionally
+            // composes via (`part as u32) << shift`; non-power-of-2 widths
+            // would force masked shifts the plan doesn't yet support.
+            for (hi, lo, name) in &spans {
+                let w = hi - lo + 1;
+                if !matches!(w, 8 | 16 | 32) {
+                    panic!(
+                        "combined_trigger register `{}` in `{}`: part `{}` has width {} bits; \
+                         only 8/16/32 are supported",
+                        reg.name, spec.device.name, name, w
+                    );
+                }
+            }
         }
     }
     if !spec.descriptors.is_empty() {
@@ -1274,7 +1364,48 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                 }
             }
             Access::Wo | Access::Trigger => {
-                if has_typed {
+                if matches!(reg.kind, Some(RegisterKind::CombinedTrigger)) {
+                    // P9.0: combined_trigger setter composes named parts
+                    // into ONE u32 store. Parts tile [0..32) (validated
+                    // above); each part's argument type follows its
+                    // bit width. The single `self.cell.write(combined)`
+                    // is the M7 ordering-fix becoming structural — a
+                    // future emitter regression that split the write
+                    // into two halves would still produce the right
+                    // end-state in memory but BCM2711 hardware would
+                    // silently drop the command (the controller latches
+                    // on the upper-half store, not on the lower-half).
+                    // Pi-flash is the catch-all for that class of bug;
+                    // the host test below verifies end-state value.
+                    let mut spans: Vec<(u8, u8, &str)> = reg.parts.iter()
+                        .map(|p| {
+                            let (hi, lo) = parse_bits(&p.bits).expect("validated");
+                            (hi, lo, p.name.as_str())
+                        })
+                        .collect();
+                    spans.sort_by_key(|s| s.1);
+                    // Function signature: one arg per part, ordered by lo bit
+                    // (low-bit part first). Each arg's type matches its width.
+                    let mut params = String::new();
+                    for (i, (hi, lo, name)) in spans.iter().enumerate() {
+                        if i > 0 { params.push_str(", "); }
+                        let w = hi - lo + 1;
+                        params.push_str(&format!("{}: u{}", name, w));
+                    }
+                    // Body: compose into a u32. Each part shifted into place.
+                    let mut compose = String::from("0u32");
+                    for (_, lo, name) in &spans {
+                        compose.push_str(&format!(" | ((({}) as u32) << {})", name, lo));
+                    }
+                    writeln!(out, "    /// Fire the combined trigger — composes the parts into a SINGLE u32 store.").unwrap();
+                    writeln!(out, "    /// The single-store property is load-bearing: BCM2711 SDHCI silently drops").unwrap();
+                    writeln!(out, "    /// the command if the write is split into two halves. The codegen emits one").unwrap();
+                    writeln!(out, "    /// `Wo<u32>::write(...)` call so the driver cannot accidentally produce two.").unwrap();
+                    writeln!(out, "    #[inline(always)]").unwrap();
+                    writeln!(out, "    pub fn set_{}(&self, {params}) {{", reg.name).unwrap();
+                    writeln!(out, "        self.{}.write({compose});", reg.name).unwrap();
+                    writeln!(out, "    }}").unwrap();
+                } else if has_typed {
                     writeln!(out, "    /// Write a typed value to `{}`{}.", reg.name, endian_note).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
                     let set_val = wrap_write("v.0");
@@ -1313,8 +1444,9 @@ fn emit_tests(out: &mut String, spec: &Spec) {
     let dev = &spec.device.name;
     let has_be = spec.registers.iter().any(|r| matches!(r.endian, Some(Endian::Big)));
     let has_passwd = spec.registers.iter().any(|r| matches!(r.kind, Some(RegisterKind::PasswdProtected)));
+    let has_combined = spec.registers.iter().any(|r| matches!(r.kind, Some(RegisterKind::CombinedTrigger)));
     let needs_mock =
-        !spec.u64_pairs.is_empty() || !spec.windowed.is_empty() || has_be || has_passwd;
+        !spec.u64_pairs.is_empty() || !spec.windowed.is_empty() || has_be || has_passwd || has_combined;
     writeln!(out, "#[cfg(test)]").unwrap();
     writeln!(out, "mod tests {{").unwrap();
     writeln!(out, "    use super::*;").unwrap();
@@ -1731,6 +1863,90 @@ fn emit_tests(out: &mut String, spec: &Spec) {
             writeln!(out, "    }}").unwrap();
             writeln!(out).unwrap();
         }
+    }
+
+    // Phase 9 P9.0 — combined_trigger single-store assertion using
+    // the P9.0a recorder. The emitted `set_*(part_a, part_b)`
+    // composes the parts into one u32 and writes through
+    // `Wo<u32>::write` — one call by construction. The test asserts
+    // exactly one `MockedOp::Write { width: 4, .. }` at the
+    // register's offset with the composed value. A future emitter
+    // regression that splits the write into two halves (which on
+    // BCM2711 silently drops the command) would produce two
+    // `MockedOp::Write { width: 2, .. }` entries and the test would
+    // fail — the bug class is auto-enforced by host test, no
+    // reviewer-audit-only fallback.
+    for reg in &spec.registers {
+        if !matches!(reg.kind, Some(RegisterKind::CombinedTrigger)) { continue; }
+        let off = reg.offset;
+        // Pre-compute the parts in lo-bit order plus their test
+        // values as numeric (u64). Keep the integer alongside the
+        // formatted argument string so the expected end-state
+        // computation doesn't have to round-trip through string
+        // parsing.
+        // Local view of each part — just the fields the test-emit
+        // path uses. The setter-signature emit (in emit_accessors)
+        // reads `p.name` separately; the test path doesn't need it
+        // because the call uses positional values.
+        struct Part { lo: u8, val: u64, width: u8 }
+        let mut spans: Vec<Part> = reg.parts.iter()
+            .enumerate()
+            .map(|(idx, p)| {
+                let (hi, lo) = parse_bits(&p.bits).expect("validated");
+                let width = hi - lo + 1;
+                // Distinct, width-appropriate test values; idx nudges
+                // each part so widths-of-different-bytes don't end
+                // up byte-equal across parts.
+                let nudge = idx as u64;
+                let val = match width {
+                    8 => 0x12u64 + nudge,
+                    16 => 0x1234u64 + (nudge << 8),
+                    32 => (0x1234_5678u64) + (nudge << 16),
+                    _ => unreachable!("validated"),
+                };
+                Part { lo, val, width }
+            })
+            .collect();
+        spans.sort_by_key(|p| p.lo);
+        // Render call args: `0x12u8, 0x1234u16, ...`
+        let call_args = spans.iter()
+            .map(|p| match p.width {
+                8 => format!("0x{:02X}u8", p.val),
+                16 => format!("0x{:04X}u16", p.val),
+                32 => format!("0x{:08X}u32", p.val),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Expected end-state u32: each part's value shifted into
+        // place per its `lo`, OR-ed together.
+        let mut expected: u64 = 0;
+        for p in &spans {
+            expected |= p.val << p.lo;
+        }
+        writeln!(out, "    #[test]").unwrap();
+        writeln!(out, "    fn {}_combined_trigger_single_u32_store() {{", reg.name).unwrap();
+        writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+        writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+        writeln!(out, "        // Drain any construction-time log entries; the only ops").unwrap();
+        writeln!(out, "        // asserted below are the ones the setter call produces.").unwrap();
+        writeln!(out, "        let _ = region.take_ops();").unwrap();
+        writeln!(out, "        regs.regs().set_{}({call_args});", reg.name).unwrap();
+        writeln!(out, "        let ops = region.take_ops();").unwrap();
+        writeln!(out, "        // Single u32 store at the register's offset is the load-").unwrap();
+        writeln!(out, "        // bearing property — BCM2711 SDHCI silently drops the").unwrap();
+        writeln!(out, "        // command if the write is split into halves. A future").unwrap();
+        writeln!(out, "        // emitter regression that emits two stores would produce").unwrap();
+        writeln!(out, "        // ops.len() == 2 here.").unwrap();
+        writeln!(out, "        assert_eq!(ops.len(), 1, \"expected exactly one MMIO op, got {{:?}}\", ops);").unwrap();
+        writeln!(out, "        match ops[0] {{").unwrap();
+        writeln!(out, "            lockjaw_mmio::mock::MockedOp::Write {{ offset: 0x{off:x}, width: 4, value }} => {{").unwrap();
+        writeln!(out, "                assert_eq!(value, 0x{expected:08X}u64, \"composed value\");").unwrap();
+        writeln!(out, "            }}").unwrap();
+        writeln!(out, "            ref op => panic!(\"expected single u32 Write at 0x{off:x}, got {{:?}}\", op),").unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out).unwrap();
     }
 
     // Phase 4A.4 — verify_against const_assert_eq! per binding. Lives
