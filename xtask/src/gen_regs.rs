@@ -708,13 +708,26 @@ fn emit_device(spec: &Spec) -> String {
                         );
                     }
                 }
-                _ => {
-                    panic!(
-                        "emitter does not support register kind {:?} (used by `{}` in device `{}`). \
-                         Mark the spec emit=false until the corresponding phase lands the emitter extension.",
-                        kind, reg.name, spec.device.name
-                    );
-                }
+                // P9.1a: lift the gate for `aliased` and
+                // `combined_trigger`. P9.0 added the combined_trigger
+                // single-store setter emit (see ~line 800 / ~1459 /
+                // ~2038) and P9.1 added per-alias accessor emit (see
+                // ~line 752 onwards) plus their respective validation
+                // rules in `validate()`. The wildcard arm here was
+                // still rejecting both kinds, so the SDHCI spec (the
+                // first consumer) couldn't actually emit. This match
+                // is "is this register kind known to the emitter at
+                // all?" — the actual per-kind work happens elsewhere.
+                // Arms are empty because every per-kind invariant
+                // (width, access, parts/aliases shape) lives in
+                // `validate()`, where emit=false specs are also
+                // checked. Removing the `_ =>` arm also upgrades the
+                // gate from runtime panic to compile-error: a future
+                // RegisterKind variant added without an arm here
+                // breaks the build instead of failing at gen-regs
+                // time.
+                RegisterKind::Aliased => {}
+                RegisterKind::CombinedTrigger => {}
             }
         }
         // Phase 6: per-register `endian = "big"` is supported on
