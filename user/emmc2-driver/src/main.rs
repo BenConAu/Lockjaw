@@ -64,37 +64,37 @@ use lockjaw_types::sdhci::{
 // CAPABILITIES / CAPABILITIES_HI (0x040 / 0x044) are 32-bit reads.
 
 /// Read an 8-bit SDHCI register at `base + offset`.
-unsafe fn sdhci_read8(base: u64, offset: usize) -> u8 {
-    ptr::read_volatile((base + offset as u64) as *const u8)
+unsafe fn sdhci_read8(base: u64, offset: u64) -> u8 {
+    ptr::read_volatile((base + offset) as *const u8)
 }
 
 /// Write an 8-bit SDHCI register at `base + offset`.
-unsafe fn sdhci_write8(base: u64, offset: usize, value: u8) {
-    ptr::write_volatile((base + offset as u64) as *mut u8, value);
+unsafe fn sdhci_write8(base: u64, offset: u64, value: u8) {
+    ptr::write_volatile((base + offset) as *mut u8, value);
 }
 
 /// Read a 16-bit SDHCI register at `base + offset`. Offset must be
 /// 2-byte aligned. Used for CLOCK_CONTROL, NORMAL_INT_STATUS, etc.
-unsafe fn sdhci_read16(base: u64, offset: usize) -> u16 {
-    ptr::read_volatile((base + offset as u64) as *const u16)
+unsafe fn sdhci_read16(base: u64, offset: u64) -> u16 {
+    ptr::read_volatile((base + offset) as *const u16)
 }
 
 /// Write a 16-bit SDHCI register at `base + offset`. CLOCK_CONTROL
 /// (0x02c), COMMAND (0x00e), NORMAL_INT_STATUS (0x030) are u16 writes.
-unsafe fn sdhci_write16(base: u64, offset: usize, value: u16) {
-    ptr::write_volatile((base + offset as u64) as *mut u16, value);
+unsafe fn sdhci_write16(base: u64, offset: u64, value: u16) {
+    ptr::write_volatile((base + offset) as *mut u16, value);
 }
 
 /// Read a 32-bit SDHCI register at `base + offset`. Caller is
 /// responsible for 4-byte alignment.
-unsafe fn sdhci_read32(base: u64, offset: usize) -> u32 {
-    ptr::read_volatile((base + offset as u64) as *const u32)
+unsafe fn sdhci_read32(base: u64, offset: u64) -> u32 {
+    ptr::read_volatile((base + offset) as *const u32)
 }
 
 /// Write a 32-bit SDHCI register at `base + offset`. ARGUMENT (0x008)
 /// is the primary u32 write in M2; offset must be 4-byte aligned.
-unsafe fn sdhci_write32(base: u64, offset: usize, value: u32) {
-    ptr::write_volatile((base + offset as u64) as *mut u32, value);
+unsafe fn sdhci_write32(base: u64, offset: u64, value: u32) {
+    ptr::write_volatile((base + offset) as *mut u32, value);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +125,7 @@ unsafe fn sdhci_write32(base: u64, offset: usize, value: u32) {
 
 /// Read an 8-bit status register and busy-poll until `mask` clears,
 /// or `timeout` elapses. Used by SOFTWARE_RESET (SW_RST_ALL).
-unsafe fn poll_until_clear_8(base: u64, offset: usize, mask: u8, timeout: Nanos) -> Result<(), ()> {
+unsafe fn poll_until_clear_8(base: u64, offset: u64, mask: u8, timeout: Nanos) -> Result<(), ()> {
     let freq = cntfreq_hz();
     let deadline = monotonic_now().deadline_in(timeout, freq);
     loop {
@@ -141,7 +141,7 @@ unsafe fn poll_until_clear_8(base: u64, offset: usize, mask: u8, timeout: Nanos)
 
 /// Read a 16-bit status register and busy-poll until `mask` becomes
 /// set, or `timeout` elapses. Used by CLOCK_CONTROL.INT_STABLE.
-unsafe fn poll_until_set_16(base: u64, offset: usize, mask: u16, timeout: Nanos) -> Result<(), ()> {
+unsafe fn poll_until_set_16(base: u64, offset: u64, mask: u16, timeout: Nanos) -> Result<(), ()> {
     let freq = cntfreq_hz();
     let deadline = monotonic_now().deadline_in(timeout, freq);
     loop {
@@ -157,7 +157,7 @@ unsafe fn poll_until_set_16(base: u64, offset: usize, mask: u16, timeout: Nanos)
 
 /// Read a 32-bit status register and busy-poll until `mask` clears,
 /// or `timeout` elapses. Used by PRESENT_STATE.CMD_INHIBIT.
-unsafe fn poll_until_clear_32(base: u64, offset: usize, mask: u32, timeout: Nanos) -> Result<(), ()> {
+unsafe fn poll_until_clear_32(base: u64, offset: u64, mask: u32, timeout: Nanos) -> Result<(), ()> {
     let freq = cntfreq_hz();
     let deadline = monotonic_now().deadline_in(timeout, freq);
     loop {

@@ -21,4 +21,5 @@
 pub mod cprman;
 pub mod fw_cfg;
 pub mod pl011;
+pub mod sdhci;
 pub mod virtio_mmio;

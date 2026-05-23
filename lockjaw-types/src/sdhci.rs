@@ -31,59 +31,59 @@ pub use crate::wire::sdhci::*;
 /// `SDMA_SYS_ADDR_REG` (0x000) — also serves as the 32-bit ADMA
 /// system address argument register. Read here only as part of
 /// dump-the-state diagnostics.
-pub const SDHCI_SYSADDR: usize = 0x000;
+pub const SDHCI_SYSADDR: u64 = 0x000;
 /// `BLOCK_SIZE_REG` (0x004) — bits[11:0] = block size in bytes.
-pub const SDHCI_BLOCK_SIZE: usize = 0x004;
+pub const SDHCI_BLOCK_SIZE: u64 = 0x004;
 /// `BLOCK_COUNT_REG` (0x006) — number of blocks to transfer.
-pub const SDHCI_BLOCK_COUNT: usize = 0x006;
+pub const SDHCI_BLOCK_COUNT: u64 = 0x006;
 /// `ARGUMENT_REG` (0x008) — command argument.
-pub const SDHCI_ARGUMENT: usize = 0x008;
+pub const SDHCI_ARGUMENT: u64 = 0x008;
 /// `TRANSFER_MODE_REG` (0x00c) + `COMMAND_REG` (0x00e) — combined
 /// 32-bit write triggers command issue.
-pub const SDHCI_TRANSFER_MODE: usize = 0x00c;
-pub const SDHCI_COMMAND: usize = 0x00e;
+pub const SDHCI_TRANSFER_MODE: u64 = 0x00c;
+pub const SDHCI_COMMAND: u64 = 0x00e;
 /// `RESPONSE_REG` (0x010..0x01f) — 4 × 32-bit response slots.
-pub const SDHCI_RESPONSE_0: usize = 0x010;
-pub const SDHCI_RESPONSE_1: usize = 0x014;
-pub const SDHCI_RESPONSE_2: usize = 0x018;
-pub const SDHCI_RESPONSE_3: usize = 0x01c;
+pub const SDHCI_RESPONSE_0: u64 = 0x010;
+pub const SDHCI_RESPONSE_1: u64 = 0x014;
+pub const SDHCI_RESPONSE_2: u64 = 0x018;
+pub const SDHCI_RESPONSE_3: u64 = 0x01c;
 /// `BUFFER_DATA_PORT_REG` (0x020) — PIO data window.
-pub const SDHCI_BUFFER_DATA_PORT: usize = 0x020;
+pub const SDHCI_BUFFER_DATA_PORT: u64 = 0x020;
 /// `PRESENT_STATE_REG` (0x024) — controller status snapshot.
-pub const SDHCI_PRESENT_STATE: usize = 0x024;
+pub const SDHCI_PRESENT_STATE: u64 = 0x024;
 /// `HOST_CONTROL_1` (0x028).
-pub const SDHCI_HOST_CONTROL: usize = 0x028;
+pub const SDHCI_HOST_CONTROL: u64 = 0x028;
 /// `POWER_CONTROL_REG` (0x029).
-pub const SDHCI_POWER_CONTROL: usize = 0x029;
+pub const SDHCI_POWER_CONTROL: u64 = 0x029;
 /// `BLOCK_GAP_CONTROL_REG` (0x02a).
-pub const SDHCI_BLOCK_GAP_CONTROL: usize = 0x02a;
+pub const SDHCI_BLOCK_GAP_CONTROL: u64 = 0x02a;
 /// `WAKEUP_CONTROL_REG` (0x02b).
-pub const SDHCI_WAKEUP_CONTROL: usize = 0x02b;
+pub const SDHCI_WAKEUP_CONTROL: u64 = 0x02b;
 /// `CLOCK_CONTROL_REG` (0x02c).
-pub const SDHCI_CLOCK_CONTROL: usize = 0x02c;
+pub const SDHCI_CLOCK_CONTROL: u64 = 0x02c;
 /// `TIMEOUT_CONTROL_REG` (0x02e).
-pub const SDHCI_TIMEOUT_CONTROL: usize = 0x02e;
+pub const SDHCI_TIMEOUT_CONTROL: u64 = 0x02e;
 /// `SOFTWARE_RESET_REG` (0x02f) — write `SW_RST_*` bits.
-pub const SDHCI_SOFTWARE_RESET: usize = 0x02f;
+pub const SDHCI_SOFTWARE_RESET: u64 = 0x02f;
 /// `NORMAL_INT_STATUS` (0x030).
-pub const SDHCI_NORMAL_INT_STATUS: usize = 0x030;
+pub const SDHCI_NORMAL_INT_STATUS: u64 = 0x030;
 /// `ERROR_INT_STATUS` (0x032).
-pub const SDHCI_ERROR_INT_STATUS: usize = 0x032;
+pub const SDHCI_ERROR_INT_STATUS: u64 = 0x032;
 /// `NORMAL_INT_STATUS_ENABLE` (0x034).
-pub const SDHCI_NORMAL_INT_STATUS_ENABLE: usize = 0x034;
+pub const SDHCI_NORMAL_INT_STATUS_ENABLE: u64 = 0x034;
 /// `ERROR_INT_STATUS_ENABLE` (0x036).
-pub const SDHCI_ERROR_INT_STATUS_ENABLE: usize = 0x036;
+pub const SDHCI_ERROR_INT_STATUS_ENABLE: u64 = 0x036;
 /// `NORMAL_INT_SIGNAL_ENABLE` (0x038).
-pub const SDHCI_NORMAL_INT_SIGNAL_ENABLE: usize = 0x038;
+pub const SDHCI_NORMAL_INT_SIGNAL_ENABLE: u64 = 0x038;
 /// `ERROR_INT_SIGNAL_ENABLE` (0x03a).
-pub const SDHCI_ERROR_INT_SIGNAL_ENABLE: usize = 0x03a;
+pub const SDHCI_ERROR_INT_SIGNAL_ENABLE: u64 = 0x03a;
 /// `CAPABILITIES` (0x040) — fixed device capabilities, low half.
-pub const SDHCI_CAPABILITIES: usize = 0x040;
+pub const SDHCI_CAPABILITIES: u64 = 0x040;
 /// `CAPABILITIES_HI` (0x044) — capabilities high half.
-pub const SDHCI_CAPABILITIES_HI: usize = 0x044;
+pub const SDHCI_CAPABILITIES_HI: u64 = 0x044;
 /// `SLOT_INT_STATUS_VERSION` (0x0fc) — slot status (low 16) +
 /// host controller version (high 16).
-pub const SDHCI_HOST_VERSION: usize = 0x0fe;
+pub const SDHCI_HOST_VERSION: u64 = 0x0fe;
 
 // ---------------------------------------------------------------------------
 // HOST_CONTROL_1 bits (offset 0x028)
@@ -187,7 +187,7 @@ pub const SDHCI_TRNS_MULTI: u16 = 0x0020;
 /// `ARGUMENT2_REG` (0x000) — argument register for Auto-CMD23. Aliases the
 /// `SDMA_SYS_ADDR_REG` location; the register's role is determined by which
 /// transfer mode is active (PIO + Auto-CMD23 here, SDMA in M6+).
-pub const SDHCI_ARGUMENT2: usize = 0x000;
+pub const SDHCI_ARGUMENT2: u64 = 0x000;
 
 // ---------------------------------------------------------------------------
 // HOST_CONTROL_1 DMA_SEL (bits[4:3], inside the existing SDHCI_HOST_CONTROL
@@ -215,7 +215,7 @@ pub const SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32: u8 = 0b0001_0000;
 /// holds the high 32 bits (unused in this Lockjaw revision). DIFFERENT
 /// register from SDHCI_SYSADDR (0x000), which is the SDMA source/dest
 /// address (also aliased as ARGUMENT2 for Auto-CMD23 in M5).
-pub const SDHCI_ADMA_ADDRESS: usize = 0x058;
+pub const SDHCI_ADMA_ADDRESS: u64 = 0x058;
 
 // ---------------------------------------------------------------------------
 // ADMA2 descriptor — 32-bit address mode, per SDHCI v3 §1.13

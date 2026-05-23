@@ -1,21 +1,48 @@
-# SKELETAL spec for BCM2711 emmc2 (SDHCI v3 compatible).
-# Filled out and emitted in P9.3. The schema features SDHCI needs:
-# - `kind = "aliased"` — SYSADDR (CMD17 single block) and ARGUMENT2
-#   (CMD23 auto-CMD23 arg) live at the SAME offset 0x000 with different
-#   semantics; codegen emits two accessor names for one cell. P9.1.
-# - `kind = "combined_trigger"` — TRANSFER_MODE (0x00c lower 16) +
-#   COMMAND (0x00c upper 16) must be a SINGLE u32 write to fire the
-#   command; otherwise the controller never sees the trigger. P9.0.
-# ADMA2-32 descriptor format moved to `user/wirespecs/sdhci.toml`
-# in P9.2 — wirespec owns DMA shared-memory layout; regspec owns
-# MMIO register layout.
+# BCM2711 emmc2 — SDHCI v3-compatible controller. The Pi 4B's
+# embedded SDIO host; drives the boot SD card via the same Standard
+# Host Controller spec as a desktop x86 SDHCI part.
+#
+# P9.3 emit. Schema features SDHCI exercises end-to-end:
+# - `kind = "aliased"` (P9.1 emitter): SYSADDR (CMD17 SDMA source)
+#   and ARGUMENT2 (CMD23 auto-CMD23 arg) share offset 0x000 with
+#   different semantics. Codegen emits two accessors over one cell.
+# - `kind = "combined_trigger"` (P9.0 emitter): TRANSFER_MODE +
+#   COMMAND must hit the wire as a single u32 store. Split writes
+#   silently drop the command on BCM2711 (the M7 ordering-fix bug);
+#   the typed setter makes single-store mechanical.
+# - Per-field `access = "ro"` (Phase 8.2): CLOCK_CONTROL is RW
+#   overall but bit 1 (INT_STABLE) is hardware-set. The codegen
+#   suppresses `with_int_stable` so driver code that tries to write
+#   the status bit fails to compile.
+# - `[[flags]]` (Phase 4A): the INT_STATUS / INT_STATUS_ENABLE /
+#   INT_SIGNAL_ENABLE / SOFTWARE_RESET families are single-bit-flag
+#   registers; the generated bitflags newtypes replace hand-rolled
+#   const-OR composition in the driver.
+# - `verify_against` (Phase 4A.4): every register offset
+#   const_assert_eq's against the hand-written constant in
+#   `lockjaw_types::sdhci`. The hand-written constants stay
+#   canonical — driver tests reference them; the regspec just
+#   verifies the generated layout matches.
+#
+# ADMA2 descriptor format moved to `user/wirespecs/sdhci.toml`
+# in P9.2 — wirespec owns DMA shared-memory layout.
 
 [device]
 name = "Sdhci"
 description = "SD Host Controller v3 / BCM2711 emmc2"
-emit = false
+emit = true
+verify_against = "lockjaw_types::sdhci"
 
-# SYSADDR / ARGUMENT2 alias at offset 0x000
+# ---------------------------------------------------------------------------
+# SYSADDR / ARGUMENT2 — aliased u32 at offset 0x000
+#
+# In SDMA mode the controller reads/writes the system-RAM buffer at
+# this address. In ARG2 mode (Auto-CMD23 enabled in TRANSFER_MODE)
+# the same cell holds the CMD23 block-count argument. Codegen emits
+# `sysaddr()` / `set_sysaddr()` plus `argument2()` / `set_argument2()`
+# delegating accessors — one cell, two names.
+# ---------------------------------------------------------------------------
+
 [[registers]]
 name = "sysaddr"
 offset = 0x000
@@ -23,25 +50,591 @@ width = 32
 access = "rw"
 kind = "aliased"
 aliases = ["argument2"]
-description = "SDMA system address (also used as ARGUMENT2 for CMD23)"
+description = "SDMA system address / ARGUMENT2 alias (Auto-CMD23 block count)"
+
+# ---------------------------------------------------------------------------
+# BLOCK_SIZE — 16-bit, bits[11:0] are the block-size field. Driver
+# writes 0x200 (512) for SD cards. Upper bits (DMA buffer boundary
+# select) are reserved on BCM2711.
+# ---------------------------------------------------------------------------
 
 [[registers]]
 name = "block_size"
 offset = 0x004
 width = 16
 access = "rw"
-description = "Block size in bytes (12-bit field)"
+description = "Block size in bytes (bits[11:0] = size; max 4 KiB per spec)"
 
-# TRANSFER_MODE + COMMAND combined trigger at offset 0x00c
+# ---------------------------------------------------------------------------
+# BLOCK_COUNT — u16. Number of blocks to transfer; the controller
+# decrements as transfers complete. Driver sets to 1 for single-block.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "block_count"
+offset = 0x006
+width = 16
+access = "rw"
+description = "Block count for the current transfer"
+
+# ---------------------------------------------------------------------------
+# ARGUMENT — u32. CMD argument (CMD17 block address, ACMD41 OCR
+# request payload, etc.). Driver writes BEFORE the COMMAND store
+# that triggers the command issue.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "argument"
+offset = 0x008
+width = 32
+access = "rw"
+description = "Command argument (sector index for CMD17, OCR for ACMD41, etc.)"
+
+# ---------------------------------------------------------------------------
+# TRANSFER_MODE + COMMAND — combined u32 trigger at offset 0x00c.
+#
+# BCM2711 silently drops the command if the two halves are written
+# separately. P9.0's combined_trigger emitter mechanises the
+# single-store requirement: the generated `set_transfer_mode_command(
+# transfer_mode, command)` composes both u16 args into one u32 and
+# emits exactly one Wo<u32>::write. There is no split-write
+# emit path.
+# ---------------------------------------------------------------------------
+
 [[registers]]
 name = "transfer_mode_command"
 offset = 0x00c
 width = 32
 access = "wo"
 kind = "combined_trigger"
-description = "Issuing a CMD = writing both halves as ONE u32 transaction"
+description = "TRANSFER_MODE (low u16) + COMMAND (high u16) — single u32 store triggers the command"
 parts = [
     { name = "transfer_mode", bits = "15:0" },
     { name = "command", bits = "31:16" },
 ]
 
+# ---------------------------------------------------------------------------
+# RESPONSE_0..3 — 4×u32 RO response slots. Card response payload
+# lands here after CMD_COMPLETE. Short responses use RESPONSE_0
+# only; long (R2: CID/CSD) responses span all four.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "response_0"
+offset = 0x010
+width = 32
+access = "ro"
+description = "Response slot 0 (short response payload; long-response low 32)"
+
+[[registers]]
+name = "response_1"
+offset = 0x014
+width = 32
+access = "ro"
+description = "Response slot 1 (long-response bits 63:32)"
+
+[[registers]]
+name = "response_2"
+offset = 0x018
+width = 32
+access = "ro"
+description = "Response slot 2 (long-response bits 95:64)"
+
+[[registers]]
+name = "response_3"
+offset = 0x01c
+width = 32
+access = "ro"
+description = "Response slot 3 (long-response bits 127:96)"
+
+# ---------------------------------------------------------------------------
+# BUFFER_DATA_PORT — u32. PIO data window. Read after BUF_RD_READY;
+# write after BUF_WR_READY. Lockjaw uses ADMA2 exclusively for
+# data, so this register is read only as part of dump-the-state
+# diagnostics.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "buffer_data_port"
+offset = 0x020
+width = 32
+access = "rw"
+description = "PIO data window (unused — Lockjaw uses ADMA2 for all data transfers)"
+
+# ---------------------------------------------------------------------------
+# PRESENT_STATE — u32, fully RO. Controller status snapshot.
+# Driver polls CMD_INHIBIT (bit 0) before issuing any command;
+# DAT_INHIBIT (bit 1) before commands that use the DAT lines
+# (data transfers, R1b busy responses).
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "present_state"
+offset = 0x024
+width = 32
+access = "ro"
+description = "Controller status snapshot (CMD/DAT inhibits, card detect, transfer in progress)"
+flags = [
+    { name = "cmd_inhibit", bit = 0, description = "Command transfer in progress — clear before issuing any CMD" },
+    { name = "dat_inhibit", bit = 1, description = "Data transfer in progress / card busy on DAT0 — clear before DAT-using CMDs" },
+    { name = "dat_active", bit = 2, description = "DAT lines actively driving (transfer underway)" },
+    { name = "write_transfer_active", bit = 8, description = "Write transfer underway" },
+    { name = "read_transfer_active", bit = 9, description = "Read transfer underway" },
+    { name = "card_inserted", bit = 16, description = "Card detected in slot" },
+    { name = "card_state_stable", bit = 17, description = "Card-detect state is stable (debounce settled)" },
+]
+
+# ---------------------------------------------------------------------------
+# HOST_CONTROL_1 — u8. RW. Driver sets DAT_4BIT after ACMD6 and
+# DMA_SEL = ADMA2_32 before issuing ADMA transfers.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "host_control"
+offset = 0x028
+width = 8
+access = "rw"
+description = "Host Control 1 (bus width + DMA engine select)"
+fields = [
+    { name = "led_on", bits = "0:0", description = "Slot LED on" },
+    { name = "dat_4bit", bits = "1:1", description = "Data bus width: 0 = 1-bit, 1 = 4-bit" },
+    { name = "high_speed", bits = "2:2", description = "High-speed mode enable" },
+    { name = "dma_sel", bits = "4:3", enum_values = [
+        { name = "Sdma",      value = 0 },
+        { name = "Adma2_32",  value = 2 },
+        { name = "Adma2_64",  value = 3 },
+    ] },
+]
+
+# ---------------------------------------------------------------------------
+# POWER_CONTROL — u8. RW. Driver sets ON | VOLT_330 to bring up the
+# bus power before issuing CMD0. BCM2711 ignores VOLT_SELECT (slot
+# is hardwired 3.3V) but the spec still requires the bits.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "power_control"
+offset = 0x029
+width = 8
+access = "rw"
+description = "Power Control (bus power enable + voltage select)"
+fields = [
+    { name = "bus_power_on", bits = "0:0", description = "Bus power on" },
+    { name = "bus_voltage", bits = "3:1", enum_values = [
+        { name = "V18", value = 0b101 },
+        { name = "V30", value = 0b110 },
+        { name = "V33", value = 0b111 },
+    ] },
+]
+
+# ---------------------------------------------------------------------------
+# BLOCK_GAP_CONTROL — u8. RW. Unused by emmc2 today (continuous
+# transfer is fine for SD); declared so the register surface is
+# complete.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "block_gap_control"
+offset = 0x02a
+width = 8
+access = "rw"
+description = "Block Gap Control (interrupt-at-block-gap and continue request — unused by emmc2)"
+
+# ---------------------------------------------------------------------------
+# WAKEUP_CONTROL — u8. RW. Wake-up event enables (card insertion,
+# removal, interrupt). Unused by emmc2 (no card-detect wiring).
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "wakeup_control"
+offset = 0x02b
+width = 8
+access = "rw"
+description = "Wakeup Control (card insertion / removal / interrupt wake events — unused by emmc2)"
+
+# ---------------------------------------------------------------------------
+# CLOCK_CONTROL — u16. RW for INT_CLK_EN / SD_CLK_EN and the divisor
+# field; INT_CLK_STABLE (bit 1) is hardware-set and the codegen
+# suppresses its setter via per-field `access = "ro"`.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "clock_control"
+offset = 0x02c
+width = 16
+access = "rw"
+description = "Clock Control (internal/SD clock enables + frequency divisor)"
+fields = [
+    { name = "int_clk_en", bits = "0:0", description = "Internal clock generator enable" },
+    { name = "int_clk_stable", bits = "1:1", access = "ro", description = "Internal clock stable (hardware-set; RO)" },
+    { name = "sd_clk_en", bits = "2:2", description = "SD clock to card slot enable" },
+    { name = "freq_sel_upper", bits = "7:6", description = "Upper 2 bits of the 10-bit SDCLK divisor (combined with `freq_sel`)" },
+    { name = "freq_sel", bits = "15:8", description = "Low 8 bits of the 10-bit SDCLK divisor" },
+]
+
+# ---------------------------------------------------------------------------
+# TIMEOUT_CONTROL — u8. RW. Sets the data-line timeout exponent.
+# Driver sets 0x0E (max ~10s at base_clk_mhz=200) at init.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "timeout_control"
+offset = 0x02e
+width = 8
+access = "rw"
+description = "Data-line timeout exponent (bits[3:0]: timeout = base_clk × 2^(13+N))"
+
+# ---------------------------------------------------------------------------
+# SOFTWARE_RESET — u8. RW. Driver writes SW_RST_ALL at init then
+# polls until cleared. Per-bit flag granularity so the codegen
+# emits with_sw_rst_all() etc., replacing the const-OR pattern.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "software_reset"
+offset = 0x02f
+width = 8
+access = "rw"
+description = "Software Reset (write to assert; controller auto-clears when reset completes)"
+flags = [
+    { name = "sw_rst_all", bit = 0, description = "Reset entire controller" },
+    { name = "sw_rst_cmd", bit = 1, description = "Reset command circuit only" },
+    { name = "sw_rst_dat", bit = 2, description = "Reset data circuit only" },
+]
+
+# ---------------------------------------------------------------------------
+# NORMAL_INT_STATUS — u16. Read + W1C in the same cell. Driver reads
+# to learn which event(s) fired, then writes 1s to ack the subset it
+# processed. SDHCI's INT_STATUS registers are NOT the PL011-ICR
+# clear-only shape (which has a separate readable RIS/MIS register);
+# read and clear share the offset, so the regspec models this as
+# `access = "rw1c"` and the codegen emits BOTH a typed snapshot read
+# AND a typed `clear_*` mask write.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "normal_int_status"
+offset = 0x030
+width = 16
+access = "rw1c"
+description = "Normal Interrupt Status (read latched events, write 1s to acknowledge)"
+flags = [
+    { name = "cmd_complete", bit = 0, description = "CMD/response phase finished" },
+    { name = "data_complete", bit = 1, description = "Data transfer finished" },
+    { name = "block_gap", bit = 2, description = "Block gap event" },
+    { name = "dma_complete", bit = 3, description = "DMA boundary or completion" },
+    { name = "buf_wr_ready", bit = 4, description = "PIO write buffer ready" },
+    { name = "buf_rd_ready", bit = 5, description = "PIO read buffer ready" },
+    { name = "card_insert", bit = 6, description = "Card inserted" },
+    { name = "card_remove", bit = 7, description = "Card removed" },
+    { name = "card_int", bit = 8, description = "Card SDIO interrupt" },
+    { name = "error", bit = 15, description = "Error summary — read ERROR_INT_STATUS for details" },
+]
+
+# ---------------------------------------------------------------------------
+# ERROR_INT_STATUS — u16. Read + W1C (same offset for both ops).
+# Driver reads to learn the specific error class when
+# NORMAL_INT_STATUS.error fires, then writes 1s to ack.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "error_int_status"
+offset = 0x032
+width = 16
+access = "rw1c"
+description = "Error Interrupt Status (read latched error class, write 1s to acknowledge)"
+flags = [
+    { name = "cmd_timeout", bit = 0, description = "Command response timeout" },
+    { name = "cmd_crc", bit = 1, description = "Command CRC mismatch" },
+    { name = "cmd_end_bit", bit = 2, description = "Command end-bit wrong" },
+    { name = "cmd_index", bit = 3, description = "Response index doesn't match issued command" },
+    { name = "data_timeout", bit = 4, description = "Data transfer timeout" },
+    { name = "data_crc", bit = 5, description = "Data CRC mismatch" },
+    { name = "data_end_bit", bit = 6, description = "Data end-bit wrong" },
+    { name = "current_limit", bit = 7, description = "Bus current limit exceeded" },
+    { name = "auto_cmd", bit = 8, description = "Auto-CMD12/CMD23 error" },
+    { name = "adma", bit = 9, description = "ADMA2 descriptor or address error" },
+]
+
+# ---------------------------------------------------------------------------
+# NORMAL_INT_STATUS_ENABLE — u16. RW. Gates which NORMAL_INT_STATUS
+# bits the controller will latch. Driver enables CMD_COMPLETE,
+# DATA_COMPLETE, ERROR at init.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "normal_int_status_enable"
+offset = 0x034
+width = 16
+access = "rw"
+description = "Gate for which NORMAL_INT_STATUS bits the controller latches"
+flags = [
+    { name = "cmd_complete", bit = 0 },
+    { name = "data_complete", bit = 1 },
+    { name = "block_gap", bit = 2 },
+    { name = "dma_complete", bit = 3 },
+    { name = "buf_wr_ready", bit = 4 },
+    { name = "buf_rd_ready", bit = 5 },
+    { name = "card_insert", bit = 6 },
+    { name = "card_remove", bit = 7 },
+    { name = "card_int", bit = 8 },
+]
+
+# ---------------------------------------------------------------------------
+# ERROR_INT_STATUS_ENABLE — u16. RW. Parallel gate for ERROR_INT_STATUS.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "error_int_status_enable"
+offset = 0x036
+width = 16
+access = "rw"
+description = "Gate for which ERROR_INT_STATUS bits the controller latches"
+flags = [
+    { name = "cmd_timeout", bit = 0 },
+    { name = "cmd_crc", bit = 1 },
+    { name = "cmd_end_bit", bit = 2 },
+    { name = "cmd_index", bit = 3 },
+    { name = "data_timeout", bit = 4 },
+    { name = "data_crc", bit = 5 },
+    { name = "data_end_bit", bit = 6 },
+    { name = "current_limit", bit = 7 },
+    { name = "auto_cmd", bit = 8 },
+    { name = "adma", bit = 9 },
+]
+
+# ---------------------------------------------------------------------------
+# NORMAL_INT_SIGNAL_ENABLE — u16. RW. Gates whether a latched
+# NORMAL_INT_STATUS bit actually raises the IRQ line. STATUS_ENABLE
+# gates latching; SIGNAL_ENABLE gates IRQ delivery. Emmc2 polls
+# today (no IRQ-driven driver), so SIGNAL_ENABLE stays clear.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "normal_int_signal_enable"
+offset = 0x038
+width = 16
+access = "rw"
+description = "Gate for which NORMAL_INT_STATUS bits raise the IRQ line"
+flags = [
+    { name = "cmd_complete", bit = 0 },
+    { name = "data_complete", bit = 1 },
+    { name = "block_gap", bit = 2 },
+    { name = "dma_complete", bit = 3 },
+    { name = "buf_wr_ready", bit = 4 },
+    { name = "buf_rd_ready", bit = 5 },
+    { name = "card_insert", bit = 6 },
+    { name = "card_remove", bit = 7 },
+    { name = "card_int", bit = 8 },
+]
+
+# ---------------------------------------------------------------------------
+# ERROR_INT_SIGNAL_ENABLE — u16. RW. Parallel IRQ gate for errors.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "error_int_signal_enable"
+offset = 0x03a
+width = 16
+access = "rw"
+description = "Gate for which ERROR_INT_STATUS bits raise the IRQ line"
+flags = [
+    { name = "cmd_timeout", bit = 0 },
+    { name = "cmd_crc", bit = 1 },
+    { name = "cmd_end_bit", bit = 2 },
+    { name = "cmd_index", bit = 3 },
+    { name = "data_timeout", bit = 4 },
+    { name = "data_crc", bit = 5 },
+    { name = "data_end_bit", bit = 6 },
+    { name = "current_limit", bit = 7 },
+    { name = "auto_cmd", bit = 8 },
+    { name = "adma", bit = 9 },
+]
+
+# ---------------------------------------------------------------------------
+# CAPABILITIES — u32. Fully RO. Hardware-burned controller capabilities.
+# Hand-written `Caps::from_bits(lo, hi)` in `lockjaw_types::sdhci`
+# parses this register plus CAPABILITIES_HI into a typed snapshot.
+# Field accessors here let the codegen-generated `capabilities()`
+# reader be the primary entry point; the typed Caps decoder stays
+# canonical and tests pin its decode against synthesized bit
+# patterns.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "capabilities"
+offset = 0x040
+width = 32
+access = "ro"
+description = "Controller Capabilities (low 32 — hardware-burned)"
+fields = [
+    { name = "timeout_clock_freq", bits = "5:0", description = "Timeout clock frequency (base for TIMEOUT_CONTROL)" },
+    { name = "base_clock_mhz", bits = "15:8", description = "Base SDCLK frequency in MHz" },
+    { name = "max_block_len", bits = "17:16", enum_values = [
+        { name = "B512",  value = 0 },
+        { name = "B1024", value = 1 },
+        { name = "B2048", value = 2 },
+    ] },
+    { name = "adma2_supported", bits = "19:19", description = "ADMA2 transfer support" },
+    { name = "high_speed_supported", bits = "21:21" },
+    { name = "voltage_330", bits = "24:24", description = "3.3V slot supported" },
+    { name = "voltage_300", bits = "25:25", description = "3.0V slot supported" },
+    { name = "voltage_180", bits = "26:26", description = "1.8V slot supported" },
+]
+
+# ---------------------------------------------------------------------------
+# CAPABILITIES_HI — u32. Fully RO. Phase 3 capabilities. Not parsed
+# by emmc2 today; declared so the register surface is complete.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "capabilities_hi"
+offset = 0x044
+width = 32
+access = "ro"
+description = "Controller Capabilities (high 32 — SDR104/SDR50/DDR50/driver-strength/etc.)"
+
+# ---------------------------------------------------------------------------
+# ADMA_ADDRESS — u32. RW. Physical address of the ADMA2 descriptor
+# table the driver constructs in DMA-coherent memory.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "adma_address"
+offset = 0x058
+width = 32
+access = "rw"
+description = "ADMA2 descriptor table physical address (32-bit ADMA2 mode)"
+
+# ---------------------------------------------------------------------------
+# HOST_VERSION — u16. RO. The 0x0fc 32-bit register splits into
+# SLOT_INTERRUPT_STATUS (low u16, ignored) + HOST_CONTROLLER_VERSION
+# (high u16, this register). Driver reads at init for diagnostics.
+# ---------------------------------------------------------------------------
+
+[[registers]]
+name = "host_version"
+offset = 0x0fe
+width = 16
+access = "ro"
+description = "Host Controller Version (high half of 0x0fc — vendor + spec version)"
+
+# ---------------------------------------------------------------------------
+# verify_against bindings — every register offset above cross-checks
+# against the hand-written constant in `lockjaw_types::sdhci`. The
+# const_assert_eq! emitted in the generated module proves the two
+# stay aligned; future agents can't drift one without the build
+# failing.
+# ---------------------------------------------------------------------------
+
+[[verify_offsets]]
+reg = "sysaddr"
+const = "SDHCI_SYSADDR"
+
+[[verify_offsets]]
+reg = "block_size"
+const = "SDHCI_BLOCK_SIZE"
+
+[[verify_offsets]]
+reg = "block_count"
+const = "SDHCI_BLOCK_COUNT"
+
+[[verify_offsets]]
+reg = "argument"
+const = "SDHCI_ARGUMENT"
+
+[[verify_offsets]]
+reg = "transfer_mode_command"
+const = "SDHCI_TRANSFER_MODE"
+
+[[verify_offsets]]
+reg = "response_0"
+const = "SDHCI_RESPONSE_0"
+
+[[verify_offsets]]
+reg = "response_1"
+const = "SDHCI_RESPONSE_1"
+
+[[verify_offsets]]
+reg = "response_2"
+const = "SDHCI_RESPONSE_2"
+
+[[verify_offsets]]
+reg = "response_3"
+const = "SDHCI_RESPONSE_3"
+
+[[verify_offsets]]
+reg = "buffer_data_port"
+const = "SDHCI_BUFFER_DATA_PORT"
+
+[[verify_offsets]]
+reg = "present_state"
+const = "SDHCI_PRESENT_STATE"
+
+[[verify_offsets]]
+reg = "host_control"
+const = "SDHCI_HOST_CONTROL"
+
+[[verify_offsets]]
+reg = "power_control"
+const = "SDHCI_POWER_CONTROL"
+
+[[verify_offsets]]
+reg = "block_gap_control"
+const = "SDHCI_BLOCK_GAP_CONTROL"
+
+[[verify_offsets]]
+reg = "wakeup_control"
+const = "SDHCI_WAKEUP_CONTROL"
+
+[[verify_offsets]]
+reg = "clock_control"
+const = "SDHCI_CLOCK_CONTROL"
+
+[[verify_offsets]]
+reg = "timeout_control"
+const = "SDHCI_TIMEOUT_CONTROL"
+
+[[verify_offsets]]
+reg = "software_reset"
+const = "SDHCI_SOFTWARE_RESET"
+
+[[verify_offsets]]
+reg = "normal_int_status"
+const = "SDHCI_NORMAL_INT_STATUS"
+
+[[verify_offsets]]
+reg = "error_int_status"
+const = "SDHCI_ERROR_INT_STATUS"
+
+[[verify_offsets]]
+reg = "normal_int_status_enable"
+const = "SDHCI_NORMAL_INT_STATUS_ENABLE"
+
+[[verify_offsets]]
+reg = "error_int_status_enable"
+const = "SDHCI_ERROR_INT_STATUS_ENABLE"
+
+[[verify_offsets]]
+reg = "normal_int_signal_enable"
+const = "SDHCI_NORMAL_INT_SIGNAL_ENABLE"
+
+[[verify_offsets]]
+reg = "error_int_signal_enable"
+const = "SDHCI_ERROR_INT_SIGNAL_ENABLE"
+
+[[verify_offsets]]
+reg = "capabilities"
+const = "SDHCI_CAPABILITIES"
+
+[[verify_offsets]]
+reg = "capabilities_hi"
+const = "SDHCI_CAPABILITIES_HI"
+
+[[verify_offsets]]
+reg = "adma_address"
+const = "SDHCI_ADMA_ADDRESS"
+
+[[verify_offsets]]
+reg = "host_version"
+const = "SDHCI_HOST_VERSION"

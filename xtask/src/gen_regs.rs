@@ -234,7 +234,21 @@ enum Access {
     Ro,
     Rw,
     Wo,
+    /// Clear-only write-1-to-clear. The register has no defined
+    /// read semantics on the hardware (PL011 ICR is the canonical
+    /// example); the codegen emits ONLY a `clear_*` accessor. If
+    /// the register IS readable AND W1C in the same cell (SDHCI
+    /// NORMAL_INT_STATUS / ERROR_INT_STATUS), use `rw1c` instead.
     W1c,
+    /// Read + write-1-to-clear in the same cell. The driver reads
+    /// the register to learn which event bits are latched, then
+    /// writes 1s to the bits it wants to acknowledge. SDHCI's
+    /// NORMAL_INT_STATUS and ERROR_INT_STATUS are the canonical
+    /// example: same offset is BOTH the readable status AND the
+    /// clear register (unlike PL011 where RIS/MIS reads and ICR
+    /// clears live at different offsets). Codegen emits both a
+    /// typed-snapshot read and a typed `clear_*` mask write.
+    Rw1c,
     Trigger,
 }
 
@@ -940,7 +954,12 @@ fn emit_header(out: &mut String, spec: &Spec) {
             Access::Ro => { needed.insert("Ro"); }
             Access::Rw => { needed.insert("Rw"); }
             Access::Wo | Access::Trigger => { needed.insert("Wo"); }
-            Access::W1c => { needed.insert("W1c"); }
+            // Rw1c reuses the W1c<T> cell type: the cell already
+            // exposes both `read()` and `clear(mask)`. The
+            // difference between W1c and Rw1c is in the EMITTED
+            // accessors (Rw1c gets both, W1c gets clear-only), not
+            // in the underlying cell.
+            Access::W1c | Access::Rw1c => { needed.insert("W1c"); }
         }
     }
     let imports: Vec<&str> = needed.iter().copied().collect();
@@ -995,7 +1014,7 @@ fn cell_type(access: Access, width: u8) -> String {
         Access::Ro => format!("Ro<{}>", wty),
         Access::Rw => format!("Rw<{}>", wty),
         Access::Wo | Access::Trigger => format!("Wo<{}>", wty),
-        Access::W1c => format!("W1c<{}>", wty),
+        Access::W1c | Access::Rw1c => format!("W1c<{}>", wty),
     }
 }
 
@@ -1569,20 +1588,49 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                 }
             }
             Access::W1c => {
-                // W1C in the spec means "clear-only". Many W1C registers in
-                // hardware (notably PL011's ICR) have undefined read semantics
-                // — the readable counterpart is a separate RO status register
-                // (RIS/MIS on PL011, NORMAL_INT_STATUS on SDHCI). The codegen
-                // does NOT expose a typed read accessor for W1C: a `clear_*`
-                // is all the typed surface a driver needs. If a future device
-                // needs read+clear in one register, it'll model the readable
-                // side as a separate `ro` entry at the same offset (via the
-                // `aliased` kind landing in Phase 7).
+                // W1C: clear-only. The register has no defined read
+                // semantics in the hardware — PL011's ICR is the
+                // canonical example (the readable counterpart lives at
+                // a different offset as a separate RO RIS/MIS register).
+                // Codegen emits only a `clear_*` mask write; a typed
+                // read accessor would be a footgun on hardware where
+                // the bits-on-read are unspecified. SDHCI INT_STATUS
+                // registers are NOT this shape — they're read+W1C in
+                // one cell, modeled as `access = "rw1c"` below.
                 if has_typed {
                     writeln!(out, "    /// Clear bits in `{}` (write-1-to-clear).", reg.name).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
                     writeln!(out, "    pub fn clear_{}(&self, mask: {ty}) {{ self.{}.clear(mask.0); }}", reg.name, reg.name).unwrap();
                 } else {
+                    writeln!(out, "    /// Clear bits in `{}` (write-1-to-clear).", reg.name).unwrap();
+                    writeln!(out, "    #[inline(always)]").unwrap();
+                    writeln!(out, "    pub fn clear_{}(&self, mask: {wty}) {{ self.{}.clear(mask); }}", reg.name, reg.name).unwrap();
+                }
+            }
+            Access::Rw1c => {
+                // Rw1c: read + write-1-to-clear at the same offset.
+                // SDHCI NORMAL_INT_STATUS / ERROR_INT_STATUS — driver
+                // reads to learn which event bits latched, then writes
+                // 1s to ack the subset it processed. The cell type is
+                // `W1c<T>` (same as plain W1C — the substrate cell
+                // already exposes `read()` AND `clear(mask)`); only
+                // the accessor surface differs. Typed snapshot read
+                // mirrors Ro emit; `clear_*` mask write mirrors W1c.
+                // No `set_*` — writes go through clear semantics, not
+                // value-store. No `modify_*` — RMW on a register
+                // where the write-half clears bits would be incoherent
+                // (the read-back wouldn't see what was just "set").
+                if has_typed {
+                    writeln!(out, "    /// Read a typed snapshot of `{}` (which bits are currently latched).", reg.name).unwrap();
+                    writeln!(out, "    #[inline(always)]").unwrap();
+                    writeln!(out, "    pub fn {}(&self) -> {ty} {{ {ty}(self.{}.read()) }}", reg.name, reg.name).unwrap();
+                    writeln!(out, "    /// Clear bits in `{}` (write-1-to-clear); pass the typed mask of bits to ack.", reg.name).unwrap();
+                    writeln!(out, "    #[inline(always)]").unwrap();
+                    writeln!(out, "    pub fn clear_{}(&self, mask: {ty}) {{ self.{}.clear(mask.0); }}", reg.name, reg.name).unwrap();
+                } else {
+                    writeln!(out, "    /// Volatile read of `{}` as `{wty}` (which bits are currently latched).", reg.name).unwrap();
+                    writeln!(out, "    #[inline(always)]").unwrap();
+                    writeln!(out, "    pub fn read_{}(&self) -> {wty} {{ self.{}.read() }}", reg.name, reg.name).unwrap();
                     writeln!(out, "    /// Clear bits in `{}` (write-1-to-clear).", reg.name).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
                     writeln!(out, "    pub fn clear_{}(&self, mask: {wty}) {{ self.{}.clear(mask); }}", reg.name, reg.name).unwrap();
@@ -1650,6 +1698,24 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                         let arg_ty = if has_typed { ty.clone() } else { wty.clone() };
                         writeln!(out, "    #[inline(always)]").unwrap();
                         writeln!(out, "    pub fn clear_{alias}(&self, mask: {arg_ty}) {{ self.clear_{}(mask); }}", reg.name).unwrap();
+                    }
+                    Access::Rw1c => {
+                        // Rw1c aliases delegate both the typed-read and
+                        // the clear, mirroring the primary's two
+                        // accessors. No setter / modify — Rw1c has no
+                        // value-store semantics (see the main emit
+                        // branch above for the rationale).
+                        if has_typed {
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn {alias}(&self) -> {ty} {{ self.{}() }}", reg.name).unwrap();
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn clear_{alias}(&self, mask: {ty}) {{ self.clear_{}(mask); }}", reg.name).unwrap();
+                        } else {
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn read_{alias}(&self) -> {wty} {{ self.read_{}() }}", reg.name).unwrap();
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn clear_{alias}(&self, mask: {wty}) {{ self.clear_{}(mask); }}", reg.name).unwrap();
+                        }
                     }
                 }
             }
@@ -2303,6 +2369,40 @@ fn emit_tests(out: &mut String, spec: &Spec) {
                     writeln!(out, "        // clears\" semantics don't apply to the store, so the assertion").unwrap();
                     writeln!(out, "        // is on bytes written, not bits cleared. The routing property").unwrap();
                     writeln!(out, "        // is what this test pins down regardless.)").unwrap();
+                    writeln!(out, "        regs.regs().{alias_clear}({mask_arg});").unwrap();
+                    writeln!(out, "        assert_eq!(region.{peek_method}(offset_of!({dev}, {})), {sample_b});", reg.name).unwrap();
+                    writeln!(out, "    }}").unwrap();
+                    writeln!(out).unwrap();
+                }
+                Access::Rw1c => {
+                    // Two assertions: alias-read sees the same bytes
+                    // the primary's offset holds (proves the read path
+                    // routes through the same cell), and alias-clear
+                    // writes bytes the primary's offset sees (proves
+                    // the clear path does too). Pre-action poke seeds
+                    // the cell with a known pattern for the read
+                    // assertion; the clear assertion follows the same
+                    // shape as the W1c branch above (mock backing is
+                    // CPU memory, not W1C hardware).
+                    let mask_arg = typed_ctor(sample_b);
+                    let alias_read = if has_typed_w {
+                        format!("{alias}().bits()")
+                    } else {
+                        format!("read_{alias}()")
+                    };
+                    let alias_clear = format!("clear_{alias}");
+                    writeln!(out, "    #[test]").unwrap();
+                    writeln!(out, "    fn {}_{}_alias_reads_same_cell() {{", reg.name, alias).unwrap();
+                    writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+                    writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+                    writeln!(out, "        region.{poke_method}(offset_of!({dev}, {}), {sample_a});", reg.name).unwrap();
+                    writeln!(out, "        assert_eq!(regs.regs().{alias_read}, {sample_a});").unwrap();
+                    writeln!(out, "    }}").unwrap();
+                    writeln!(out).unwrap();
+                    writeln!(out, "    #[test]").unwrap();
+                    writeln!(out, "    fn {}_{}_alias_clears_same_cell() {{", reg.name, alias).unwrap();
+                    writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+                    writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
                     writeln!(out, "        regs.regs().{alias_clear}({mask_arg});").unwrap();
                     writeln!(out, "        assert_eq!(region.{peek_method}(offset_of!({dev}, {})), {sample_b});", reg.name).unwrap();
                     writeln!(out, "    }}").unwrap();
