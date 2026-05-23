@@ -6,7 +6,9 @@
 //! emitter handles the basic features PL011 uses (plain RO/RW/WO/W1C,
 //! single-bit flags, multi-bit fields, enum-valued fields). Later
 //! phases extend the emitter to handle stream, big-endian, aliased,
-//! combined_trigger, passwd_protected, and `[[descriptors]]`.
+//! combined_trigger, and passwd_protected. DMA shared-memory layouts
+//! (Phase 2's `[[descriptors]]` placeholder) moved to wirespec in
+//! Phase 7 — `xtask gen-wires` owns that pipeline.
 //!
 //! Schema risk lives here: if PL011's exercise of the schema reveals
 //! gaps, fix the schema NOW — before Phase 3 drives the first
@@ -95,8 +97,6 @@ struct Spec {
     device: DeviceMeta,
     #[serde(default)]
     registers: Vec<Register>,
-    #[serde(default)]
-    descriptors: Vec<Descriptor>,
     // Phase 4A.2: paired 32-bit low/high registers exposed as a
     // synthesized u64 accessor. Avoids manual driver-side composition.
     #[serde(default)]
@@ -310,20 +310,6 @@ struct Part {
     name: String,
     /// Bit range within the register, "hi:lo" inclusive.
     bits: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct Descriptor {
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    width: u8,
-    #[serde(default)]
-    #[allow(dead_code)]
-    description: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    fields: Vec<Field>,
 }
 
 // ---------------------------------------------------------------------------
@@ -553,20 +539,6 @@ fn validate(spec: &Spec, path: &Path) {
                 "{}: verify_offset register `{}` not found",
                 path.display(), vo.reg
             );
-        }
-    }
-    // Descriptor sections (Phase 7 SDHCI ADMA2): bit ranges within the
-    // descriptor's declared width. Validated even when emit=false so future
-    // descriptor specs catch out-of-range bits at `gen-regs --check` time.
-    for desc in &spec.descriptors {
-        if !matches!(desc.width, 8 | 16 | 32 | 64) {
-            panic!(
-                "{}: descriptor `{}` has unsupported width {}; must be 8/16/32/64",
-                path.display(), desc.name, desc.width
-            );
-        }
-        for f in &desc.fields {
-            validate_field(f, desc.width, &format!("descriptor `{}`", desc.name), path);
         }
     }
 }
@@ -902,13 +874,6 @@ fn emit_device(spec: &Spec) -> String {
             }
         }
     }
-    if !spec.descriptors.is_empty() {
-        panic!(
-            "Phase 2 emitter does not support [[descriptors]] (used by `{}`). Lands in Phase 7.",
-            spec.device.name
-        );
-    }
-
     let mut out = String::new();
     emit_header(&mut out, spec);
     emit_verify_coverage_comment(&mut out, spec);

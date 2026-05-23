@@ -15,4 +15,5 @@
 //! across the codegen split.
 
 pub mod fwcfg;
+pub mod sdhci;
 pub mod virtio;

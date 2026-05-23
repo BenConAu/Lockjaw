@@ -1,0 +1,60 @@
+# SDHCI ADMA2 descriptor wire DTOs. ADMA2-32 is the variant emmc2
+# uses on BCM2711 (32-bit DMA addresses); ADMA2-64 is deferred until a
+# controller needs it.
+#
+# Generated to `lockjaw-types/src/wire/sdhci.rs` by
+# `cargo xtask gen-wires`. Drift caught by `cargo xtask gen-wires --check`.
+
+family = "sdhci"
+description = "SDHCI ADMA2 descriptor wire DTOs (LE on the wire)"
+
+# ---------------------------------------------------------------------------
+# Adma2Descriptor — 8-byte ADMA2 32-bit-address descriptor (SDHCI v3
+# §1.13.3.1). The controller DMA-reads an array of these from a
+# descriptor table whose physical address the driver writes into
+# `ADMA_ADDRESS`. Each descriptor:
+#
+#   bytes 0..1 = Attributes (16-bit word; only bits 5:0 are defined
+#                per spec, bits 15:6 are reserved-must-be-zero — the
+#                wire field is u16 to match the hardware boundary,
+#                bit-packing semantics live in lockjaw-types/src/sdhci.rs
+#                as ADMA2_ATTR_VALID/END/INT/ACT_TRAN/ACT_LINK)
+#   bytes 2..3 = Length in bytes (0 = 65536 per spec quirk; emmc2
+#                caps at 65535 to avoid the quirk)
+#   bytes 4..7 = Data Address (4-byte aligned, 32-bit physical)
+#
+# Wirespec EXCLUDES bit-field decoding within a wire field (per the
+# Phase 7 boundary), so the attr u16 is opaque at the wirespec level.
+# Named constructors for the four legal descriptor shapes (NOP, TRAN,
+# TRAN+END, LINK) plus the orthogonal `with_int` modifier live in
+# `lockjaw-types/src/sdhci.rs` as an `impl Adma2Descriptor { ... }`
+# block on the generated type — parallel to FwCfgDmaAccess's
+# convenience helpers in `lockjaw-types/src/fwcfg.rs`. Driver code
+# never hand-ORs `ADMA2_ATTR_*` constants into `new()`; it goes
+# through the named constructors which forbid illegal combinations
+# (e.g. ACT_TRAN | ACT_LINK, missing VALID) by construction.
+# ---------------------------------------------------------------------------
+
+[[wire]]
+name = "Adma2Descriptor"
+description = "ADMA2 32-bit-address descriptor (SDHCI v3 §1.13.3.1)."
+size = 8
+endian = "little"
+
+  [[wire.fields]]
+  name = "attr"
+  offset = 0
+  width = 16
+  description = "Attributes word — OR of ADMA2_ATTR_VALID/END/INT/ACT_TRAN/ACT_LINK (bits 5:0 defined, bits 15:6 reserved)."
+
+  [[wire.fields]]
+  name = "length"
+  offset = 2
+  width = 16
+  description = "Transfer length in bytes (max 65535 per descriptor; emmc2 caps here to avoid the length=0=65536 spec quirk)."
+
+  [[wire.fields]]
+  name = "address"
+  offset = 4
+  width = 32
+  description = "Data buffer guest-physical address (4-byte aligned, 32-bit only — ADMA2-32 variant)."

@@ -4,12 +4,21 @@
 /// All pure types — no MMIO access, no volatile, no barriers.
 /// Host-testable layout / decode logic.
 ///
+/// Wire DTOs (`Adma2Descriptor`) live in `crate::wire::sdhci`,
+/// generated from `user/wirespecs/sdhci.toml` by `cargo xtask
+/// gen-wires`. This module re-exports them so consumers can use
+/// `lockjaw_types::sdhci::Adma2Descriptor` directly; the
+/// `ADMA2_ATTR_*` bit constants below compose into the typed
+/// `attr` field at construction.
+///
 /// References:
 ///   - SD Host Controller Standard Specification v4.20 (relevant
 ///     parts, since the BCM2711 emmc2 controller is SDHCI v3)
 ///   - Linux `drivers/mmc/host/sdhci.h` (cross-reference for
 ///     register offsets and CAPABILITIES bit layout)
 ///   - SD Physical Layer Specification v6.00 (command set)
+
+pub use crate::wire::sdhci::*;
 
 // ---------------------------------------------------------------------------
 // SDHCI register offsets (Standard Spec § 2.1.1)
@@ -252,6 +261,77 @@ pub const ADMA2_ATTR_ACT_LINK: u16 = 0b11 << 4;
 pub const fn adma2_tran_end_descriptor(buf_phys: u32, length: u16) -> u64 {
     let attrs: u16 = ADMA2_ATTR_VALID | ADMA2_ATTR_END | ADMA2_ATTR_ACT_TRAN;
     ((buf_phys as u64) << 32) | ((length as u64) << 16) | (attrs as u64)
+}
+
+// ---------------------------------------------------------------------------
+// Adma2Descriptor convenience constructors.
+//
+// The generated `Adma2Descriptor::new(attr, length, address)` is the
+// raw constructor. SDHCI v3 §1.13.4 defines exactly four descriptor
+// shapes — NOP, TRAN, TRAN+END, LINK — and the bit combinations are
+// load-bearing: forgetting VALID makes the controller silently skip
+// the entry; ORing both ACT_TRAN and ACT_LINK is undefined behavior;
+// omitting END on the final TRAN of a chain hangs the controller
+// waiting for a next descriptor that never arrives. The named
+// constructors below produce exactly the four legal shapes, so a
+// driver author cannot construct an illegal combination by hand-
+// ORing `ADMA2_ATTR_*` constants into a single u16 argument.
+//
+// INT is orthogonal to the action — `with_int` is the one chainable
+// modifier, mirroring how driver IRQ-vs-poll choice is independent
+// of descriptor shape.
+// ---------------------------------------------------------------------------
+
+impl Adma2Descriptor {
+    /// VALID | ACT_TRAN — mid-chain data transfer. Use `tran_end`
+    /// for the last descriptor in a chain (sets END too); a
+    /// chain that ends on `tran` without END hangs the controller.
+    ///
+    /// Argument order is (address, length) — matches the consumer
+    /// mental model "buffer at X, Y bytes long" and the legacy
+    /// `adma2_tran_end_descriptor(buf_phys, length)` helper, NOT
+    /// the raw `Adma2Descriptor::new(attr, length, address)` wire-
+    /// field order. The wire constructor follows the byte layout
+    /// (codegen-determined); the named constructors are hand-written
+    /// and follow caller ergonomics.
+    pub fn tran(address: u32, length: u16) -> Self {
+        Self::new(ADMA2_ATTR_VALID | ADMA2_ATTR_ACT_TRAN, length, address)
+    }
+
+    /// VALID | END | ACT_TRAN — final data transfer in a chain.
+    /// Single-descriptor transfers use this exclusively (no preceding
+    /// `tran` entries). Argument order (address, length) — see `tran`.
+    pub fn tran_end(address: u32, length: u16) -> Self {
+        Self::new(
+            ADMA2_ATTR_VALID | ADMA2_ATTR_END | ADMA2_ATTR_ACT_TRAN,
+            length,
+            address,
+        )
+    }
+
+    /// VALID | ACT_LINK — chain to another descriptor table at
+    /// `address`. Length is don't-care for LINK per spec; emitted
+    /// as 0 by convention.
+    pub fn link(address: u32) -> Self {
+        Self::new(ADMA2_ATTR_VALID | ADMA2_ATTR_ACT_LINK, 0, address)
+    }
+
+    /// VALID alone — no-op descriptor (ACT field zero). Controller
+    /// advances past it without transferring data. Rarely needed
+    /// outside descriptor-table alignment padding.
+    pub fn nop() -> Self {
+        Self::new(ADMA2_ATTR_VALID, 0, 0)
+    }
+
+    /// Set the INT bit so the controller raises the descriptor-done
+    /// interrupt on completion of this entry. Orthogonal to the
+    /// action; chainable onto any of `tran` / `tran_end` / `link` /
+    /// `nop`. Emmc2 polls today (no driver wires this yet); kept
+    /// available for IRQ-driven transfers.
+    pub fn with_int(self) -> Self {
+        let attr = self.attr() | ADMA2_ATTR_INT;
+        Self::new(attr, self.length(), self.address())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,5 +1147,81 @@ mod tests {
         // (Spec quirk: length=0 means 65536 — not used here.)
         let d = adma2_tran_end_descriptor(0x1000, 65535);
         assert_eq!(((d >> 16) & 0xFFFF) as u16, 65535);
+    }
+
+    #[test]
+    fn adma2_descriptor_tran_constructor() {
+        // tran: VALID | ACT_TRAN, no END (mid-chain shape).
+        // Argument order (address, length) — matches legacy helper.
+        let d = Adma2Descriptor::tran(0xDEAD_B000, 512);
+        assert_eq!(d.attr(), ADMA2_ATTR_VALID | ADMA2_ATTR_ACT_TRAN);
+        assert_eq!(d.length(), 512);
+        assert_eq!(d.address(), 0xDEAD_B000);
+        // END must not be set on a non-terminating tran.
+        assert_eq!(d.attr() & ADMA2_ATTR_END, 0);
+    }
+
+    #[test]
+    fn adma2_descriptor_tran_end_constructor() {
+        // tran_end: VALID | END | ACT_TRAN — single-block path's shape.
+        // Argument order (address, length) — matches legacy helper.
+        let d = Adma2Descriptor::tran_end(0xDEAD_B000, 512);
+        assert_eq!(
+            d.attr(),
+            ADMA2_ATTR_VALID | ADMA2_ATTR_END | ADMA2_ATTR_ACT_TRAN,
+        );
+        assert_eq!(d.length(), 512);
+        assert_eq!(d.address(), 0xDEAD_B000);
+        // Wire bytes must match the legacy `adma2_tran_end_descriptor`
+        // u64 layout (LE on wire): both helpers produce the same 8
+        // bytes for the same inputs in the same order. Pins the P9.9
+        // migration target — driver call sites swap one-for-one with
+        // no argument transposition.
+        let legacy = adma2_tran_end_descriptor(0xDEAD_B000, 512);
+        assert_eq!(d.attr() as u64, legacy & 0xFFFF);
+        assert_eq!(d.length() as u64, (legacy >> 16) & 0xFFFF);
+        assert_eq!(d.address() as u64, legacy >> 32);
+    }
+
+    #[test]
+    fn adma2_descriptor_link_constructor() {
+        // link: VALID | ACT_LINK; length is don't-care, emitted as 0.
+        // The constructors-produce-exactly-one-action invariant is
+        // enforced by the equality check — `link` cannot return a
+        // descriptor whose attr has both ACT_TRAN and ACT_LINK ORed.
+        let d = Adma2Descriptor::link(0x1000_0000);
+        assert_eq!(d.attr(), ADMA2_ATTR_VALID | ADMA2_ATTR_ACT_LINK);
+        assert_eq!(d.length(), 0);
+        assert_eq!(d.address(), 0x1000_0000);
+    }
+
+    #[test]
+    fn adma2_descriptor_nop_constructor() {
+        // nop: VALID alone (ACT field zero). Length and address zero.
+        // ACT field check via the masked 2-bit value at bits 5:4 —
+        // ACT_TRAN (0b10) and ACT_LINK (0b11) share bit 5, so masking
+        // the union doesn't distinguish "no action" from "either
+        // action"; the bit-shift form is correct.
+        let d = Adma2Descriptor::nop();
+        assert_eq!(d.attr(), ADMA2_ATTR_VALID);
+        assert_eq!(d.length(), 0);
+        assert_eq!(d.address(), 0);
+        assert_eq!((d.attr() >> 4) & 0b11, 0);
+    }
+
+    #[test]
+    fn adma2_descriptor_with_int_chains() {
+        // with_int ORs INT onto any base shape's attr; length and
+        // address pass through unchanged.
+        let base = Adma2Descriptor::tran(0x4000, 256);
+        let withi = base.with_int();
+        assert_eq!(
+            withi.attr(),
+            ADMA2_ATTR_VALID | ADMA2_ATTR_ACT_TRAN | ADMA2_ATTR_INT,
+        );
+        assert_eq!(withi.length(), 256);
+        assert_eq!(withi.address(), 0x4000);
+        // Idempotent — chaining twice keeps the same INT bit set.
+        assert_eq!(withi.with_int().attr(), withi.attr());
     }
 }
