@@ -354,12 +354,37 @@ fn load_all_specs(dir: &str) -> Vec<(PathBuf, Spec)> {
 // ---------------------------------------------------------------------------
 
 fn validate(spec: &Spec, path: &Path) {
-    // Track every offset already claimed, AND whether it was claimed by an
-    // aliased register. Aliased registers may overlap with other aliased
-    // registers at the same offset (that's the point); a plain register
-    // overlapping an aliased one — or vice versa — is a bug.
-    let mut seen_offsets: std::collections::BTreeMap<u64, /* aliased = */ bool> =
-        std::collections::BTreeMap::new();
+    // Global name-collision pre-pass. Runs here (not in emit_device)
+    // so parsed-only specs (emit = false) are still validated for
+    // duplicate register names, alias-vs-primary collisions, and
+    // alias-vs-alias collisions. Otherwise a future flip of
+    // emit = true would surface schema bugs that have been latent
+    // across many commits.
+    {
+        let mut names = NameRegistry::new();
+        for reg in &spec.registers {
+            if let Err(c) = names.register_primary(reg.name.as_str()) {
+                panic!("{}: {}", path.display(), c.message());
+            }
+        }
+        for reg in &spec.registers {
+            for alias in &reg.aliases {
+                if let Err(c) = names.register_alias(alias.as_str(), reg.name.as_str()) {
+                    panic!("{}: {}", path.display(), c.message());
+                }
+            }
+        }
+    }
+
+    // Each register's offset must be unique. P9.1's aliased model is
+    // one `[[registers]]` entry per cell — alternate names live in
+    // the primary's `aliases = [...]` list, not as separate entries.
+    // The pre-Phase-9 "two aliased entries may share an offset"
+    // exception was inconsistent with emit_layout (which emits one
+    // #[repr(C)] field per entry and panics on overlap), so the
+    // validator now rejects every collision regardless of kind.
+    let mut seen_offsets: std::collections::BTreeSet<u64> =
+        std::collections::BTreeSet::new();
     for reg in &spec.registers {
         if !matches!(reg.width, 8 | 16 | 32 | 64) {
             panic!(
@@ -374,21 +399,14 @@ fn validate(spec: &Spec, path: &Path) {
                 path.display(), reg.name, reg.offset, byte_width
             );
         }
-        let is_aliased = matches!(reg.kind, Some(RegisterKind::Aliased));
-        match seen_offsets.get(&reg.offset).copied() {
-            Some(prev_aliased) => {
-                if !(prev_aliased && is_aliased) {
-                    panic!(
-                        "{}: register `{}` offset 0x{:x} collides with an earlier register; \
-                         only aliased registers may share an offset (and BOTH sides must declare \
-                         kind = \"aliased\")",
-                        path.display(), reg.name, reg.offset
-                    );
-                }
-            }
-            None => {
-                seen_offsets.insert(reg.offset, is_aliased);
-            }
+        if !seen_offsets.insert(reg.offset) {
+            panic!(
+                "{}: register `{}` offset 0x{:x} collides with an earlier register. \
+                 If both names refer to the same hardware cell, use the primary \
+                 register's `aliases = [\"...\"]` list (with `kind = \"aliased\"`) \
+                 — two `[[registers]]` entries at the same offset are not supported.",
+                path.display(), reg.name, reg.offset
+            );
         }
         // Flags and fields are mutually exclusive: a register is EITHER a
         // bag of single-bit flags OR has multi-bit fields. (Mixing makes
@@ -590,7 +608,82 @@ fn parse_bits(s: &str) -> Option<(u8, u8)> {
 // because the generated file is committed and reviewers should read it.
 // ---------------------------------------------------------------------------
 
+// Single global namespace for register names + aliases. The
+// per-entry origin (primary vs alias-of-X) is part of the type,
+// not just a value-slot convention: `NameOrigin` and the
+// `register_primary` / `register_alias` API surface require
+// callers to thread the owning register through alias inserts.
+// A future agent restructuring this to drop the origin tracking
+// (e.g. swapping to a HashSet<&str>) would have to delete
+// NameOrigin and rewrite Collision::message — visible structural
+// change rather than a quietly-degraded error message.
+#[derive(Copy, Clone)]
+enum NameOrigin<'a> {
+    /// Declared as a primary register name.
+    Primary,
+    /// Declared as an alias on the named primary register.
+    AliasOf(&'a str),
+}
+
+struct Collision<'a> {
+    name: &'a str,
+    new: NameOrigin<'a>,
+    prior: NameOrigin<'a>,
+}
+
+impl<'a> Collision<'a> {
+    /// Format the collision into a panic-ready string. The shape
+    /// names both sides so the spec author can find the offending
+    /// pair without re-reading the whole spec.
+    fn message(&self) -> String {
+        use NameOrigin::*;
+        match (self.new, self.prior) {
+            (Primary, Primary) =>
+                format!("register name `{}` declared twice", self.name),
+            (AliasOf(owner), Primary) =>
+                format!("alias `{}` (on register `{}`) collides with primary register name `{}`",
+                        self.name, owner, self.name),
+            (Primary, AliasOf(prior_owner)) =>
+                format!("primary register name `{}` collides with an alias already declared on `{}`",
+                        self.name, prior_owner),
+            (AliasOf(owner), AliasOf(prior_owner)) =>
+                format!("alias `{}` declared on both `{}` and `{}`",
+                        self.name, prior_owner, owner),
+        }
+    }
+}
+
+struct NameRegistry<'a> {
+    entries: std::collections::HashMap<&'a str, NameOrigin<'a>>,
+}
+
+impl<'a> NameRegistry<'a> {
+    fn new() -> Self {
+        Self { entries: std::collections::HashMap::new() }
+    }
+    fn register_primary(&mut self, name: &'a str) -> Result<(), Collision<'a>> {
+        let new = NameOrigin::Primary;
+        if let Some(&prior) = self.entries.get(name) {
+            return Err(Collision { name, new, prior });
+        }
+        self.entries.insert(name, new);
+        Ok(())
+    }
+    fn register_alias(&mut self, alias: &'a str, owner: &'a str) -> Result<(), Collision<'a>> {
+        let new = NameOrigin::AliasOf(owner);
+        if let Some(&prior) = self.entries.get(alias) {
+            return Err(Collision { name: alias, new, prior });
+        }
+        self.entries.insert(alias, new);
+        Ok(())
+    }
+}
+
 fn emit_device(spec: &Spec) -> String {
+    // Global name-collision validation runs in `validate()` so that
+    // parsed-only specs (emit = false) are also checked. By the
+    // time we get here `NameRegistry` has already cleared the spec.
+    //
     // Reject features the emitter doesn't implement yet. Skeletal specs
     // that need these set emit=false and we never get here for them.
     //
@@ -679,13 +772,47 @@ fn emit_device(spec: &Spec) -> String {
             );
         }
         // Phase 9 P9.0: `combined_trigger` accepts non-empty `parts`.
-        // Aliases still pending (P9.1).
-        if !reg.aliases.is_empty() {
+        // Phase 9 P9.1: `kind = "aliased"` + non-empty `aliases` pairs
+        // emit additional accessor names over the same cell field.
+        // The two attributes must agree: `aliases` is the data
+        // (alternative names), `kind = "aliased"` is the marker that
+        // tells the emitter to surface them.
+        let is_aliased_kind = matches!(reg.kind, Some(RegisterKind::Aliased));
+        if !reg.aliases.is_empty() && !is_aliased_kind {
             panic!(
-                "Phase 2 emitter does not support aliases (used by `{}` in device `{}`); \
-                 lands in P9.1.",
-                reg.name, spec.device.name
+                "{}: register `{}` declares `aliases` but kind is not `aliased` — \
+                 set `kind = \"aliased\"` to enable the alias-accessor emit, or \
+                 drop the aliases field if they're unintended",
+                spec.device.name, reg.name
             );
+        }
+        if is_aliased_kind && reg.aliases.is_empty() {
+            panic!(
+                "{}: register `{}` has `kind = \"aliased\"` but declares no `aliases` — \
+                 add at least one alternate name in the `aliases` field, or drop the kind",
+                spec.device.name, reg.name
+            );
+        }
+        // combined_trigger + aliases is not implementable today —
+        // but `kind` is `Option<RegisterKind>` so a single register
+        // can't declare both. The cross-check that DOES catch a
+        // spec author trying to declare `aliases` on a
+        // combined_trigger register is the
+        // `!aliases.is_empty() && !is_aliased_kind` branch above:
+        // the combined_trigger kind isn't `Aliased`, so the
+        // aliases-without-aliased-kind check fires with a clear
+        // "set kind = aliased or drop the field" message.
+        //
+        // Self-alias is always a spec error; cross-register collisions
+        // are caught by the global-name pre-pass at the top of this
+        // function. Don't re-check globally here.
+        for alias in &reg.aliases {
+            if alias == &reg.name {
+                panic!(
+                    "{}: register `{}` lists itself as an alias",
+                    spec.device.name, reg.name
+                );
+            }
         }
         if !reg.parts.is_empty() && !matches!(reg.kind, Some(RegisterKind::CombinedTrigger)) {
             panic!(
@@ -1435,6 +1562,71 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                 }
             }
         }
+        // P9.1: aliased — emit thin delegating accessors for each
+        // alternate name. The cell field stays under `reg.name` in the
+        // #[repr(C)] layout (struct can only have one field per
+        // offset); alias accessors route through the primary's methods,
+        // so both names produce identical wire effects and inline to
+        // the same code in release builds. Driver code picks whichever
+        // name fits its semantic intent (e.g. SDHCI's `sysaddr` for
+        // SDMA setup vs `argument2` for CMD23 auto-arg).
+        if !reg.aliases.is_empty() {
+            for alias in &reg.aliases {
+                writeln!(out).unwrap();
+                writeln!(out, "    /// `{alias}` — alias of `{}`; both names route through the same cell.", reg.name).unwrap();
+                match reg.access {
+                    Access::Ro => {
+                        if has_typed {
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn {alias}(&self) -> {ty} {{ self.{}() }}", reg.name).unwrap();
+                        } else {
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn read_{alias}(&self) -> {wty} {{ self.read_{}() }}", reg.name).unwrap();
+                        }
+                    }
+                    Access::Rw => {
+                        if has_typed {
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn {alias}(&self) -> {ty} {{ self.{}() }}", reg.name).unwrap();
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn set_{alias}(&self, v: {ty}) {{ self.set_{}(v); }}", reg.name).unwrap();
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn modify_{alias}<F: FnOnce({ty}) -> {ty}>(&self, f: F) {{ self.modify_{}(f); }}", reg.name).unwrap();
+                        } else {
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn read_{alias}(&self) -> {wty} {{ self.read_{}() }}", reg.name).unwrap();
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn write_{alias}(&self, v: {wty}) {{ self.write_{}(v); }}", reg.name).unwrap();
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn modify_{alias}<F: FnOnce({wty}) -> {wty}>(&self, f: F) {{ self.modify_{}(f); }}", reg.name).unwrap();
+                        }
+                    }
+                    Access::Wo | Access::Trigger => {
+                        // combined_trigger + aliases is rejected at
+                        // validate time by the per-register
+                        // `!aliases.is_empty() && !is_aliased_kind`
+                        // check in emit_device (a combined_trigger
+                        // register has kind=CombinedTrigger, not
+                        // Aliased; declaring `aliases` on it makes
+                        // that branch fire). By the time we get here
+                        // the kind is not CombinedTrigger; emit the
+                        // plain delegation.
+                        if has_typed {
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn set_{alias}(&self, v: {ty}) {{ self.set_{}(v); }}", reg.name).unwrap();
+                        } else {
+                            writeln!(out, "    #[inline(always)]").unwrap();
+                            writeln!(out, "    pub fn write_{alias}(&self, v: {wty}) {{ self.write_{}(v); }}", reg.name).unwrap();
+                        }
+                    }
+                    Access::W1c => {
+                        let arg_ty = if has_typed { ty.clone() } else { wty.clone() };
+                        writeln!(out, "    #[inline(always)]").unwrap();
+                        writeln!(out, "    pub fn clear_{alias}(&self, mask: {arg_ty}) {{ self.clear_{}(mask); }}", reg.name).unwrap();
+                    }
+                }
+            }
+        }
     }
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
@@ -1445,8 +1637,9 @@ fn emit_tests(out: &mut String, spec: &Spec) {
     let has_be = spec.registers.iter().any(|r| matches!(r.endian, Some(Endian::Big)));
     let has_passwd = spec.registers.iter().any(|r| matches!(r.kind, Some(RegisterKind::PasswdProtected)));
     let has_combined = spec.registers.iter().any(|r| matches!(r.kind, Some(RegisterKind::CombinedTrigger)));
+    let has_aliased = spec.registers.iter().any(|r| !r.aliases.is_empty());
     let needs_mock =
-        !spec.u64_pairs.is_empty() || !spec.windowed.is_empty() || has_be || has_passwd || has_combined;
+        !spec.u64_pairs.is_empty() || !spec.windowed.is_empty() || has_be || has_passwd || has_combined || has_aliased;
     writeln!(out, "#[cfg(test)]").unwrap();
     writeln!(out, "mod tests {{").unwrap();
     writeln!(out, "    use super::*;").unwrap();
@@ -1947,6 +2140,143 @@ fn emit_tests(out: &mut String, spec: &Spec) {
         writeln!(out, "        }}").unwrap();
         writeln!(out, "    }}").unwrap();
         writeln!(out).unwrap();
+    }
+
+    // Phase 9 P9.1 — aliased: assert both names route to the same
+    // cell. Behavioral tests parametric over register width AND
+    // access kind. The structural assertion
+    // `offset_of!(<dev>, <alias>)` is unavailable (the alias is not
+    // a struct field), so all assertions go through `peek_*` at the
+    // primary's struct-field offset combined with the matching
+    // accessor for the access mode.
+    for reg in &spec.registers {
+        if reg.aliases.is_empty() { continue; }
+        let has_typed_w = !reg.flags.is_empty() || !reg.fields.is_empty();
+        // Width-parametric helpers: pick the peek/poke method and the
+        // hex-literal shape so the emitted test compiles regardless
+        // of `reg.width`. Same per-width tuple shape the BE and passwd
+        // emitters use.
+        let (peek_method, poke_method, sample_a, sample_b) = match reg.width {
+            8  => ("peek_u8",  "poke_u8",  "0xA5u8",                   "0x5Au8"),
+            16 => ("peek_u16", "poke_u16", "0xDEADu16",                "0xBEEFu16"),
+            32 => ("peek_u32", "poke_u32", "0xDEAD_BEEFu32",           "0xCAFE_BABEu32"),
+            64 => ("peek_u64", "poke_u64", "0xDEAD_BEEF_CAFE_BABEu64", "0x1122_3344_5566_7788u64"),
+            _  => unreachable!("validated"),
+        };
+        // For typed registers the setter takes the typed snapshot
+        // (`Type(raw)`); the getter returns the snapshot (`.0` peels
+        // back to the raw word). For plain registers it's the raw
+        // word directly. The peek/poke side always uses the raw
+        // word — that's what's in memory.
+        let typed_ctor = |raw: &str| -> String {
+            if has_typed_w {
+                format!("{}({raw})", to_pascal(&reg.name))
+            } else {
+                raw.to_string()
+            }
+        };
+        for alias in &reg.aliases {
+            match reg.access {
+                Access::Rw => {
+                    let alias_set_arg = typed_ctor(sample_a);
+                    let primary_set_arg = typed_ctor(sample_b);
+                    let (alias_setter, primary_setter, alias_getter) = if has_typed_w {
+                        (format!("set_{alias}"), format!("set_{}", reg.name), format!("regs.regs().{alias}().0"))
+                    } else {
+                        (format!("write_{alias}"), format!("write_{}", reg.name), format!("regs.regs().read_{alias}()"))
+                    };
+                    writeln!(out, "    #[test]").unwrap();
+                    writeln!(out, "    fn {}_{}_alias_round_trips_through_same_cell() {{", reg.name, alias).unwrap();
+                    writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+                    writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+                    writeln!(out, "        // Write via the alias setter; peek raw at the primary's struct-field offset.").unwrap();
+                    writeln!(out, "        regs.regs().{alias_setter}({alias_set_arg});").unwrap();
+                    writeln!(out, "        assert_eq!(region.{peek_method}(offset_of!({dev}, {})), {sample_a});", reg.name).unwrap();
+                    writeln!(out, "        // Vice versa: write via the primary, read through the alias getter.").unwrap();
+                    writeln!(out, "        regs.regs().{primary_setter}({primary_set_arg});").unwrap();
+                    writeln!(out, "        assert_eq!({alias_getter}, {sample_b});").unwrap();
+                    writeln!(out, "    }}").unwrap();
+                    writeln!(out).unwrap();
+                }
+                Access::Ro => {
+                    // No setter exists for either name; poke the
+                    // backing memory at the primary's offset and
+                    // read through the alias accessor.
+                    let alias_getter = if has_typed_w {
+                        format!("regs.regs().{alias}().0")
+                    } else {
+                        format!("regs.regs().read_{alias}()")
+                    };
+                    writeln!(out, "    #[test]").unwrap();
+                    writeln!(out, "    fn {}_{}_alias_reads_same_cell() {{", reg.name, alias).unwrap();
+                    writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+                    writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+                    writeln!(out, "        region.{poke_method}(offset_of!({dev}, {}), {sample_a});", reg.name).unwrap();
+                    writeln!(out, "        assert_eq!({alias_getter}, {sample_a});").unwrap();
+                    writeln!(out, "    }}").unwrap();
+                    writeln!(out).unwrap();
+                }
+                Access::Wo | Access::Trigger => {
+                    // No reader; write via the alias setter and peek
+                    // raw at the primary's offset.
+                    let alias_set_arg = typed_ctor(sample_a);
+                    let alias_setter = if has_typed_w {
+                        format!("set_{alias}")
+                    } else {
+                        format!("write_{alias}")
+                    };
+                    writeln!(out, "    #[test]").unwrap();
+                    writeln!(out, "    fn {}_{}_alias_writes_same_cell() {{", reg.name, alias).unwrap();
+                    writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+                    writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+                    writeln!(out, "        regs.regs().{alias_setter}({alias_set_arg});").unwrap();
+                    writeln!(out, "        assert_eq!(region.{peek_method}(offset_of!({dev}, {})), {sample_a});", reg.name).unwrap();
+                    writeln!(out, "    }}").unwrap();
+                    writeln!(out).unwrap();
+                }
+                Access::W1c => {
+                    // Emit: call clear(mask) via the alias accessor;
+                    // peek raw at the primary's struct-field offset
+                    // and assert the peeked bytes equal the mask —
+                    // proving the alias's clear_* routed through the
+                    // same cell as the primary.
+                    //
+                    // The mock's backing is CPU memory, not W1C
+                    // hardware: `clear()` is implemented as a
+                    // volatile write of the mask, and CPU memory
+                    // accepts that write verbatim ("write-1-clears"
+                    // semantics live in the device, not in the
+                    // backing store). End-state-peek-equals-mask is
+                    // the assertion shape this constraint forces;
+                    // the routing property is what's load-bearing
+                    // here regardless of whether the mock emulates
+                    // W1C bit-clearing.
+                    let mask_arg = typed_ctor(sample_b);
+                    // W1C `clear_*` method name doesn't vary by
+                    // typed-vs-raw — emit_accessors emits
+                    // `clear_<alias>` in both branches; only the
+                    // argument type differs. The argument shape
+                    // is handled by `typed_ctor` above.
+                    let alias_clear = format!("clear_{alias}");
+                    writeln!(out, "    #[test]").unwrap();
+                    writeln!(out, "    fn {}_{}_alias_clears_same_cell() {{", reg.name, alias).unwrap();
+                    writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
+                    writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+                    writeln!(out, "        // Call clear({sample_b}) via the alias accessor; the cell's W1C").unwrap();
+                    writeln!(out, "        // clear() volatile-writes the mask to memory. Peek at the").unwrap();
+                    writeln!(out, "        // primary's struct-field offset must return the mask — proving").unwrap();
+                    writeln!(out, "        // the alias accessor routed through the same cell as the primary.").unwrap();
+                    writeln!(out, "        // (The mock's backing is CPU memory, not W1C hardware; \"write-1-").unwrap();
+                    writeln!(out, "        // clears\" semantics don't apply to the store, so the assertion").unwrap();
+                    writeln!(out, "        // is on bytes written, not bits cleared. The routing property").unwrap();
+                    writeln!(out, "        // is what this test pins down regardless.)").unwrap();
+                    writeln!(out, "        regs.regs().{alias_clear}({mask_arg});").unwrap();
+                    writeln!(out, "        assert_eq!(region.{peek_method}(offset_of!({dev}, {})), {sample_b});", reg.name).unwrap();
+                    writeln!(out, "    }}").unwrap();
+                    writeln!(out).unwrap();
+                }
+            }
+        }
     }
 
     // Phase 4A.4 — verify_against const_assert_eq! per binding. Lives
