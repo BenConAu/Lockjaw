@@ -898,6 +898,16 @@ fn emit_device(spec: &Spec) -> String {
         if !reg.fields.is_empty() {
             emit_fields_newtype(&mut out, reg);
         }
+        // P9.0b: typed per-part newtypes for combined_trigger setters.
+        // Without these the setter signature becomes two same-typed
+        // uN parameters (`set_transfer_mode_command(u16, u16)`) and
+        // a positional swap silently miscomposes the u32 store. The
+        // newtypes lift the swap from runtime-debugging-nightmare to
+        // compile-error: `set_transfer_mode_command(Command(c),
+        // TransferMode(t))` won't typecheck.
+        if matches!(reg.kind, Some(RegisterKind::CombinedTrigger)) {
+            emit_combined_trigger_part_newtypes(&mut out, reg);
+        }
     }
     emit_reserved_bits(&mut out, spec);
     emit_accessors(&mut out, spec);
@@ -1179,6 +1189,42 @@ fn emit_verify_coverage_comment(out: &mut String, spec: &Spec) {
     }
     writeln!(out, "//").unwrap();
     writeln!(out).unwrap();
+}
+
+/// P9.0b: emit one `#[repr(transparent)]` newtype per combined_trigger
+/// part. The setter takes these typed wrappers (not raw uN) so a
+/// positional swap of two same-width parts is a compile error
+/// rather than a silent wrong-half-bits store. Same construction-
+/// safety category as `Adma2Descriptor::tran_end(address, length)` —
+/// distinct types around what would otherwise be ambiguous positional
+/// scalars.
+fn emit_combined_trigger_part_newtypes(out: &mut String, reg: &Register) {
+    for p in &reg.parts {
+        let (hi, lo) = parse_bits(&p.bits).expect("validated");
+        let width = hi - lo + 1;
+        let pty = to_pascal(&p.name);
+        writeln!(out, "// ---------- {} ----------", pty).unwrap();
+        writeln!(out).unwrap();
+        writeln!(
+            out,
+            "/// `{}` half of `{}`'s combined_trigger setter (bits {}:{}).",
+            p.name, reg.name, hi, lo,
+        ).unwrap();
+        writeln!(
+            out,
+            "/// Distinct type so the setter's two same-width arguments cannot be",
+        ).unwrap();
+        writeln!(
+            out,
+            "/// positionally swapped: passing `{}(...)` where `<other half>(...)` is",
+            pty,
+        ).unwrap();
+        writeln!(out, "/// expected fails to compile.").unwrap();
+        writeln!(out, "#[derive(Copy, Clone, Debug, PartialEq, Eq)]").unwrap();
+        writeln!(out, "#[repr(transparent)]").unwrap();
+        writeln!(out, "pub struct {}(pub u{});", pty, width).unwrap();
+        writeln!(out).unwrap();
+    }
 }
 
 fn emit_fields_newtype(out: &mut String, reg: &Register) {
@@ -1489,23 +1535,26 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                         })
                         .collect();
                     spans.sort_by_key(|s| s.1);
-                    // Function signature: one arg per part, ordered by lo bit
-                    // (low-bit part first). Each arg's type matches its width.
+                    // P9.0b: function signature uses typed per-part
+                    // newtypes (emitted above). A positional swap of
+                    // two same-width parts now fails to compile.
                     let mut params = String::new();
-                    for (i, (hi, lo, name)) in spans.iter().enumerate() {
+                    for (i, (_, _, name)) in spans.iter().enumerate() {
                         if i > 0 { params.push_str(", "); }
-                        let w = hi - lo + 1;
-                        params.push_str(&format!("{}: u{}", name, w));
+                        let pty = to_pascal(name);
+                        params.push_str(&format!("{}: {}", name, pty));
                     }
-                    // Body: compose into a u32. Each part shifted into place.
+                    // Body: compose into a u32. Each part shifted into
+                    // place. `.0` peels the newtype back to the raw uN.
                     let mut compose = String::from("0u32");
                     for (_, lo, name) in &spans {
-                        compose.push_str(&format!(" | ((({}) as u32) << {})", name, lo));
+                        compose.push_str(&format!(" | ((({}.0) as u32) << {})", name, lo));
                     }
                     writeln!(out, "    /// Fire the combined trigger — composes the parts into a SINGLE u32 store.").unwrap();
                     writeln!(out, "    /// The single-store property is load-bearing: BCM2711 SDHCI silently drops").unwrap();
                     writeln!(out, "    /// the command if the write is split into two halves. The codegen emits one").unwrap();
                     writeln!(out, "    /// `Wo<u32>::write(...)` call so the driver cannot accidentally produce two.").unwrap();
+                    writeln!(out, "    /// Typed per-part newtypes (P9.0b) make positional swap a compile error.").unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
                     writeln!(out, "    pub fn set_{}(&self, {params}) {{", reg.name).unwrap();
                     writeln!(out, "        self.{}.write({compose});", reg.name).unwrap();
@@ -2059,7 +2108,7 @@ fn emit_tests(out: &mut String, spec: &Spec) {
         // path uses. The setter-signature emit (in emit_accessors)
         // reads `p.name` separately; the test path doesn't need it
         // because the call uses positional values.
-        struct Part { lo: u8, val: u64, width: u8 }
+        struct Part { lo: u8, val: u64, width: u8, name: String }
         let mut spans: Vec<Part> = reg.parts.iter()
             .enumerate()
             .map(|(idx, p)| {
@@ -2075,17 +2124,23 @@ fn emit_tests(out: &mut String, spec: &Spec) {
                     32 => (0x1234_5678u64) + (nudge << 16),
                     _ => unreachable!("validated"),
                 };
-                Part { lo, val, width }
+                Part { lo, val, width, name: p.name.clone() }
             })
             .collect();
         spans.sort_by_key(|p| p.lo);
-        // Render call args: `0x12u8, 0x1234u16, ...`
+        // P9.0b: call args wrap each value in its typed newtype.
+        // Renders as `TransferMode(0x1234u16), Command(0x1334u16)`
+        // rather than the raw `0x1234u16, 0x1334u16` — the test
+        // exercises the swap-safe API surface.
         let call_args = spans.iter()
-            .map(|p| match p.width {
-                8 => format!("0x{:02X}u8", p.val),
-                16 => format!("0x{:04X}u16", p.val),
-                32 => format!("0x{:08X}u32", p.val),
-                _ => unreachable!(),
+            .map(|p| {
+                let raw = match p.width {
+                    8 => format!("0x{:02X}u8", p.val),
+                    16 => format!("0x{:04X}u16", p.val),
+                    32 => format!("0x{:08X}u32", p.val),
+                    _ => unreachable!(),
+                };
+                format!("{}({})", to_pascal(&p.name), raw)
             })
             .collect::<Vec<_>>()
             .join(", ");
