@@ -58,6 +58,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_SIGNAL_NOTIFICATION => SyscallReturn::Void(sys_signal_notification(ctx)),
         SYS_WAIT_NOTIFICATION => SyscallReturn::Value(sys_wait_notification(ctx)),
         SYS_BIND_IRQ => SyscallReturn::Void(sys_bind_irq(ctx)),
+        SYS_UNMASK_IRQ => SyscallReturn::Void(sys_unmask_irq(ctx)),
         SYS_CREATE_ENDPOINT => SyscallReturn::Value(sys_create_endpoint(ctx)),
         SYS_RECV_NB => sys_recv_nb(ctx),
         SYS_WAIT_ANY => SyscallReturn::Value(sys_wait_any(ctx)),
@@ -631,7 +632,13 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
         lockjaw_types::object::HandleKind::Notification { kva } => kva,
         _ => return SyscallError::INVALID_HANDLE,
     };
-    if crate::arch::aarch64::irq_bind::bind(intid, notif_kva) {
+    let level_triggered = !edge_triggered;
+    // Owner identity: the calling thread's ProcessObject KVA. Used
+    // by sys_unmask_irq to reject cross-process GIC-enable attempts
+    // (one driver re-arming another driver's intid). Per-process,
+    // unforgeable from userspace.
+    let owner = CurrentThread::process_kva();
+    if crate::arch::aarch64::irq_bind::bind(intid, notif_kva, owner, level_triggered) {
         // Enable SPI in the GIC distributor (PPIs are already enabled in gic::init)
         if intid >= 32 {
             // SAFETY: intid validated by irq_bind::bind; enable_spi is a GIC
@@ -642,6 +649,40 @@ fn sys_bind_irq(ctx: &mut ExceptionContext) -> SyscallError {
     } else {
         SyscallError::INVALID_PARAMETER
     }
+}
+
+/// sys_unmask_irq(intid) — re-enable a previously masked level-triggered IRQ.
+/// x0 = hardware INTID. Used by user-space drivers after handling a level-
+/// triggered IRQ that the kernel disabled in `irq_dispatch`. The driver
+/// clears the source-side status (e.g. SDHCI's NORMAL_INT_STATUS via W1C),
+/// then calls this to allow the GIC to deliver the next IRQ.
+///
+/// No-op for edge-triggered IRQs (which the kernel doesn't mask) — calling
+/// `re_enable_spi` on an already-enabled intid is a benign duplicate write
+/// to GICD_ISENABLER.
+fn sys_unmask_irq(ctx: &mut ExceptionContext) -> SyscallError {
+    let intid = ctx.gpr[0] as u32;
+    if intid < 32 {
+        // PPIs/SGIs can't be masked/unmasked via SPI registers and aren't
+        // userspace-bindable today; reject rather than silently no-op.
+        return SyscallError::INVALID_PARAMETER;
+    }
+    // The binding-table check ensures only previously-bound INTIDs
+    // can be unmasked (rules out random SPIs). The owner check is
+    // the SECOND gate — it ensures only the process that bound the
+    // INTID can re-enable it. Without this, any process holding any
+    // binding could flip the GIC enable bit for an IRQ bound to a
+    // different driver (cross-process confused deputy on per-driver
+    // device state).
+    let caller = CurrentThread::process_kva();
+    if !crate::arch::aarch64::irq_bind::is_owner(intid, caller) {
+        return SyscallError::INVALID_PARAMETER;
+    }
+    // SAFETY: intid validated as a known binding owned by the
+    // caller; re_enable_spi is a GIC MMIO write that is safe to
+    // execute for any valid SPI.
+    unsafe { crate::arch::aarch64::gic::re_enable_spi(intid); }
+    SyscallError::OK
 }
 
 /// sys_create_endpoint(handle) — create an Endpoint from a donated page.

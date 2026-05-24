@@ -124,6 +124,16 @@ pub const SYS_DMA_SYNC_FOR_CPU: u64 = 29;
 /// subsequent DMA read sees what the CPU wrote. Returns
 /// `NOT_SUPPORTED` until C1 lands the real handler.
 pub const SYS_DMA_SYNC_FOR_DEVICE: u64 = 30;
+/// Re-enable a previously masked level-triggered IRQ in the GIC.
+/// Required after handling a level-triggered IRQ: the kernel masks
+/// the intid in `irq_dispatch` so the level-still-asserted source
+/// can't refire immediately after EOIR; userspace clears the source
+/// (e.g. writes 1 to NORMAL_INT_STATUS) and then calls this to
+/// re-enable. No-op for edge-triggered IRQs (they aren't masked).
+/// (Was SYS_UNMASK_IRQ = 29 on m7-irq-experiment branch; renumbered
+/// to 31 here because 29/30 were taken by the cacheable-DMA syscalls
+/// landed in C0 of the migration after the branch diverged.)
+pub const SYS_UNMASK_IRQ: u64 = 31;
 
 /// Flag for SYS_ALLOC_PAGES: allocated pages must be physically contiguous.
 pub const ALLOC_FLAG_CONTIGUOUS: u64 = 1 << 0;
@@ -144,6 +154,7 @@ pub fn syscall_name(num: u64) -> &'static str {
         SYS_SIGNAL_NOTIFICATION => "sys_signal_notification",
         SYS_WAIT_NOTIFICATION => "sys_wait_notification",
         SYS_BIND_IRQ => "sys_bind_irq",
+        SYS_UNMASK_IRQ => "sys_unmask_irq",
         SYS_CREATE_ENDPOINT => "sys_create_endpoint",
         SYS_RECV_NB => "sys_recv_nb",
         SYS_WAIT_ANY => "sys_wait_any",

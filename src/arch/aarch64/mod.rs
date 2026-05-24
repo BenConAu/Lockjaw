@@ -19,6 +19,26 @@ pub fn irq_dispatch() {
 
     // Check if this INTID is bound to a userspace notification
     if let Some(notif_kva) = irq_bind::lookup(intid) {
+        // Level-triggered IRQs: the source line stays asserted until
+        // userspace clears the source-side latch (e.g. writes 1 to
+        // NORMAL_INT_STATUS on SDHCI). Without masking the intid in
+        // the GIC distributor, the IRQ refires immediately after
+        // EOIR (already done inside gic::handle_irq above), wedging
+        // the kernel in an IRQ storm. Mask now; userspace re-enables
+        // via sys_unmask_irq after clearing the source.
+        //
+        // Edge-triggered IRQs don't need this — the GIC's edge
+        // semantics latch a fresh interrupt only on the next rising
+        // edge of the source line, so the mask/unmask round-trip
+        // would be wasted MMIO. virtio-mmio (edge per spec) takes
+        // this path.
+        if irq_bind::is_level_triggered(intid) && intid >= 32 {
+            // SAFETY: intid validated in-range by is_level_triggered;
+            // disable_spi is a GIC MMIO write that is safe to execute
+            // for any valid SPI.
+            unsafe { gic::disable_spi(intid); }
+        }
+
         // Signal the notification — increment timeline value by 1
         // The notification_signal function handles waking any waiting thread
         use crate::ipc::notification;

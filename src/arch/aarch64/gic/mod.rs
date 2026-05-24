@@ -20,6 +20,13 @@ use core::ptr;
 const GICD_TYPER: u64 = 0x0004;
 const GICD_IGROUPR: u64 = 0x0080;
 const GICD_ISENABLER: u64 = 0x0100;
+/// GICD_ICENABLER (Interrupt Clear-Enable Registers, GICv2 §8.13.7 /
+/// GICv3 §12.13.10). Mirror layout to GICD_ISENABLER but write-1-to-
+/// CLEAR-ENABLE: writing 1 disables the corresponding IRQ at the
+/// distributor. Used for level-triggered IRQ masking — the kernel
+/// disables the intid in `irq_dispatch` after signaling userspace so
+/// the line-still-asserted source can't refire across EOIR.
+const GICD_ICENABLER: u64 = 0x0180;
 const GICD_IPRIORITYR: u64 = 0x0400;
 
 /// Virtual timer PPI interrupt ID (generic ARMv8).
@@ -174,6 +181,40 @@ pub unsafe fn enable_spi(intid: u32, edge_triggered: bool) {
     }
 
     // Enable in GICD_ISENABLER
+    let en_addr = gicd_addr() + GICD_ISENABLER + reg * 4;
+    mmio_write32(en_addr, 1 << bit);
+}
+
+/// Disable a Shared Peripheral Interrupt in the GIC distributor.
+/// Mirror of `enable_spi` but writes to GICD_ICENABLER (write-1-to-
+/// clear-enable). Used by `irq_dispatch` after signaling userspace
+/// for a level-triggered IRQ: without disabling, the
+/// still-asserted source line refires the IRQ immediately after
+/// EOIR. Userspace re-enables via `re_enable_spi` (called from the
+/// `sys_unmask_irq` syscall) once it has cleared the source-side
+/// status bit.
+///
+/// # Safety
+/// Must be called after `init()`. `intid` must be an SPI (>= 32).
+pub unsafe fn disable_spi(intid: u32) {
+    let reg = (intid / 32) as u64;
+    let bit = intid % 32;
+    let dis_addr = gicd_addr() + GICD_ICENABLER + reg * 4;
+    mmio_write32(dis_addr, 1 << bit);
+}
+
+/// Re-enable an SPI that has been disabled by `disable_spi`. Skips
+/// the priority / group / trigger configuration that `enable_spi`
+/// would re-run — those were set when the intid was first enabled
+/// via `enable_spi` (called from `sys_bind_irq`). Re-running them
+/// could clobber the trigger mode for a still-active driver.
+///
+/// # Safety
+/// Must be called after `init()`. `intid` must be an SPI (>= 32)
+/// that has previously been enabled via `enable_spi`.
+pub unsafe fn re_enable_spi(intid: u32) {
+    let reg = (intid / 32) as u64;
+    let bit = intid % 32;
     let en_addr = gicd_addr() + GICD_ISENABLER + reg * 4;
     mmio_write32(en_addr, 1 << bit);
 }
