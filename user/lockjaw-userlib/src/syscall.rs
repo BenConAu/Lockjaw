@@ -332,6 +332,33 @@ pub fn sys_bind_irq_flags(intid: u64, notif: NotificationHandle, flags: u64) -> 
 /// IRQ trigger flag: edge-triggered delivery.
 pub const IRQ_FLAG_EDGE: u64 = 1;
 
+/// Re-enable a previously-masked level-triggered IRQ.
+///
+/// The kernel masks level-triggered IRQs in the GIC distributor
+/// immediately after signaling the bound notification (otherwise
+/// the still-asserted source line refires the IRQ across EOIR).
+/// User-space drivers handling level IRQs must:
+///   1. Wake from `sys_wait_notification`.
+///   2. Read the device's interrupt-status register.
+///   3. Clear the latched status bits via the device's W1C path
+///      (e.g. SDHCI: write 1s to NORMAL_INT_STATUS).
+///   4. Call `sys_unmask_irq(intid)` to re-arm the GIC.
+///
+/// No-op for edge-triggered IRQs (the kernel doesn't mask those),
+/// but the syscall still requires the intid to be a previously-
+/// bound binding so it can't re-enable arbitrary SPIs.
+pub fn sys_unmask_irq(intid: u64) -> SyscallError {
+    let err: u64;
+    unsafe {
+        asm!(
+            "svc #0",
+            inlateout("x0") intid => err,
+            in("x8") SYS_UNMASK_IRQ,
+        );
+    }
+    SyscallError(err)
+}
+
 /// Wait on a notification until the timeline value reaches the threshold.
 /// Returns the current counter value on success, or blocks until it does.
 pub fn sys_wait_notification(notif: NotificationHandle, threshold: u64) -> Result<u64, SyscallError> {
