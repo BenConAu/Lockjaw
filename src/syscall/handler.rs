@@ -72,6 +72,13 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_UNMAP_PAGES => SyscallReturn::Void(sys_unmap_pages(ctx)),
         SYS_QUERY_CALLER_TOKEN => SyscallReturn::Value(Ok(sys_query_caller_token())),
         SYS_SCHED_TELEMETRY => sys_sched_telemetry(ctx),
+        // Cacheable-DMA migration C0: ABI surface reserved, no
+        // behaviour yet. C1 swaps these for real handlers that
+        // call into `crate::arch::aarch64::cache` (see
+        // docs/cacheable-dma-migration-plan.md).
+        SYS_DMA_SYNC_FOR_CPU | SYS_DMA_SYNC_FOR_DEVICE => {
+            SyscallReturn::Void(SyscallError::NOT_SUPPORTED)
+        }
         SYS_EXIT => {
             scheduler::exit_current(); // never returns
         }

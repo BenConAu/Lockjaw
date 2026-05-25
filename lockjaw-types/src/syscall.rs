@@ -49,6 +49,15 @@ impl SyscallError {
     /// (which means the page allocator is exhausted).
     pub const HANDLE_TABLE_FULL: Self = SyscallError(12);
 
+    /// The syscall exists in the ABI but the kernel-side handler is
+    /// not yet implemented on this build. Used by the cacheable-DMA
+    /// migration's Phase C0 (`sys_dma_sync_for_cpu` / `for_device`
+    /// stubs) to surface the "ABI surface reserved; no behaviour
+    /// yet" state cleanly. Callers are expected to treat this as a
+    /// fatal error during migration; promoted to OK at C1 when the
+    /// real handlers go live.
+    pub const NOT_SUPPORTED: Self = SyscallError(13);
+
     /// An unknown or unrecoverable error occurred.
     pub const UNKNOWN: Self = SyscallError(u64::MAX);
 
@@ -103,6 +112,18 @@ pub const SYS_UNMAP_PAGES: u64 = 25;
 pub const SYS_QUERY_CALLER_TOKEN: u64 = 26;
 pub const SYS_ALLOC_DMA_PAGES: u64 = 27;
 pub const SYS_SCHED_TELEMETRY: u64 = 28;
+/// Make DMA writes visible to the CPU. Invalidates the cache lines
+/// covering `[offset, offset+len)` within the named DmaPool-origin
+/// PageSet so a subsequent CPU load reads fresh DRAM rather than a
+/// stale cache line. See `docs/cacheable-dma-migration-plan.md`.
+/// Returns `NOT_SUPPORTED` until C1 lands the real handler.
+pub const SYS_DMA_SYNC_FOR_CPU: u64 = 29;
+/// Make pending CPU writes visible to the device. Cleans
+/// (write-back) the cache lines covering `[offset, offset+len)`
+/// within the named DmaPool-origin PageSet so the device's
+/// subsequent DMA read sees what the CPU wrote. Returns
+/// `NOT_SUPPORTED` until C1 lands the real handler.
+pub const SYS_DMA_SYNC_FOR_DEVICE: u64 = 30;
 
 /// Flag for SYS_ALLOC_PAGES: allocated pages must be physically contiguous.
 pub const ALLOC_FLAG_CONTIGUOUS: u64 = 1 << 0;
@@ -139,6 +160,8 @@ pub fn syscall_name(num: u64) -> &'static str {
         SYS_UNMAP_PAGES => "sys_unmap_pages",
         SYS_QUERY_CALLER_TOKEN => "sys_query_caller_token",
         SYS_SCHED_TELEMETRY => "sys_sched_telemetry",
+        SYS_DMA_SYNC_FOR_CPU => "sys_dma_sync_for_cpu",
+        SYS_DMA_SYNC_FOR_DEVICE => "sys_dma_sync_for_device",
         _ => "unknown",
     }
 }

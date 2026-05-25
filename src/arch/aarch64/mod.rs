@@ -1,4 +1,5 @@
 mod boot;
+pub mod cache;
 pub mod exceptions;
 pub mod gic;
 pub mod irq_bind;

@@ -180,6 +180,15 @@ pub extern "C" fn kmain() -> ! {
     }
     kprintln!("Higher-half active — UART at ", Hex(plat.uart0_base + mm::addr::KERNEL_VA_OFFSET));
 
+    // Read CTR_EL0.DminLine and verify the silicon's data cache
+    // line size matches `lockjaw_types::cache::CACHE_LINE_BYTES`.
+    // The cacheable-DMA sync primitives (see
+    // docs/cacheable-dma-migration-plan.md) build their range math
+    // against the constant; mismatch would either miss lines or
+    // operate on adjacent buffers. C0: read + check only; the asm
+    // primitives are compiled but unreferenced until C1 lands.
+    arch::aarch64::cache::init_and_check();
+
     // Bring up the kernel VA (KVM) allocator. Carves a 512 GiB
     // higher-half pool for kernel objects that need virtual
     // contiguity but not physical contiguity (initially: PageSet

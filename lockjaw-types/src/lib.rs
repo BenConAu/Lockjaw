@@ -2,6 +2,7 @@
 
 pub mod addr;
 pub mod buddy;
+pub mod cache;
 pub mod constants;
 pub mod dma_pool;
 pub mod elf;
