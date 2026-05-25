@@ -15,8 +15,8 @@ const PER_FUNCTION_CAP: u64 = 1600;
 /// Total kernel stack budget: normal path + worst-case nested exception.
 const TOTAL_BUDGET: u64 = 8192;
 
-const KERNEL_ELF_DEBUG: &str = "target/aarch64-unknown-none/debug/lockjaw";
-const KERNEL_ELF_RELEASE: &str = "target/aarch64-unknown-none/release/lockjaw";
+const KERNEL_ELF_DEBUG: &str = "target/aarch64-unknown-none-softfloat/debug/lockjaw";
+const KERNEL_ELF_RELEASE: &str = "target/aarch64-unknown-none-softfloat/release/lockjaw";
 
 /// Entry points for worst-case depth analysis.
 const NORMAL_ENTRY: &str = "_start";

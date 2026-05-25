@@ -16,7 +16,7 @@ QEMU_FLAGS="-machine virt,gic-version=${GIC_VERSION} -cpu cortex-a53 -display no
     -global virtio-mmio.force-legacy=false \
     -drive file=test.img,format=raw,if=none,id=blk0 \
     -device virtio-blk-device,drive=blk0"
-KERNEL="target/aarch64-unknown-none/debug/lockjaw"
+KERNEL="target/aarch64-unknown-none-softfloat/debug/lockjaw"
 
 if [ ! -f test.img ]; then
     echo "ERROR: test.img not found. Run 'make test-img' first (or 'make test')." >&2

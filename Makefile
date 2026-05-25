@@ -1,5 +1,5 @@
-KERNEL_ELF := target/aarch64-unknown-none/debug/lockjaw
-KERNEL_ELF_RELEASE := target/aarch64-unknown-none/release/lockjaw
+KERNEL_ELF := target/aarch64-unknown-none-softfloat/debug/lockjaw
+KERNEL_ELF_RELEASE := target/aarch64-unknown-none-softfloat/release/lockjaw
 
 QEMU := qemu-system-aarch64
 # Two UARTs: UART0 (kernel debug) and UART1 (userspace driver), both to stdio.

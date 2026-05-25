@@ -1,7 +1,42 @@
 [build]
-target = "aarch64-unknown-none"
+# Use the softfloat variant of aarch64-unknown-none. This is the
+# proper Rust target for bare-metal code that doesn't use NEON/FP:
+# the target spec declares the soft-float ABI so rustc never emits
+# SIMD instructions in kernel code (no need for `-C target-feature
+# =-fp-armv8,-neon` rustflag — that produces ABI-mismatch warnings
+# on the regular `aarch64-unknown-none` target, which assumes NEON
+# in its ABI).
+#
+# Why no NEON in the kernel: SAVE_REGS / RESTORE_REGS preserve
+# only GPRs (31 × 8 = 248 bytes) + ELR / SPSR / ESR / SP_EL0 /
+# TPIDR_EL0. Allowing the compiler to emit NEON instructions would
+# require saving the 32 × 16-byte V registers + FPCR/FPSR (528
+# bytes) on every IRQ and syscall. For a microkernel that does
+# essentially no SIMD-eligible work (IPC, scheduling, address-
+# space management) this overhead is pure waste. Linux makes the
+# same choice via `-mgeneral-regs-only`.
+#
+# Invariant: nothing in src/ or lockjaw-types/src/ uses f32/f64
+# (verified via grep at change time). If a future kernel feature
+# needs FP, choose between saving NEON in SAVE_REGS or doing the
+# FP work in a user-mode server.
+#
+# Applies ONLY to the kernel build — user-mode crates have their
+# own .cargo/config.toml under user/<name>/ and target
+# `aarch64-unknown-none` (with NEON) for their own SIMD use.
+#
+# Backstory: rustc autovectorises loops with shape
+# `for k in 0..N { acc += f(k); }` into NEON SIMD using v0-v31 by
+# default on aarch64-unknown-none. lockjaw-types::buddy::bitmap_offset
+# was one such loop. A 10 ms timer IRQ landing inside its NEON
+# accumulator pattern corrupted v0/v1 (NEON is caller-saved across
+# the un-saving IRQ path), produced nonsense `base` values, and
+# tripped a hard OOB panic in find_free's indexed bitmap read.
+# Pi 4B reproduced 100% post-C1 of the cacheable-DMA migration;
+# QEMU virt at -smp 1 never hit the narrow window.
+target = "aarch64-unknown-none-softfloat"
 
-[target.aarch64-unknown-none]
+[target.aarch64-unknown-none-softfloat]
 rustflags = [
     "-C", "link-arg=-Tlinker.ld",
     "-C", "link-arg=--gc-sections",

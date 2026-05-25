@@ -35,6 +35,7 @@
     "lockjaw::ipc::reply::create_reply",
 ]
 
+
 # Thread entry trampoline calls the thread's entry function via blr x19.
 # All possible targets listed here. boot_tcb_entry_unreachable is the
 # CPU 0 boot TCB's entry slot — never reachable in practice (boot TCB
