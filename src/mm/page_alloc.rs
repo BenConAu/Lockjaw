@@ -73,19 +73,21 @@ pub unsafe fn init_with_gap(
     }
 
     // Region 2: everything after the stacks, MINUS the M6 DMA pool
-    // (carved off the tail so it is never registered with buddy AND
-    // is excluded from the kernel TTBR1 direct map — see
-    // `enable_higher_half`'s KERNEL_RAM_L2 init).
+    // (carved off the tail so it is never registered with buddy).
+    // Post C1 of the cacheable-DMA migration the pool participates
+    // in the kernel TTBR1 direct map as Normal Cacheable; the
+    // pre-C1 L2-block exclusion is gone. The pool is still kept
+    // out of buddy because it has its own allocator
+    // (`dma_pool::alloc_pages`) — feeding pool pages into buddy
+    // would double-issue them.
     //
-    // The pool is exactly DMA_POOL_PAGES pages (one AArch64 L2 block
-    // = 2 MiB) and is anchored to the highest 2-MiB-aligned PA
-    // boundary that fits below ram_end. This alignment is the
-    // precondition for the L2-only exclusion in mmu.rs: the pool
-    // covers exactly one L2 block descriptor, no L3-split needed.
-    //
-    // Pool init is separate (`cap::dma_pool::init`); the MMU code
-    // reads `cap::dma_pool::base_phys()` to find the L2 block to
-    // clear.
+    // The pool is exactly DMA_POOL_PAGES pages (one AArch64 L2
+    // block = 2 MiB) and is anchored to the highest 2-MiB-aligned
+    // PA boundary that fits below ram_end. The 2 MiB alignment is
+    // historical: it was the precondition for the pre-C1 L2-only
+    // exclusion. Post-C1 nothing requires the alignment, but it
+    // costs nothing and keeps the pool's PA range easy to reason
+    // about. Pool init is separate (`cap::dma_pool::init`).
     if crate::mm::addr::total_pages() > stacks_end_page {
         let dma_pool_pages = lockjaw_types::dma_pool::DMA_POOL_PAGES;
         let l2_block_pages = lockjaw_types::dma_pool::DMA_POOL_PAGES; // = pages-per-2MiB

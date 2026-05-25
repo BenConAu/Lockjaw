@@ -23,8 +23,9 @@ pub const MAX_PRACTICAL_PAGES_PER_SET: usize = 16_384;
 
 /// Source of a PageSet's data pages. Determines which allocator the free
 /// path returns pages to and which kernel-side mapping policies are
-/// permitted (DmaPool pages can ONLY be mapped `NormalNonCacheable`;
-/// Buddy pages cannot be mapped that way).
+/// permitted (DmaPool pages can ONLY be mapped `Normal` Cacheable
+/// post-C1 of the cacheable-DMA migration; Buddy pages cannot be
+/// mapped `NormalNonCacheable`).
 ///
 /// **Discriminant 0 is intentionally NOT a variant.** A zero-initialised
 /// header (the default for any freshly-allocated kernel page) reads as
@@ -33,9 +34,18 @@ pub const MAX_PRACTICAL_PAGES_PER_SET: usize = 16_384;
 /// the header observes an invalid discriminant — caught by the kernel's
 /// header read path which goes through `from_raw` to validate.
 ///
-/// This makes "forgot to initialise origin" surface as a typed error
-/// instead of silently defaulting to Buddy (which would mis-classify a
-/// DmaPool page as cacheable-safe and reintroduce the alias bug).
+/// This makes "forgot to initialise origin" surface as a typed
+/// error instead of silently defaulting to Buddy. Post C1 of the
+/// cacheable-DMA migration the misclassification consequences
+/// are still concrete (they're just no longer the alias bug):
+///   - the free path returns the page to the wrong allocator
+///     (buddy instead of `dma_pool::free_pages`), leaking pool
+///     bitmap entries against the tight 2 MiB reservation;
+///   - the sync syscalls reject the misclassified page when a
+///     driver tries to invalidate / clean it (origin != DmaPool);
+///   - the discipline / reservation rejections in
+///     `create_process` and donate-as-kernel-object would be
+///     bypassed, since they key off origin == DmaPool.
 ///
 /// `#[repr(u64)]` makes the field 8-byte aligned so `PageSetHeader`
 /// keeps the trailing-`pages[]`-array u64 alignment without explicit
@@ -50,10 +60,13 @@ pub enum PageSetOrigin {
     /// alias with the kernel direct map.
     Buddy = 1,
     /// Pages came from the DMA pool — physically reserved at boot,
-    /// excluded from the kernel direct map, never re-mapped cacheable
-    /// anywhere. Free path returns them to `dma_pool::free_pages`.
-    /// Mapping policy: `NormalNonCacheable` only. Cacheable `Normal`
-    /// rejected. Donation as kernel object rejected.
+    /// participating in the kernel TTBR1 direct map as Cacheable
+    /// Inner+Outer WB (post-C1 of the cacheable-DMA migration).
+    /// Free path returns them to `dma_pool::free_pages`. Mapping
+    /// policy: `Normal` Cacheable only — `NormalNonCacheable`
+    /// and `Device` rejected. Coherence with devices is maintained
+    /// via `sys_dma_sync_for_cpu` / `sys_dma_sync_for_device` at
+    /// handoff points. Donation as kernel object rejected.
     DmaPool = 2,
     /// Pages are externally owned — firmware-placed (DTB) or device
     /// MMIO regions wrapped as a PageSet so handles can be exported

@@ -72,13 +72,8 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
         SYS_UNMAP_PAGES => SyscallReturn::Void(sys_unmap_pages(ctx)),
         SYS_QUERY_CALLER_TOKEN => SyscallReturn::Value(Ok(sys_query_caller_token())),
         SYS_SCHED_TELEMETRY => sys_sched_telemetry(ctx),
-        // Cacheable-DMA migration C0: ABI surface reserved, no
-        // behaviour yet. C1 swaps these for real handlers that
-        // call into `crate::arch::aarch64::cache` (see
-        // docs/cacheable-dma-migration-plan.md).
-        SYS_DMA_SYNC_FOR_CPU | SYS_DMA_SYNC_FOR_DEVICE => {
-            SyscallReturn::Void(SyscallError::NOT_SUPPORTED)
-        }
+        SYS_DMA_SYNC_FOR_CPU => SyscallReturn::Void(sys_dma_sync_for_cpu(ctx)),
+        SYS_DMA_SYNC_FOR_DEVICE => SyscallReturn::Void(sys_dma_sync_for_device(ctx)),
         SYS_EXIT => {
             scheduler::exit_current(); // never returns
         }
@@ -138,11 +133,19 @@ fn create_kernel_object_kvm(
 
     // SAFETY: PageSet handle → registered header.
     let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
-    // M6: donate-as-kernel-object remaps the donated frame as
-    // cacheable Normal in KVM (build_kernel_page) and TAKES OWNERSHIP
-    // of the frame from the PageSet (consume_pageset_apply). Only
+    // donate-as-kernel-object remaps the donated frame as Normal
+    // Cacheable in KVM (build_kernel_page) and TAKES OWNERSHIP of
+    // the frame from the PageSet (consume_pageset_apply). Only
     // Buddy-origin pages are eligible:
-    //   - DmaPool: cacheable remap would create the alias.
+    //   - DmaPool: post C1 of the cacheable-DMA migration the
+    //     attribute would be compatible (both kernel direct map
+    //     and KVM use Normal Cacheable), but the OWNERSHIP
+    //     transfer is wrong — a DmaPool page consumed here would
+    //     never return to `dma_pool::free_pages` (the page's
+    //     lifetime is now controlled by the kernel object), so
+    //     the pool's bitmap entry leaks. Pool reservation is a
+    //     tight 2 MiB budget; leaking entries starves the actual
+    //     DMA path.
     //   - ExternallyOwned: kernel doesn't own these pages, can't
     //     take ownership of something it didn't allocate.
     //   - None: uninit origin is an alloc-site bug.
@@ -398,10 +401,14 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 /// Returns a PageSet handle in x1 with `origin = DmaPool`.
 ///
 /// Pages come from the boot-reserved DMA pool, which is not registered
-/// with buddy and (in a follow-up commit) is excluded from the kernel
-/// direct map. The resulting PageSet can ONLY be mapped via
-/// `MapMemoryAttribute::NormalNonCacheable`; cacheable mapping paths
-/// reject DmaPool origin to prevent the mixed-attribute alias bug.
+/// with buddy. Post C1 of the cacheable-DMA migration the pool also
+/// participates in the kernel TTBR1 direct map as Normal Cacheable;
+/// the resulting PageSet must be mapped via
+/// `MapMemoryAttribute::Normal` (cacheable). `NormalNonCacheable`
+/// and `Device` are rejected for DmaPool origin to preserve the
+/// single-attribute invariant (Cacheable everywhere). Coherence with
+/// devices is maintained via `sys_dma_sync_for_cpu` /
+/// `sys_dma_sync_for_device` at device-handoff points.
 ///
 /// The phys address of the first data page is queryable via
 /// `sys_query_pageset_phys(handle, 0)` — needed by drivers programming
@@ -473,14 +480,16 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     // SAFETY: kva from a PageSet handle — registered header.
     let header = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
 
-    // M6 attribute-vs-origin enforcement: the page-resident origin
-    // field decides which mapping regimes are legal. Buddy pages can
-    // be mapped Normal / Device; mapping them NormalNonCacheable would
-    // create the mixed-attribute alias with the kernel direct map.
-    // DmaPool pages can ONLY be mapped NormalNonCacheable; cacheable
-    // mappings would reintroduce the alias from the other direction.
-    // (See docs/ben_principles.md Tier 3 #13 — origin discriminants
-    // start at 1 so a zero-init read is observably invalid.)
+    // C1 of the cacheable-DMA migration: attribute-vs-origin
+    // enforcement post-flip. Single-attribute invariant preserved
+    // (Cacheable everywhere for DmaPool, Cacheable for Buddy,
+    // Cacheable or Device for ExternallyOwned). The rejection
+    // matrix below has the same SHAPE as M6 sub-commit 2a step 2's
+    // original — exactly one allowed attribute per origin (Device
+    // is the second allowed attribute for ExternallyOwned because
+    // MMIO physical regions are intrinsically Device) — only the
+    // chosen attribute changes from NormalNonCacheable to Normal
+    // for DmaPool. See docs/cacheable-dma-migration-plan.md.
     use lockjaw_types::pageset_table::PageSetOrigin;
     use lockjaw_types::vmem::MapMemoryAttribute;
     let origin = match header.raw().origin() {
@@ -492,9 +501,13 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
         // mixed-attribute alias with the kernel direct map.
         (PageSetOrigin::Buddy, MapMemoryAttribute::NormalNonCacheable) =>
             return SyscallError::INVALID_PARAMETER,
-        // DmaPool: NC only; cacheable mappings would reintroduce the
-        // alias from the other direction.
-        (PageSetOrigin::DmaPool, MapMemoryAttribute::Normal) =>
+        // DmaPool: Cacheable Normal only (C1 flip). NC is rejected
+        // because the pool now participates in the kernel TTBR1
+        // direct map cacheably — an NC user mapping would
+        // re-create the mixed-attribute alias the M6 substrate
+        // forbids. The sync syscalls maintain coherency at the
+        // device-handoff points.
+        (PageSetOrigin::DmaPool, MapMemoryAttribute::NormalNonCacheable) =>
             return SyscallError::INVALID_PARAMETER,
         (PageSetOrigin::DmaPool, MapMemoryAttribute::Device) =>
             return SyscallError::INVALID_PARAMETER,
@@ -1305,4 +1318,118 @@ fn sys_query_caller_token() -> u64 {
     // SAFETY: current_tcb_kva is always valid.
     let tcb = unsafe { KernelRef::<Tcb>::from_kva(tcb_kva) };
     tcb.get().last_caller_token
+}
+
+/// sys_dma_sync_for_cpu(pageset, offset, len) — make a device's
+/// prior DMA writes visible to subsequent CPU loads on the byte
+/// range `[offset, offset+len)` within `pageset`.
+///
+/// Internally invalidates the covering cache lines via `dc ivac`
+/// (see docs/cacheable-dma-migration-plan.md for the bus-protocol
+/// rationale — `dc ivac` is outer-shareable and the cache
+/// controller participates in the bus protocol, so pending writes
+/// from coherent masters drain to the PoC before the invalidation
+/// completes — that is the AXI-drain mechanism the migration
+/// relies on).
+///
+/// PageSet must be DmaPool-origin. Buddy-origin and ExternallyOwned
+/// rejected: Buddy-origin Cacheable DMA is a pre-existing
+/// QEMU-virt-only pattern that is coherent at the simulator level
+/// and does not need invalidate; ExternallyOwned (DTB / MMIO) is
+/// not DMA memory.
+///
+/// x0 = PageSet handle, x1 = byte offset, x2 = byte length.
+fn sys_dma_sync_for_cpu(ctx: &mut ExceptionContext) -> SyscallError {
+    dma_sync_common(ctx, /* for_cpu = */ true)
+}
+
+/// sys_dma_sync_for_device(pageset, offset, len) — flush pending
+/// CPU writes on `[offset, offset+len)` within `pageset` so a
+/// subsequent device DMA read sees them.
+///
+/// Internally cleans (writes back) the covering cache lines via
+/// `dc cvac`. PageSet validation identical to
+/// `sys_dma_sync_for_cpu`.
+fn sys_dma_sync_for_device(ctx: &mut ExceptionContext) -> SyscallError {
+    dma_sync_common(ctx, /* for_cpu = */ false)
+}
+
+/// Shared validation + KVA-resolution + cache-op dispatch for the
+/// two sync syscalls. Single helper so the validation rules cannot
+/// drift between the two operations.
+fn dma_sync_common(ctx: &mut ExceptionContext, for_cpu: bool) -> SyscallError {
+    let handle = ctx.gpr[0] as u32;
+    let offset = ctx.gpr[1];
+    let len = ctx.gpr[2];
+
+    // Handle lookup — RIGHT_READ is sufficient. The cache op
+    // doesn't modify the PageSet's logical contents (clean preserves
+    // data; invalidate drops cache lines, which is a CPU-side
+    // operation — the PageSet's memory bytes are not written by
+    // the kernel).
+    let ht = CurrentThread::handle_table();
+    let entry = match ht.lookup(handle, Rights::from_bits(RIGHT_READ), ObjectType::PageSet) {
+        Ok(e) => e,
+        Err(e) => return e,
+    };
+    let header_kva = match entry.kind {
+        lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
+        _ => return SyscallError::INVALID_HANDLE,
+    };
+    // SAFETY: handle table returned a valid PageSet kind.
+    let header = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
+
+    // Origin check: DmaPool only. Buddy-origin Cacheable DMA exists
+    // pre-migration (virtio-blk on QEMU) but is coherent at the
+    // QEMU simulator level and doesn't need invalidate. Extending
+    // this surface to Buddy-origin would require deciding whether
+    // the Buddy direct-map mapping is invalidated too — out of
+    // scope for this migration; tracked in tech-debt.
+    use lockjaw_types::pageset_table::PageSetOrigin;
+    let origin = match header.raw().origin() {
+        Some(o) => o,
+        None => return SyscallError::INVALID_HANDLE,
+    };
+    if origin != PageSetOrigin::DmaPool {
+        return SyscallError::INVALID_PARAMETER;
+    }
+
+    // Range check: offset + len must fit within the pageset's
+    // data-page count. Checked arithmetic guards against
+    // user-controlled overflow (codex review pass 1 also pinned
+    // the cache-range math's overflow boundary; this gates before
+    // it reaches that math).
+    let page_count = header.data_page_count() as u64;
+    let pageset_bytes = page_count * lockjaw_types::addr::PAGE_SIZE;
+    let end = match offset.checked_add(len) {
+        Some(e) => e,
+        None => return SyscallError::INVALID_PARAMETER,
+    };
+    if end > pageset_bytes {
+        return SyscallError::INVALID_PARAMETER;
+    }
+
+    // KVA resolution: DmaPool pages are contiguous in PA; first
+    // page's PA + KERNEL_VA_OFFSET = direct-map KVA. After C1's
+    // mmu change, this region is Cacheable Inner+Outer WB so the
+    // `dc ivac` / `dc cvac` instructions reach valid cache lines.
+    let pa_base = match header.get_page(0) {
+        Some(pa) => pa,
+        // Zero-length syncs may legitimately pass an empty pageset
+        // (unusual but defined). Return OK without dispatching.
+        None => return SyscallError::OK,
+    };
+    let kva_base = pa_base + crate::mm::addr::KERNEL_VA_OFFSET;
+    let kva_start = kva_base + offset;
+
+    if for_cpu {
+        // SAFETY: kva_start..+len is a DmaPool direct-map range we
+        // just validated. Invalidation drops dirty CPU lines; the
+        // sync_for_cpu contract is that the device has finished
+        // writing this buffer and the caller has not yet read it.
+        unsafe { crate::arch::aarch64::cache::invalidate_range(kva_start, len); }
+    } else {
+        crate::arch::aarch64::cache::clean_range(kva_start, len);
+    }
+    SyscallError::OK
 }

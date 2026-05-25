@@ -441,3 +441,17 @@ The Phase 5 banner-ordering fix in `uart_main` (kernel-debug puts BEFORE UART1 b
 The bigger architectural move: `uart_putc` is one instance of "poll a hardware bit until it changes or we give up." The same shape appears in SDHCI (`poll_until_clear` / `poll_until_set` in emmc2-driver), in virtio (config-status readback after FEATURES_OK), in any device with a busy bit. A shared `poll_until_deadline` primitive belongs in `lockjaw-userlib` alongside the barriers.
 
 **Why bootstrap:** today's two converted drivers run in QEMU where TX always drains; the hang is only theoretical. Adding deadline plumbing without a concrete liveness failure to debug against would be speculative. Revisit when (a) the first Pi-hardware bring-up surfaces a real spin-forever incident, or (b) the second event-loop driver lands (probably a console for posix) — whichever comes first.
+
+---
+
+## DmaPool pages are not zeroed on alloc
+
+**Where:** `src/cap/pageset_table.rs::alloc_dma_pages` (kernel-side allocator) → consumed by `sys_alloc_dma_pages` (userland-facing syscall).
+
+**What:** When a user driver calls `sys_alloc_dma_pages(count)`, the kernel returns a PageSet handle backed by `count` contiguous pages from the DMA pool, but the bytes inside those pages can carry stale data from the previous owner. The driver-side `OwnedDmaMapping::alloc_contiguous` calls right after sys_alloc_dma_pages do not zero either. Consumers that want a known-zero buffer (e.g., emmc2 selftest, which uses `ptr::write_bytes(va, 0, 512)` immediately after mapping) must zero it themselves.
+
+Pre-C1 of the cacheable-DMA migration there was a structural reason to skip kernel-side zeroing: the pool was excluded from the kernel direct map, so zero-through-direct-map would create the mixed-attribute alias the M6 substrate forbade. Post-C1 the pool participates in the direct map cacheably and kernel-side zeroing is mechanically possible.
+
+**Fix:** Decide whether `sys_alloc_dma_pages` should zero on alloc. Arguments for: data-leak-by-default prevention if a DMA buffer ever crosses a privilege boundary (today no boundary crossing — drivers are all single-process per buffer — but the rule would be defensive). Arguments against: zeroing 2 MiB worst-case has nonzero cost; most DMA consumers promptly overwrite (driver fills the buffer or kicks the device to fill it), eating a duplicate write. If landed: kernel-side `zero_range_via_direct_map(pool_base + N*PAGE_SIZE, count * PAGE_SIZE)` followed by `cache::clean_range` so the device sees zeros on its first DMA read. Could also be a flag argument on `sys_alloc_dma_pages` so the caller opts in.
+
+**Why bootstrap:** the comment at the alloc site historically cited an alias argument that is no longer the reason. C1's stale-comment cleanup pass made the comment honest about the absence of zeroing without making the policy decision. Track here so the design question is not lost.

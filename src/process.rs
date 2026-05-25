@@ -317,12 +317,22 @@ fn provision_resources(
     };
     // SAFETY: kva from a PageSet handle — registered header KVA.
     let stack_ps = unsafe { PageSetRef::from_header_kva(stack_kva) };
-    // M6: reject DmaPool-origin PageSets as process stacks. Stack
-    // pages get mapped cacheable Normal in the new address space,
-    // which would create the mixed-attribute alias with the direct
-    // map. DmaPool PageSets can ONLY be mapped NormalNonCacheable
-    // via sys_map_pages. Uninit origin (None) is also rejected as
-    // a typed surface for the explicit-init invariant.
+    // Reject DmaPool-origin PageSets as process stacks. Post C1 of
+    // the cacheable-DMA migration, DmaPool pages ARE mappable as
+    // Normal Cacheable, so the original M6 mixed-attribute alias
+    // argument no longer applies — but the rejection stands for
+    // two distinct reasons:
+    //   (a) DmaPool is a tight 2 MiB reservation intended for
+    //       device-DMA buffers. Charging process stacks against
+    //       that budget would starve the actual DMA path.
+    //   (b) DmaPool consumers operate under an explicit sync
+    //       discipline (sys_dma_sync_for_cpu / for_device at
+    //       device handoff points). Process stacks have no
+    //       device handoffs and no sync calls; granting them
+    //       DmaPool origin would let a stack slip through the
+    //       discipline by accident.
+    // Uninit origin (None) is also rejected as a typed surface
+    // for the explicit-init invariant.
     match stack_ps.origin() {
         Some(lockjaw_types::pageset_table::PageSetOrigin::Buddy) => {}
         _ => return Err(CreateProcessError::BadHandle),
@@ -357,9 +367,18 @@ fn provision_resources(
         _ => return Err(CreateProcessError::BadHandle),
     };
     let scratch_ps = unsafe { PageSetRef::from_header_kva(scratch_kva) };
-    // M6: scratch pages get accessed cacheably by the kernel during
-    // mapping batch flush (they're treated as a Mapping[]). DmaPool
-    // pages would alias; uninit origin is rejected as a bug signal.
+    // Reject DmaPool-origin PageSets as scratch pages. Post C1 of
+    // the cacheable-DMA migration the kernel's cacheable access of
+    // the page during mapping-batch flush no longer creates an
+    // alias (DmaPool is also Cacheable post-C1), so the original
+    // alias argument no longer applies. The rejection stands for
+    // the same two reasons as the stack rejection above:
+    //   (a) DmaPool is a tight 2 MiB device-DMA reservation;
+    //       charging scratch against that budget starves real DMA.
+    //   (b) DmaPool consumers operate under explicit sync
+    //       discipline at device handoff points. Scratch pages
+    //       have no device handoffs and would slip the discipline.
+    // Uninit origin is rejected as a bug signal.
     match scratch_ps.origin() {
         Some(lockjaw_types::pageset_table::PageSetOrigin::Buddy) => {}
         _ => return Err(CreateProcessError::BadHandle),

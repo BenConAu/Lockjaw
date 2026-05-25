@@ -48,15 +48,19 @@ pub fn sys_alloc_pages(count: u64) -> Result<PageSetHandle, SyscallError> {
 
 /// Allocate physically-contiguous DMA-safe pages from the kernel's DMA
 /// pool. Returns a PageSet handle on success; the resulting PageSet
-/// has `origin = DmaPool` and can ONLY be mapped via
-/// `MapMemoryAttribute::NormalNonCacheable`. Use
-/// `sys_query_pageset_phys(handle, 0)` to obtain the first page's
-/// physical address (needed by drivers programming ADMA / SDMA
-/// descriptor targets).
+/// has `origin = DmaPool` and (post C1 of the cacheable-DMA migration)
+/// must be mapped via `MapMemoryAttribute::Normal` — the kernel
+/// rejects `NormalNonCacheable` and `Device` for DmaPool origin.
+/// Use `sys_query_pageset_phys(handle, 0)` to obtain the first
+/// page's physical address (needed by drivers programming ADMA /
+/// SDMA descriptor targets).
 ///
 /// Pool pages are physically reserved at kernel boot and never
-/// registered with buddy — kernel cacheable-mapping paths reject
-/// DmaPool-origin PageSets to prevent the mixed-attribute alias bug.
+/// registered with buddy. Coherence with devices is maintained via
+/// `sys_dma_sync_for_cpu` / `sys_dma_sync_for_device` at handoff
+/// points (see `lockjaw_userlib::dma_sync`); the single-attribute
+/// invariant (Cacheable everywhere) prevents the mixed-attribute
+/// alias bug.
 pub fn sys_alloc_dma_pages(count: u64) -> Result<PageSetHandle, SyscallError> {
     let err: u64;
     let val: u64;

@@ -9,13 +9,32 @@
 /// Threading: single-core, IRQs masked — same `UnsafeCell` pattern as
 /// `page_alloc.rs`. Replace with SpinMutex when SMP lands.
 ///
-/// **Direct-map exclusion**: the pool's 2 MiB L2 block is cleared
-/// from the TTBR1 direct map at boot by
-/// `arch::aarch64::mmu::exclude_dma_pool_from_direct_map` (called
-/// from `main.rs` after `setup_guard_pages`). Together with the
-/// rejection matrix in `sys_map_pages` / `create_process` / donate-
-/// as-kernel-object, this closes both sides of the mixed-attribute
-/// alias: pool pages cannot be reached cacheably from any TTBR.
+/// **Cacheable direct-map participation** (post C1 of the
+/// cacheable-DMA migration — see
+/// `docs/cacheable-dma-migration-plan.md`): the pool's 2 MiB L2
+/// block participates in the kernel TTBR1 direct map as Normal
+/// Cacheable Inner+Outer WB. Per-process user mappings of pool
+/// pages are also Normal Cacheable, enforced by the rejection
+/// matrix in `sys_map_pages` — DmaPool origin accepts ONLY
+/// `Normal`; `NormalNonCacheable` and `Device` are rejected.
+/// Single-attribute invariant preserved: pool pages are
+/// Cacheable everywhere they are mapped. Coherence with devices
+/// is maintained at the device-handoff points via the
+/// `sys_dma_sync_for_cpu` / `sys_dma_sync_for_device` syscalls,
+/// mirroring Linux's `dma_sync_for_cpu` /
+/// `dma_sync_for_device` API.
+///
+/// `create_process` and donate-as-kernel-object continue to
+/// reject DmaPool origin — not for alias reasons (the alias
+/// bug is unreachable by construction), but because (a) the
+/// pool is a tight 2 MiB reservation and stacks / scratch /
+/// kernel objects would starve the actual DMA path, and
+/// (b) those code paths have no sync-syscall handoff sites
+/// and would silently slip the discipline. Pre-C1 history:
+/// the pool was originally `NormalNonCacheable` everywhere
+/// (M6 sub-commit 2a step 2, commit `10a01e8`) with the
+/// kernel direct map excluding the pool's L2 block; that
+/// exclusion is gone now.
 
 use core::cell::UnsafeCell;
 use lockjaw_types::addr::{PhysAddr, PAGE_SIZE};

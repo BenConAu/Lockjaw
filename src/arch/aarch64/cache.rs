@@ -1,9 +1,3 @@
-// C0 of the cacheable-DMA migration ships `invalidate_range` and
-// `clean_range` compiled but unreferenced from any caller. They go
-// live at C1 along with the sync syscall handlers. `dead_code`
-// allowed at the module level here only until C1.
-#![allow(dead_code)]
-
 //! Kernel-side cache-maintenance primitives.
 //!
 //! Hosts the `dc ivac` (invalidate to point-of-coherency) and
@@ -11,17 +5,28 @@
 //! cacheable-DMA migration relies on (see
 //! `docs/cacheable-dma-migration-plan.md`).
 //!
-//! At C0 these primitives are compiled but unreferenced from any
-//! dispatch path — `sys_dma_sync_for_cpu` / `sys_dma_sync_for_device`
-//! return `NOT_SUPPORTED` at C0. They go live in C1, when the
-//! `mmu::exclude_dma_pool_from_direct_map` exclusion is removed and
-//! the pool's KVAs become reachable for `dc ivac` to operate on.
+//! Post C1 of the migration these primitives back the
+//! `sys_dma_sync_for_cpu` / `sys_dma_sync_for_device` handlers in
+//! `syscall::handler::dma_sync_common`. The kernel TTBR1 direct
+//! map covers DmaPool pages cacheably (the pre-C1
+//! `mmu::exclude_dma_pool_from_direct_map` exclusion was deleted
+//! in C1), so `dc ivac` / `dc cvac` operate on real cache lines
+//! at the pool's direct-map KVAs. Coherence with devices is
+//! maintained at device-handoff points: drivers call
+//! `sys_dma_sync_for_cpu` after a device DMA-write completes (so
+//! the CPU's next load sees fresh DRAM) and
+//! `sys_dma_sync_for_device` before a device DMA-read starts (so
+//! the controller sees the CPU's writes).
 //!
 //! `init_and_check()` reads `CTR_EL0.DminLine` at boot and panics
 //! if the silicon's actual data cache line size disagrees with
 //! `lockjaw_types::cache::CACHE_LINE_BYTES`. The const is the
 //! source of truth for the range math the syscalls use; the boot
 //! check catches platform mismatch before any DMA is in flight.
+//! Also called once at boot from `main.rs` after the pool's
+//! direct-map mapping is established, immediately before the
+//! pool-wide `dc ivac` sweep that forecloses firmware-era stale
+//! cache lines.
 
 use core::arch::asm;
 use lockjaw_types::cache::CACHE_LINE_BYTES;

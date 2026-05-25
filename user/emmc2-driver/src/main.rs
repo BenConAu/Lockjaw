@@ -7,7 +7,6 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 
-use core::arch::asm;
 use core::ptr;
 use lockjaw_userlib::*;
 use lockjaw_userlib::clock::{ClockClient, ClockError};
@@ -15,6 +14,7 @@ use lockjaw_userlib::block::{
     BlockEngine, BlockError, BlockInfo, run_block_server,
 };
 use lockjaw_userlib::handle::PageSetGuard;
+use lockjaw_userlib::dma_sync::{sys_dma_sync_for_cpu, sys_dma_sync_for_device};
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, sleep_for, Nanos};
 // `monotonic_now` returns `MonoTicks`, which is `Ord`; the comparisons in the
@@ -351,6 +351,10 @@ enum Emmc2Error {
     DescVaExhausted,
     /// sys_map_pages for the descriptor table failed.
     DescMapFailed,
+    /// sys_dma_sync_for_device on the descriptor table failed
+    /// (per-transfer, after writing the descriptor and before
+    /// kicking the controller).
+    DescSyncFailed,
 }
 
 impl Emmc2Error {
@@ -370,7 +374,8 @@ impl Emmc2Error {
             Self::DescAllocFailed              => "desc alloc failed",
             Self::DescPhysQueryFailed          => "desc phys query failed",
             Self::DescVaExhausted              => "desc VA exhausted",
-            Self::DescMapFailed                => "desc map NC failed",
+            Self::DescMapFailed                => "desc map failed",
+            Self::DescSyncFailed               => "desc sync_for_device failed",
         }
     }
 }
@@ -403,7 +408,8 @@ fn put_emmc2_error(err: &Emmc2Error) {
         | Emmc2Error::DescAllocFailed
         | Emmc2Error::DescPhysQueryFailed
         | Emmc2Error::DescVaExhausted
-        | Emmc2Error::DescMapFailed => {}
+        | Emmc2Error::DescMapFailed
+        | Emmc2Error::DescSyncFailed => {}
     }
 }
 
@@ -1018,7 +1024,7 @@ pub extern "C" fn _start() -> ! {
         Err(_) => { puts("[EMMC2:BLK] selftest alloc FAILED\n"); halt(); }
     };
     let selftest_va = VMEM.alloc(1).expect("[EMMC2:BLK] selftest VA alloc FAILED");
-    if !sys_map_pages(selftest_buf, selftest_va, MapMemoryAttribute::NormalNonCacheable).is_ok() {
+    if !sys_map_pages(selftest_buf, selftest_va, MapMemoryAttribute::Normal).is_ok() {
         puts("[EMMC2:BLK] selftest map FAILED\n");
         halt();
     }
@@ -1089,10 +1095,18 @@ pub extern "C" fn _start() -> ! {
 /// Single-block ADMA2 read of `sector`. CMD17 + READ|DMA only. No
 /// MULTI, no BLK_CNT_EN, no Auto-CMD23 — those belong to the
 /// multi-block path. Mirrors the M6 sub-commit 2b sequence.
+///
+/// `desc_ps` is the DmaPool PageSet handle backing the descriptor
+/// table; needed to sync the descriptor write down to DRAM via
+/// `sys_dma_sync_for_device` before kicking the controller
+/// (cacheable-DMA migration C1: the descriptor mapping is Normal
+/// Cacheable post-migration, so a `dsb sy` alone is not enough to
+/// flush the cache line).
 unsafe fn adma2_single_block_read(
     mmio_va: u64,
     sector: u64,
     buf_phys: u64,
+    desc_ps: PageSetHandle,
     desc_va: u64,
     desc_phys: u64,
 ) -> Result<(), Emmc2Error> {
@@ -1123,7 +1137,17 @@ unsafe fn adma2_single_block_read(
     // above), so we can safely overwrite the previous descriptor.
     let desc = adma2_tran_end_descriptor(buf_phys as u32, 512);
     ptr::write_volatile(desc_va as *mut u64, desc);
-    asm!("dsb sy", options(nomem, nostack));
+    // Flush the descriptor's cache line to DRAM before the
+    // controller's DMA fetches it. Post cacheable-DMA migration
+    // C1 the descriptor mapping is Normal Cacheable, so the
+    // M6-era `dsb sy` here is no longer sufficient — DSB orders
+    // CPU stores against subsequent CPU operations, but the
+    // store may still sit in the L1 cache when the controller
+    // reads memory. sys_dma_sync_for_device does `dc cvac` + dsb
+    // sy, which writes the line back to DRAM.
+    if !sys_dma_sync_for_device(desc_ps, 0, 8).is_ok() {
+        return Err(Emmc2Error::DescSyncFailed);
+    }
 
     // Re-select ADMA2-32 in HOST_CONTROL_1. Preserve the 4-bit bus
     // width bit (set during M3 ACMD6); replace the DMA_SEL field
@@ -1220,6 +1244,7 @@ unsafe fn adma2_transfer(
     sector: u64,
     n_blocks: u16,
     buf_phys: u64,
+    desc_ps: PageSetHandle,
     desc_va: u64,
     desc_phys: u64,
 ) -> Result<AdmaTiming, Emmc2Error> {
@@ -1249,7 +1274,12 @@ unsafe fn adma2_transfer(
     // desc_va); overwrite its 8 bytes for this transfer.
     let desc = adma2_tran_end_descriptor(buf_phys as u32, bytes as u16);
     ptr::write_volatile(desc_va as *mut u64, desc);
-    asm!("dsb sy", options(nomem, nostack));
+    // Sync descriptor down to DRAM — same rationale as in
+    // adma2_single_block_read (descriptor mapping is now Normal
+    // Cacheable post-C1; dsb sy alone doesn't flush the line).
+    if !sys_dma_sync_for_device(desc_ps, 0, 8).is_ok() {
+        return Err(Emmc2Error::DescSyncFailed);
+    }
 
     sdhci_write32(mmio_va, SDHCI_ADMA_ADDRESS, desc_phys as u32);
     sdhci_write32(mmio_va, SDHCI_ARGUMENT2, n_blocks as u32);
@@ -1384,8 +1414,13 @@ struct Emmc2BlockEngine {
     mmio_va: u64,
     capacity_sectors: u64,
     /// Persistent ADMA2-32 descriptor table. One 8-byte tran+end
-    /// descriptor is rewritten per transfer. Allocated from the DMA
-    /// pool and mapped NormalNonCacheable.
+    /// descriptor is rewritten per transfer. Allocated from the
+    /// DMA pool and (post cacheable-DMA migration C1) mapped
+    /// Normal Cacheable. The `desc_ps` handle is retained so
+    /// every per-transfer descriptor write can be followed by a
+    /// `sys_dma_sync_for_device` call to flush the cache line
+    /// down to DRAM before the controller fetches the descriptor.
+    desc_ps: PageSetHandle,
     desc_va: u64,
     desc_phys: u64,
     dma_buffers: [DmaBuf; MAX_DMA_BUFFERS],
@@ -1400,12 +1435,15 @@ impl Emmc2BlockEngine {
     unsafe fn new(mmio_va: u64, capacity_sectors: u64)
         -> Result<Self, Emmc2Error>
     {
-        // Descriptor table: 1 page from the DMA pool, NormalNonCacheable.
+        // Descriptor table: 1 page from the DMA pool. Post-C1 of
+        // the cacheable-DMA migration this is mapped Normal
+        // Cacheable; the matching sys_dma_sync_for_device call
+        // before each controller kick is in adma2_single_block_read.
         let desc_ps = sys_alloc_dma_pages(1).map_err(|_| Emmc2Error::DescAllocFailed)?;
         let desc_phys = sys_query_pageset_phys(desc_ps, 0)
             .map_err(|_| Emmc2Error::DescPhysQueryFailed)?;
         let desc_va = VMEM.alloc(1).ok_or(Emmc2Error::DescVaExhausted)?;
-        if !sys_map_pages(desc_ps, desc_va, MapMemoryAttribute::NormalNonCacheable).is_ok() {
+        if !sys_map_pages(desc_ps, desc_va, MapMemoryAttribute::Normal).is_ok() {
             return Err(Emmc2Error::DescMapFailed);
         }
         if desc_phys >= (1u64 << 32) {
@@ -1423,6 +1461,7 @@ impl Emmc2BlockEngine {
         Ok(Self {
             mmio_va,
             capacity_sectors,
+            desc_ps,
             desc_va,
             desc_phys,
             dma_buffers: [DMA_BUF_EMPTY; MAX_DMA_BUFFERS],
@@ -1446,9 +1485,20 @@ impl BlockEngine for Emmc2BlockEngine {
             capacity_sectors: self.capacity_sectors,
             sector_size: 512,
             // emmc2 allocs buffers via `sys_alloc_dma_pages` (DmaPool
-            // origin); the kernel rejects any non-NC mapping for
-            // those PageSets, so clients MUST map NormalNonCacheable.
-            buffer_attribute: MapMemoryAttribute::NormalNonCacheable,
+            // origin). Post cacheable-DMA migration C1 the kernel
+            // accepts only Normal (Cacheable) mappings for DmaPool
+            // PageSets. Cross-process coherence is the ENGINE's
+            // responsibility: `Engine::read` invokes
+            // `sys_dma_sync_for_cpu` over the read range before
+            // returning, so by the time control reaches the client
+            // (over IPC) the buffer's cache lines for that range
+            // are already invalidated and the next CPU load reads
+            // fresh DRAM. Clients DO NOT need to issue their own
+            // sync after `read` returns; they DO need to call
+            // `sys_dma_sync_for_device` before any write-direction
+            // request (not exercised today — writes are disabled
+            // until CMD18+Auto-CMD23 cold-boot is validated).
+            buffer_attribute: MapMemoryAttribute::Normal,
         }
     }
 
@@ -1506,7 +1556,7 @@ impl BlockEngine for Emmc2BlockEngine {
             let res = unsafe {
                 adma2_single_block_read(
                     self.mmio_va, sector + i, buf_sector_pa,
-                    self.desc_va, self.desc_phys,
+                    self.desc_ps, self.desc_va, self.desc_phys,
                 )
             };
             if let Err(err) = res {
@@ -1527,6 +1577,24 @@ impl BlockEngine for Emmc2BlockEngine {
                 puts("\n");
                 return Err(BlockError::IoError);
             }
+        }
+        // Cacheable-DMA migration C1: the buffer is now mapped
+        // Normal Cacheable. After the controller has finished
+        // writing it via DMA, invalidate the CPU cache lines so
+        // subsequent CPU loads read fresh DRAM rather than stale
+        // pre-DMA cached state. This is the principled replacement
+        // for the M7-era incidental drain (32-byte diagnostic dump
+        // / sdhci_read32(PRESENT_STATE)) — see
+        // docs/cacheable-dma-migration-plan.md and Linux's
+        // dma_sync_sg_for_cpu in sdhci_adma_table_post.
+        //
+        // Sync at engine level (after the inner loop) rather than
+        // per-iteration because no caller code touches the buffer
+        // between iterations; one sync covers count*512 bytes.
+        let sync_bytes = count * 512;
+        if !sys_dma_sync_for_cpu(buffer, 0, sync_bytes).is_ok() {
+            puts("[EMMC2:READ] sync_for_cpu FAILED\n");
+            return Err(BlockError::IoError);
         }
         Ok(())
     }

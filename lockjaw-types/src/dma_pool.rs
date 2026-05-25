@@ -1,18 +1,25 @@
 /// DMA pool allocator — pure model.
 ///
 /// The DMA pool is a physically-contiguous region of RAM reserved at
-/// kernel boot and *excluded from the kernel direct map* (the
-/// `paddr + KERNEL_VA_OFFSET` cacheable identity map that covers all
-/// other RAM). Pages from this pool can only be reached through
-/// per-process `NormalNonCacheable` mappings, which avoids the
-/// mixed-attribute alias bug that would otherwise occur when an
-/// SDHCI / virtio device writes to RAM that the CPU also caches.
+/// kernel boot. Post-C1 of the cacheable-DMA migration (see
+/// `docs/cacheable-dma-migration-plan.md`) it participates in the
+/// kernel TTBR1 direct map as Cacheable Inner+Outer WB and user
+/// processes map it Cacheable as well (single-attribute invariant
+/// preserved: Cacheable everywhere). Coherence with devices is
+/// maintained via `sys_dma_sync_for_cpu` (`dc ivac` — invalidate
+/// before CPU reads device-written data) and `sys_dma_sync_for_device`
+/// (`dc cvac` — clean before device reads CPU-written data) at
+/// handoff points, mirroring Linux's `dma_sync_for_cpu` /
+/// `dma_sync_for_device` API.
 ///
-/// Sub-commit 2a (this milestone) introduces the pool, the
-/// `sys_alloc_dma_pages` syscall, and the kernel-side rejection
-/// matrix that prevents pool pages from leaking into cacheable
-/// mapping paths. Sub-commit 2b consumes the pool from
-/// `user/emmc2-driver` for ADMA2 buffers + descriptor tables.
+/// Pre-C1 history: the pool was originally `NormalNonCacheable`
+/// EVERYWHERE (kernel direct map excluded the pool's L2 block; user
+/// mappings forced to NC). The rejection matrix that enforced this
+/// invariant still exists, just with the chosen attribute flipped
+/// to Cacheable. See M6 sub-commit 2a step 2 (commit `10a01e8`) for
+/// the original alias-safety design rationale, and the migration
+/// plan for the Cacheable trade-off (Linux/U-Boot pattern alignment
+/// + AXI-drain via `dc ivac` bus-protocol side effect).
 ///
 /// **All numerical constants live here**; the kernel module
 /// (`src/cap/dma_pool.rs`) wraps this with a locked singleton and

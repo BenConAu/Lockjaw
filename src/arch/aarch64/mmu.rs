@@ -569,47 +569,16 @@ pub unsafe fn setup_guard_pages(guard_pages: &[PhysAddr]) {
     );
 }
 
-/// Exclude the M6 DMA pool from the kernel TTBR1 direct map.
-///
-/// The pool is one 2 MiB L2 block (DMA_POOL_PAGES = 512 pages,
-/// aligned at boot — see `page_alloc::init_with_gap`). Clearing that
-/// one L2 entry removes the cacheable direct-map view of the pool's
-/// physical range, so the only way to reach pool pages is through a
-/// per-process `NormalNonCacheable` mapping via `sys_map_pages`. This
-/// closes the speculative-cache-fill side of the mixed-attribute
-/// alias bug that codex flagged on the M6 sub-commit 2a step 2 review.
-///
-/// Must run AFTER `setup_guard_pages` (which builds KERNEL_L2_RAM and
-/// installs the table descriptor at KERNEL_L1[1]). Safe to call even
-/// when the pool wasn't initialised (tight-RAM platforms) — does
-/// nothing when `pool_base_phys == 0`.
-///
-/// # Safety
-/// Higher-half mapping must be active and KERNEL_L2_RAM must be
-/// installed (i.e. `setup_guard_pages` already ran).
-pub unsafe fn exclude_dma_pool_from_direct_map(pool_base_phys: u64) {
-    if pool_base_phys == 0 {
-        return; // Pool wasn't initialised; nothing to exclude.
-    }
-    let ram_base: u64 = super::platform::info().ram_base;
-    assert!(pool_base_phys >= ram_base,
-        "DMA pool below ram_base: pool_base=0x{:x} ram_base=0x{:x}",
-        pool_base_phys, ram_base);
-    let offset = pool_base_phys - ram_base;
-    assert_eq!(offset & ((2 * 1024 * 1024) - 1), 0,
-        "DMA pool not 2 MiB aligned: pool_base=0x{:x}", pool_base_phys);
-    let l2_index = (offset >> 21) as usize;
-    assert!(l2_index < 512,
-        "DMA pool L2 index out of range: {}", l2_index);
-
-    // Single PTE clear — invalid descriptor means any access via the
-    // direct-map VA for these pages faults at TTBR1 lookup.
-    KERNEL_L2_RAM.entries[l2_index] = PageTableEntry::empty();
-
-    asm!("tlbi vmalle1is");                  // Invalidate all TLB entries
-    asm!("dsb ish");                         // Ensure invalidation completes
-    asm!("isb");                             // Sync pipeline
-}
+// M6 sub-commit 2a step 2's `exclude_dma_pool_from_direct_map`
+// was deleted in C1 of the cacheable-DMA migration (see
+// docs/cacheable-dma-migration-plan.md). The pool now
+// participates in the kernel TTBR1 direct map as Cacheable
+// Inner+Outer WB; sync syscalls maintain coherency at the
+// device-handoff points instead of preventing the alias by
+// excluding the mapping. The single-attribute invariant the M6
+// substrate enforces is preserved: pool pages are now Cacheable
+// EVERYWHERE they are mapped (kernel + every user process), no
+// NC opt-in.
 
 /// Drop from EL1 to EL0 with a specific TTBR0 page table.
 ///

@@ -448,9 +448,12 @@ pub extern "C" fn _start() -> ! {
 
     let blk = BlockClient::new(blk_srv_ep, reply);
 
-    // Query the block engine's required buffer attribute. virtio-blk
-    // returns Normal (cacheable, sys_alloc_pages_contiguous); emmc2
-    // returns NormalNonCacheable (DMA pool, NC-only at the kernel).
+    // Query the block engine's required buffer attribute. Both
+    // virtio-blk and emmc2 now return Normal (cacheable): virtio-blk
+    // uses Buddy-origin pages (always cacheable; coherent DMA on
+    // QEMU); emmc2 uses DmaPool-origin pages (Cacheable post C1 of
+    // the cacheable-DMA migration; coherence maintained via the
+    // sync syscalls at engine.read / engine.write boundaries).
     // Mapping with the wrong attribute fails at sys_map_pages.
     let blk_info = match blk.get_info() {
         Ok(i) => i,

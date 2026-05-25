@@ -41,8 +41,13 @@ static TABLE: PageSetTableWrapper = PageSetTableWrapper::new();
 /// Does NOT own the header range — the caller is responsible for
 /// cleanup on failure (typically via OwnedKvmRangeGuard). `origin`
 /// records which allocator owns the DATA pages (header pages always
-/// come from buddy via KVM); the kernel reads this in every cacheable-
-/// mapping path to enforce the DmaPool-NC-only rule (M6).
+/// come from buddy via KVM); the kernel reads this in every mapping
+/// path to enforce the post-C1 attribute rules — see
+/// `sys_map_pages` for the matrix (DmaPool → Normal Cacheable only;
+/// Buddy → Normal Cacheable or Device; ExternallyOwned → Normal or
+/// Device). The same `origin` field also gates the donate-as-kernel-
+/// object and process-stack paths, which reject DmaPool to preserve
+/// the sync-discipline contract.
 fn insert_into_table(
     count: usize,
     header_kva: KernelVa,
@@ -249,11 +254,16 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
 /// descriptor tables and buffers (M6 sub-commit 2b).
 ///
 /// The header pages come from buddy/KVM as usual (regular cacheable
-/// kernel memory — only the DATA pages are DMA-pool-origin). The
-/// kernel rejects DmaPool-origin PageSets in every cacheable-mapping
-/// path (see `sys_map_pages`, `create_process`, KVM remap, donate-as-
-/// kernel-object) so the data pages can only be reached through a
-/// per-process `NormalNonCacheable` mapping.
+/// kernel memory — only the DATA pages are DMA-pool-origin). Post
+/// C1 of the cacheable-DMA migration the data pages are mapped
+/// `Normal` Cacheable in every reachable mapping (kernel TTBR1
+/// direct map + per-process user mappings); `sys_map_pages` rejects
+/// `NormalNonCacheable` and `Device` attributes for DmaPool origin.
+/// Coherence with devices is maintained via `sys_dma_sync_for_cpu`
+/// / `sys_dma_sync_for_device` at handoff points. `create_process`
+/// and donate-as-kernel-object still reject DmaPool origin (process
+/// stacks and kernel-object donations have no sync-discipline call
+/// sites and would slip through the contract by accident).
 ///
 /// Returns the PageSet ID, or `None` if:
 /// - count is 0 or > MAX_PRACTICAL_PAGES_PER_SET
@@ -277,10 +287,18 @@ pub fn alloc_dma_pages(count: usize) -> Option<u64> {
     }
 
     // Allocate DMA pool pages. Pool returns the first PA of a
-    // contiguous run; we DO NOT zero through the direct map because
-    // the alias would defeat the whole point. Pool pages are zeroed
-    // once at boot (in dma_pool init) and stay zero until written via
-    // a per-process NC mapping.
+    // contiguous run. We do NOT zero on alloc — pool pages may
+    // carry data from prior alloc/free cycles by the previous
+    // owner. The pre-C1 rationale here was "alias would defeat
+    // the whole point", which no longer applies post C1 of the
+    // cacheable-DMA migration (pool participates in the kernel
+    // direct map cacheably; zero-through-direct-map is now
+    // mechanically possible). Whether zero-on-alloc should be
+    // added is a separate design question (see tech-debt); for
+    // now per-process mappings of DmaPool PageSets are Normal
+    // Cacheable per the post-C1 rejection matrix in
+    // `sys_map_pages`, and consumers that need a zeroed buffer
+    // must zero it themselves.
     let first_data = match crate::cap::dma_pool::alloc_pages(count) {
         Ok(phys) => phys,
         Err(_) => return None, // guard frees header range

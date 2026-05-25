@@ -278,14 +278,26 @@ pub extern "C" fn kmain() -> ! {
         arch::aarch64::mmu::setup_guard_pages(&guard_pages);
         kprintln!("Guard pages active (unmapped).");
 
-        // M6: exclude the DMA pool's 2 MiB L2 block from the kernel
-        // TTBR1 direct map. Closes the speculative-cache-fill side
-        // of the mixed-attribute alias bug for NormalNonCacheable
-        // mappings (Tier 3 #13 / docs/m6-subcommit-2-plan.md).
-        // No-op if pool init was skipped on tight-RAM platforms.
-        arch::aarch64::mmu::exclude_dma_pool_from_direct_map(
-            cap::dma_pool::base_phys(),
-        );
+        // C1 of the cacheable-DMA migration (see
+        // docs/cacheable-dma-migration-plan.md): the DMA pool now
+        // participates in the kernel TTBR1 direct map as Cacheable
+        // Inner+Outer WB. Any firmware-era cache lines for the
+        // pool's PAs become reachable via the direct map the
+        // moment we did NOT exclude them above. Invalidate the
+        // entire pool's KVA range so the first sys_alloc_dma_pages
+        // consumer reads fresh DRAM rather than stale VC4-firmware
+        // cache state. Safe to invalidate (no kernel/driver code
+        // has written to the pool yet); ~1 ms one-time per boot
+        // for 2 MiB. Forecloses the non-deterministic
+        // first-allocation corruption bug class structurally at
+        // the moment direct-map reachability begins.
+        let pool_base = cap::dma_pool::base_phys();
+        if pool_base != 0 {
+            let pool_kva = pool_base + mm::addr::KERNEL_VA_OFFSET;
+            let pool_bytes = (lockjaw_types::dma_pool::DMA_POOL_PAGES as u64)
+                * lockjaw_types::addr::PAGE_SIZE;
+            arch::aarch64::cache::invalidate_range(pool_kva, pool_bytes);
+        }
 
         mm::stack::init_canary();
     }

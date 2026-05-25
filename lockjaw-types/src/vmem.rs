@@ -30,8 +30,11 @@ pub const MAPPINGS_PER_PAGE: usize = PAGE_SIZE as usize / core::mem::size_of::<M
 ///
 /// `Normal = 0` so callers that previously passed the literal `0` for
 /// "default normal memory" keep the same wire encoding through the
-/// migration. M6 sub-commit 2 adds the `NormalNonCacheable` variant for
-/// the ADMA2 buffer + descriptor-table mappings.
+/// migration. The `NormalNonCacheable` variant survives but, post C1
+/// of the cacheable-DMA migration, is no longer used by the
+/// DmaPool path; it remains as an explicit attribute for any
+/// future non-DMA use case that has reasoned justification for
+/// uncached memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub enum MapMemoryAttribute {
@@ -42,15 +45,17 @@ pub enum MapMemoryAttribute {
     /// Required for MMIO regions (UART, GIC, SDHCI controller registers).
     Device = 1,
     /// MAIR_NORMAL_NC — Normal memory, inner + outer non-cacheable,
-    /// outer shareable. Used for DMA buffers and descriptor tables
-    /// when the device drives RAM directly without participating in
-    /// CPU cache coherency (M6: emmc2 ADMA2 on Pi 4B).
-    ///
-    /// Kernel-side restriction: only valid on DmaPool-origin PageSets
-    /// (pages that are physically excluded from the kernel direct map).
-    /// Applying NC to a Buddy-origin PageSet would create the mixed-
-    /// attribute alias bug — `sys_map_pages` rejects with
-    /// INVALID_PARAMETER.
+    /// outer shareable. Originally introduced (M6 sub-commit 2)
+    /// as the mandatory attribute for DmaPool DMA buffers and
+    /// descriptor tables. **Post C1 of the cacheable-DMA migration
+    /// this attribute is rejected for DmaPool origin and no
+    /// current code path takes it** — DmaPool uses `Normal`
+    /// Cacheable with explicit sync syscalls at handoff. The
+    /// variant survives as a first-class attribute for any future
+    /// non-DMA use case that genuinely needs uncached memory; any
+    /// new caller must be paired with an audited rejection rule
+    /// in `sys_map_pages`. Today every (origin, NC) combination
+    /// the kernel sees is rejected.
     NormalNonCacheable = 2,
 }
 

@@ -39,8 +39,10 @@ impl<T: 'static> MappedRegs<T> {
     ///
     /// Caller asserts:
     /// - `va` points to a region of at least `size_of::<T>()` bytes
-    ///   mapped as MMIO (Device-nGnRnE or `NormalNonCacheable` for
-    ///   DMA-shared regions).
+    ///   mapped as MMIO (Device-nGnRnE) or as DMA-shared memory
+    ///   (`Normal` Cacheable for DmaPool / Buddy origin; caller is
+    ///   responsible for the matching `sys_dma_sync_*` calls at
+    ///   handoff points).
     /// - `va` is aligned to `align_of::<T>()`.
     /// - No other `MappedRegs<T>` instance aliases the same region.
     ///   The intended user is `lockjaw_userlib::devmgr::claim_typed`,

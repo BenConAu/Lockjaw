@@ -1,30 +1,30 @@
 //! Typed access to DMA-shared memory.
 //!
-//! `DmaCell<T>` and `DmaSlice<T, N>` wrap raw pointers to memory the
-//! driver has mapped for DMA (typically `NormalNonCacheable` for
-//! emmc2 ADMA, or `Normal` for virtio rings on coherent hardware).
-//! They provide typed volatile read/write, with the bit-pattern
-//! safety contract enforced by the `T: DmaValue` bound from
-//! `lockjaw-types`.
+//! `DmaCell<T>` and `DmaSlice<T, N>` wrap raw pointers to memory
+//! the driver has mapped for DMA (`Normal` Cacheable across the
+//! board post C1 of the cacheable-DMA migration). They provide
+//! typed volatile read/write, with the bit-pattern safety contract
+//! enforced by the `T: DmaValue` bound from `lockjaw-types`.
 //!
 //! # Scope of the abstraction (read before adding fields)
 //!
 //! - Provides typed *volatile* access to memory shared between CPU
 //!   and device DMA.
-//! - Does **NOT** model cache coherency. Each `DmaCell` / `DmaSlice`
-//!   must be backed by a page whose mapping attribute matches the
-//!   intended access pattern:
-//!   - `NormalNonCacheable` (emmc2 ADMA buffers via the DMA pool) —
-//!     device sees what CPU writes immediately; no cache maintenance
-//!     needed.
-//!   - `Normal` (virtio rings, virtio-blk request header, ramfb
-//!     fw_cfg DMA scratch) — device-coherent on the hardware Lockjaw
-//!     runs on; relies on hardware coherency, no explicit cache flush.
+//! - Does **NOT** automatically maintain cache coherency. Each
+//!   `DmaCell` / `DmaSlice` must be backed by a page whose mapping
+//!   attribute matches the intended access pattern:
+//!   - `Normal` (Cacheable Inner+Outer WB) — used by every DMA
+//!     consumer today. The driver is responsible for issuing
+//!     `sys_dma_sync_for_cpu` / `sys_dma_sync_for_device` at
+//!     handoff points (see `lockjaw_userlib::dma_sync`). On
+//!     coherent DMA buses (QEMU virt) these are no-ops; on
+//!     non-coherent buses (BCM2711 emmc2) they perform the
+//!     cache-invalidate / cache-clean that drains the bus and
+//!     makes the data visible to the right side.
 //! - Caller is responsible for: (a) ensuring the mapping attribute
 //!   is appropriate; (b) issuing barriers around publication points
-//!   (via `lockjaw_mmio::barrier::*`); (c) cache maintenance if a
-//!   future driver mixes cacheable CPU access with non-coherent DMA
-//!   (substrate would need `DC_CVAC` / `DC_IVAC` helpers — not yet).
+//!   (via `lockjaw_mmio::barrier::*`); (c) calling the appropriate
+//!   `sys_dma_sync_*` syscall at every device handoff.
 //! - The substrate's claim: "removes the volatile-write/read
 //!   mechanics and pointer arithmetic from drivers" — NOT "DMA is
 //!   correct by construction."
