@@ -39,6 +39,7 @@ use lockjaw_types::sdhci::{
     SDHCI_BLOCK_SIZE, SDHCI_BLOCK_COUNT,
     SDHCI_NORMAL_INT_STATUS, SDHCI_ERROR_INT_STATUS,
     SDHCI_NORMAL_INT_STATUS_ENABLE, SDHCI_ERROR_INT_STATUS_ENABLE,
+    SDHCI_NORMAL_INT_SIGNAL_ENABLE, SDHCI_ERROR_INT_SIGNAL_ENABLE,
     SDHCI_INT_CMD_COMPLETE, SDHCI_INT_DATA_COMPLETE,
     SDHCI_INT_ERROR,
     SDHCI_INT_CMD_TIMEOUT, SDHCI_INT_CMD_CRC,
@@ -474,7 +475,29 @@ pub extern "C" fn _start() -> ! {
         sys_exit();
     }
     let mmio_pageset = PageSetHandle(claim[1]);
+    let irq_intid = claim[2];
     let packed_clock_ref = claim[3];
+    puts("[EMMC2:IRQ] intid=");
+    put_decimal(irq_intid);
+    puts("\n");
+
+    // Bind the SDHCI IRQ as LEVEL-triggered (grafted from
+    // m7-irq-experiment, on top of post-c1 fix-plan B1-B4.1).
+    // BCM2711 DTS declares "interrupts = <GIC_SPI 126
+    // IRQ_TYPE_LEVEL_HIGH>"; the SDHCI controller's INT line stays
+    // asserted until userspace clears NORMAL_INT_STATUS bits via W1C.
+    // Kernel's irq_dispatch masks level intids after delivery; we
+    // re-enable via bound_irq.unmask() after clearing the source.
+    //
+    // bind_irq_level is the framework helper for the page-alloc +
+    // create-notification + bind-IRQ bootstrap — driver source no
+    // longer carries those raw sys_* calls (CLAUDE.md user-mode
+    // driver rule).
+    let bound_irq = match lockjaw_userlib::irq::bind_irq_level(irq_intid) {
+        Ok(b) => b,
+        Err(_) => { puts("emmc2: bind_irq_level FAILED\n"); halt(); }
+    };
+    puts("[EMMC2:IRQ] bound notification (level)\n");
 
     // The DTB binding for bcm2711-emmc2 includes a clocks reference;
     // M0a's parser populated it and the device-manager packed it into
@@ -537,10 +560,25 @@ pub extern "C" fn _start() -> ! {
     // is the bug the M2 v1 instrumentation surfaced: SD_CLK was
     // 400 kHz, neither CMD_COMPLETE nor ERROR ever fired.
     //
-    // We don't enable IRQ *signals* (NORMAL_INT_SIGNAL_ENABLE 0x038
-    // / ERROR_INT_SIGNAL_ENABLE 0x03A) — the driver polls today,
-    // and signal-enable controls whether the GIC line asserts.
-    // M3+ will flip those bits when we wire the IRQ path.
+    // SIGNAL_ENABLE (NORMAL_INT_SIGNAL_ENABLE 0x038 /
+    // ERROR_INT_SIGNAL_ENABLE 0x03A) is intentionally NOT touched
+    // here. STATUS_ENABLE gates whether the controller latches the
+    // bit; SIGNAL_ENABLE gates whether a latched bit asserts the
+    // GIC line. The ID phase (CMD0/8/41/2/3/7) below uses polling
+    // — it reads NORMAL_INT_STATUS directly without going through
+    // the GIC — so STATUS_ENABLE must be on and SIGNAL_ENABLE must
+    // stay off, otherwise the controller would assert the GIC line
+    // before any IRQ binding exists and the kernel would have no
+    // notification to signal.
+    //
+    // After ID phase completes, Emmc2BlockEngine::new (1) clears any
+    // STATUS bits that the ID-phase polling left latched (notably
+    // DATA_COMPLETE from CMD7's R1b busy release, which issue_command
+    // does not W1C) and then (2) flips SIGNAL_ENABLE on for
+    // CMD_COMPLETE / DATA_COMPLETE / ERROR. From that point the
+    // data-path CMD17 in adma2_single_block_read waits on the IRQ
+    // via lockjaw_userlib::irq::BoundIrq::wait_until rather than
+    // polling. See Engine::new for the full sequencing rationale.
     unsafe {
         sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS_ENABLE, 0xFFFF);
         sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS_ENABLE,  0xFFFF);
@@ -1017,7 +1055,7 @@ pub extern "C" fn _start() -> ! {
     // caller-controlled LBAs.
     // -----------------------------------------------------------------------
     let capacity_sectors = capacity_bytes / 512;
-    let engine = match unsafe { Emmc2BlockEngine::new(mmio_va, capacity_sectors) } {
+    let engine = match unsafe { Emmc2BlockEngine::new(mmio_va, capacity_sectors, bound_irq) } {
         Ok(e) => e,
         Err(err) => {
             puts("[EMMC2:BLK] engine init FAILED: ");
@@ -1121,6 +1159,7 @@ unsafe fn adma2_single_block_read(
     desc_ps: PageSetHandle,
     desc_va: u64,
     desc_phys: u64,
+    bound_irq: &mut lockjaw_userlib::irq::BoundIrq,
 ) -> Result<(), Emmc2Error> {
     if buf_phys >= (1u64 << 32) {
         return Err(Emmc2Error::BufferPhysAbove4Gib(buf_phys));
@@ -1184,46 +1223,76 @@ unsafe fn adma2_single_block_read(
     let freq = cntfreq_hz();
     sdhci_write16(mmio_va, SDHCI_COMMAND, cmd17);
 
-    let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
+    // IRQ-driven completion (m7-irq-experiment graft).
+    //
+    // SDHCI is configured LEVEL_HIGH. Each IRQ delivery:
+    //   1. Kernel ACKs+EOIRs in GIC, masks the intid (level-triggered),
+    //      signals our notification (counter += 1).
+    //   2. bound_irq.wait_until wakes the driver and advances the
+    //      threshold by 1 so the next call expects a fresh IRQ.
+    //   3. We read NORMAL_INT_STATUS to see what fired (CMD_COMPLETE,
+    //      DATA_COMPLETE, ERROR — could be one, could be all).
+    //   4. We clear the latched bits (W1C). DEVICE-SPECIFIC; stays
+    //      here. The framework owns the wait/unmask wiring; the
+    //      driver owns its own status-register protocol.
+    //   5. bound_irq.unmask so the GIC re-enables delivery.
+    //
+    // The loop handles both "two separate IRQs" (CMD then DATA arrive
+    // far apart) and "one IRQ with both bits set" (fast transfer where
+    // CMD and DATA latch close together). cmd_complete_seen tracks
+    // whether we've already cleared CMD_COMPLETE so an ERROR mid-data
+    // is reported as DataError, not CmdError.
+    //
+    // Deadline-bounded wait: a wedged IRQ path would hang the block
+    // server forever. BoundIrq::wait_until returns IrqWaitError::Timeout
+    // when the deadline expires; we surface it as
+    // CmdCompleteTimeout / TransferCompleteTimeout exactly like the
+    // original polling shape did. Single 1-second budget covers both
+    // CMD_COMPLETE (typical < 1 ms) and DATA_COMPLETE (typical < 100 ms
+    // for one block).
+    let mut cmd_complete_seen = false;
+    let deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
     loop {
+        if bound_irq.wait_until(deadline).is_err() {
+            return Err(if cmd_complete_seen {
+                Emmc2Error::TransferCompleteTimeout
+            } else {
+                Emmc2Error::CmdCompleteTimeout
+            });
+        }
+
         let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
+
         if status & SDHCI_INT_ERROR != 0 {
             let err_int_status = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
             sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
-                SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
-            return Err(Emmc2Error::CmdError { err_int_status });
+            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, 0xFFFF);
+            let _ = bound_irq.unmask();
+            return Err(if cmd_complete_seen {
+                Emmc2Error::DataError { err_int_status }
+            } else {
+                Emmc2Error::CmdError { err_int_status }
+            });
         }
+
         if status & SDHCI_INT_CMD_COMPLETE != 0 {
             sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
-            break;
+            cmd_complete_seen = true;
         }
-        if monotonic_now() >= cmd_deadline {
-            return Err(Emmc2Error::CmdCompleteTimeout);
-        }
-        core::hint::spin_loop();
-    }
 
-    // M6 used a 100ms TRANSFER_COMPLETE deadline for single-block;
-    // matched here so the function is byte-equivalent.
-    let xfer_deadline = monotonic_now().deadline_in(Nanos::from_millis(100), freq);
-    loop {
-        let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
-        if status & SDHCI_INT_ERROR != 0 {
-            let err_int_status = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
-            sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
-                SDHCI_INT_ERROR | SDHCI_INT_DATA_COMPLETE);
-            return Err(Emmc2Error::DataError { err_int_status });
-        }
         if status & SDHCI_INT_DATA_COMPLETE != 0 {
             sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
+            let _ = bound_irq.unmask();
+            // Fall through to B4.1 DAT_INHIBIT drain below before
+            // returning Ok.
             break;
         }
-        if monotonic_now() >= xfer_deadline {
-            return Err(Emmc2Error::TransferCompleteTimeout);
-        }
-        core::hint::spin_loop();
+
+        // Status had no relevant bits set (spurious wake, or
+        // CMD_COMPLETE alone with DATA still in flight). Unmask the
+        // GIC so the next IRQ can be delivered and loop back to
+        // wait_until — the deadline still bounds total time spent.
+        let _ = bound_irq.unmask();
     }
 
     // B4.1 — post-DATA_COMPLETE DAT_INHIBIT drain.
@@ -1477,15 +1546,28 @@ struct Emmc2BlockEngine {
     desc_phys: u64,
     dma_buffers: [DmaBuf; MAX_DMA_BUFFERS],
     dma_count: usize,
+    /// IRQ-driven completion state (m7-irq-experiment graft).
+    /// Framework-owned: the BoundIrq bundles the notification, the
+    /// hardware INTID, and the threshold counter. Driver code calls
+    /// `wait_until` to block for the next IRQ and `unmask()` to
+    /// re-arm the GIC after clearing the device-side status latch.
+    irq: lockjaw_userlib::irq::BoundIrq,
 }
 
 impl Emmc2BlockEngine {
     /// Allocate the descriptor table page, switch the controller to
-    /// ADMA2-32, return a ready-to-serve engine. Caller still owns
-    /// `mmio_va` and is responsible for keeping the controller
-    /// initialized through enumeration before calling this.
-    unsafe fn new(mmio_va: u64, capacity_sectors: u64)
-        -> Result<Self, Emmc2Error>
+    /// ADMA2-32, enable NORMAL/ERROR_INT_SIGNAL_ENABLE for the IRQ
+    /// path, return a ready-to-serve engine. Caller still owns
+    /// `mmio_va` and the IRQ notification handle, and is responsible
+    /// for keeping the controller initialized through enumeration
+    /// before calling this. Signal-enables are turned on HERE (not
+    /// at boot) so the ID-phase polling path in `issue_command`
+    /// continues to work without IRQ interference.
+    unsafe fn new(
+        mmio_va: u64,
+        capacity_sectors: u64,
+        irq: lockjaw_userlib::irq::BoundIrq,
+    ) -> Result<Self, Emmc2Error>
     {
         // Descriptor table: 1 page from the DMA pool. Post-C1 of
         // the cacheable-DMA migration this is mapped Normal
@@ -1510,6 +1592,46 @@ impl Emmc2BlockEngine {
         // Program the descriptor table address once; the same table
         // is reused across every transfer.
         sdhci_write32(mmio_va, SDHCI_ADMA_ADDRESS, desc_phys as u32);
+        // Clear any latched STATUS bits before enabling signaling.
+        //
+        // ID-phase polling can leave NORMAL_INT_STATUS bits set —
+        // notably DATA_COMPLETE after CMD7 (RESP_SHORT_BUSY / R1b):
+        // the card holds DAT0 busy while it transitions to the
+        // selected state, and the release latches DATA_COMPLETE.
+        // issue_command's W1C only clears CMD_COMPLETE; the
+        // subsequent PRESENT_STATE.DAT_INHIBIT poll waits for the
+        // busy release but does not touch NORMAL_INT_STATUS.
+        //
+        // Per SDHCI v3 §2.2.24, the GIC line is asserted whenever
+        // (STATUS_ENABLE & SIGNAL_ENABLE & STATUS) is non-zero —
+        // combinatorial, no edge detection. So if SIGNAL_ENABLE is
+        // flipped on with STATUS.DATA_COMPLETE still latched, the
+        // controller asserts the GIC line IMMEDIATELY, the kernel
+        // takes the IRQ + masks the SPI + signals the notification,
+        // and BoundIrq.threshold (= 1 after bind) is satisfied
+        // before CMD17 has even been issued. The first wait_until
+        // returns instantly with stale STATUS, the driver "succeeds"
+        // on a transfer that never happened, and the buffer reads
+        // garbage.
+        //
+        // Clearing STATUS via W1C-0xFFFF here is the structural fix
+        // — it's a superset of B4.2's per-command stale-bit guard,
+        // but at this specific site it's REQUIRED to make the
+        // ID-phase → data-phase IRQ-mode transition safe.
+        sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, 0xFFFF);
+        sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+
+        // Enable IRQ signaling for the data path (m7-irq-experiment
+        // graft). NORMAL/ERROR_INT_STATUS_ENABLE was already set at
+        // boot (in _start); SIGNAL_ENABLE gates whether a latched
+        // STATUS bit asserts the GIC line. We only turn it on AFTER
+        // the ID phase (issue_command keeps polling — no signal
+        // enable during ID = no IRQ overlap during enumeration).
+        let normal_sig = SDHCI_INT_CMD_COMPLETE
+            | SDHCI_INT_DATA_COMPLETE
+            | SDHCI_INT_ERROR;
+        sdhci_write16(mmio_va, SDHCI_NORMAL_INT_SIGNAL_ENABLE, normal_sig);
+        sdhci_write16(mmio_va, SDHCI_ERROR_INT_SIGNAL_ENABLE, 0xFFFF);
         Ok(Self {
             mmio_va,
             capacity_sectors,
@@ -1518,6 +1640,7 @@ impl Emmc2BlockEngine {
             desc_phys,
             dma_buffers: [DMA_BUF_EMPTY; MAX_DMA_BUFFERS],
             dma_count: 0,
+            irq,
         })
     }
 
@@ -1627,6 +1750,7 @@ impl BlockEngine for Emmc2BlockEngine {
                 adma2_single_block_read(
                     self.mmio_va, sector + i, buf_sector_pa,
                     self.desc_ps, self.desc_va, self.desc_phys,
+                    &mut self.irq,
                 )
             };
             if let Err(err) = res {
