@@ -56,19 +56,55 @@ impl KernelStackBase {
 }
 
 // ---------------------------------------------------------------------------
-// SavedContext — callee-saved register frame
+// SavedContext — full thread register frame swapped by context_switch
 // ---------------------------------------------------------------------------
 
-/// Callee-saved register frame pushed/popped by context_switch.
+/// Full thread register frame pushed/popped by context_switch.
 /// Layout must match the stp/ldp pairs in the assembly.
-#[repr(C)]
+///
+/// Includes user-mode NEON state. Preemption is asynchronous (a timer
+/// IRQ can land at any user-mode instruction with any SIMD register
+/// live), so the scheduler must preserve the entire architectural V
+/// register file v0-v31 plus FPCR/FPSR — AAPCS64 caller/callee-saved
+/// discipline does not apply at a preempt boundary, only at an
+/// explicit function-call boundary. See docs/post-c1-fix-plan.md B1.1
+/// for the path-walk that proves saving only v8-v15 leaves the bug.
+///
+/// Field order is constrained by the AArch64 load/store-pair encoding:
+/// `ldp/stp` for 64-bit GPRs uses a signed 7-bit immediate scaled by 8
+/// (range ±504 bytes). FPCR/FPSR therefore sit at offsets 96/104 —
+/// adjacent to the GPRs — so a single `stp xN, xM, [sp, #96]` writes
+/// both. Putting them after vregs (at offset 608) would push them out
+/// of the x-form's reach and force a temp-register dance. VREGs sit
+/// last because the q-form has the wider ±1008-byte range and so
+/// tolerates the larger offsets that the layout produces.
+///
+/// `#[repr(C, align(16))]` is load-bearing: the q-form `stp/ldp` for
+/// 128-bit Q registers requires 16-byte alignment of the effective
+/// address (alignment fault regardless of `SCTLR_EL1.A`). The TCB
+/// allocation that backs this struct is page-aligned and the struct
+/// size is 624 = 39 × 16, so the bootstrap `saved_sp =
+/// stack_top - size_of::<SavedContext>()` lands on a 16-byte boundary
+/// — but the explicit alignment attribute makes the invariant
+/// structurally true rather than coincidentally true.
+#[repr(C, align(16))]
 pub struct SavedContext {
+    // ----- Offset 0..95: callee-saved GPRs (12 × 8 = 96 bytes) -----
     pub x19: u64, pub x20: u64,
     pub x21: u64, pub x22: u64,
     pub x23: u64, pub x24: u64,
     pub x25: u64, pub x26: u64,
     pub x27: u64, pub x28: u64,
     pub x29: u64, pub lr: u64,
+    // ----- Offset 96..111: FP control + status (2 × 8 = 16 bytes) -----
+    // Architecturally 64-bit registers; only the low 32 bits have
+    // defined fields (Linux uses u32 for the same reason). u64 here
+    // matches mrs/msr semantics one-to-one and stays in the x-form
+    // ldp/stp immediate range — see struct doc.
+    pub fpcr: u64,
+    pub fpsr: u64,
+    // ----- Offset 112..623: V register file (32 × 16 = 512 bytes) -----
+    pub vregs: [u128; 32],
 }
 
 // Compile-time assertions tying struct layout to the assembly offsets.
@@ -79,7 +115,13 @@ const _: () = {
     assert!(core::mem::offset_of!(SavedContext, x20) == 1 * 8);
     assert!(core::mem::offset_of!(SavedContext, x29) == 10 * 8);
     assert!(core::mem::offset_of!(SavedContext, lr) == 11 * 8);
-    assert!(core::mem::size_of::<SavedContext>() == 12 * 8);
+    assert!(core::mem::offset_of!(SavedContext, fpcr) == 96);
+    assert!(core::mem::offset_of!(SavedContext, fpsr) == 104);
+    assert!(core::mem::offset_of!(SavedContext, vregs) == 112);
+    assert!(core::mem::size_of::<SavedContext>() == 624);
+    // q-form stp/ldp requires a 16-byte-aligned effective address;
+    // enforce structurally so the asm never traps on alignment.
+    assert!(core::mem::align_of::<SavedContext>() >= 16);
 };
 
 // ---------------------------------------------------------------------------
@@ -114,6 +156,12 @@ impl ThreadBootstrap {
                 lr: thread_entry_addr,
                 x20: 0, x21: 0, x22: 0, x23: 0, x24: 0,
                 x25: 0, x26: 0, x27: 0, x28: 0, x29: 0,
+                // Fresh thread starts with NEON cleared. FPCR=0 is the
+                // architectural default (RN rounding, no traps, no
+                // exceptions); FPSR=0 clears all sticky exception flags.
+                fpcr: 0,
+                fpsr: 0,
+                vregs: [0; 32],
             },
             saved_sp,
         }
@@ -272,8 +320,19 @@ mod tests {
     // --- SavedContext layout (assembly ABI contract) ---
 
     #[test]
-    fn saved_context_size_is_96_bytes() {
-        assert_eq!(core::mem::size_of::<SavedContext>(), 96);
+    fn saved_context_size_is_624_bytes() {
+        // WHY: 12 GPRs (96) + FPCR (8) + FPSR (8) + 32 V regs (512)
+        // = 624 = 39 × 16, which keeps saved_sp 16-byte aligned and
+        // satisfies the q-form stp/ldp alignment requirement.
+        assert_eq!(core::mem::size_of::<SavedContext>(), 624);
+    }
+
+    #[test]
+    fn saved_context_alignment_is_at_least_16() {
+        // WHY: context_switch's `stp q.., q.., [sp, #N]` traps on
+        // misaligned access regardless of SCTLR_EL1.A. The struct's
+        // explicit align(16) guarantees this end-to-end.
+        assert!(core::mem::align_of::<SavedContext>() >= 16);
     }
 
     #[test]
@@ -287,6 +346,29 @@ mod tests {
         // WHY: context_switch assembly stores x30 (lr) at [sp, #(10 * 8)]
         // and restores it before ret — lr determines where the thread resumes
         assert_eq!(core::mem::offset_of!(SavedContext, lr), 88);
+    }
+
+    #[test]
+    fn saved_context_fpcr_at_offset_96() {
+        // WHY: context_switch stores FPCR via `stp xN, xM, [sp, #96]`
+        // (paired with FPSR at +8). The 7-bit scaled-by-8 ldp/stp
+        // x-form encodes ±504 byte offsets — placing FPCR adjacent
+        // to the GPRs keeps it inside that window.
+        assert_eq!(core::mem::offset_of!(SavedContext, fpcr), 96);
+    }
+
+    #[test]
+    fn saved_context_fpsr_at_offset_104() {
+        assert_eq!(core::mem::offset_of!(SavedContext, fpsr), 104);
+    }
+
+    #[test]
+    fn saved_context_vregs_at_offset_112() {
+        // WHY: context_switch stores v0..v31 starting at offset 112
+        // using 16 paired `stp q.., q.., [sp, #(112 + i*32)]`. Last
+        // pair (v30,v31) lands at offset 592 — inside the q-form's
+        // ±1008 byte immediate window.
+        assert_eq!(core::mem::offset_of!(SavedContext, vregs), 112);
     }
 
     // --- ThreadBootstrap (new thread frame) ---
@@ -314,10 +396,27 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_saved_sp_is_stack_top_minus_96() {
+    fn bootstrap_zeroes_neon_state() {
+        // WHY: a fresh thread must start with FPCR=0 (architectural
+        // default rounding+exception config) and FPSR=0 (no sticky
+        // flags). v0..v31 also zeroed so the thread observes a clean
+        // SIMD slate on first dispatch.
+        let boot = ThreadBootstrap::new(0xAAAA, 0xBBBB, 0x1_0000);
+        assert_eq!(boot.saved_context.fpcr, 0);
+        assert_eq!(boot.saved_context.fpsr, 0);
+        for (i, v) in boot.saved_context.vregs.iter().enumerate() {
+            assert_eq!(*v, 0, "v{i} should be zero at bootstrap");
+        }
+    }
+
+    #[test]
+    fn bootstrap_saved_sp_is_stack_top_minus_624() {
         let stack_top = 0x1_0000u64;
         let boot = ThreadBootstrap::new(0, 0, stack_top);
-        assert_eq!(boot.saved_sp, stack_top - 96);
+        assert_eq!(boot.saved_sp, stack_top - 624);
+        // And the result is 16-byte aligned, so the q-form stp/ldp
+        // in context_switch encounters an aligned effective address.
+        assert_eq!(boot.saved_sp % 16, 0);
     }
 
     // --- Tcb layout ---

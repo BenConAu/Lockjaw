@@ -63,10 +63,12 @@
 "__vec_fiq" = 288
 "__vec_serror" = 288
 "__vec_sync_lower" = 288
-# context_switch: sub sp, sp, #(12 * 8) = 96 bytes for SavedContext
-# (callee-saved x19–x30). Switches stacks mid-function; the 96 bytes
-# remain allocated on the old thread's stack.
-"context_switch" = 96
+# context_switch: sub sp, sp, #624 for SavedContext = 12 callee-saved
+# GPRs (x19–x30, 96 B) + FPCR/FPSR (16 B) + v0..v31 (32 × 16 = 512 B).
+# 624 = 39 × 16 keeps SP 16-aligned for the q-form stp/ldp. Switches
+# stacks mid-function; the 624 bytes remain allocated on the old
+# thread's stack until that thread is next dispatched.
+"context_switch" = 624
 # thread_entry: trampoline that calls blr x19. No stack allocation.
 "thread_entry" = 0
 # _start: sets SP from linker symbol, no frame allocation.

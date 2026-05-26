@@ -35,6 +35,7 @@ fn main() {
         Some("check-vtables") => check_vtables(),
         Some("check-init-size") => check_init_size(),
         Some("check-linker-symbols") => check_linker_symbols(),
+        Some("check-kernel-no-neon") => check_kernel_no_neon(),
         Some("gen-regs") => {
             let check = rest.iter().any(|a| a == "--check");
             gen_regs::run(check);
@@ -51,6 +52,7 @@ fn main() {
             eprintln!("  check-vtables          Scan data sections for absolute code pointers");
             eprintln!("  check-init-size        Verify init ELF fits in kernel mapping buffer");
             eprintln!("  check-linker-symbols   Enforce docs/linker-symbol-audit.md allowlist");
+            eprintln!("  check-kernel-no-neon   Verify kernel binary emits no NEON/FP instructions");
             eprintln!("  gen-regs [--check]     Generate lockjaw-regs from user/regspecs/*.toml");
             eprintln!("  gen-wires [--check]    Generate lockjaw-types::wire from user/wirespecs/*.toml");
             process::exit(1);
@@ -1543,6 +1545,304 @@ fn check_linker_symbols() {
     eprintln!("for any new linker-symbol-to-integer site, classified as");
     eprintln!("VA-image / PA / PA-prepivot-static / DISPLAY.");
     process::exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// check-kernel-no-neon — kernel binary is provably NEON/FP-instruction-free
+// ---------------------------------------------------------------------------
+//
+// The B1.1 user-mode NEON save/restore in context_switch rests on the
+// invariant that the kernel handler doesn't touch NEON between
+// SAVE_REGS and context_switch — so the user thread's v0..v31 state
+// in hardware is unchanged when context_switch reads it. The
+// aarch64-unknown-none-softfloat target prevents rustc from emitting
+// NEON, but inline asm could in principle reintroduce it. This check
+// disassembles the kernel ELF and fails if it sees any NEON/FP
+// register reference.
+
+fn check_kernel_no_neon() {
+    println!("=== Kernel-binary NEON-free check ===");
+    println!("  invariant: context_switch's user-NEON save/restore");
+    println!("  relies on the kernel emitting zero NEON/FP instructions");
+    println!("  between SAVE_REGS and context_switch (soft-float target).");
+    println!();
+
+    // Build kernel first (release — same artefact ships to Pi).
+    println!("Building kernel (release)...");
+    let status = Command::new("cargo")
+        .args(["build", "--release"])
+        .status()
+        .expect("failed to run cargo build --release");
+    if !status.success() {
+        eprintln!("FAIL: cargo build --release failed");
+        process::exit(1);
+    }
+    println!();
+
+    // Use rust-objdump (ships with rustup, matches target triple).
+    ensure_tool("rust-objdump", "rustup component add llvm-tools-preview");
+
+    let out = Command::new("rust-objdump")
+        .args(["-d", KERNEL_ELF_RELEASE])
+        .stderr(Stdio::inherit())
+        .output()
+        .expect("failed to run rust-objdump");
+    if !out.status.success() {
+        eprintln!("FAIL: rust-objdump exited non-zero");
+        process::exit(1);
+    }
+    let disasm = String::from_utf8_lossy(&out.stdout);
+
+    // Walk lines, flag any instruction operand referencing NEON/FP
+    // registers. Conservative patterns:
+    //   " v<N>."  — V register with lane spec ("v0.4s", "v17.16b")
+    //   " q<N>,"  — Q register operand ("stp q0, q1, ...")
+    //   " d<N>,"  — D register operand ("ldr d2, [x0]")
+    //   " s<N>,"  — S register operand ("fadd s0, s1, s2")
+    // Each pattern needs a leading space so it matches operands, not
+    // hex bytes or addresses.
+    //
+    // The `context_switch` function is the one approved exception:
+    // it explicitly spills and reloads the user thread's v0..v31 /
+    // FPCR / FPSR across a stack swap. Those instructions are the
+    // ENTIRE POINT of B1.1; the check must allow them without
+    // weakening the global "kernel emits no NEON" invariant — so we
+    // gate by function name (not by instruction shape).
+    const ALLOWED_FUNCTION: &str = "<context_switch>:";
+    let mut offenders: Vec<(usize, String)> = Vec::new();
+    let mut in_allowed_fn = false;
+    for (lineno, line) in disasm.lines().enumerate() {
+        // Function header line: "<funcname>:" at end of line. Update
+        // the in_allowed_fn flag and move on.
+        if line.ends_with(':') && line.contains('<') && line.contains('>') {
+            in_allowed_fn = line.ends_with(ALLOWED_FUNCTION);
+            continue;
+        }
+        // Skip header / file lines that aren't instruction listings.
+        // Instruction lines have form: "   <hex>: <bytes> <mnem> <ops>"
+        // — easiest filter is "must contain a tab" (objdump format).
+        if !line.contains('\t') {
+            continue;
+        }
+        if in_allowed_fn {
+            continue;
+        }
+        if line_has_neon_reference(line) {
+            offenders.push((lineno + 1, line.to_string()));
+            if offenders.len() >= 20 {
+                break;
+            }
+        }
+    }
+
+    if offenders.is_empty() {
+        println!("=== Kernel-binary NEON-free check PASSED ===");
+        return;
+    }
+
+    eprintln!("=== Kernel-binary NEON-free check FAILED ===");
+    eprintln!();
+    eprintln!("Found {} instruction(s) referencing NEON/FP registers", offenders.len());
+    eprintln!("(showing first {}):", offenders.len().min(20));
+    for (n, l) in &offenders {
+        eprintln!("  L{}: {}", n, l.trim());
+    }
+    eprintln!();
+    eprintln!("If a kernel feature genuinely needs FP/SIMD, either move it");
+    eprintln!("to a user-mode server (microkernel-coherent choice) or extend");
+    eprintln!("SAVE_REGS/RESTORE_REGS and switch the target back. The current");
+    eprintln!("design choice (commit e52450c + docs/post-c1-fix-plan.md B1.1)");
+    eprintln!("is no kernel FP/SIMD.");
+    process::exit(1);
+}
+
+/// True if an objdump line shows an instruction operand referring to a
+/// NEON / FP register (V/Q/D/S forms). Conservative: prefers false
+/// positives (false alarm, easy to investigate) over false negatives
+/// (the silent corruption B1.1 closes).
+fn line_has_neon_reference(line: &str) -> bool {
+    // Scan only the mnemonic + operand portion of the line — everything
+    // AFTER the first tab in objdump's `addr: bytes <tab> mnem ops`
+    // format. The bytes column can contain hex tokens (e.g. d5384240,
+    // d12345 from word-broken sections, literal pools) whose substring
+    // shape would otherwise alias register references. Restricting the
+    // scan to post-tab content makes the matcher's domain "decoded
+    // instruction text" rather than "anything on the line."
+    let scan_region = match line.find('\t') {
+        Some(t) => &line[t + 1..],
+        None => return false,
+    };
+    let bytes = scan_region.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        // Register letter may be preceded by space (subsequent operand)
+        // OR tab (first operand directly after the mnemonic — objdump
+        // prints `ldr\tq0, [x19]` with a tab between `ldr` and `q0`).
+        // i == 0 also counts because the post-tab region starts at the
+        // mnemonic — but real register references after the mnemonic
+        // always have at least one whitespace separator, so the i > 0
+        // guard avoids treating the mnemonic itself as a register
+        // candidate.
+        let preceded_by_ws = i > 0 && matches!(bytes[i - 1], b' ' | b'\t');
+        if !preceded_by_ws {
+            i += 1;
+            continue;
+        }
+        let c = bytes[i];
+        if !matches!(c, b'v' | b'q' | b'd' | b's') {
+            i += 1;
+            continue;
+        }
+        // Followed by 1 or 2 digits. Register numbers max at 31
+        // (5 bits), so 1-2 digits exactly. Bounding at ≤ 2 stops
+        // long hex tokens from masquerading as registers — only 'd' is
+        // a hex character so this matters for d, but the bound applies
+        // uniformly for symmetry.
+        let mut j = i + 1;
+        let digit_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_digit() && (j - digit_start) < 2 {
+            j += 1;
+        }
+        if j == digit_start {
+            // No digits — bare letter, not a register name.
+            i += 1;
+            continue;
+        }
+        // Reject if there are MORE digits after the 2-digit cap (a
+        // long token — bytes[j] would still be a digit, meaning we
+        // artificially truncated a longer run).
+        if j < bytes.len() && bytes[j].is_ascii_digit() {
+            i = j;
+            continue;
+        }
+        // Suffix telling us this is really a register reference:
+        //   v form ends with '.'  (lane spec: v0.4s, v17.16b)
+        //   q/d/s form ends with ',' (operand separator), ']' (in
+        //   addressing-mode tail), or whitespace before another arg.
+        if j >= bytes.len() {
+            i += 1;
+            continue;
+        }
+        let suffix = bytes[j];
+        let is_neon = match c {
+            b'v' => suffix == b'.',
+            b'q' | b'd' | b's' => matches!(suffix, b',' | b']' | b'\t' | b' '),
+            _ => false,
+        };
+        if is_neon {
+            return true;
+        }
+        i = j;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Synthetic objdump-shaped lines: address ':' bytes <tab> mnem [<tab> ops].
+    // Positive controls cover the operand shapes most likely to appear
+    // in inline asm — single-operand q-form loads (the original blind
+    // spot), GPR↔NEON moves, lane-spec V refs, and the multi-operand
+    // q-pair shape that already worked. Negative controls cover
+    // ordinary GPR code and the hex-byte column.
+
+    #[test]
+    fn neon_scan_detects_first_operand_q_form() {
+        // ldr q0 — the case the original space-only matcher missed.
+        assert!(line_has_neon_reference(
+            "ffff008000018f64: 3dc00270 \tldr\tq0, [x19]"
+        ));
+    }
+
+    #[test]
+    fn neon_scan_detects_first_operand_str_q() {
+        assert!(line_has_neon_reference(
+            "ffff008000018f64: 3d800270 \tstr\tq3, [x19]"
+        ));
+    }
+
+    #[test]
+    fn neon_scan_detects_first_operand_fmov_d() {
+        // GPR→NEON: fmov d0, x1.
+        assert!(line_has_neon_reference(
+            "ffff008000018f64: 9e670020 \tfmov\td0, x1"
+        ));
+    }
+
+    #[test]
+    fn neon_scan_detects_first_operand_dup_v_lane() {
+        // dup v6.2d, x3 — first-operand v-form with lane spec.
+        assert!(line_has_neon_reference(
+            "ffff008000018f64: 4e080066 \tdup\tv6.2d, x3"
+        ));
+    }
+
+    #[test]
+    fn neon_scan_detects_movi_v_immediate() {
+        assert!(line_has_neon_reference(
+            "ffff008000018f64: 4f000400 \tmovi\tv0.16b, #0"
+        ));
+    }
+
+    #[test]
+    fn neon_scan_detects_stp_q_pair() {
+        // Two NEON operands — the original matcher already caught the
+        // second one; this confirms the rewrite doesn't regress.
+        assert!(line_has_neon_reference(
+            "ffff008000018f64: ad0387e0 \tstp\tq0, q1, [sp, #112]"
+        ));
+    }
+
+    #[test]
+    fn neon_scan_detects_v_form_lane_in_operand_list() {
+        assert!(line_has_neon_reference(
+            "ffff008000018f64: 0e205800 \tcnt\tv0.8b, v0.8b"
+        ));
+    }
+
+    #[test]
+    fn neon_scan_ignores_plain_gpr_mov() {
+        assert!(!line_has_neon_reference(
+            "ffff008000018f64: aa1f03e0 \tmov\tx0, xzr"
+        ));
+    }
+
+    #[test]
+    fn neon_scan_ignores_compare_immediate() {
+        assert!(!line_has_neon_reference(
+            "ffff008000018f64: f100041f \tcmp\tx0, #0x2"
+        ));
+    }
+
+    #[test]
+    fn neon_scan_ignores_d_starting_hex_byte_in_pre_tab_region() {
+        // d5384240 in the encoding column would have aliased d<N>
+        // under a whole-line scanner. The post-tab restriction skips it.
+        assert!(!line_has_neon_reference(
+            "ffff008000000014: d5384240 \tmrs\tx0, CurrentEL"
+        ));
+    }
+
+    #[test]
+    fn neon_scan_ignores_branch_with_condition() {
+        // b.eq target — `.eq` could look like a v-form lane spec but
+        // the letter isn't v.
+        assert!(!line_has_neon_reference(
+            "ffff008000018f64: 54000000 \tb.eq\t0xffff008000018f70"
+        ));
+    }
+
+    #[test]
+    fn neon_scan_handles_no_tab_lines() {
+        // Section header / disassembly preamble — must not panic and
+        // must not flag.
+        assert!(!line_has_neon_reference(
+            "Disassembly of section .text:"
+        ));
+        assert!(!line_has_neon_reference(""));
+    }
 }
 
 /// True if a line takes the address of something that resolves to a
