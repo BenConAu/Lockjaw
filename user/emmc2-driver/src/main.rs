@@ -343,6 +343,16 @@ enum Emmc2Error {
     CmdCompleteTimeout,
     /// TRANSFER_COMPLETE never arrived within the 100ms deadline.
     TransferCompleteTimeout,
+    /// PRESENT_STATE.DAT_INHIBIT did not clear within 10 ms after
+    /// DATA_COMPLETE fired (B4.1). The DATA_COMPLETE interrupt
+    /// signals card-side transfer end, but PRESENT_STATE.DAT_INHIBIT
+    /// is the controller's own "data path genuinely idle / writes
+    /// drained" signal. Polling it after DATA_COMPLETE is what makes
+    /// a standalone single-block read produce committed DRAM by the
+    /// time it returns — without it, isolated reads (e.g. the
+    /// emmc2 selftest) can race ahead of the controller's outbound
+    /// AXI writes.
+    DatInhibitStuck { present_state: u32 },
     /// sys_alloc_dma_pages for the descriptor table failed.
     DescAllocFailed,
     /// sys_query_pageset_phys for the descriptor table failed.
@@ -371,6 +381,7 @@ impl Emmc2Error {
             Self::DataError { .. }             => "data phase error",
             Self::CmdCompleteTimeout           => "cmd_complete timeout",
             Self::TransferCompleteTimeout      => "transfer_complete timeout",
+            Self::DatInhibitStuck { .. }       => "dat_inhibit stuck post-completion",
             Self::DescAllocFailed              => "desc alloc failed",
             Self::DescPhysQueryFailed          => "desc phys query failed",
             Self::DescVaExhausted              => "desc VA exhausted",
@@ -394,7 +405,8 @@ fn put_emmc2_error(err: &Emmc2Error) {
             puts(" len=");
             put_decimal(*len as u64);
         }
-        Emmc2Error::InhibitStuck { present_state } => {
+        Emmc2Error::InhibitStuck { present_state }
+        | Emmc2Error::DatInhibitStuck { present_state } => {
             puts(" present_state=");
             put_hex(*present_state as u64);
         }
@@ -1213,6 +1225,46 @@ unsafe fn adma2_single_block_read(
         }
         core::hint::spin_loop();
     }
+
+    // B4.1 — post-DATA_COMPLETE DAT_INHIBIT drain.
+    //
+    // DATA_COMPLETE signals card-side transfer end, but the BCM2711
+    // Arasan controller can keep outbound AXI writes in flight to
+    // DRAM for a tail period after asserting it. The CPU's
+    // sys_dma_sync_for_cpu (`dc civac` + `dsb sy`) only orders
+    // CPU-cache operations; it does not arbitrate against the
+    // controller's outstanding bus writes. Returning Ok before
+    // those writes have committed lets the caller (e.g. emmc2
+    // selftest) read the buffer and see pre-DMA zeros.
+    //
+    // PRESENT_STATE.DAT_INHIBIT is the controller's own "data
+    // path genuinely idle" bit: it stays set while the data path
+    // has any outstanding activity — including the post-DATA_COMPLETE
+    // AXI write tail. Polling it here forces the read call to wait
+    // for the controller to actually drain.
+    //
+    // Pre-B4.1 history: the existing pre-command CMD_INHIBIT |
+    // DAT_INHIBIT poll at the top of this function (kept in place
+    // as defensive double-coverage) implicitly drained the PREVIOUS
+    // transfer on every subsequent read — which is why long FAT32
+    // / posix read chains worked while the standalone selftest
+    // failed. M7-era diagnostic dumps that "fixed" the selftest
+    // worked for the same reason: their MMIO reads serialised
+    // against the controller's outstanding writes. This is the
+    // principled replacement.
+    //
+    // 10 ms deadline matches the plan's B4.1 budget; the actual
+    // drain is microseconds in normal operation.
+    if poll_until_clear_32(
+        mmio_va, SDHCI_PRESENT_STATE,
+        SDHCI_DAT_INHIBIT,
+        Nanos::from_millis(10),
+    ).is_err() {
+        return Err(Emmc2Error::DatInhibitStuck {
+            present_state: sdhci_read32(mmio_va, SDHCI_PRESENT_STATE),
+        });
+    }
+
     Ok(())
 }
 
