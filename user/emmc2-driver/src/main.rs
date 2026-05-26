@@ -1541,6 +1541,24 @@ impl BlockEngine for Emmc2BlockEngine {
         {
             return Err(BlockError::InvalidParameter);
         }
+        // B2.2 (docs/post-c1-fix-plan.md): clean any pre-DMA dirty
+        // cache lines in the destination buffer to DRAM BEFORE the
+        // controller writes it. Without this, lines dirtied by an
+        // earlier CPU write to the same buffer (e.g. the selftest's
+        // pre-DMA `ptr::write_bytes(.., 0, ..)`, or a previous read's
+        // partial overwrite) can later be written back over the
+        // device's DMA-deposited bytes, leaving the post-DMA
+        // sys_dma_sync_for_cpu (below) returning stale zeros. This is
+        // the load-bearing fix for the C1 Pi-flash `0xAA55` gate;
+        // B2.1's kernel `dc civac` upgrade alone cannot recover
+        // dirty-pre-DMA lines (the writeback step would overwrite
+        // the device bytes). Mirrors Linux's
+        // `dma_map_single(DMA_FROM_DEVICE)` contract.
+        let sync_bytes = count * 512;
+        if !sys_dma_sync_for_device(buffer, 0, sync_bytes).is_ok() {
+            puts("[EMMC2:READ] sync_for_device FAILED\n");
+            return Err(BlockError::IoError);
+        }
         // Reads always use CMD17 (single-block). Multi-sector reads
         // loop one block at a time, advancing buf.pa by 512 bytes per
         // sector. The CMD18+Auto-CMD23 path in adma2_transfer is dead
@@ -1591,7 +1609,7 @@ impl BlockEngine for Emmc2BlockEngine {
         // Sync at engine level (after the inner loop) rather than
         // per-iteration because no caller code touches the buffer
         // between iterations; one sync covers count*512 bytes.
-        let sync_bytes = count * 512;
+        // sync_bytes computed once at the top of the function.
         if !sys_dma_sync_for_cpu(buffer, 0, sync_bytes).is_ok() {
             puts("[EMMC2:READ] sync_for_cpu FAILED\n");
             return Err(BlockError::IoError);
