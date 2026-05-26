@@ -319,6 +319,111 @@ pub fn standard_driver_init<T: 'static>(
 }
 
 // ---------------------------------------------------------------------------
+// Tier B (level-IRQ variant) — LevelDriverCtx + standard_driver_init_level.
+//
+// Mirror of `DriverCtx` + `standard_driver_init`, but the IRQ binding
+// uses `lockjaw_userlib::irq::bind_irq_level` instead of `bind_irq`
+// with `IRQ_FLAG_EDGE`. The resulting ctx carries a rich `BoundIrq`
+// (notif + intid + threshold + `wait_until` + `unmask` methods) rather
+// than the edge-shape `notif + initial_threshold` triple — the
+// level-IRQ idiom needs the typed wait/unmask helpers because every
+// IRQ delivery requires a paired source-clear + kernel unmask round
+// trip (the GIC line stays asserted until the device's status latch
+// clears).
+//
+// Added in P9.4b for emmc2 (BCM2711 SDHCI, INTID 158, IRQ_TYPE_LEVEL_HIGH).
+// The two ctx structs share every non-IRQ field; future refactor can
+// lift the common shape into a generic if a second level-IRQ driver
+// shows up.
+// ---------------------------------------------------------------------------
+
+/// Public driver-facing surface produced by
+/// `standard_driver_init_level`. Same shape as `DriverCtx` except
+/// the IRQ surface is a rich `BoundIrq` (with `wait_until` + `unmask`)
+/// instead of the edge-shape (`irq_intid` + `irq_notif` +
+/// `irq_initial_threshold`) triple.
+pub struct LevelDriverCtx<T: 'static> {
+    /// Typed MMIO registers.
+    pub regs: MappedRegs<T>,
+    /// Bound level-triggered IRQ — call `irq.wait_until(deadline)`
+    /// for completion waits and `irq.unmask()` after clearing the
+    /// device-side status latch (W1C). Sourced via
+    /// `lockjaw_userlib::irq::bind_irq_level`.
+    pub irq: crate::irq::BoundIrq,
+    /// Resolved `clocks = <&phandle id>` reference from the device's
+    /// DTB node, or `None` if the node had no `clocks` property
+    /// (P9.4a).
+    pub clock_ref: Option<ClockRef>,
+    /// Server endpoint the driver receives requests on.
+    pub server_ep: EndpointHandle,
+    /// Device-manager endpoint, exposed so drivers can issue
+    /// follow-on operations (clock acquisition, multi-MMIO claims).
+    pub devmgr_ep: EndpointHandle,
+    /// Reply object for outbound IPC.
+    pub reply_obj: ReplyHandle,
+    /// MMIO pageset handle. Crate-private — see `DriverCtx`.
+    #[allow(dead_code)]
+    pub(crate) mmio_pageset: PageSetHandle,
+}
+
+/// Errors `standard_driver_init_level` can produce. Mirrors
+/// `DriverInitError` except `IrqBind` carries `BindIrqError` from
+/// `lockjaw_userlib::irq` instead of the edge-shape `IrqBindError`.
+#[derive(Debug, Clone, Copy)]
+pub enum LevelDriverInitError {
+    /// `driver_bootstrap` failed.
+    Bootstrap(BootstrapError),
+    /// `probe_by_hash` failed.
+    Probe(ProbeError),
+    /// `claim_typed` failed.
+    Claim(ClaimError),
+    /// `bind_irq_level` failed.
+    IrqBind(crate::irq::BindIrqError),
+    /// `init` returned no server endpoint, but the standard shape
+    /// requires one.
+    NoServerEndpoint,
+}
+
+/// Standard "boot → probe → claim → bind LEVEL IRQ → return ctx"
+/// for drivers whose hardware fires LEVEL-triggered interrupts
+/// (e.g. SDHCI v3 on BCM2711). Built from Tier-A pieces;
+/// `bind_irq_level` from `lockjaw_userlib::irq` replaces the edge
+/// `bind_irq(_, IRQ_FLAG_EDGE)` call.
+///
+/// Per-IRQ-delivery handshake (paired by `BoundIrq`'s methods):
+/// 1. `ctx.irq.wait_until(deadline)` blocks until kernel signals.
+/// 2. Driver reads its device's status register, clears the latched
+///    bit via W1C (device-specific — stays in driver source).
+/// 3. `ctx.irq.unmask()` re-arms the GIC distributor so the kernel
+///    can deliver the next IRQ. Required because the kernel masks
+///    the SPI immediately after the previous delivery (a level line
+///    that's still asserted would otherwise re-fire instantly).
+pub fn standard_driver_init_level<T: 'static>(
+    name: &str,
+    compatible_hash: u64,
+) -> Result<LevelDriverCtx<T>, LevelDriverInitError> {
+    let boot = driver_bootstrap().map_err(LevelDriverInitError::Bootstrap)?;
+    puts2(name, ": bootstrapped\n");
+    let server_ep = boot.server_ep.ok_or(LevelDriverInitError::NoServerEndpoint)?;
+    let probe = probe_by_hash(&boot, compatible_hash, 0)
+        .map_err(LevelDriverInitError::Probe)?;
+    let claimed = claim_typed::<T>(boot.devmgr_ep, boot.reply_obj, probe.mmio_addr)
+        .map_err(LevelDriverInitError::Claim)?;
+    let irq = crate::irq::bind_irq_level(claimed.irq_intid as u64)
+        .map_err(LevelDriverInitError::IrqBind)?;
+    puts2(name, ": IRQ bound (level)\n");
+    Ok(LevelDriverCtx {
+        regs: claimed.regs,
+        irq,
+        clock_ref: claimed.clock_ref,
+        server_ep,
+        devmgr_ep: boot.devmgr_ep,
+        reply_obj: boot.reply_obj,
+        mmio_pageset: claimed.mmio_pageset,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tier B (no-IRQ variant) — NoIrqInit + standard_init_no_irq.
 //
 // Mirror of `DriverCtx` + `standard_driver_init`, minus the IRQ-bind
@@ -535,6 +640,39 @@ macro_rules! driver_main {
             $crate::puts(concat!($name, ": starting\n"));
             let ctx: $crate::driver_runtime::DriverCtx<$layout> =
                 match $crate::driver_runtime::standard_driver_init::<$layout>(
+                    $name,
+                    $probe_hash,
+                ) {
+                    Ok(c) => c,
+                    Err(_) => $crate::driver_runtime::boot_puts_and_halt(
+                        concat!($name, ": init failed\n")
+                    ),
+                };
+            $main(ctx)
+        }
+    };
+    // P9.4b: level-IRQ variant. Routes to standard_driver_init_level
+    // (uses bind_irq_level) and hands the user fn a LevelDriverCtx
+    // with a rich BoundIrq (wait_until + unmask) instead of the
+    // edge-shape irq_notif + initial_threshold pair. Distinguished
+    // syntactically by the explicit `level = true,` arm. Edge
+    // drivers keep the existing arm above and are byte-identical.
+    (
+        name = $name:literal,
+        hash = $hash:ident,
+        probe_hash = $probe_hash:expr,
+        layout = $layout:ty,
+        main = $main:ident,
+        level = true $(,)?
+    ) => {
+        $crate::boot_stub! {
+            hash = $hash,
+            main = __lockjaw_driver_entry,
+        }
+        fn __lockjaw_driver_entry() -> ! {
+            $crate::puts(concat!($name, ": starting\n"));
+            let ctx: $crate::driver_runtime::LevelDriverCtx<$layout> =
+                match $crate::driver_runtime::standard_driver_init_level::<$layout>(
                     $name,
                     $probe_hash,
                 ) {
