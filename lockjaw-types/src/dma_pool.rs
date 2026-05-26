@@ -6,11 +6,12 @@
 /// kernel TTBR1 direct map as Cacheable Inner+Outer WB and user
 /// processes map it Cacheable as well (single-attribute invariant
 /// preserved: Cacheable everywhere). Coherence with devices is
-/// maintained via `sys_dma_sync_for_cpu` (`dc ivac` — invalidate
-/// before CPU reads device-written data) and `sys_dma_sync_for_device`
-/// (`dc cvac` — clean before device reads CPU-written data) at
-/// handoff points, mirroring Linux's `dma_sync_for_cpu` /
-/// `dma_sync_for_device` API.
+/// maintained via `sys_dma_sync_for_cpu` (`dc civac` —
+/// clean-and-invalidate before CPU reads device-written data — see
+/// docs/post-c1-fix-plan.md §B2.1 for why civac, not ivac) and
+/// `sys_dma_sync_for_device` (`dc cvac` — clean before device reads
+/// CPU-written data) at handoff points, mirroring Linux's
+/// `dma_sync_for_cpu` / `dma_sync_for_device` API.
 ///
 /// Pre-C1 history: the pool was originally `NormalNonCacheable`
 /// EVERYWHERE (kernel direct map excluded the pool's L2 block; user
@@ -18,8 +19,13 @@
 /// invariant still exists, just with the chosen attribute flipped
 /// to Cacheable. See M6 sub-commit 2a step 2 (commit `10a01e8`) for
 /// the original alias-safety design rationale, and the migration
-/// plan for the Cacheable trade-off (Linux/U-Boot pattern alignment
-/// + AXI-drain via `dc ivac` bus-protocol side effect).
+/// plan for the Cacheable trade-off (Linux/U-Boot pattern alignment).
+/// **Device DMA-write drain is the DEVICE's responsibility**,
+/// signalled by its completion interrupt/status — NOT a CPU-cache
+/// primitive side effect. A pre-B2.1 paragraph here cited "AXI-drain
+/// via `dc ivac` bus-protocol side effect" as the migration's drain
+/// mechanism; that was wrong (see `src/arch/aarch64/cache.rs`
+/// module doc for the corrected explanation).
 ///
 /// **All numerical constants live here**; the kernel module
 /// (`src/cap/dma_pool.rs`) wraps this with a locked singleton and

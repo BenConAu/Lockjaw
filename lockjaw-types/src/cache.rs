@@ -3,7 +3,7 @@
 //! Pure types — no asm, no MMIO, no kernel/userlib coupling. The kernel
 //! side reads `CTR_EL0.DminLine` at boot to confirm the host's actual
 //! data cache line matches `CACHE_LINE_BYTES`; the asm primitives that
-//! actually issue `dc ivac` / `dc cvac` live in `src/arch/aarch64/cache.rs`
+//! actually issue `dc civac` / `dc cvac` live in `src/arch/aarch64/cache.rs`
 //! kernel-side because they require EL1.
 //!
 //! ARMv8 architectural minimum is 16 bytes; the practical floor across

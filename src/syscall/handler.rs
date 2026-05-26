@@ -1324,13 +1324,20 @@ fn sys_query_caller_token() -> u64 {
 /// prior DMA writes visible to subsequent CPU loads on the byte
 /// range `[offset, offset+len)` within `pageset`.
 ///
-/// Internally invalidates the covering cache lines via `dc ivac`
-/// (see docs/cacheable-dma-migration-plan.md for the bus-protocol
-/// rationale — `dc ivac` is outer-shareable and the cache
-/// controller participates in the bus protocol, so pending writes
-/// from coherent masters drain to the PoC before the invalidation
-/// completes — that is the AXI-drain mechanism the migration
-/// relies on).
+/// Internally clean-and-invalidates the covering cache lines via
+/// `dc civac` (B2.1 — see `src/arch/aarch64/cache.rs` module doc
+/// and `docs/post-c1-fix-plan.md` §B2.1 for the rationale; `dc
+/// ivac` was the pre-B2.1 mnemonic but is UNPREDICTABLE on dirty
+/// lines per ARM DDI 0487 §D7.4.2). **The device's DMA write
+/// drain is the device's own responsibility**, signalled by its
+/// completion interrupt/status (e.g. SDHCI's `TRANSFER_COMPLETE`).
+/// Callers MUST observe that completion BEFORE calling
+/// `sys_dma_sync_for_cpu` — this syscall does not wait for the
+/// device, it only updates PE-local cache state. The contract:
+/// "buffer reads back as device bytes after this call" further
+/// requires that the buffer's cache lines were CLEAN of pre-DMA
+/// dirty CPU writes before the device started the DMA (driver
+/// must call `sys_dma_sync_for_device` first — B2.2).
 ///
 /// PageSet must be DmaPool-origin. Buddy-origin and ExternallyOwned
 /// rejected: Buddy-origin Cacheable DMA is a pre-existing
@@ -1412,7 +1419,7 @@ fn dma_sync_common(ctx: &mut ExceptionContext, for_cpu: bool) -> SyscallError {
     // KVA resolution: DmaPool pages are contiguous in PA; first
     // page's PA + KERNEL_VA_OFFSET = direct-map KVA. After C1's
     // mmu change, this region is Cacheable Inner+Outer WB so the
-    // `dc ivac` / `dc cvac` instructions reach valid cache lines.
+    // `dc civac` / `dc cvac` instructions reach valid cache lines.
     let pa_base = match header.get_page(0) {
         Some(pa) => pa,
         // Zero-length syncs may legitimately pass an empty pageset
@@ -1424,9 +1431,18 @@ fn dma_sync_common(ctx: &mut ExceptionContext, for_cpu: bool) -> SyscallError {
 
     if for_cpu {
         // SAFETY: kva_start..+len is a DmaPool direct-map range we
-        // just validated. Invalidation drops dirty CPU lines; the
-        // sync_for_cpu contract is that the device has finished
-        // writing this buffer and the caller has not yet read it.
+        // just validated. Post-B2.1 `invalidate_range` issues
+        // `dc civac` (clean-and-invalidate) — it does NOT drop
+        // dirty lines, it writes them back first. The
+        // `sync_for_cpu` contract: caller has observed the device's
+        // completion (e.g. SDHCI's `TRANSFER_COMPLETE`) so the DMA
+        // bytes are in DRAM, AND the driver kept the buffer free
+        // of pre-DMA dirty CPU writes via a prior
+        // `sys_dma_sync_for_device` call (B2.2). If pre-DMA dirty
+        // lines exist, the clean-phase of `civac` here writes the
+        // stale CPU bytes back over the device's DMA-deposited
+        // bytes — driver bug, not a kernel bug. See cache.rs
+        // module doc for the full contract.
         unsafe { crate::arch::aarch64::cache::invalidate_range(kva_start, len); }
     } else {
         crate::arch::aarch64::cache::clean_range(kva_start, len);
