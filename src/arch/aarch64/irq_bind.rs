@@ -2,9 +2,18 @@ use core::cell::UnsafeCell;
 use lockjaw_types::addr::KernelVa;
 
 /// Maximum number of IRQ-to-Notification bindings.
-/// Must cover UART (INTID 33-40) and virtio-mmio (INTID 48-79).
-/// Known limitation: static table, see docs/tech-debt.md.
-const MAX_BINDINGS: usize = 96;
+///
+/// Must cover QEMU virt's UART (INTID 33-40) and virtio-mmio
+/// (INTID 48-79) AND Pi 4B's higher-numbered SPIs: PL011 = 153,
+/// emmc2 = 158. The pre-B4.3 ceiling of 96 silently rejected Pi
+/// bindings — bind() returned false on Pi IRQ INTIDs but the
+/// polling-only driver stack masked the failure. Raising to 256
+/// covers every SPI in the BCM2711's IRQ space (the GICv2
+/// distributor on Pi 4B reports 256 IRQ lines per the boot log)
+/// and unblocks the m7-irq-experiment merge that wires emmc2 to
+/// IRQ-driven completion. Cost: Option<u64> × 256 = 4 KiB in BSS,
+/// vs the prior 1.5 KiB; well within static budget.
+const MAX_BINDINGS: usize = 256;
 
 // ---------------------------------------------------------------------------
 // IrqBindings singleton
