@@ -89,6 +89,15 @@ static EMMC2_ELF: &[u8] = include_bytes!("../../emmc2-driver/target/aarch64-unkn
 /// against regressions.
 static SLEEP_TEST_ELF: &[u8] = include_bytes!("../../sleep-test/target/aarch64-unknown-none/release/lockjaw-sleep-test");
 
+/// Regression guard for B1.1 (full v0..v31 + FPCR + FPSR save/restore
+/// in context_switch). Loads all 32 V registers with a known pattern,
+/// yields to invite the scheduler to dispatch a sibling user process
+/// (any of the ~14 NEON-on user binaries), then re-reads and asserts
+/// every register survived the round-trip. Prints `[NEON-CANARY] PASS`
+/// (asserted by the QEMU integration tests) on success.
+/// Built by: cd user/neon-canary && cargo build --release
+static NEON_CANARY_ELF: &[u8] = include_bytes!("../../neon-canary/target/aarch64-unknown-none/release/lockjaw-neon-canary");
+
 /// The partition-manager ELF binary, embedded at compile time.
 /// Built by: cd user/partition-manager && cargo build --release
 /// Sits between the raw block server and fat32-server: reads LBA 0,
@@ -462,6 +471,7 @@ pub extern "C" fn _start() -> ! {
     // calls run_block_server on it.
     let emmc2_blk_srv_ep = alloc_endpoint("emmc2 blk srv");
     let sleep_test_boot_ep = alloc_endpoint("sleep-test boot");
+    let neon_canary_boot_ep = alloc_endpoint("neon-canary boot");
     let partmgr_boot_ep = alloc_endpoint("partmgr boot");
     // init owns partition_srv_ep: given to partition-manager (to serve on)
     // and to fat32-server (as its upstream block device). Partition-manager
@@ -524,6 +534,12 @@ pub extern "C" fn _start() -> ! {
     // (sys_wait_any with absolute monotonic deadline). It needs no
     // device handles — bootstrap is a synchronization handshake only.
     spawn_elf(SLEEP_TEST_ELF, "sleep-test", map_array_va, temp_base_va, plan_buf_va, scratch_ps, sleep_test_boot_ep, 1);
+    // neon-canary verifies B1.1's user-mode NEON save/restore in
+    // context_switch. Needs no device handles — bootstrap is a
+    // synchronization handshake only. Spawned alongside sleep-test
+    // because it depends on the steady-state init-spawned siblings
+    // running for preemption pressure.
+    spawn_elf(NEON_CANARY_ELF, "neon-canary", map_array_va, temp_base_va, plan_buf_va, scratch_ps, neon_canary_boot_ep, 1);
 
     // Bootstrap hello: export a test notification into its handle table.
     puts("init: waiting for hello bootstrap...\n");
@@ -793,6 +809,13 @@ pub extern "C" fn _start() -> ! {
     let _ = sys_receive(sleep_test_boot_ep);
     sys_reply(0, 0, 0, 0);
     puts("[BOOTSTRAP] sleep-test\n");
+
+    // Bootstrap neon-canary: same shape — no handles flow; the canary
+    // drives its own load/yield/check loop afterwards.
+    puts("init: waiting for neon-canary bootstrap...\n");
+    let _ = sys_receive(neon_canary_boot_ep);
+    sys_reply(0, 0, 0, 0);
+    puts("[BOOTSTRAP] neon-canary\n");
 
     // Boot complete. Park indefinitely — init has no further work
     // and the kernel cannot let it exit (boot TCB stack is in the

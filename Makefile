@@ -47,6 +47,7 @@ build-user: clean-all build-hash
 	cd user/clock-test && cargo build --release
 	cd user/emmc2-driver && cargo build --release
 	cd user/sleep-test && cargo build --release
+	cd user/neon-canary && cargo build --release
 	cd user/partition-manager && cargo build --release
 	cd user/init && cargo build --release
 

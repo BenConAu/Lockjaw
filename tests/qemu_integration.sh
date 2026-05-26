@@ -160,6 +160,25 @@ assert_contains "\[SLEEP-TEST\] elapsed within tolerance" \
 assert_not_contains "\[SLEEP-TEST\] elapsed OUT OF TOLERANCE" \
     "S4 sleep deadline did not over-shoot or under-shoot"
 
+# B1.2 NEON canary: spawns a second cooperating thread inside one
+# process. Both threads load all 32 V registers with a thread+
+# iteration-tagged pattern, sys_yield (deterministically dispatching
+# the sibling), then re-read and assert every register survived. The
+# two-cooperating-threads setup matters because on QEMU -smp 1 the
+# other init-spawned binaries are blocked on sys_receive during the
+# canary's runtime window — a single-threaded canary's sys_yield
+# would find no other ready thread and never invoke context_switch,
+# passing vacuously. With two ready threads in the canary process,
+# every yield crosses context_switch by construction.
+# Regression guard for B1.1's save/restore of v0..v31 + FPCR + FPSR.
+assert_contains "\[BOOTSTRAP\] neon-canary" "Init-neon-canary bootstrap IPC completed"
+assert_contains "\[NEON-CANARY\] PASS" \
+    "B1.2 context_switch preserves all 32 V regs across two-thread cooperative yields"
+assert_not_contains "\[NEON-CANARY\] FAIL" \
+    "B1.2 no NEON corruption observed across context switches"
+assert_not_contains "\[NEON-CANARY\] MISMATCH" \
+    "B1.2 no per-register pattern mismatch"
+
 echo "Phase 9 — Thread Exit:"
 assert_contains "\[EXIT\] Thread" "Thread cleanup ran (finish_exit)"
 assert_contains "pages freed" "Thread exit freed resources"
