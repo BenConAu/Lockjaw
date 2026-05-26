@@ -40,7 +40,7 @@ use crate::syscall::{
     sys_create_reply, sys_exit, sys_receive, sys_reply, sys_wait_any, IRQ_FLAG_EDGE,
 };
 use lockjaw_mmio::region::MappedRegs;
-use lockjaw_types::device::{CMD_PROBE_DEVICE, PROBE_END, PROBE_OK};
+use lockjaw_types::device::{ClockRef, CMD_PROBE_DEVICE, PROBE_END, PROBE_OK};
 use lockjaw_types::wait::WaitEntry;
 
 // ---------------------------------------------------------------------------
@@ -240,6 +240,12 @@ pub struct DriverCtx<T: 'static> {
     /// Type-level contract (was a hard-coded `1` with an inline doc
     /// comment in driver code).
     pub irq_initial_threshold: u64,
+    /// Resolved `clocks = <&phandle id>` reference from the device's
+    /// DTB node, or `None` if the node had no `clocks` property
+    /// (P9.4a). Drivers that need a clock (e.g. emmc2) pass straight
+    /// into `ClockClient::acquire`; drivers that don't (uart,
+    /// virtio-blk on QEMU virt) ignore the field.
+    pub clock_ref: Option<ClockRef>,
     /// Server endpoint the driver receives requests on.
     pub server_ep: EndpointHandle,
     /// Device-manager endpoint, exposed so drivers can issue
@@ -304,6 +310,7 @@ pub fn standard_driver_init<T: 'static>(
         irq_intid: claimed.irq_intid,
         irq_notif: bound.notif,
         irq_initial_threshold: bound.initial_threshold,
+        clock_ref: claimed.clock_ref,
         server_ep,
         devmgr_ep: boot.devmgr_ep,
         reply_obj: boot.reply_obj,
@@ -356,6 +363,22 @@ pub enum ProbeClaimError {
     Claim(ClaimError),
 }
 
+/// Success surface of `NoIrqInit::regs`: bundles the typed MMIO
+/// handle with the device's DTB `clocks` reference. `clock_ref`
+/// lives inside the success arm so the failure arm carries no
+/// stale clock data — a driver writing
+/// `if let Ok(c) = init.regs { ClockClient::acquire(_, _, c.clock_ref?.controller_phandle, ...) }`
+/// is correct by construction.
+pub struct ClaimedRegs<T: 'static> {
+    /// Typed MMIO registers handed back by `claim_typed`.
+    pub regs: MappedRegs<T>,
+    /// Typed clock reference from the device's DTB `clocks` property,
+    /// or `None` when the node has no `clocks`. Pass straight into
+    /// `ClockClient::acquire`. Drivers that don't need clocks
+    /// (ramfb, cprman itself) ignore the field.
+    pub clock_ref: Option<ClockRef>,
+}
+
 /// Public surface produced by `standard_init_no_irq`. Always carries
 /// bootstrap IPC pieces (a successful bootstrap is a precondition);
 /// `regs` is `Result` because probe + claim can fail recoverably.
@@ -373,10 +396,14 @@ pub struct NoIrqInit<T: 'static> {
     pub devmgr_ep: EndpointHandle,
     /// Reply object for outbound IPC.
     pub reply_obj: ReplyHandle,
-    /// Typed MMIO registers on success, or the probe/claim error
-    /// the caller can match on to decide between halt and degrade.
-    /// MMIO pageset stays internal — Phase 9 wires the release path.
-    pub regs: Result<MappedRegs<T>, ProbeClaimError>,
+    /// Typed MMIO registers + DTB clock reference on success, or the
+    /// probe/claim error the caller can match on to decide between
+    /// halt and degrade. `clock_ref` lives inside the success arm
+    /// (P9.4a) — the failure arm carries no clock data so a driver
+    /// cannot accidentally treat a probe failure as "device present,
+    /// no clocks property". MMIO pageset stays internal — Phase 9
+    /// wires the release path.
+    pub regs: Result<ClaimedRegs<T>, ProbeClaimError>,
 }
 
 /// Standard "boot → check server endpoint → (best-effort) probe →
@@ -406,13 +433,16 @@ pub fn standard_init_no_irq<T: 'static>(
     puts2(name, ": bootstrapped\n");
     let server_ep = boot.server_ep.ok_or(NoIrqBootstrapError::NoServerEndpoint)?;
     // Probe + claim are best-effort; on failure we still return the
-    // bootstrap pieces so the caller can run a degraded server.
+    // bootstrap pieces so the caller can run a degraded server. The
+    // success arm bundles the typed MMIO handle with the device's
+    // clock_ref so failure paths can't carry stale clock data
+    // (P9.4a).
     let regs = probe_by_hash(&boot, compatible_hash, 0)
         .map_err(ProbeClaimError::Probe)
         .and_then(|probe| {
             claim_typed::<T>(boot.devmgr_ep, boot.reply_obj, probe.mmio_addr)
                 .map_err(ProbeClaimError::Claim)
-                .map(|c| c.regs)
+                .map(|c| ClaimedRegs { regs: c.regs, clock_ref: c.clock_ref })
         });
     Ok(NoIrqInit {
         server_ep,

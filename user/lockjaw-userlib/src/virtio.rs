@@ -389,6 +389,7 @@ pub fn virtio_driver_init(
                 irq_intid: claimed.irq_intid,
                 irq_notif: bound.notif,
                 irq_initial_threshold: bound.initial_threshold,
+                clock_ref: claimed.clock_ref,
                 server_ep,
                 devmgr_ep: boot.devmgr_ep,
                 reply_obj: boot.reply_obj,

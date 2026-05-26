@@ -320,8 +320,11 @@ fn ramfb_entry() -> ! {
         Ok(i) => i,
         Err(_) => { puts("ramfb: bootstrap FAILED\n"); sys_exit(); }
     };
+    // P9.4a: NoIrqInit::regs's Ok arm is now ClaimedRegs { regs,
+    // clock_ref }. ramfb has no clocks property in its DTB node, so
+    // we ignore clock_ref and lift out the typed MappedRegs.
     let regs = match init.regs {
-        Ok(r) => r,
+        Ok(c) => c.regs,
         Err(_) => { puts("ramfb: claim FAILED\n"); sys_exit(); }
     };
     puts("ramfb: claimed fw_cfg\n");

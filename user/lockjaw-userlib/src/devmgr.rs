@@ -16,7 +16,9 @@ use crate::syscall::{sys_call_ret4, sys_close_handle, sys_map_pages};
 use crate::virtual_memory::{unmap_pages_tracked, VMEM};
 use lockjaw_mmio::region::MappedRegs;
 use lockjaw_types::addr::PAGE_SIZE;
-use lockjaw_types::device::{CMD_CLAIM_BY_ADDR, CMD_RELEASE_BY_ADDR, CLAIM_OK};
+use lockjaw_types::device::{
+    unpack_clock_ref, ClockRef, CLAIM_OK, CMD_CLAIM_BY_ADDR, CMD_RELEASE_BY_ADDR,
+};
 use lockjaw_types::vmem::MapMemoryAttribute;
 
 /// What the device manager handed us, packaged for driver use.
@@ -26,6 +28,14 @@ pub struct ClaimedDevice<T: 'static> {
     /// Allocated IRQ interrupt ID. The driver binds this to a
     /// notification via `sys_bind_irq_flags` to receive completions.
     pub irq_intid: u32,
+    /// Resolved `clocks = <&phandle id>` reference from the device's
+    /// DTB node, or `None` if the node had no `clocks` property.
+    /// `claim[3]` (the packed_clock_ref word) is decoded once here
+    /// so drivers don't carry their own `unpack_clock_ref` call
+    /// site. Pass straight into `ClockClient::acquire`. Drivers
+    /// that don't need clocks (ramfb, virtio-blk, uart, cprman
+    /// itself) ignore the field.
+    pub clock_ref: Option<ClockRef>,
     /// Pageset handle backing the MMIO mapping. Most drivers ignore
     /// this; it's exposed for callers that want to participate in
     /// later revocation flows.
@@ -144,6 +154,13 @@ pub fn claim_typed<T: 'static>(
     // driver owns it.
     let guard = PageSetGuard::new(PageSetHandle(claim[1]));
     let irq_intid = claim[2] as u32;
+    // claim[3] is the packed_clock_ref word the device-manager
+    // built from the DTB `clocks = <&phandle id>` reference for
+    // this node (0 if absent). Decoding here means drivers that
+    // need a clock get `ctx.clock_ref` straight away instead of
+    // carrying their own `unpack_clock_ref` call site.
+    let clock_ref = unpack_clock_ref(claim[3])
+        .map(|(controller_phandle, clock_id)| ClockRef { controller_phandle, clock_id });
 
     let page_va = match VMEM.alloc(1) {
         Some(va) => va,
@@ -180,7 +197,7 @@ pub fn claim_typed<T: 'static>(
     // owns the pageset for its whole lifetime.
     let regs = unsafe { MappedRegs::<T>::new(mmio_va) };
 
-    Ok(ClaimedDevice { regs, irq_intid, mmio_pageset, mmio_addr, page_va })
+    Ok(ClaimedDevice { regs, irq_intid, clock_ref, mmio_pageset, mmio_addr, page_va })
 }
 
 /// Fire-and-forget `CMD_RELEASE_BY_ADDR`. Used on `claim_typed`

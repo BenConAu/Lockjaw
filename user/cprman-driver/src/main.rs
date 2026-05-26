@@ -199,8 +199,12 @@ fn cprman_entry() -> ! {
     // (Pi-side device-manager state issue). Collapsing both into
     // one Err arm would mislabel a real claim failure as "wrong
     // platform" on hardware where the device actually exists.
+    // P9.4a: NoIrqInit::regs's Ok arm is now ClaimedRegs { regs,
+    // clock_ref }. cprman IS the clock provider — its own DTB node
+    // has no `clocks` property — so we ignore clock_ref and store
+    // the typed MappedRegs.
     let regs = match init.regs {
-        Ok(r) => { self_test(r.regs()); Some(r) }
+        Ok(c) => { self_test(c.regs.regs()); Some(c.regs) }
         Err(ProbeClaimError::Probe(_)) => {
             puts("[CPRMAN] no BCM2711 CPRMAN on this platform (QEMU); serving NotSupported for all clock ops\n");
             None
