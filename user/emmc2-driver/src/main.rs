@@ -1,20 +1,18 @@
 #![no_std]
 #![no_main]
 
-const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash.rs"));
-
-#[used]
-#[link_section = ".lockjaw_hash"]
-static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
-
 use core::ptr;
 use lockjaw_userlib::*;
 use lockjaw_userlib::clock::{ClockClient, ClockError};
 use lockjaw_userlib::block::{
     BlockEngine, BlockError, BlockInfo, run_block_server,
 };
-use lockjaw_userlib::handle::PageSetGuard;
+use lockjaw_userlib::driver_runtime::{
+    standard_driver_init_level, LevelDriverCtx, LevelDriverInitError,
+};
 use lockjaw_userlib::dma_sync::{sys_dma_sync_for_cpu, sys_dma_sync_for_device};
+use lockjaw_mmio::region::MappedRegs;
+use lockjaw_regs::sdhci::Sdhci;
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, sleep_for, Nanos};
 // `monotonic_now` returns `MonoTicks`, which is `Ord`; the comparisons in the
@@ -22,9 +20,7 @@ use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, sleep_for, Nanos};
 // for pure-time waits (regulator settle, post-clock idle) — never inside
 // status polls, which busy-wait with `core::hint::spin_loop()` between MMIO
 // reads to avoid quantizing 200µs hardware events to a 10ms scheduler tick.
-use lockjaw_types::device::{
-    BCM2711_EMMC2_HASH, CMD_CLAIM_DEVICE, CLAIM_OK, unpack_clock_ref,
-};
+use lockjaw_types::device::BCM2711_EMMC2_HASH;
 use lockjaw_types::sdhci::{
     Capabilities, OcrRegister, r6_rca, CsdV2,
     CMD8_IF_COND_ARG, ACMD41_ARG_HCS,
@@ -64,37 +60,52 @@ use lockjaw_types::sdhci::{
 // can fault on real silicon. SOFTWARE_RESET (0x02f) is a single byte;
 // CAPABILITIES / CAPABILITIES_HI (0x040 / 0x044) are 32-bit reads.
 
-/// Read an 8-bit SDHCI register at `base + offset`.
-unsafe fn sdhci_read8(base: u64, offset: u64) -> u8 {
+// Per-width shims kept (post P9.4c) as the transitional MMIO surface
+// while typed accessors land in P9.5-P9.8. Signature change vs
+// pre-P9.4c: `handle: &Sdhci` instead of `base: u64`. The body
+// derives the base via the safe pointer-to-int cast — no extra
+// `unsafe` block introduced. Per-width helper deletions:
+//   - sdhci_read8/write8 → P9.5
+//   - sdhci_read16/write16 → P9.6 (combined_trigger carve-out → P9.7)
+//   - sdhci_read32/write32 → P9.8
+
+/// Read an 8-bit SDHCI register at `handle + offset`.
+unsafe fn sdhci_read8(handle: &Sdhci, offset: u64) -> u8 {
+    let base = handle as *const Sdhci as u64;
     ptr::read_volatile((base + offset) as *const u8)
 }
 
-/// Write an 8-bit SDHCI register at `base + offset`.
-unsafe fn sdhci_write8(base: u64, offset: u64, value: u8) {
+/// Write an 8-bit SDHCI register at `handle + offset`.
+unsafe fn sdhci_write8(handle: &Sdhci, offset: u64, value: u8) {
+    let base = handle as *const Sdhci as u64;
     ptr::write_volatile((base + offset) as *mut u8, value);
 }
 
-/// Read a 16-bit SDHCI register at `base + offset`. Offset must be
+/// Read a 16-bit SDHCI register at `handle + offset`. Offset must be
 /// 2-byte aligned. Used for CLOCK_CONTROL, NORMAL_INT_STATUS, etc.
-unsafe fn sdhci_read16(base: u64, offset: u64) -> u16 {
+unsafe fn sdhci_read16(handle: &Sdhci, offset: u64) -> u16 {
+    let base = handle as *const Sdhci as u64;
     ptr::read_volatile((base + offset) as *const u16)
 }
 
-/// Write a 16-bit SDHCI register at `base + offset`. CLOCK_CONTROL
+/// Write a 16-bit SDHCI register at `handle + offset`. CLOCK_CONTROL
 /// (0x02c), COMMAND (0x00e), NORMAL_INT_STATUS (0x030) are u16 writes.
-unsafe fn sdhci_write16(base: u64, offset: u64, value: u16) {
+unsafe fn sdhci_write16(handle: &Sdhci, offset: u64, value: u16) {
+    let base = handle as *const Sdhci as u64;
     ptr::write_volatile((base + offset) as *mut u16, value);
 }
 
-/// Read a 32-bit SDHCI register at `base + offset`. Caller is
+/// Read a 32-bit SDHCI register at `handle + offset`. Caller is
 /// responsible for 4-byte alignment.
-unsafe fn sdhci_read32(base: u64, offset: u64) -> u32 {
+unsafe fn sdhci_read32(handle: &Sdhci, offset: u64) -> u32 {
+    let base = handle as *const Sdhci as u64;
     ptr::read_volatile((base + offset) as *const u32)
 }
 
-/// Write a 32-bit SDHCI register at `base + offset`. ARGUMENT (0x008)
+/// Write a 32-bit SDHCI register at `handle + offset`. ARGUMENT (0x008)
 /// is the primary u32 write in M2; offset must be 4-byte aligned.
-unsafe fn sdhci_write32(base: u64, offset: u64, value: u32) {
+unsafe fn sdhci_write32(handle: &Sdhci, offset: u64, value: u32) {
+    let base = handle as *const Sdhci as u64;
     ptr::write_volatile((base + offset) as *mut u32, value);
 }
 
@@ -126,11 +137,11 @@ unsafe fn sdhci_write32(base: u64, offset: u64, value: u32) {
 
 /// Read an 8-bit status register and busy-poll until `mask` clears,
 /// or `timeout` elapses. Used by SOFTWARE_RESET (SW_RST_ALL).
-unsafe fn poll_until_clear_8(base: u64, offset: u64, mask: u8, timeout: Nanos) -> Result<(), ()> {
+unsafe fn poll_until_clear_8(sdhci: &Sdhci, offset: u64, mask: u8, timeout: Nanos) -> Result<(), ()> {
     let freq = cntfreq_hz();
     let deadline = monotonic_now().deadline_in(timeout, freq);
     loop {
-        if sdhci_read8(base, offset) & mask == 0 {
+        if sdhci_read8(sdhci, offset) & mask == 0 {
             return Ok(());
         }
         if monotonic_now() >= deadline {
@@ -142,11 +153,11 @@ unsafe fn poll_until_clear_8(base: u64, offset: u64, mask: u8, timeout: Nanos) -
 
 /// Read a 16-bit status register and busy-poll until `mask` becomes
 /// set, or `timeout` elapses. Used by CLOCK_CONTROL.INT_STABLE.
-unsafe fn poll_until_set_16(base: u64, offset: u64, mask: u16, timeout: Nanos) -> Result<(), ()> {
+unsafe fn poll_until_set_16(sdhci: &Sdhci, offset: u64, mask: u16, timeout: Nanos) -> Result<(), ()> {
     let freq = cntfreq_hz();
     let deadline = monotonic_now().deadline_in(timeout, freq);
     loop {
-        if sdhci_read16(base, offset) & mask != 0 {
+        if sdhci_read16(sdhci, offset) & mask != 0 {
             return Ok(());
         }
         if monotonic_now() >= deadline {
@@ -158,11 +169,11 @@ unsafe fn poll_until_set_16(base: u64, offset: u64, mask: u16, timeout: Nanos) -
 
 /// Read a 32-bit status register and busy-poll until `mask` clears,
 /// or `timeout` elapses. Used by PRESENT_STATE.CMD_INHIBIT.
-unsafe fn poll_until_clear_32(base: u64, offset: u64, mask: u32, timeout: Nanos) -> Result<(), ()> {
+unsafe fn poll_until_clear_32(sdhci: &Sdhci, offset: u64, mask: u32, timeout: Nanos) -> Result<(), ()> {
     let freq = cntfreq_hz();
     let deadline = monotonic_now().deadline_in(timeout, freq);
     loop {
-        if sdhci_read32(base, offset) & mask == 0 {
+        if sdhci_read32(sdhci, offset) & mask == 0 {
             return Ok(());
         }
         if monotonic_now() >= deadline {
@@ -187,9 +198,9 @@ unsafe fn poll_until_clear_32(base: u64, offset: u64, mask: u32, timeout: Nanos)
 /// 1_000_000-iteration spin tied correctness to CPU clock and
 /// codegen; with a real-time deadline the timeout is what it says
 /// regardless of platform.
-unsafe fn soft_reset_all(base: u64) -> Result<(), ()> {
-    sdhci_write8(base, SDHCI_SOFTWARE_RESET, SW_RST_ALL);
-    poll_until_clear_8(base, SDHCI_SOFTWARE_RESET, SW_RST_ALL, Nanos::from_millis(200))
+unsafe fn soft_reset_all(sdhci: &Sdhci) -> Result<(), ()> {
+    sdhci_write8(sdhci, SDHCI_SOFTWARE_RESET, SW_RST_ALL);
+    poll_until_clear_8(sdhci, SDHCI_SOFTWARE_RESET, SW_RST_ALL, Nanos::from_millis(200))
 }
 
 // ---------------------------------------------------------------------------
@@ -206,21 +217,21 @@ unsafe fn soft_reset_all(base: u64) -> Result<(), ()> {
 ///   4. Re-enable SD_CLK_EN.
 ///
 /// Used for both ID-mode (400 kHz) and data-transfer mode (25 MHz).
-unsafe fn configure_clock(base: u64, base_hz: u64, target_hz: u64) -> Result<(), ()> {
+unsafe fn configure_clock(sdhci: &Sdhci, base_hz: u64, target_hz: u64) -> Result<(), ()> {
     // Gate off the clock output before touching the divisor.
-    let cur = sdhci_read16(base, SDHCI_CLOCK_CONTROL);
-    sdhci_write16(base, SDHCI_CLOCK_CONTROL, cur & !SDHCI_CLOCK_CARD_EN);
+    let cur = sdhci_read16(sdhci, SDHCI_CLOCK_CONTROL);
+    sdhci_write16(sdhci, SDHCI_CLOCK_CONTROL, cur & !SDHCI_CLOCK_CARD_EN);
     // Write divisor + internal clock enable in one shot.
     let (lo, hi) = compute_clock_divisor(base_hz, target_hz);
     let ctrl = (lo as u16) << 8 | (hi as u16) << 6 | SDHCI_CLOCK_INT_EN;
-    sdhci_write16(base, SDHCI_CLOCK_CONTROL, ctrl);
+    sdhci_write16(sdhci, SDHCI_CLOCK_CONTROL, ctrl);
     // SDHCI spec gives a typical lock time well under 1 ms; 100 ms
     // is generous enough that a misconfigured base clock surfaces
     // as a clean error rather than a hang.
-    poll_until_set_16(base, SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_STABLE, Nanos::from_millis(100))?;
+    poll_until_set_16(sdhci, SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_STABLE, Nanos::from_millis(100))?;
     // Stable: enable the clock output to the card slot.
-    let ctrl_en = sdhci_read16(base, SDHCI_CLOCK_CONTROL) | SDHCI_CLOCK_CARD_EN;
-    sdhci_write16(base, SDHCI_CLOCK_CONTROL, ctrl_en);
+    let ctrl_en = sdhci_read16(sdhci, SDHCI_CLOCK_CONTROL) | SDHCI_CLOCK_CARD_EN;
+    sdhci_write16(sdhci, SDHCI_CLOCK_CONTROL, ctrl_en);
     Ok(())
 }
 
@@ -253,15 +264,15 @@ enum CmdResult {
 ///   4. Poll NORMAL_INT_STATUS for CMD_COMPLETE or ERROR.
 ///   5. Clear CMD_COMPLETE (write-1-to-clear).
 ///   6. Return RESPONSE_0.
-unsafe fn issue_command(base: u64, arg: u32, cmd_word: u16) -> CmdResult {
+unsafe fn issue_command(sdhci: &Sdhci, arg: u32, cmd_word: u16) -> CmdResult {
     // Wait for CMD line to be free. Should clear within microseconds
     // on a healthy controller; 100 ms is generous bound.
-    if poll_until_clear_32(base, SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, Nanos::from_millis(100)).is_err() {
+    if poll_until_clear_32(sdhci, SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, Nanos::from_millis(100)).is_err() {
         return CmdResult::InhibitStuck;
     }
-    sdhci_write32(base, SDHCI_ARGUMENT, arg);
+    sdhci_write32(sdhci, SDHCI_ARGUMENT, arg);
     // Writing COMMAND triggers the command on the bus.
-    sdhci_write16(base, SDHCI_COMMAND, cmd_word);
+    sdhci_write16(sdhci, SDHCI_COMMAND, cmd_word);
     // Poll NORMAL_INT_STATUS for CMD_COMPLETE or ERROR. Manual loop
     // (not the generic helper) because we need to distinguish three
     // outcomes (success / error / timeout) and clear different
@@ -273,22 +284,22 @@ unsafe fn issue_command(base: u64, arg: u32, cmd_word: u16) -> CmdResult {
     let freq = cntfreq_hz();
     let deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
     loop {
-        let status = sdhci_read16(base, SDHCI_NORMAL_INT_STATUS);
+        let status = sdhci_read16(sdhci, SDHCI_NORMAL_INT_STATUS);
         if status & SDHCI_INT_ERROR != 0 {
             // Capture which error bit fired *before* clearing, so the
             // caller can decode the cause. Then clear underlying bits
             // (w1c) followed by the summary bit — leaving
             // ERROR_INT_STATUS set causes the controller to re-assert
             // the NORMAL_INT_STATUS ERROR summary on the next command.
-            let err_bits = sdhci_read16(base, SDHCI_ERROR_INT_STATUS);
-            sdhci_write16(base, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS,
+            let err_bits = sdhci_read16(sdhci, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(sdhci, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(sdhci, SDHCI_NORMAL_INT_STATUS,
                 SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
             return CmdResult::ControllerError(err_bits);
         }
         if status & SDHCI_INT_CMD_COMPLETE != 0 {
-            sdhci_write16(base, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
-            return CmdResult::Ok(sdhci_read32(base, SDHCI_RESPONSE_0));
+            sdhci_write16(sdhci, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+            return CmdResult::Ok(sdhci_read32(sdhci, SDHCI_RESPONSE_0));
         }
         if monotonic_now() >= deadline {
             return CmdResult::NoResponse;
@@ -427,86 +438,87 @@ fn put_emmc2_error(err: &Emmc2Error) {
 }
 
 // ---------------------------------------------------------------------------
-// Entry point
+// Entry point — Tier-A escape valve (boot_stub! + manual
+// standard_driver_init_level call).
 // ---------------------------------------------------------------------------
+//
+// P9.4c: replaced the raw _start + sys_alloc_pages +
+// sys_create_reply + bootstrap_endpoint + CMD_CLAIM_DEVICE +
+// bind_irq_level + VMEM.alloc + sys_map_pages + unpack_clock_ref
+// boilerplate with the Tier-A escape-valve shape: `boot_stub!`
+// emits the `_start` thunk + `LOCKJAW_HASH_SECTION` static, and
+// `emmc2_entry` calls `standard_driver_init_level::<Sdhci>` (P9.4b)
+// directly so it can match on the specific failure variant.
+//
+// The framework helper owns:
+//   - driver_bootstrap (the sys_alloc_pages + sys_create_reply +
+//     bootstrap_endpoint sys_call dance) → server_ep / devmgr_ep /
+//     reply_obj
+//   - probe_by_hash → CMD_PROBE_DEVICE walks the DTB-derived device
+//     list; returns ProbeError::NotFound when no device matches
+//     BCM2711_EMMC2_HASH (the QEMU graceful-exit path).
+//   - claim_typed::<Sdhci> → CMD_CLAIM_BY_ADDR followed by the VMEM
+//     alloc + sys_map_pages + intra-page-offset MappedRegs<Sdhci>
+//     construction. Driver source contains zero `unsafe {
+//     MappedRegs::new(...) }` and zero CMD_CLAIM_DEVICE call sites.
+//   - bind_irq_level(intid) → BoundIrq with wait_until + unmask.
+//   - unpack_clock_ref(claim[3]) → ctx.clock_ref (P9.4a).
+//
+// emmc2_entry's body keeps only the emmc2-specific protocol:
+// ClockClient::acquire (driver-policy decision — which clock?), then
+// the soft_reset → configure_clock → CMD0..CMD7 → engine init → run
+// sequence, which is identical to pre-P9.4c (modulo sourcing the
+// typed `&Sdhci` from ctx.regs.regs() rather than from a raw u64
+// derived from sys_map_pages). Per-width typed accessors land in
+// P9.5-P9.8.
+//
+// Why Tier-A escape valve and not the Tier-C `driver_main!(level =
+// true)` macro arm: the integration-test gate requires a specific
+// failure log line when bcm2711-emmc2 is absent on QEMU
+// (`[EMMC2:INIT] no bcm2711-emmc2 device on this platform (QEMU)`).
+// `driver_main!`'s macro arm hardcodes a generic `<name>: init
+// failed` on the Err arm, which wouldn't satisfy that gate.
+// Matching on `LevelDriverInitError::Probe` directly in driver
+// source lets the driver emit its own gated log line — same pattern
+// cprman / ramfb use for their probe-failure handling.
+boot_stub! {
+    hash = LOCKJAW_SOURCE_HASH,
+    main = emmc2_entry,
+}
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+fn emmc2_entry() -> ! {
     puts("emmc2: starting\n");
-
-    // Allocate our Reply object — we drive sys_call against
-    // device-manager (claim + clock acquire) but never receive on a
-    // server endpoint (M1 is a one-shot probe, no server loop).
-    let reply_obj = match sys_alloc_pages(1).and_then(sys_create_reply) {
-        Ok(h) => h,
-        Err(_) => { puts("emmc2: create reply FAILED\n"); halt(); }
-    };
-
-    puts("emmc2: bootstrapping...\n");
-    let reply = match sys_call_ret4(bootstrap_endpoint(), reply_obj, 0, 0, 0, 0) {
-        Ok(r) => r,
-        Err(_) => { puts("emmc2: bootstrap FAILED\n"); halt(); }
-    };
-    // Reply layout: [devmgr_client, blk_srv_ep, _, _].
-    //   - devmgr_client: used for CMD_CLAIM_DEVICE (SDHCI MMIO) and
-    //     CMD_GET_CLOCK_HANDLE (clock binding).
-    //   - blk_srv_ep: the endpoint init created for us to receive
-    //     BlockEngine IPC requests on (M7). Owned by init outside
-    //     this driver; init exports the same handle to other
-    //     processes that need block storage on Pi 4B.
-    let devmgr_client = EndpointHandle(reply[0]);
-    let blk_srv_ep = EndpointHandle(reply[1]);
-    puts("emmc2: bootstrapped\n");
-
-    // Claim the BCM2711 emmc2 device. Reply layout (per
-    // CMD_CLAIM_DEVICE in lockjaw_types::device):
-    //   [status, mmio_handle, intid, packed_clock_ref]
-    // On QEMU virt the device is absent → CLAIM_ERR; we exit cleanly
-    // so the integration test can assert the graceful-fail path
-    // without us hanging.
-    let claim = match sys_call_ret4(
-        devmgr_client, reply_obj, CMD_CLAIM_DEVICE, BCM2711_EMMC2_HASH, 0, 0,
+    let ctx: LevelDriverCtx<Sdhci> = match standard_driver_init_level::<Sdhci>(
+        "emmc2", BCM2711_EMMC2_HASH,
     ) {
-        Ok(r) => r,
-        Err(_) => { puts("emmc2: claim call FAILED\n"); halt(); }
+        Ok(c) => c,
+        Err(LevelDriverInitError::Probe(_)) => {
+            // QEMU virt has no bcm2711-emmc2 — exit cleanly so the
+            // integration test can assert the graceful-fail path.
+            puts("[EMMC2:INIT] no bcm2711-emmc2 device on this platform (QEMU); exiting\n");
+            sys_exit();
+        }
+        Err(_) => {
+            puts("emmc2: framework init failed (bootstrap / claim / bind_irq_level)\n");
+            sys_exit();
+        }
     };
-    if claim[0] != CLAIM_OK {
-        puts("[EMMC2:INIT] no bcm2711-emmc2 device on this platform (QEMU); exiting\n");
-        sys_exit();
-    }
-    let mmio_pageset = PageSetHandle(claim[1]);
-    let irq_intid = claim[2];
-    let packed_clock_ref = claim[3];
-    puts("[EMMC2:IRQ] intid=");
-    put_decimal(irq_intid);
-    puts("\n");
 
-    // Bind the SDHCI IRQ as LEVEL-triggered (grafted from
-    // m7-irq-experiment, on top of post-c1 fix-plan B1-B4.1).
-    // BCM2711 DTS declares "interrupts = <GIC_SPI 126
-    // IRQ_TYPE_LEVEL_HIGH>"; the SDHCI controller's INT line stays
-    // asserted until userspace clears NORMAL_INT_STATUS bits via W1C.
-    // Kernel's irq_dispatch masks level intids after delivery; we
-    // re-enable via bound_irq.unmask() after clearing the source.
-    //
-    // bind_irq_level is the framework helper for the page-alloc +
-    // create-notification + bind-IRQ bootstrap — driver source no
-    // longer carries those raw sys_* calls (CLAUDE.md user-mode
-    // driver rule).
-    let bound_irq = match lockjaw_userlib::irq::bind_irq_level(irq_intid) {
-        Ok(b) => b,
-        Err(_) => { puts("emmc2: bind_irq_level FAILED\n"); halt(); }
-    };
-    puts("[EMMC2:IRQ] bound notification (level)\n");
+    // Reborrow the typed MMIO handle as `&Sdhci` for the ID-phase
+    // polling helpers (soft_reset_all, configure_clock, issue_command).
+    // `ctx.regs` is the MappedRegs<Sdhci> the framework claim_typed
+    // handed back; `regs()` yields `&T` for as long as ctx lives.
+    let sdhci = ctx.regs.regs();
 
     // The DTB binding for bcm2711-emmc2 includes a clocks reference;
     // M0a's parser populated it and the device-manager packed it into
-    // the claim reply. If it's absent the driver can't proceed
-    // safely (the controller's base clock is whatever VC firmware
-    // last set, which may be wrong). Surface and exit rather than
-    // operate on a clock we don't own.
-    let (controller_phandle, clock_id) = match unpack_clock_ref(packed_clock_ref) {
-        Some(pair) => pair,
+    // claim[3], which P9.4a's claim_typed unpacked into
+    // ctx.clock_ref. If it's absent the driver can't proceed safely
+    // (the controller's base clock is whatever VC firmware last set,
+    // which may be wrong). Surface and exit rather than operate on a
+    // clock we don't own.
+    let clock_ref = match ctx.clock_ref {
+        Some(c) => c,
         None => {
             puts("emmc2: bcm2711-emmc2 DTB node has no clocks property — refusing to proceed\n");
             sys_exit();
@@ -517,7 +529,7 @@ pub extern "C" fn _start() -> ! {
     // M2 calls set_rate / enable to drive the SDHCI base clock. The
     // ClockClient is held in scope; drop closes the Endpoint per RAII.
     let clk = match ClockClient::acquire(
-        devmgr_client, reply_obj, controller_phandle, clock_id,
+        ctx.devmgr_ep, ctx.reply_obj, clock_ref.controller_phandle, clock_ref.clock_id,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -528,24 +540,15 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    // Map the SDHCI register page. The DTB declares the region as
-    // 0x100 bytes (one 4 KB page is plenty); the device-manager
-    // claim path returns a single-page PageSet. MapMemoryAttribute::Device
-    // selects the Device-nGnRnE MAIR slot so loads/stores aren't
-    // reordered or merged by the CPU.
-    let mmio_va = match VMEM.alloc(1) {
-        Some(va) => va,
-        None => { puts("emmc2: VA exhausted for MMIO\n"); halt(); }
-    };
-    if !sys_map_pages(mmio_pageset, mmio_va, MapMemoryAttribute::Device).is_ok() {
-        puts("emmc2: map MMIO FAILED\n");
-        halt();
-    }
+    // Server endpoint passthrough (renamed to match the pre-P9.4c
+    // local). Init exports the same handle to other processes that
+    // need block storage on Pi 4B.
+    let blk_srv_ep = ctx.server_ep;
 
     // Soft-reset the controller. SW_RST_ALL puts every internal block
     // back to the post-power-on state; required before any further
     // configuration touches CLOCK_CONTROL or POWER_CONTROL.
-    if unsafe { soft_reset_all(mmio_va) }.is_err() {
+    if unsafe { soft_reset_all(sdhci) }.is_err() {
         puts("emmc2: SW_RST_ALL did not clear within timeout\n");
         halt();
     }
@@ -580,16 +583,16 @@ pub extern "C" fn _start() -> ! {
     // via lockjaw_userlib::irq::BoundIrq::wait_until rather than
     // polling. See Engine::new for the full sequencing rationale.
     unsafe {
-        sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS_ENABLE, 0xFFFF);
-        sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS_ENABLE,  0xFFFF);
+        sdhci_write16(sdhci, SDHCI_NORMAL_INT_STATUS_ENABLE, 0xFFFF);
+        sdhci_write16(sdhci, SDHCI_ERROR_INT_STATUS_ENABLE,  0xFFFF);
     }
 
     // Read CAPABILITIES (low 32 bits at 0x040) and CAPABILITIES_HI
     // (high 32 bits at 0x044). Decoded view lives in lockjaw-types
     // so the bit layout has host tests; the driver just dispatches
     // the two volatile reads.
-    let caps_lo = unsafe { sdhci_read32(mmio_va, SDHCI_CAPABILITIES) };
-    let caps_hi = unsafe { sdhci_read32(mmio_va, SDHCI_CAPABILITIES_HI) };
+    let caps_lo = unsafe { sdhci_read32(sdhci, SDHCI_CAPABILITIES) };
+    let caps_hi = unsafe { sdhci_read32(sdhci, SDHCI_CAPABILITIES_HI) };
     let caps = Capabilities::decode(caps_lo, caps_hi);
 
     // HOST_VERSION (0x0fe) is a u16: bits[7:0] = spec version
@@ -597,7 +600,7 @@ pub extern "C" fn _start() -> ! {
     // is the constant 2. This is distinct from bit 28 of CAPABILITIES
     // (64-bit addressing support, a per-capability flag, not the spec
     // revision number).
-    let host_version = unsafe { sdhci_read16(mmio_va, SDHCI_HOST_VERSION) };
+    let host_version = unsafe { sdhci_read16(sdhci, SDHCI_HOST_VERSION) };
     let spec_version = (host_version & 0xFF) as u8;
 
     // M1 success line.
@@ -672,8 +675,8 @@ pub extern "C" fn _start() -> ! {
     // Power on the SD bus at 3.3 V before enabling the SD clock.
     // Set max data timeout (TMCLK × 2^27 = 0x0E) while we're here.
     unsafe {
-        sdhci_write8(mmio_va, SDHCI_POWER_CONTROL, SDHCI_POWER_330 | SDHCI_POWER_ON);
-        sdhci_write8(mmio_va, SDHCI_TIMEOUT_CONTROL, 0x0E);
+        sdhci_write8(sdhci, SDHCI_POWER_CONTROL, SDHCI_POWER_330 | SDHCI_POWER_ON);
+        sdhci_write8(sdhci, SDHCI_TIMEOUT_CONTROL, 0x0E);
     }
 
     // Wait for card power to stabilise before enabling the SD clock.
@@ -684,7 +687,7 @@ pub extern "C" fn _start() -> ! {
 
     // Enable the SDHCI internal clock at ID-mode rate (≤ 400 kHz), wait
     // for the oscillator to stabilise, then gate the clock to the card.
-    if unsafe { configure_clock(mmio_va, actual_base_hz, 400_000) }.is_err() {
+    if unsafe { configure_clock(sdhci, actual_base_hz, 400_000) }.is_err() {
         puts("emmc2: SDHCI INT_CLK_STABLE not set within timeout\n");
         halt();
     }
@@ -702,7 +705,7 @@ pub extern "C" fn _start() -> ! {
     // idle. A controller-level error here (e.g. CMD line wedged) is
     // still useful diagnostic context for what follows.
     let cmd0 = sd_command_word(SdCommand::GoIdleState.index(), SDHCI_CMD_RESP_NONE);
-    match unsafe { issue_command(mmio_va, 0, cmd0) } {
+    match unsafe { issue_command(sdhci, 0, cmd0) } {
         CmdResult::Ok(_) => puts("[EMMC2:IDPHASE] CMD0 acknowledged\n"),
         CmdResult::InhibitStuck => puts("[EMMC2:IDPHASE] CMD0: CMD_INHIBIT stuck (controller not responding)\n"),
         CmdResult::ControllerError(bits) => {
@@ -719,7 +722,7 @@ pub extern "C" fn _start() -> ! {
     // cards don't respond to CMD8; UHS and SDXC cards need it for ACMD41.
     let cmd8_flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX;
     let cmd8 = sd_command_word(SdCommand::SendIfCond.index(), cmd8_flags);
-    let resp = match unsafe { issue_command(mmio_va, CMD8_IF_COND_ARG, cmd8) } {
+    let resp = match unsafe { issue_command(sdhci, CMD8_IF_COND_ARG, cmd8) } {
         CmdResult::Ok(r) => r,
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] CMD8 FAILED: CMD_INHIBIT did not clear before deadline\n");
@@ -782,7 +785,7 @@ pub extern "C" fn _start() -> ! {
     let acmd41_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
     let ocr = loop {
         // CMD55 — prefixes ACMD41; response is R1 from the card.
-        match unsafe { issue_command(mmio_va, 0, cmd55_word) } {
+        match unsafe { issue_command(sdhci, 0, cmd55_word) } {
             CmdResult::Ok(_) => {}
             CmdResult::InhibitStuck => {
                 puts("[EMMC2:IDPHASE] CMD55 FAILED: CMD_INHIBIT stuck\n");
@@ -800,7 +803,7 @@ pub extern "C" fn _start() -> ! {
             }
         }
         // ACMD41 — the card returns OCR; busy bit clears when ready.
-        let r0 = match unsafe { issue_command(mmio_va, ACMD41_ARG_HCS, acmd41_word) } {
+        let r0 = match unsafe { issue_command(sdhci, ACMD41_ARG_HCS, acmd41_word) } {
             CmdResult::Ok(r) => r,
             CmdResult::InhibitStuck => {
                 puts("[EMMC2:IDPHASE] ACMD41 FAILED: CMD_INHIBIT stuck\n");
@@ -841,7 +844,7 @@ pub extern "C" fn _start() -> ! {
         SdCommand::AllSendCid.index(),
         SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC,
     );
-    match unsafe { issue_command(mmio_va, 0, cmd2_word) } {
+    match unsafe { issue_command(sdhci, 0, cmd2_word) } {
         CmdResult::Ok(_) => {}
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] CMD2 FAILED: CMD_INHIBIT stuck\n");
@@ -867,7 +870,7 @@ pub extern "C" fn _start() -> ! {
         SdCommand::SendRelativeAddr.index(),
         SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
     );
-    let rca: u16 = match unsafe { issue_command(mmio_va, 0, cmd3_word) } {
+    let rca: u16 = match unsafe { issue_command(sdhci, 0, cmd3_word) } {
         CmdResult::Ok(r) => r6_rca(r),
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] CMD3 FAILED: CMD_INHIBIT stuck\n");
@@ -898,13 +901,13 @@ pub extern "C" fn _start() -> ! {
         SdCommand::SendCsd.index(),
         SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC,
     );
-    let capacity_bytes: u64 = match unsafe { issue_command(mmio_va, rca_arg, cmd9_word) } {
+    let capacity_bytes: u64 = match unsafe { issue_command(sdhci, rca_arg, cmd9_word) } {
         CmdResult::Ok(_) => {
             let resp = unsafe {[
-                sdhci_read32(mmio_va, SDHCI_RESPONSE_0),
-                sdhci_read32(mmio_va, SDHCI_RESPONSE_1),
-                sdhci_read32(mmio_va, SDHCI_RESPONSE_2),
-                sdhci_read32(mmio_va, SDHCI_RESPONSE_3),
+                sdhci_read32(sdhci, SDHCI_RESPONSE_0),
+                sdhci_read32(sdhci, SDHCI_RESPONSE_1),
+                sdhci_read32(sdhci, SDHCI_RESPONSE_2),
+                sdhci_read32(sdhci, SDHCI_RESPONSE_3),
             ]};
             match CsdV2::decode(resp) {
                 Ok(csd) => csd.capacity_bytes,
@@ -940,7 +943,7 @@ pub extern "C" fn _start() -> ! {
         SdCommand::SelectCard.index(),
         SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
     );
-    match unsafe { issue_command(mmio_va, rca_arg, cmd7_word) } {
+    match unsafe { issue_command(sdhci, rca_arg, cmd7_word) } {
         CmdResult::Ok(_) => {}
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] CMD7 FAILED: CMD_INHIBIT stuck\n");
@@ -959,7 +962,7 @@ pub extern "C" fn _start() -> ! {
     }
     // Wait for DAT0 to deassert — the card signals "ready" by releasing it.
     if unsafe { poll_until_clear_32(
-        mmio_va, SDHCI_PRESENT_STATE,
+        sdhci, SDHCI_PRESENT_STATE,
         SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
         Nanos::from_millis(500),
     )}.is_err() {
@@ -974,7 +977,7 @@ pub extern "C" fn _start() -> ! {
         SdCommand::AppCmd.index(),
         SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
     );
-    match unsafe { issue_command(mmio_va, rca_arg, cmd55_rca_word) } {
+    match unsafe { issue_command(sdhci, rca_arg, cmd55_rca_word) } {
         CmdResult::Ok(_) => {}
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] CMD55 (pre-ACMD6) FAILED: CMD_INHIBIT stuck\n");
@@ -996,7 +999,7 @@ pub extern "C" fn _start() -> ! {
         SdCommand::SetBusWidth.index(),
         SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
     );
-    match unsafe { issue_command(mmio_va, 0x2, acmd6_word) } {
+    match unsafe { issue_command(sdhci, 0x2, acmd6_word) } {
         CmdResult::Ok(_) => {}
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] ACMD6 FAILED: CMD_INHIBIT stuck\n");
@@ -1016,14 +1019,14 @@ pub extern "C" fn _start() -> ! {
     // Mirror the 4-bit bus width in HOST_CONTROL_1 immediately after
     // the card acknowledges ACMD6 — the host side must match the card.
     unsafe {
-        let hc = sdhci_read8(mmio_va, SDHCI_HOST_CONTROL);
-        sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc | SDHCI_HOST_CTRL_DAT_4BIT);
+        let hc = sdhci_read8(sdhci, SDHCI_HOST_CONTROL);
+        sdhci_write8(sdhci, SDHCI_HOST_CONTROL, hc | SDHCI_HOST_CTRL_DAT_4BIT);
     }
 
     // Raise the SD bus clock from 400 kHz (ID mode) to 25 MHz (data
     // transfer mode).  SDHCI spec § 3.2.4: disable SD_CLK_EN first,
     // then reprogram divisor — `configure_clock` does this.
-    if unsafe { configure_clock(mmio_va, actual_base_hz, 25_000_000) }.is_err() {
+    if unsafe { configure_clock(sdhci, actual_base_hz, 25_000_000) }.is_err() {
         puts("[EMMC2:READY] clock-to-25MHz FAILED: INT_CLK_STABLE timeout\n");
         sys_exit();
     }
@@ -1055,7 +1058,12 @@ pub extern "C" fn _start() -> ! {
     // caller-controlled LBAs.
     // -----------------------------------------------------------------------
     let capacity_sectors = capacity_bytes / 512;
-    let engine = match unsafe { Emmc2BlockEngine::new(mmio_va, capacity_sectors, bound_irq) } {
+    // Drop the `sdhci` borrow on ctx.regs before moving it into the
+    // engine. After this point any further direct SDHCI access in
+    // emmc2_entry must go through `engine.regs.regs()` (used by the
+    // selftest below).
+    let _ = sdhci;
+    let engine = match unsafe { Emmc2BlockEngine::new(ctx.regs, capacity_sectors, ctx.irq) } {
         Ok(e) => e,
         Err(err) => {
             puts("[EMMC2:BLK] engine init FAILED: ");
@@ -1153,7 +1161,7 @@ pub extern "C" fn _start() -> ! {
 /// Cacheable post-migration, so a `dsb sy` alone is not enough to
 /// flush the cache line).
 unsafe fn adma2_single_block_read(
-    mmio_va: u64,
+    sdhci: &Sdhci,
     sector: u64,
     buf_phys: u64,
     desc_ps: PageSetHandle,
@@ -1173,12 +1181,12 @@ unsafe fn adma2_single_block_read(
     // READ_TRANSFER_ACTIVE) never clear. Polling inhibit before any
     // writes is what Linux's sdhci_send_command does.
     if poll_until_clear_32(
-        mmio_va, SDHCI_PRESENT_STATE,
+        sdhci, SDHCI_PRESENT_STATE,
         SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
         Nanos::from_millis(100),
     ).is_err() {
         return Err(Emmc2Error::InhibitStuck {
-            present_state: sdhci_read32(mmio_va, SDHCI_PRESENT_STATE),
+            present_state: sdhci_read32(sdhci, SDHCI_PRESENT_STATE),
         });
     }
 
@@ -1204,24 +1212,24 @@ unsafe fn adma2_single_block_read(
     // width bit (set during M3 ACMD6); replace the DMA_SEL field
     // bits only. Idempotent (engine.new already set it) but kept for
     // safety against any other code path that might have changed it.
-    let hc = sdhci_read8(mmio_va, SDHCI_HOST_CONTROL);
+    let hc = sdhci_read8(sdhci, SDHCI_HOST_CONTROL);
     let hc_new = (hc & !SDHCI_HOST_CTRL_DMA_SEL_MASK)
         | SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32;
-    sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc_new);
+    sdhci_write8(sdhci, SDHCI_HOST_CONTROL, hc_new);
 
-    sdhci_write32(mmio_va, SDHCI_ADMA_ADDRESS, desc_phys as u32);
+    sdhci_write32(sdhci, SDHCI_ADMA_ADDRESS, desc_phys as u32);
 
-    sdhci_write16(mmio_va, SDHCI_BLOCK_SIZE, 512);
-    sdhci_write16(mmio_va, SDHCI_BLOCK_COUNT, 1);
-    sdhci_write16(mmio_va, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ | SDHCI_TRNS_DMA);
-    sdhci_write32(mmio_va, SDHCI_ARGUMENT, sector as u32);
+    sdhci_write16(sdhci, SDHCI_BLOCK_SIZE, 512);
+    sdhci_write16(sdhci, SDHCI_BLOCK_COUNT, 1);
+    sdhci_write16(sdhci, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ | SDHCI_TRNS_DMA);
+    sdhci_write32(sdhci, SDHCI_ARGUMENT, sector as u32);
 
     let cmd17 = sd_command_word(
         SdCommand::ReadSingleBlock.index(),
         SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
     );
     let freq = cntfreq_hz();
-    sdhci_write16(mmio_va, SDHCI_COMMAND, cmd17);
+    sdhci_write16(sdhci, SDHCI_COMMAND, cmd17);
 
     // IRQ-driven completion (m7-irq-experiment graft).
     //
@@ -1261,12 +1269,12 @@ unsafe fn adma2_single_block_read(
             });
         }
 
-        let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
+        let status = sdhci_read16(sdhci, SDHCI_NORMAL_INT_STATUS);
 
         if status & SDHCI_INT_ERROR != 0 {
-            let err_int_status = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
-            sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, 0xFFFF);
+            let err_int_status = sdhci_read16(sdhci, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(sdhci, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(sdhci, SDHCI_NORMAL_INT_STATUS, 0xFFFF);
             let _ = bound_irq.unmask();
             return Err(if cmd_complete_seen {
                 Emmc2Error::DataError { err_int_status }
@@ -1276,12 +1284,12 @@ unsafe fn adma2_single_block_read(
         }
 
         if status & SDHCI_INT_CMD_COMPLETE != 0 {
-            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+            sdhci_write16(sdhci, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
             cmd_complete_seen = true;
         }
 
         if status & SDHCI_INT_DATA_COMPLETE != 0 {
-            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
+            sdhci_write16(sdhci, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
             let _ = bound_irq.unmask();
             // Fall through to B4.1 DAT_INHIBIT drain below before
             // returning Ok.
@@ -1325,12 +1333,12 @@ unsafe fn adma2_single_block_read(
     // 10 ms deadline matches the plan's B4.1 budget; the actual
     // drain is microseconds in normal operation.
     if poll_until_clear_32(
-        mmio_va, SDHCI_PRESENT_STATE,
+        sdhci, SDHCI_PRESENT_STATE,
         SDHCI_DAT_INHIBIT,
         Nanos::from_millis(10),
     ).is_err() {
         return Err(Emmc2Error::DatInhibitStuck {
-            present_state: sdhci_read32(mmio_va, SDHCI_PRESENT_STATE),
+            present_state: sdhci_read32(sdhci, SDHCI_PRESENT_STATE),
         });
     }
 
@@ -1360,7 +1368,7 @@ pub enum AdmaDirection {
 
 #[allow(dead_code)]  // Disabled until CMD18+Auto-CMD23 cold-boot is validated. See doc/tech-debt.md.
 unsafe fn adma2_transfer(
-    mmio_va: u64,
+    sdhci: &Sdhci,
     direction: AdmaDirection,
     sector: u64,
     n_blocks: u16,
@@ -1381,12 +1389,12 @@ unsafe fn adma2_transfer(
     // Writing ADMA_ADDRESS or other transfer-affecting registers while
     // a previous transfer is still active wedges the controller.
     if poll_until_clear_32(
-        mmio_va, SDHCI_PRESENT_STATE,
+        sdhci, SDHCI_PRESENT_STATE,
         SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
         Nanos::from_millis(100),
     ).is_err() {
         return Err(Emmc2Error::InhibitStuck {
-            present_state: sdhci_read32(mmio_va, SDHCI_PRESENT_STATE),
+            present_state: sdhci_read32(sdhci, SDHCI_PRESENT_STATE),
         });
     }
 
@@ -1402,20 +1410,20 @@ unsafe fn adma2_transfer(
         return Err(Emmc2Error::DescSyncFailed);
     }
 
-    sdhci_write32(mmio_va, SDHCI_ADMA_ADDRESS, desc_phys as u32);
-    sdhci_write32(mmio_va, SDHCI_ARGUMENT2, n_blocks as u32);
+    sdhci_write32(sdhci, SDHCI_ADMA_ADDRESS, desc_phys as u32);
+    sdhci_write32(sdhci, SDHCI_ARGUMENT2, n_blocks as u32);
 
-    sdhci_write16(mmio_va, SDHCI_BLOCK_SIZE, 512);
-    sdhci_write16(mmio_va, SDHCI_BLOCK_COUNT, n_blocks);
+    sdhci_write16(sdhci, SDHCI_BLOCK_SIZE, 512);
+    sdhci_write16(sdhci, SDHCI_BLOCK_COUNT, n_blocks);
     let trns_dir = match direction {
         AdmaDirection::Read => SDHCI_TRNS_READ,
         AdmaDirection::Write => 0, // absence of TRNS_READ = write
     };
-    sdhci_write16(mmio_va, SDHCI_TRANSFER_MODE,
+    sdhci_write16(sdhci, SDHCI_TRANSFER_MODE,
         trns_dir | SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN
             | SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD23);
     // CMD18/CMD25 argument is the LBA (SDHC/SDXC blocks-as-units).
-    sdhci_write32(mmio_va, SDHCI_ARGUMENT, sector as u32);
+    sdhci_write32(sdhci, SDHCI_ARGUMENT, sector as u32);
 
     let cmd = sd_command_word(
         match direction {
@@ -1427,21 +1435,21 @@ unsafe fn adma2_transfer(
 
     let freq = cntfreq_hz();
     let t0 = monotonic_now();
-    sdhci_write16(mmio_va, SDHCI_COMMAND, cmd);
+    sdhci_write16(sdhci, SDHCI_COMMAND, cmd);
 
     // Poll CMD_COMPLETE
     let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
     loop {
-        let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
+        let status = sdhci_read16(sdhci, SDHCI_NORMAL_INT_STATUS);
         if status & SDHCI_INT_ERROR != 0 {
-            let err_int_status = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
-            sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
+            let err_int_status = sdhci_read16(sdhci, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(sdhci, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(sdhci, SDHCI_NORMAL_INT_STATUS,
                 SDHCI_INT_ERROR | SDHCI_INT_CMD_COMPLETE);
             return Err(Emmc2Error::CmdError { err_int_status });
         }
         if status & SDHCI_INT_CMD_COMPLETE != 0 {
-            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
+            sdhci_write16(sdhci, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
             break;
         }
         if monotonic_now() >= cmd_deadline {
@@ -1455,16 +1463,16 @@ unsafe fn adma2_transfer(
     // signals once after the FULL descriptor's transfer ends.
     let xfer_deadline = monotonic_now().deadline_in(Nanos::from_millis(500), freq);
     loop {
-        let status = sdhci_read16(mmio_va, SDHCI_NORMAL_INT_STATUS);
+        let status = sdhci_read16(sdhci, SDHCI_NORMAL_INT_STATUS);
         if status & SDHCI_INT_ERROR != 0 {
-            let err_int_status = sdhci_read16(mmio_va, SDHCI_ERROR_INT_STATUS);
-            sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
-            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS,
+            let err_int_status = sdhci_read16(sdhci, SDHCI_ERROR_INT_STATUS);
+            sdhci_write16(sdhci, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+            sdhci_write16(sdhci, SDHCI_NORMAL_INT_STATUS,
                 SDHCI_INT_ERROR | SDHCI_INT_DATA_COMPLETE);
             return Err(Emmc2Error::DataError { err_int_status });
         }
         if status & SDHCI_INT_DATA_COMPLETE != 0 {
-            sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
+            sdhci_write16(sdhci, SDHCI_NORMAL_INT_STATUS, SDHCI_INT_DATA_COMPLETE);
             break;
         }
         if monotonic_now() >= xfer_deadline {
@@ -1532,7 +1540,12 @@ struct DmaBuf {
 const DMA_BUF_EMPTY: DmaBuf = DmaBuf { handle: 0, pa: 0, sector_count: 0 };
 
 struct Emmc2BlockEngine {
-    mmio_va: u64,
+    /// Typed MMIO handle for the SDHCI register region. Replaces the
+    /// pre-P9.4c raw `mmio_va: u64` field — `regs.regs()` yields
+    /// `&Sdhci` for the per-call shim API, and future P9.5-P9.8
+    /// commits will move per-width accesses to typed accessors on
+    /// the same handle.
+    regs: MappedRegs<Sdhci>,
     capacity_sectors: u64,
     /// Persistent ADMA2-32 descriptor table. One 8-byte tran+end
     /// descriptor is rewritten per transfer. Allocated from the
@@ -1557,18 +1570,23 @@ struct Emmc2BlockEngine {
 impl Emmc2BlockEngine {
     /// Allocate the descriptor table page, switch the controller to
     /// ADMA2-32, enable NORMAL/ERROR_INT_SIGNAL_ENABLE for the IRQ
-    /// path, return a ready-to-serve engine. Caller still owns
-    /// `mmio_va` and the IRQ notification handle, and is responsible
-    /// for keeping the controller initialized through enumeration
-    /// before calling this. Signal-enables are turned on HERE (not
-    /// at boot) so the ID-phase polling path in `issue_command`
-    /// continues to work without IRQ interference.
+    /// path, return a ready-to-serve engine. Caller hands over the
+    /// typed MMIO handle (via P9.4c framework entry) and the bound
+    /// IRQ, and is responsible for keeping the controller
+    /// initialized through enumeration before calling this. Signal-
+    /// enables are turned on HERE (not at boot) so the ID-phase
+    /// polling path in `issue_command` continues to work without IRQ
+    /// interference.
     unsafe fn new(
-        mmio_va: u64,
+        regs: MappedRegs<Sdhci>,
         capacity_sectors: u64,
         irq: lockjaw_userlib::irq::BoundIrq,
     ) -> Result<Self, Emmc2Error>
     {
+        // Reborrow as &Sdhci for the rest of init (passed to
+        // sdhci_read*/write* shims). regs is moved into the engine
+        // at the end of this function.
+        let sdhci = regs.regs();
         // Descriptor table: 1 page from the DMA pool. Post-C1 of
         // the cacheable-DMA migration this is mapped Normal
         // Cacheable; the matching sys_dma_sync_for_device call
@@ -1585,13 +1603,13 @@ impl Emmc2BlockEngine {
         }
         // Switch HOST_CONTROL_1.DMA_SEL to ADMA2-32; preserve the
         // 4-bit bus width from ACMD6.
-        let hc = sdhci_read8(mmio_va, SDHCI_HOST_CONTROL);
+        let hc = sdhci_read8(sdhci, SDHCI_HOST_CONTROL);
         let hc_new = (hc & !SDHCI_HOST_CTRL_DMA_SEL_MASK)
             | SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32;
-        sdhci_write8(mmio_va, SDHCI_HOST_CONTROL, hc_new);
+        sdhci_write8(sdhci, SDHCI_HOST_CONTROL, hc_new);
         // Program the descriptor table address once; the same table
         // is reused across every transfer.
-        sdhci_write32(mmio_va, SDHCI_ADMA_ADDRESS, desc_phys as u32);
+        sdhci_write32(sdhci, SDHCI_ADMA_ADDRESS, desc_phys as u32);
         // Clear any latched STATUS bits before enabling signaling.
         //
         // ID-phase polling can leave NORMAL_INT_STATUS bits set —
@@ -1618,8 +1636,8 @@ impl Emmc2BlockEngine {
         // — it's a superset of B4.2's per-command stale-bit guard,
         // but at this specific site it's REQUIRED to make the
         // ID-phase → data-phase IRQ-mode transition safe.
-        sdhci_write16(mmio_va, SDHCI_NORMAL_INT_STATUS, 0xFFFF);
-        sdhci_write16(mmio_va, SDHCI_ERROR_INT_STATUS, 0xFFFF);
+        sdhci_write16(sdhci, SDHCI_NORMAL_INT_STATUS, 0xFFFF);
+        sdhci_write16(sdhci, SDHCI_ERROR_INT_STATUS, 0xFFFF);
 
         // Enable IRQ signaling for the data path (m7-irq-experiment
         // graft). NORMAL/ERROR_INT_STATUS_ENABLE was already set at
@@ -1630,10 +1648,14 @@ impl Emmc2BlockEngine {
         let normal_sig = SDHCI_INT_CMD_COMPLETE
             | SDHCI_INT_DATA_COMPLETE
             | SDHCI_INT_ERROR;
-        sdhci_write16(mmio_va, SDHCI_NORMAL_INT_SIGNAL_ENABLE, normal_sig);
-        sdhci_write16(mmio_va, SDHCI_ERROR_INT_SIGNAL_ENABLE, 0xFFFF);
+        sdhci_write16(sdhci, SDHCI_NORMAL_INT_SIGNAL_ENABLE, normal_sig);
+        sdhci_write16(sdhci, SDHCI_ERROR_INT_SIGNAL_ENABLE, 0xFFFF);
+        // Drop the `sdhci` borrow so we can move `regs` into the
+        // struct (NLL should already handle this, but the explicit
+        // shadow keeps the intent obvious in review).
+        let _ = sdhci;
         Ok(Self {
-            mmio_va,
+            regs,
             capacity_sectors,
             desc_ps,
             desc_va,
@@ -1748,7 +1770,7 @@ impl BlockEngine for Emmc2BlockEngine {
             let buf_sector_pa = buf.pa + i * 512;
             let res = unsafe {
                 adma2_single_block_read(
-                    self.mmio_va, sector + i, buf_sector_pa,
+                    self.regs.regs(), sector + i, buf_sector_pa,
                     self.desc_ps, self.desc_va, self.desc_phys,
                     &mut self.irq,
                 )

@@ -682,7 +682,15 @@ pub extern "C" fn _start() -> ! {
         Ok(idx) => idx,
         Err(_) => { puts("init: export emmc2_blk_srv_ep to emmc2 FAILED\n"); park_forever(); }
     };
-    sys_reply(emmc2_devmgr_idx, emmc2_blk_srv_idx_for_emmc2, 0, 0);
+    // P9.4c: bootstrap reply order changed to match the framework's
+    // `driver_bootstrap` convention (reply[0] = server_ep,
+    // reply[1] = devmgr_ep) — the same shape blk-driver / uart use.
+    // Pre-P9.4c emmc2 read these as `[devmgr, blk_srv, _, _]` with a
+    // raw bootstrap; the new emmc2_entry consumes the framework ctx
+    // via standard_driver_init_level and would deadlock if init
+    // still sent them swapped (probe IPC would target the unstarted
+    // blk server endpoint instead of devmgr).
+    sys_reply(emmc2_blk_srv_idx_for_emmc2, emmc2_devmgr_idx, 0, 0);
     puts("[BOOTSTRAP] emmc2\n");
 
     // Pick the block backend for fat32-server. On Pi 4B the

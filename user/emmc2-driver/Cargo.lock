@@ -6,6 +6,8 @@ version = 4
 name = "lockjaw-emmc2-driver"
 version = "0.1.0"
 dependencies = [
+ "lockjaw-mmio",
+ "lockjaw-regs",
  "lockjaw-types",
  "lockjaw-userlib",
 ]
