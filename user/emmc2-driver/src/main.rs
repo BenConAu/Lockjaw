@@ -12,7 +12,10 @@ use lockjaw_userlib::driver_runtime::{
 };
 use lockjaw_userlib::dma_sync::{sys_dma_sync_for_cpu, sys_dma_sync_for_device};
 use lockjaw_mmio::region::MappedRegs;
-use lockjaw_regs::sdhci::Sdhci;
+use lockjaw_regs::sdhci::{
+    HostControl, HostControlDmaSel, PowerControl, PowerControlBusVoltage,
+    Sdhci, SoftwareReset,
+};
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, sleep_for, Nanos};
 // `monotonic_now` returns `MonoTicks`, which is `Ord`; the comparisons in the
@@ -24,12 +27,9 @@ use lockjaw_types::device::BCM2711_EMMC2_HASH;
 use lockjaw_types::sdhci::{
     Capabilities, OcrRegister, r6_rca, CsdV2,
     CMD8_IF_COND_ARG, ACMD41_ARG_HCS,
-    SDHCI_SOFTWARE_RESET, SW_RST_ALL,
     SDHCI_CAPABILITIES, SDHCI_CAPABILITIES_HI,
     SDHCI_HOST_VERSION, SDHCI_SPEC_300,
     SDHCI_CLOCK_CONTROL, SDHCI_CLOCK_INT_EN, SDHCI_CLOCK_INT_STABLE, SDHCI_CLOCK_CARD_EN,
-    SDHCI_POWER_CONTROL, SDHCI_POWER_ON, SDHCI_POWER_330,
-    SDHCI_TIMEOUT_CONTROL,
     SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, SDHCI_DAT_INHIBIT,
     SDHCI_ARGUMENT, SDHCI_ARGUMENT2, SDHCI_TRANSFER_MODE, SDHCI_COMMAND,
     SDHCI_BLOCK_SIZE, SDHCI_BLOCK_COUNT,
@@ -42,8 +42,6 @@ use lockjaw_types::sdhci::{
     SDHCI_INT_CMD_END_BIT, SDHCI_INT_CMD_INDEX,
     SDHCI_INT_DATA_TIMEOUT, SDHCI_INT_DATA_CRC, SDHCI_INT_DATA_END_BIT,
     SDHCI_RESPONSE_0, SDHCI_RESPONSE_1, SDHCI_RESPONSE_2, SDHCI_RESPONSE_3,
-    SDHCI_HOST_CONTROL, SDHCI_HOST_CTRL_DAT_4BIT,
-    SDHCI_HOST_CTRL_DMA_SEL_MASK, SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32,
     SDHCI_ADMA_ADDRESS,
     SDHCI_CMD_CRC, SDHCI_CMD_INDEX, SDHCI_CMD_DATA,
     SDHCI_CMD_RESP_NONE, SDHCI_CMD_RESP_SHORT, SDHCI_CMD_RESP_LONG, SDHCI_CMD_RESP_SHORT_BUSY,
@@ -65,21 +63,10 @@ use lockjaw_types::sdhci::{
 // pre-P9.4c: `handle: &Sdhci` instead of `base: u64`. The body
 // derives the base via the safe pointer-to-int cast — no extra
 // `unsafe` block introduced. Per-width helper deletions:
-//   - sdhci_read8/write8 → P9.5
+//   - sdhci_read8/write8 → P9.5 (DONE — typed via HostControl /
+//     PowerControl / SoftwareReset newtypes + write_timeout_control)
 //   - sdhci_read16/write16 → P9.6 (combined_trigger carve-out → P9.7)
 //   - sdhci_read32/write32 → P9.8
-
-/// Read an 8-bit SDHCI register at `handle + offset`.
-unsafe fn sdhci_read8(handle: &Sdhci, offset: u64) -> u8 {
-    let base = handle as *const Sdhci as u64;
-    ptr::read_volatile((base + offset) as *const u8)
-}
-
-/// Write an 8-bit SDHCI register at `handle + offset`.
-unsafe fn sdhci_write8(handle: &Sdhci, offset: u64, value: u8) {
-    let base = handle as *const Sdhci as u64;
-    ptr::write_volatile((base + offset) as *mut u8, value);
-}
 
 /// Read a 16-bit SDHCI register at `handle + offset`. Offset must be
 /// 2-byte aligned. Used for CLOCK_CONTROL, NORMAL_INT_STATUS, etc.
@@ -135,22 +122,6 @@ unsafe fn sdhci_write32(handle: &Sdhci, offset: u64, value: u32) {
 //   - hardware-event poll: deadline + `spin_loop`.
 // The polls return Err(()) on timeout; the caller logs the failure.
 
-/// Read an 8-bit status register and busy-poll until `mask` clears,
-/// or `timeout` elapses. Used by SOFTWARE_RESET (SW_RST_ALL).
-unsafe fn poll_until_clear_8(sdhci: &Sdhci, offset: u64, mask: u8, timeout: Nanos) -> Result<(), ()> {
-    let freq = cntfreq_hz();
-    let deadline = monotonic_now().deadline_in(timeout, freq);
-    loop {
-        if sdhci_read8(sdhci, offset) & mask == 0 {
-            return Ok(());
-        }
-        if monotonic_now() >= deadline {
-            return Err(());
-        }
-        core::hint::spin_loop();
-    }
-}
-
 /// Read a 16-bit status register and busy-poll until `mask` becomes
 /// set, or `timeout` elapses. Used by CLOCK_CONTROL.INT_STABLE.
 unsafe fn poll_until_set_16(sdhci: &Sdhci, offset: u64, mask: u16, timeout: Nanos) -> Result<(), ()> {
@@ -192,15 +163,29 @@ unsafe fn poll_until_clear_32(sdhci: &Sdhci, offset: u64, mask: u32, timeout: Na
 /// guarantees the bit clears within ~100 ms once the reset completes.
 /// Returns Err if the bit hasn't cleared by the deadline.
 ///
-/// Deadline-bounded busy poll (see `poll_until_clear_8` and the
-/// status-bit-poll comment block above for why we busy-spin between
-/// MMIO reads instead of yielding via `sleep_for`). The earlier
-/// 1_000_000-iteration spin tied correctness to CPU clock and
-/// codegen; with a real-time deadline the timeout is what it says
-/// regardless of platform.
-unsafe fn soft_reset_all(sdhci: &Sdhci) -> Result<(), ()> {
-    sdhci_write8(sdhci, SDHCI_SOFTWARE_RESET, SW_RST_ALL);
-    poll_until_clear_8(sdhci, SDHCI_SOFTWARE_RESET, SW_RST_ALL, Nanos::from_millis(200))
+/// Deadline-bounded busy poll (see the status-bit-poll comment
+/// block above for why we busy-spin between MMIO reads instead of
+/// yielding via `sleep_for`). The earlier 1_000_000-iteration spin
+/// tied correctness to CPU clock and codegen; with a real-time
+/// deadline the timeout is what it says regardless of platform.
+fn soft_reset_all(sdhci: &Sdhci) -> Result<(), ()> {
+    // P9.5: typed accessor — `set_software_reset` writes the W1S
+    // bit via the generated `Sdhci` regs; `software_reset().contains(...)`
+    // decodes the post-write status via the typed bitflag. The poll
+    // is inlined here because the SDHCI_SOFTWARE_RESET register was
+    // the only consumer of the deleted poll_until_clear_8 helper.
+    sdhci.set_software_reset(SoftwareReset::SW_RST_ALL);
+    let freq = cntfreq_hz();
+    let deadline = monotonic_now().deadline_in(Nanos::from_millis(200), freq);
+    loop {
+        if !sdhci.software_reset().contains(SoftwareReset::SW_RST_ALL) {
+            return Ok(());
+        }
+        if monotonic_now() >= deadline {
+            return Err(());
+        }
+        core::hint::spin_loop();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -548,7 +533,7 @@ fn emmc2_entry() -> ! {
     // Soft-reset the controller. SW_RST_ALL puts every internal block
     // back to the post-power-on state; required before any further
     // configuration touches CLOCK_CONTROL or POWER_CONTROL.
-    if unsafe { soft_reset_all(sdhci) }.is_err() {
+    if soft_reset_all(sdhci).is_err() {
         puts("emmc2: SW_RST_ALL did not clear within timeout\n");
         halt();
     }
@@ -674,10 +659,15 @@ fn emmc2_entry() -> ! {
 
     // Power on the SD bus at 3.3 V before enabling the SD clock.
     // Set max data timeout (TMCLK × 2^27 = 0x0E) while we're here.
-    unsafe {
-        sdhci_write8(sdhci, SDHCI_POWER_CONTROL, SDHCI_POWER_330 | SDHCI_POWER_ON);
-        sdhci_write8(sdhci, SDHCI_TIMEOUT_CONTROL, 0x0E);
-    }
+    // P9.5: typed PowerControl builder + raw u8 write for
+    // timeout_control (no typed newtype generated for that
+    // register — sdhci.toml doesn't declare named fields on it).
+    sdhci.set_power_control(
+        PowerControl::default()
+            .with_bus_power_on(true)
+            .with_bus_voltage(PowerControlBusVoltage::V33),
+    );
+    sdhci.write_timeout_control(0x0E);
 
     // Wait for card power to stabilise before enabling the SD clock.
     // Pi 4B has a fixed 3.3 V rail; ~1 ms is enough for the regulator
@@ -1018,10 +1008,11 @@ fn emmc2_entry() -> ! {
     }
     // Mirror the 4-bit bus width in HOST_CONTROL_1 immediately after
     // the card acknowledges ACMD6 — the host side must match the card.
-    unsafe {
-        let hc = sdhci_read8(sdhci, SDHCI_HOST_CONTROL);
-        sdhci_write8(sdhci, SDHCI_HOST_CONTROL, hc | SDHCI_HOST_CTRL_DAT_4BIT);
-    }
+    // P9.5: typed modify-in-place — the closure receives the current
+    // HostControl snapshot and returns a new value with dat_4bit set;
+    // the generated `modify_host_control` does the read-modify-write
+    // atomically through the typed accessor (no manual mask-shift).
+    sdhci.modify_host_control(|hc| hc.with_dat_4bit(true));
 
     // Raise the SD bus clock from 400 kHz (ID mode) to 25 MHz (data
     // transfer mode).  SDHCI spec § 3.2.4: disable SD_CLK_EN first,
@@ -1212,10 +1203,11 @@ unsafe fn adma2_single_block_read(
     // width bit (set during M3 ACMD6); replace the DMA_SEL field
     // bits only. Idempotent (engine.new already set it) but kept for
     // safety against any other code path that might have changed it.
-    let hc = sdhci_read8(sdhci, SDHCI_HOST_CONTROL);
-    let hc_new = (hc & !SDHCI_HOST_CTRL_DMA_SEL_MASK)
-        | SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32;
-    sdhci_write8(sdhci, SDHCI_HOST_CONTROL, hc_new);
+    // P9.5: typed modify-in-place via the generated enum field
+    // accessor — `with_dma_sel(HostControlDmaSel::Adma2_32)` masks
+    // and shifts the DMA_SEL field correctly without driver-side
+    // hand-rolled mask arithmetic.
+    sdhci.modify_host_control(|hc| hc.with_dma_sel(HostControlDmaSel::Adma2_32));
 
     sdhci_write32(sdhci, SDHCI_ADMA_ADDRESS, desc_phys as u32);
 
@@ -1602,11 +1594,9 @@ impl Emmc2BlockEngine {
             return Err(Emmc2Error::DescPhysAbove4Gib(desc_phys));
         }
         // Switch HOST_CONTROL_1.DMA_SEL to ADMA2-32; preserve the
-        // 4-bit bus width from ACMD6.
-        let hc = sdhci_read8(sdhci, SDHCI_HOST_CONTROL);
-        let hc_new = (hc & !SDHCI_HOST_CTRL_DMA_SEL_MASK)
-            | SDHCI_HOST_CTRL_DMA_SEL_ADMA2_32;
-        sdhci_write8(sdhci, SDHCI_HOST_CONTROL, hc_new);
+        // 4-bit bus width from ACMD6 (P9.5 — typed
+        // `with_dma_sel(HostControlDmaSel::Adma2_32)`).
+        sdhci.modify_host_control(|hc| hc.with_dma_sel(HostControlDmaSel::Adma2_32));
         // Program the descriptor table address once; the same table
         // is reused across every transfer.
         sdhci_write32(sdhci, SDHCI_ADMA_ADDRESS, desc_phys as u32);
