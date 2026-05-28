@@ -15,7 +15,7 @@ use lockjaw_mmio::region::MappedRegs;
 use lockjaw_regs::sdhci::{
     ClockControl, Command, ErrorIntSignalEnable, ErrorIntStatus, ErrorIntStatusEnable,
     HostControlDmaSel, NormalIntSignalEnable, NormalIntStatus, NormalIntStatusEnable,
-    PowerControl, PowerControlBusVoltage, Sdhci, SoftwareReset, TransferMode,
+    PowerControl, PowerControlBusVoltage, PresentState, Sdhci, SoftwareReset, TransferMode,
 };
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, sleep_for, Nanos};
@@ -28,55 +28,16 @@ use lockjaw_types::device::BCM2711_EMMC2_HASH;
 use lockjaw_types::sdhci::{
     Capabilities, OcrRegister, r6_rca, CsdV2,
     CMD8_IF_COND_ARG, ACMD41_ARG_HCS,
-    SDHCI_CAPABILITIES, SDHCI_CAPABILITIES_HI,
     SDHCI_SPEC_300,
-    SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, SDHCI_DAT_INHIBIT,
-    SDHCI_ARGUMENT, SDHCI_ARGUMENT2,
     SDHCI_INT_CMD_TIMEOUT, SDHCI_INT_CMD_CRC,
     SDHCI_INT_CMD_END_BIT, SDHCI_INT_CMD_INDEX,
     SDHCI_INT_DATA_TIMEOUT, SDHCI_INT_DATA_CRC, SDHCI_INT_DATA_END_BIT,
-    SDHCI_RESPONSE_0, SDHCI_RESPONSE_1, SDHCI_RESPONSE_2, SDHCI_RESPONSE_3,
-    SDHCI_ADMA_ADDRESS,
     SDHCI_CMD_CRC, SDHCI_CMD_INDEX, SDHCI_CMD_DATA,
     SDHCI_CMD_RESP_NONE, SDHCI_CMD_RESP_SHORT, SDHCI_CMD_RESP_LONG, SDHCI_CMD_RESP_SHORT_BUSY,
     SDHCI_TRNS_READ, SDHCI_TRNS_DMA, SDHCI_TRNS_BLK_CNT_EN, SDHCI_TRNS_MULTI, SDHCI_TRNS_AUTO_CMD23,
     SdCommand, compute_clock_divisor, sd_command_word,
     adma2_tran_end_descriptor,
 };
-
-// ---------------------------------------------------------------------------
-// MMIO helpers
-// ---------------------------------------------------------------------------
-//
-// SDHCI assigns specific access widths per register; mismatched widths
-// can fault on real silicon. SOFTWARE_RESET (0x02f) is a single byte;
-// CAPABILITIES / CAPABILITIES_HI (0x040 / 0x044) are 32-bit reads.
-
-// Per-width shims kept (post P9.4c) as the transitional MMIO surface
-// while typed accessors land in P9.5-P9.8. Signature: `handle:
-// &Sdhci` instead of `base: u64`; the body derives the base via the
-// safe pointer-to-int cast — no extra `unsafe` block introduced.
-// Per-width helper deletions:
-//   - sdhci_read8/write8 → P9.5 (DONE — typed via HostControl /
-//     PowerControl / SoftwareReset newtypes + write_timeout_control)
-//   - sdhci_read16/write16 → P9.6 + P9.7 (DONE — 16-bit registers
-//     typed in P9.6; the TRANSFER_MODE+COMMAND pair moved to the
-//     combined_trigger set_transfer_mode_command setter in P9.7)
-//   - sdhci_read32/write32 → P9.8
-
-/// Read a 32-bit SDHCI register at `handle + offset`. Caller is
-/// responsible for 4-byte alignment.
-unsafe fn sdhci_read32(handle: &Sdhci, offset: u64) -> u32 {
-    let base = handle as *const Sdhci as u64;
-    ptr::read_volatile((base + offset) as *const u32)
-}
-
-/// Write a 32-bit SDHCI register at `handle + offset`. ARGUMENT (0x008)
-/// is the primary u32 write in M2; offset must be 4-byte aligned.
-unsafe fn sdhci_write32(handle: &Sdhci, offset: u64, value: u32) {
-    let base = handle as *const Sdhci as u64;
-    ptr::write_volatile((base + offset) as *mut u32, value);
-}
 
 // ---------------------------------------------------------------------------
 // Status-bit polls (deadline-bounded, busy)
@@ -135,18 +96,6 @@ fn poll_until<F: FnMut() -> bool>(mut pred: F, timeout: Nanos) -> Result<(), ()>
         }
         core::hint::spin_loop();
     }
-}
-
-/// Read a 32-bit status register and busy-poll until `mask` clears,
-/// or `timeout` elapses. Used by PRESENT_STATE.CMD_INHIBIT.
-///
-/// Transitional: stays until P9.8 deletes the 32-bit shims; the
-/// remaining callers (B4.1 post-completion DAT_INHIBIT poll +
-/// pre-CMD inhibit poll in adma2_single_block_read / adma2_transfer)
-/// will move to `poll_until(|| sdhci.present_state().dat_inhibit())`
-/// once present_state's typed accessor lands.
-unsafe fn poll_until_clear_32(sdhci: &Sdhci, offset: u64, mask: u32, timeout: Nanos) -> Result<(), ()> {
-    poll_until(|| sdhci_read32(sdhci, offset) & mask == 0, timeout)
 }
 
 // ---------------------------------------------------------------------------
@@ -252,13 +201,16 @@ enum CmdResult {
 ///   4. Poll NORMAL_INT_STATUS for CMD_COMPLETE or ERROR.
 ///   5. Clear CMD_COMPLETE (write-1-to-clear).
 ///   6. Return RESPONSE_0.
-unsafe fn issue_command(sdhci: &Sdhci, arg: u32, cmd_word: u16) -> CmdResult {
+fn issue_command(sdhci: &Sdhci, arg: u32, cmd_word: u16) -> CmdResult {
     // Wait for CMD line to be free. Should clear within microseconds
     // on a healthy controller; 100 ms is generous bound.
-    if poll_until_clear_32(sdhci, SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, Nanos::from_millis(100)).is_err() {
+    if poll_until(
+        || !sdhci.present_state().contains(PresentState::CMD_INHIBIT),
+        Nanos::from_millis(100),
+    ).is_err() {
         return CmdResult::InhibitStuck;
     }
-    sdhci_write32(sdhci, SDHCI_ARGUMENT, arg);
+    sdhci.write_argument(arg);
     // Writing COMMAND triggers the command on the bus. P9.7: the
     // generated combined_trigger setter emits a single 32-bit store
     // to transfer_mode_command (TRANSFER_MODE in the low half,
@@ -301,7 +253,7 @@ unsafe fn issue_command(sdhci: &Sdhci, arg: u32, cmd_word: u16) -> CmdResult {
         }
         if status.contains(NormalIntStatus::CMD_COMPLETE) {
             sdhci.clear_normal_int_status(NormalIntStatus::CMD_COMPLETE);
-            return CmdResult::Ok(sdhci_read32(sdhci, SDHCI_RESPONSE_0));
+            return CmdResult::Ok(sdhci.read_response_0());
         }
         if monotonic_now() >= deadline {
             return CmdResult::NoResponse;
@@ -596,8 +548,8 @@ fn emmc2_entry() -> ! {
     // (high 32 bits at 0x044). Decoded view lives in lockjaw-types
     // so the bit layout has host tests; the driver just dispatches
     // the two volatile reads.
-    let caps_lo = unsafe { sdhci_read32(sdhci, SDHCI_CAPABILITIES) };
-    let caps_hi = unsafe { sdhci_read32(sdhci, SDHCI_CAPABILITIES_HI) };
+    let caps_lo = sdhci.capabilities().bits();
+    let caps_hi = sdhci.read_capabilities_hi();
     let caps = Capabilities::decode(caps_lo, caps_hi);
 
     // HOST_VERSION (0x0fe) is a u16: bits[7:0] = spec version
@@ -718,7 +670,7 @@ fn emmc2_entry() -> ! {
     // idle. A controller-level error here (e.g. CMD line wedged) is
     // still useful diagnostic context for what follows.
     let cmd0 = sd_command_word(SdCommand::GoIdleState.index(), SDHCI_CMD_RESP_NONE);
-    match unsafe { issue_command(sdhci, 0, cmd0) } {
+    match issue_command(sdhci, 0, cmd0) {
         CmdResult::Ok(_) => puts("[EMMC2:IDPHASE] CMD0 acknowledged\n"),
         CmdResult::InhibitStuck => puts("[EMMC2:IDPHASE] CMD0: CMD_INHIBIT stuck (controller not responding)\n"),
         CmdResult::ControllerError(bits) => {
@@ -735,7 +687,7 @@ fn emmc2_entry() -> ! {
     // cards don't respond to CMD8; UHS and SDXC cards need it for ACMD41.
     let cmd8_flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX;
     let cmd8 = sd_command_word(SdCommand::SendIfCond.index(), cmd8_flags);
-    let resp = match unsafe { issue_command(sdhci, CMD8_IF_COND_ARG, cmd8) } {
+    let resp = match issue_command(sdhci, CMD8_IF_COND_ARG, cmd8) {
         CmdResult::Ok(r) => r,
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] CMD8 FAILED: CMD_INHIBIT did not clear before deadline\n");
@@ -798,7 +750,7 @@ fn emmc2_entry() -> ! {
     let acmd41_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
     let ocr = loop {
         // CMD55 — prefixes ACMD41; response is R1 from the card.
-        match unsafe { issue_command(sdhci, 0, cmd55_word) } {
+        match issue_command(sdhci, 0, cmd55_word) {
             CmdResult::Ok(_) => {}
             CmdResult::InhibitStuck => {
                 puts("[EMMC2:IDPHASE] CMD55 FAILED: CMD_INHIBIT stuck\n");
@@ -816,7 +768,7 @@ fn emmc2_entry() -> ! {
             }
         }
         // ACMD41 — the card returns OCR; busy bit clears when ready.
-        let r0 = match unsafe { issue_command(sdhci, ACMD41_ARG_HCS, acmd41_word) } {
+        let r0 = match issue_command(sdhci, ACMD41_ARG_HCS, acmd41_word) {
             CmdResult::Ok(r) => r,
             CmdResult::InhibitStuck => {
                 puts("[EMMC2:IDPHASE] ACMD41 FAILED: CMD_INHIBIT stuck\n");
@@ -857,7 +809,7 @@ fn emmc2_entry() -> ! {
         SdCommand::AllSendCid.index(),
         SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC,
     );
-    match unsafe { issue_command(sdhci, 0, cmd2_word) } {
+    match issue_command(sdhci, 0, cmd2_word) {
         CmdResult::Ok(_) => {}
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] CMD2 FAILED: CMD_INHIBIT stuck\n");
@@ -883,7 +835,7 @@ fn emmc2_entry() -> ! {
         SdCommand::SendRelativeAddr.index(),
         SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
     );
-    let rca: u16 = match unsafe { issue_command(sdhci, 0, cmd3_word) } {
+    let rca: u16 = match issue_command(sdhci, 0, cmd3_word) {
         CmdResult::Ok(r) => r6_rca(r),
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] CMD3 FAILED: CMD_INHIBIT stuck\n");
@@ -914,14 +866,14 @@ fn emmc2_entry() -> ! {
         SdCommand::SendCsd.index(),
         SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC,
     );
-    let capacity_bytes: u64 = match unsafe { issue_command(sdhci, rca_arg, cmd9_word) } {
+    let capacity_bytes: u64 = match issue_command(sdhci, rca_arg, cmd9_word) {
         CmdResult::Ok(_) => {
-            let resp = unsafe {[
-                sdhci_read32(sdhci, SDHCI_RESPONSE_0),
-                sdhci_read32(sdhci, SDHCI_RESPONSE_1),
-                sdhci_read32(sdhci, SDHCI_RESPONSE_2),
-                sdhci_read32(sdhci, SDHCI_RESPONSE_3),
-            ]};
+            let resp = [
+                sdhci.read_response_0(),
+                sdhci.read_response_1(),
+                sdhci.read_response_2(),
+                sdhci.read_response_3(),
+            ];
             match CsdV2::decode(resp) {
                 Ok(csd) => csd.capacity_bytes,
                 Err(e) => {
@@ -956,7 +908,7 @@ fn emmc2_entry() -> ! {
         SdCommand::SelectCard.index(),
         SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
     );
-    match unsafe { issue_command(sdhci, rca_arg, cmd7_word) } {
+    match issue_command(sdhci, rca_arg, cmd7_word) {
         CmdResult::Ok(_) => {}
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] CMD7 FAILED: CMD_INHIBIT stuck\n");
@@ -974,11 +926,13 @@ fn emmc2_entry() -> ! {
         }
     }
     // Wait for DAT0 to deassert — the card signals "ready" by releasing it.
-    if unsafe { poll_until_clear_32(
-        sdhci, SDHCI_PRESENT_STATE,
-        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
+    if poll_until(
+        || {
+            let ps = sdhci.present_state();
+            !ps.contains(PresentState::CMD_INHIBIT) && !ps.contains(PresentState::DAT_INHIBIT)
+        },
         Nanos::from_millis(500),
-    )}.is_err() {
+    ).is_err() {
         puts("[EMMC2:IDPHASE] CMD7 DAT_INHIBIT did not clear (card busy timeout)\n");
         sys_exit();
     }
@@ -990,7 +944,7 @@ fn emmc2_entry() -> ! {
         SdCommand::AppCmd.index(),
         SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
     );
-    match unsafe { issue_command(sdhci, rca_arg, cmd55_rca_word) } {
+    match issue_command(sdhci, rca_arg, cmd55_rca_word) {
         CmdResult::Ok(_) => {}
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] CMD55 (pre-ACMD6) FAILED: CMD_INHIBIT stuck\n");
@@ -1012,7 +966,7 @@ fn emmc2_entry() -> ! {
         SdCommand::SetBusWidth.index(),
         SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
     );
-    match unsafe { issue_command(sdhci, 0x2, acmd6_word) } {
+    match issue_command(sdhci, 0x2, acmd6_word) {
         CmdResult::Ok(_) => {}
         CmdResult::InhibitStuck => {
             puts("[EMMC2:IDPHASE] ACMD6 FAILED: CMD_INHIBIT stuck\n");
@@ -1194,13 +1148,15 @@ unsafe fn adma2_single_block_read(
     // PRESENT_STATE bits 1/2/9 (CMD_INHIBIT_DAT, DAT_LINE_ACTIVE,
     // READ_TRANSFER_ACTIVE) never clear. Polling inhibit before any
     // writes is what Linux's sdhci_send_command does.
-    if poll_until_clear_32(
-        sdhci, SDHCI_PRESENT_STATE,
-        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
+    if poll_until(
+        || {
+            let ps = sdhci.present_state();
+            !ps.contains(PresentState::CMD_INHIBIT) && !ps.contains(PresentState::DAT_INHIBIT)
+        },
         Nanos::from_millis(100),
     ).is_err() {
         return Err(Emmc2Error::InhibitStuck {
-            present_state: sdhci_read32(sdhci, SDHCI_PRESENT_STATE),
+            present_state: sdhci.present_state().bits(),
         });
     }
 
@@ -1232,7 +1188,7 @@ unsafe fn adma2_single_block_read(
     // hand-rolled mask arithmetic.
     sdhci.modify_host_control(|hc| hc.with_dma_sel(HostControlDmaSel::Adma2_32));
 
-    sdhci_write32(sdhci, SDHCI_ADMA_ADDRESS, desc_phys as u32);
+    sdhci.write_adma_address(desc_phys as u32);
 
     // Typed BLOCK_SIZE/BLOCK_COUNT writes (regspec generates raw u16
     // write_* accessors — the registers have no named bit fields).
@@ -1240,7 +1196,7 @@ unsafe fn adma2_single_block_read(
     sdhci.write_block_count(1);
     // ARGUMENT must be latched before the COMMAND half of the
     // combined write triggers the command on the bus.
-    sdhci_write32(sdhci, SDHCI_ARGUMENT, sector as u32);
+    sdhci.write_argument(sector as u32);
 
     let cmd17 = sd_command_word(
         SdCommand::ReadSingleBlock.index(),
@@ -1363,13 +1319,12 @@ unsafe fn adma2_single_block_read(
     //
     // 10 ms deadline matches the plan's B4.1 budget; the actual
     // drain is microseconds in normal operation.
-    if poll_until_clear_32(
-        sdhci, SDHCI_PRESENT_STATE,
-        SDHCI_DAT_INHIBIT,
+    if poll_until(
+        || !sdhci.present_state().contains(PresentState::DAT_INHIBIT),
         Nanos::from_millis(10),
     ).is_err() {
         return Err(Emmc2Error::DatInhibitStuck {
-            present_state: sdhci_read32(sdhci, SDHCI_PRESENT_STATE),
+            present_state: sdhci.present_state().bits(),
         });
     }
 
@@ -1419,13 +1374,15 @@ unsafe fn adma2_transfer(
     // Inhibit poll FIRST — see adma2_single_block_read for rationale.
     // Writing ADMA_ADDRESS or other transfer-affecting registers while
     // a previous transfer is still active wedges the controller.
-    if poll_until_clear_32(
-        sdhci, SDHCI_PRESENT_STATE,
-        SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT,
+    if poll_until(
+        || {
+            let ps = sdhci.present_state();
+            !ps.contains(PresentState::CMD_INHIBIT) && !ps.contains(PresentState::DAT_INHIBIT)
+        },
         Nanos::from_millis(100),
     ).is_err() {
         return Err(Emmc2Error::InhibitStuck {
-            present_state: sdhci_read32(sdhci, SDHCI_PRESENT_STATE),
+            present_state: sdhci.present_state().bits(),
         });
     }
 
@@ -1441,8 +1398,8 @@ unsafe fn adma2_transfer(
         return Err(Emmc2Error::DescSyncFailed);
     }
 
-    sdhci_write32(sdhci, SDHCI_ADMA_ADDRESS, desc_phys as u32);
-    sdhci_write32(sdhci, SDHCI_ARGUMENT2, n_blocks as u32);
+    sdhci.write_adma_address(desc_phys as u32);
+    sdhci.write_argument2(n_blocks as u32);
 
     // P9.6: typed BLOCK_SIZE/BLOCK_COUNT writes (mirror of the
     // single-block path).
@@ -1457,7 +1414,7 @@ unsafe fn adma2_transfer(
     // CMD18/CMD25 argument is the LBA (SDHC/SDXC blocks-as-units).
     // ARGUMENT before the combined TRANSFER_MODE+COMMAND write
     // (P9.7 reorder — same rationale as adma2_single_block_read).
-    sdhci_write32(sdhci, SDHCI_ARGUMENT, sector as u32);
+    sdhci.write_argument(sector as u32);
 
     let cmd = sd_command_word(
         match direction {
@@ -1648,7 +1605,7 @@ impl Emmc2BlockEngine {
         sdhci.modify_host_control(|hc| hc.with_dma_sel(HostControlDmaSel::Adma2_32));
         // Program the descriptor table address once; the same table
         // is reused across every transfer.
-        sdhci_write32(sdhci, SDHCI_ADMA_ADDRESS, desc_phys as u32);
+        sdhci.write_adma_address(desc_phys as u32);
         // Clear any latched STATUS bits before enabling signaling.
         //
         // ID-phase polling can leave NORMAL_INT_STATUS bits set —
