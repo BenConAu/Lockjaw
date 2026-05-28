@@ -455,3 +455,24 @@ Pre-C1 of the cacheable-DMA migration there was a structural reason to skip kern
 **Fix:** Decide whether `sys_alloc_dma_pages` should zero on alloc. Arguments for: data-leak-by-default prevention if a DMA buffer ever crosses a privilege boundary (today no boundary crossing — drivers are all single-process per buffer — but the rule would be defensive). Arguments against: zeroing 2 MiB worst-case has nonzero cost; most DMA consumers promptly overwrite (driver fills the buffer or kicks the device to fill it), eating a duplicate write. If landed: kernel-side `zero_range_via_direct_map(pool_base + N*PAGE_SIZE, count * PAGE_SIZE)` followed by `cache::clean_range` so the device sees zeros on its first DMA read. Could also be a flag argument on `sys_alloc_dma_pages` so the caller opts in.
 
 **Why bootstrap:** the comment at the alloc site historically cited an alias argument that is no longer the reason. C1's stale-comment cleanup pass made the comment honest about the absence of zeroing without making the policy decision. Track here so the design question is not lost.
+
+---
+
+## emmc2 error-IRQ enable is Pi-fault-path-only (make test cannot guard it)
+
+**Where:** `user/emmc2-driver/src/main.rs` — `Emmc2BlockEngine::new` SIGNAL_ENABLE composition, and the status-decode in `adma2_single_block_read`'s IRQ loop.
+
+**What:** The driver enables three normal-interrupt signals for the data path — `CMD_COMPLETE | DATA_COMPLETE | ERROR` — and the IRQ wait loop decodes the same three. `ERROR` (NORMAL_INT_SIGNAL_ENABLE bit 15) is the master gate for error IRQ delivery; drop it and data-path CRC/timeout/end-bit errors never wake the loop — they surface only as the 1-second `TransferCompleteTimeout` fallback instead of a precise `DataError { err_int_status }`.
+
+**The gap:** `make test` cannot catch a regression that drops `ERROR` (or any required signal-enable bit) from the composition. Two reasons compound:
+1. On QEMU virt the emmc2-driver takes the device-absent exit (`[EMMC2:INIT] no bcm2711-emmc2 device on this platform`) before `Engine::new` ever runs — the composition is never executed under test.
+2. Even if it ran, QEMU's block path is virtio-blk; there is no SDHCI/Arasan emulation that generates CRC/timeout/end-bit errors, so the error-IRQ path is not exercised anywhere in CI. The failure is Pi-hardware-fault-path-only and silent until a real bus error occurs.
+
+This already bit us once: the P9.6 typed-accessor conversion dropped `| ERROR` from the composition (the generated value-test `NormalIntSignalEnable::ERROR.bits() == 1<<15` did not catch it, because that test is itself generated from the regspec flag — it guards the constant's value, not the driver's use of it). Caught in review, not by a test.
+
+**What would actually catch it:**
+- **QEMU SDHCI error injection** — a test device model that asserts ERROR_INT_STATUS bits on command, so the IRQ-driven error path runs in CI. Largest effort; also the only thing that exercises the full error decode, not just the enable bit.
+- **Driver host-test harness** — extract `Engine::new`'s register-programming sequence into a host-testable pure step that records its MMIO writes (the P9.0a thread-local MMIO op recorder in lockjaw-mmio already exists for codegen tests) and assert the SIGNAL_ENABLE write includes bit 15. Medium effort; catches the enable-composition regression specifically but not the decode side.
+- **Shared "IRQ-driven SDHCI mandatory signal set" const** in a host-tested crate that both the driver consumes and a unit test asserts contains ERROR. Smallest, but a layering smell (emmc2-specific data in shared lockjaw-regs) and only the rule-of-two would justify it — deferred until a second IRQ-driven SDHCI consumer exists.
+
+**Why bootstrap:** emmc2 is the only IRQ-driven SDHCI consumer today and the only block backend on Pi 4B. The error path is correct as written (verified against SDHCI 3.0 §2.2.21 + Linux's `host->ier`); the gap is test-coverage, not behaviour. Tracked here so the next person who touches the signal-enable composition or the regspec int-enable flags knows the change is invisible to `make test` and must be reasoned about against the spec.

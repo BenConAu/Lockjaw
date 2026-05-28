@@ -378,6 +378,12 @@ flags = [
     { name = "card_insert", bit = 6 },
     { name = "card_remove", bit = 7 },
     { name = "card_int", bit = 8 },
+    # Bit 15: master enable for latching the error summary into
+    # NORMAL_INT_STATUS (SDHCI 3.0 §2.2.21 Table 2-32). AND-gated
+    # above the per-error ERROR_INT_STATUS_ENABLE bits — both must
+    # be set for an error class to reach the NORMAL_INT_STATUS.error
+    # summary. Mandatory for any IRQ-driven SDHCI consumer.
+    { name = "error", bit = 15 },
 ]
 
 # ---------------------------------------------------------------------------
@@ -426,6 +432,14 @@ flags = [
     { name = "card_insert", bit = 6 },
     { name = "card_remove", bit = 7 },
     { name = "card_int", bit = 8 },
+    # Bit 15: master gate for error IRQ delivery (SDHCI 3.0 §2.2.21
+    # Table 2-32). With this clear, error conditions latch in
+    # NORMAL_INT_STATUS (when STATUS_ENABLE.error is set) but never
+    # assert the IRQ line, regardless of which per-error bits are set
+    # in ERROR_INT_SIGNAL_ENABLE. AND-gated above those per-error
+    # bits — Linux's sdhci.c sets it in host->ier. Mandatory for any
+    # IRQ-driven SDHCI consumer.
+    { name = "error", bit = 15 },
 ]
 
 # ---------------------------------------------------------------------------

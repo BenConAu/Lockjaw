@@ -501,6 +501,7 @@ impl NormalIntStatusEnable {
     pub const CARD_INSERT: Self = Self(1 << 6);
     pub const CARD_REMOVE: Self = Self(1 << 7);
     pub const CARD_INT: Self = Self(1 << 8);
+    pub const ERROR: Self = Self(1 << 15);
 }
 
 impl core::ops::BitOr for NormalIntStatusEnable {
@@ -582,6 +583,7 @@ impl NormalIntSignalEnable {
     pub const CARD_INSERT: Self = Self(1 << 6);
     pub const CARD_REMOVE: Self = Self(1 << 7);
     pub const CARD_INT: Self = Self(1 << 8);
+    pub const ERROR: Self = Self(1 << 15);
 }
 
 impl core::ops::BitOr for NormalIntSignalEnable {
@@ -1133,6 +1135,7 @@ mod tests {
         assert_eq!(NormalIntStatusEnable::CARD_INSERT.bits(), 1 << 6, "card_insert");
         assert_eq!(NormalIntStatusEnable::CARD_REMOVE.bits(), 1 << 7, "card_remove");
         assert_eq!(NormalIntStatusEnable::CARD_INT.bits(), 1 << 8, "card_int");
+        assert_eq!(NormalIntStatusEnable::ERROR.bits(), 1 << 15, "error");
     }
 
     #[test]
@@ -1176,6 +1179,7 @@ mod tests {
         assert_eq!(NormalIntSignalEnable::CARD_INSERT.bits(), 1 << 6, "card_insert");
         assert_eq!(NormalIntSignalEnable::CARD_REMOVE.bits(), 1 << 7, "card_remove");
         assert_eq!(NormalIntSignalEnable::CARD_INT.bits(), 1 << 8, "card_int");
+        assert_eq!(NormalIntSignalEnable::ERROR.bits(), 1 << 15, "error");
     }
 
     #[test]
