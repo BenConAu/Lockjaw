@@ -13,9 +13,9 @@ use lockjaw_userlib::driver_runtime::{
 use lockjaw_userlib::dma_sync::{sys_dma_sync_for_cpu, sys_dma_sync_for_device};
 use lockjaw_mmio::region::MappedRegs;
 use lockjaw_regs::sdhci::{
-    ClockControl, ErrorIntSignalEnable, ErrorIntStatus, ErrorIntStatusEnable,
+    ClockControl, Command, ErrorIntSignalEnable, ErrorIntStatus, ErrorIntStatusEnable,
     HostControlDmaSel, NormalIntSignalEnable, NormalIntStatus, NormalIntStatusEnable,
-    PowerControl, PowerControlBusVoltage, Sdhci, SoftwareReset,
+    PowerControl, PowerControlBusVoltage, Sdhci, SoftwareReset, TransferMode,
 };
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, sleep_for, Nanos};
@@ -31,7 +31,7 @@ use lockjaw_types::sdhci::{
     SDHCI_CAPABILITIES, SDHCI_CAPABILITIES_HI,
     SDHCI_SPEC_300,
     SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, SDHCI_DAT_INHIBIT,
-    SDHCI_ARGUMENT, SDHCI_ARGUMENT2, SDHCI_TRANSFER_MODE, SDHCI_COMMAND,
+    SDHCI_ARGUMENT, SDHCI_ARGUMENT2,
     SDHCI_INT_CMD_TIMEOUT, SDHCI_INT_CMD_CRC,
     SDHCI_INT_CMD_END_BIT, SDHCI_INT_CMD_INDEX,
     SDHCI_INT_DATA_TIMEOUT, SDHCI_INT_DATA_CRC, SDHCI_INT_DATA_END_BIT,
@@ -53,27 +53,16 @@ use lockjaw_types::sdhci::{
 // CAPABILITIES / CAPABILITIES_HI (0x040 / 0x044) are 32-bit reads.
 
 // Per-width shims kept (post P9.4c) as the transitional MMIO surface
-// while typed accessors land in P9.5-P9.8. Signature change vs
-// pre-P9.4c: `handle: &Sdhci` instead of `base: u64`. The body
-// derives the base via the safe pointer-to-int cast — no extra
-// `unsafe` block introduced. Per-width helper deletions:
+// while typed accessors land in P9.5-P9.8. Signature: `handle:
+// &Sdhci` instead of `base: u64`; the body derives the base via the
+// safe pointer-to-int cast — no extra `unsafe` block introduced.
+// Per-width helper deletions:
 //   - sdhci_read8/write8 → P9.5 (DONE — typed via HostControl /
 //     PowerControl / SoftwareReset newtypes + write_timeout_control)
-//   - sdhci_read16/write16 → P9.6 (combined_trigger carve-out → P9.7)
+//   - sdhci_read16/write16 → P9.6 + P9.7 (DONE — 16-bit registers
+//     typed in P9.6; the TRANSFER_MODE+COMMAND pair moved to the
+//     combined_trigger set_transfer_mode_command setter in P9.7)
 //   - sdhci_read32/write32 → P9.8
-
-/// Write a 16-bit SDHCI register at `handle + offset`. Only callers
-/// post-P9.6 are the three TRANSFER_MODE / COMMAND writes
-/// (issue_command's COMMAND for ID-phase commands plus the paired
-/// TRANSFER_MODE+COMMAND writes in adma2_single_block_read /
-/// adma2_transfer). P9.7 collapses those into a single u32
-/// combined_trigger write through the generated
-/// set_transfer_mode_command setter, which lets this shim and the
-/// last two raw 16-bit writes go away.
-unsafe fn sdhci_write16(handle: &Sdhci, offset: u64, value: u16) {
-    let base = handle as *const Sdhci as u64;
-    ptr::write_volatile((base + offset) as *mut u16, value);
-}
 
 /// Read a 32-bit SDHCI register at `handle + offset`. Caller is
 /// responsible for 4-byte alignment.
@@ -270,8 +259,15 @@ unsafe fn issue_command(sdhci: &Sdhci, arg: u32, cmd_word: u16) -> CmdResult {
         return CmdResult::InhibitStuck;
     }
     sdhci_write32(sdhci, SDHCI_ARGUMENT, arg);
-    // Writing COMMAND triggers the command on the bus.
-    sdhci_write16(sdhci, SDHCI_COMMAND, cmd_word);
+    // Writing COMMAND triggers the command on the bus. P9.7: the
+    // generated combined_trigger setter emits a single 32-bit store
+    // to transfer_mode_command (TRANSFER_MODE in the low half,
+    // COMMAND in the high half) — the BCM2711 Arasan controller
+    // REQUIRES one u32 write or it silently drops the command. ID-
+    // phase commands carry no data phase, so TRANSFER_MODE is 0;
+    // the controller samples it at the COMMAND write and ignores it
+    // for non-data commands.
+    sdhci.set_transfer_mode_command(TransferMode(0), Command(cmd_word));
     // Poll NORMAL_INT_STATUS for CMD_COMPLETE or ERROR. Manual loop
     // (not the generic helper) because we need to distinguish three
     // outcomes (success / error / timeout) and clear different
@@ -1238,15 +1234,12 @@ unsafe fn adma2_single_block_read(
 
     sdhci_write32(sdhci, SDHCI_ADMA_ADDRESS, desc_phys as u32);
 
-    // P9.6: typed BLOCK_SIZE/BLOCK_COUNT writes (regspec generates
-    // raw u16 write_* accessors — the registers have no named bit
-    // fields). TRANSFER_MODE + COMMAND stay on the raw shim for one
-    // more commit; P9.7 converts the pair into a single u32
-    // combined_trigger write per the Arasan-controller errata
-    // workaround in the typed-MMIO plan.
+    // Typed BLOCK_SIZE/BLOCK_COUNT writes (regspec generates raw u16
+    // write_* accessors — the registers have no named bit fields).
     sdhci.write_block_size(512);
     sdhci.write_block_count(1);
-    sdhci_write16(sdhci, SDHCI_TRANSFER_MODE, SDHCI_TRNS_READ | SDHCI_TRNS_DMA);
+    // ARGUMENT must be latched before the COMMAND half of the
+    // combined write triggers the command on the bus.
     sdhci_write32(sdhci, SDHCI_ARGUMENT, sector as u32);
 
     let cmd17 = sd_command_word(
@@ -1254,7 +1247,19 @@ unsafe fn adma2_single_block_read(
         SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
     );
     let freq = cntfreq_hz();
-    sdhci_write16(sdhci, SDHCI_COMMAND, cmd17);
+    // P9.7: single-u32 combined_trigger write of TRANSFER_MODE
+    // (TRNS_READ | TRNS_DMA) + COMMAND (cmd17). This makes the M7
+    // controller-ordering fix mechanical: the BCM2711 Arasan
+    // controller REQUIRES TRANSFER_MODE and COMMAND to arrive as one
+    // 32-bit store or it silently drops the command. #131 stabilised
+    // this by hand-disciplining the write order; the generated
+    // set_transfer_mode_command setter now enforces the single-store
+    // shape structurally (P9.0 emitter; verified by the codegen test
+    // transfer_mode_command_combined_trigger_single_u32_store).
+    sdhci.set_transfer_mode_command(
+        TransferMode(SDHCI_TRNS_READ | SDHCI_TRNS_DMA),
+        Command(cmd17),
+    );
 
     // IRQ-driven completion (m7-irq-experiment graft).
     //
@@ -1447,10 +1452,11 @@ unsafe fn adma2_transfer(
         AdmaDirection::Read => SDHCI_TRNS_READ,
         AdmaDirection::Write => 0, // absence of TRNS_READ = write
     };
-    sdhci_write16(sdhci, SDHCI_TRANSFER_MODE,
-        trns_dir | SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN
-            | SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD23);
+    let trns = trns_dir | SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN
+        | SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD23;
     // CMD18/CMD25 argument is the LBA (SDHC/SDXC blocks-as-units).
+    // ARGUMENT before the combined TRANSFER_MODE+COMMAND write
+    // (P9.7 reorder — same rationale as adma2_single_block_read).
     sdhci_write32(sdhci, SDHCI_ARGUMENT, sector as u32);
 
     let cmd = sd_command_word(
@@ -1463,7 +1469,12 @@ unsafe fn adma2_transfer(
 
     let freq = cntfreq_hz();
     let t0 = monotonic_now();
-    sdhci_write16(sdhci, SDHCI_COMMAND, cmd);
+    // P9.7: single-u32 combined_trigger write (TRANSFER_MODE +
+    // COMMAND). Mirror of the single-block path; keeps the
+    // multi-block dead-code path on the same write discipline so a
+    // future CMD18 re-enable doesn't reintroduce the split-write
+    // Arasan errata exposure.
+    sdhci.set_transfer_mode_command(TransferMode(trns), Command(cmd));
 
     // Poll CMD_COMPLETE (P9.6: typed status snapshot + clear).
     let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
@@ -1670,10 +1681,12 @@ impl Emmc2BlockEngine {
         sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF));
 
         // Enable IRQ signaling for the data path. STATUS_ENABLE was
-        // set at boot (in _start); SIGNAL_ENABLE gates whether a
-        // latched STATUS bit asserts the GIC line. Turned on AFTER
-        // the ID phase (issue_command polls — no signal enable
-        // during ID = no IRQ overlap during enumeration).
+        // set during emmc2_entry's post-bootstrap init (right after
+        // soft_reset_all, before the ID phase); SIGNAL_ENABLE gates
+        // whether a latched STATUS bit asserts the GIC line. Turned
+        // on HERE, AFTER the ID phase (issue_command polls — no
+        // signal enable during ID = no IRQ overlap during
+        // enumeration).
         //
         // The set is the three events the IRQ loop in
         // adma2_single_block_read handles: CMD_COMPLETE,
