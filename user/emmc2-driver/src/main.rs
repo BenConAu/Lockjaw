@@ -11,6 +11,7 @@ use lockjaw_userlib::driver_runtime::{
     standard_driver_init_level, LevelDriverCtx, LevelDriverInitError,
 };
 use lockjaw_userlib::dma_sync::{sys_dma_sync_for_cpu, sys_dma_sync_for_device};
+use lockjaw_mmio::dma::DmaCell;
 use lockjaw_mmio::region::MappedRegs;
 use lockjaw_regs::sdhci::{
     ClockControl, Command, ErrorIntSignalEnable, ErrorIntStatus, ErrorIntStatusEnable,
@@ -36,8 +37,8 @@ use lockjaw_types::sdhci::{
     SDHCI_CMD_RESP_NONE, SDHCI_CMD_RESP_SHORT, SDHCI_CMD_RESP_LONG, SDHCI_CMD_RESP_SHORT_BUSY,
     SDHCI_TRNS_READ, SDHCI_TRNS_DMA, SDHCI_TRNS_BLK_CNT_EN, SDHCI_TRNS_MULTI, SDHCI_TRNS_AUTO_CMD23,
     SdCommand, compute_clock_divisor, sd_command_word,
-    adma2_tran_end_descriptor,
 };
+use lockjaw_types::wire::sdhci::Adma2Descriptor;
 
 // ---------------------------------------------------------------------------
 // Status-bit polls (deadline-bounded, busy)
@@ -1164,8 +1165,13 @@ unsafe fn adma2_single_block_read(
     // table memory is reused across calls; the controller has either not
     // started yet (first call) or has fully released (inhibit cleared
     // above), so we can safely overwrite the previous descriptor.
-    let desc = adma2_tran_end_descriptor(buf_phys as u32, 512);
-    ptr::write_volatile(desc_va as *mut u64, desc);
+    // Typed Adma2Descriptor wire DTO (tran_end = VALID | END | ACT_TRAN,
+    // a construction-safe shape per lockjaw_types::sdhci) written through
+    // a DmaCell. The descriptor page is a raw sys_map_pages mapping, so we
+    // wrap its VA with DmaCell::at — the lone remaining unsafe on this
+    // path; a bounds-checked OwnedDmaMapping cell accessor would remove it.
+    let desc = Adma2Descriptor::tran_end(buf_phys as u32, 512);
+    DmaCell::<Adma2Descriptor>::at(desc_va).write(desc);
     // Flush the descriptor's cache line to DRAM before the
     // controller's DMA fetches it. Post cacheable-DMA migration
     // C1 the descriptor mapping is Normal Cacheable, so the
@@ -1389,8 +1395,8 @@ unsafe fn adma2_transfer(
     // One descriptor covers the whole multi-block transfer. Descriptor
     // table from the single-block path is reused (still mapped at
     // desc_va); overwrite its 8 bytes for this transfer.
-    let desc = adma2_tran_end_descriptor(buf_phys as u32, bytes as u16);
-    ptr::write_volatile(desc_va as *mut u64, desc);
+    let desc = Adma2Descriptor::tran_end(buf_phys as u32, bytes as u16);
+    DmaCell::<Adma2Descriptor>::at(desc_va).write(desc);
     // Sync descriptor down to DRAM — same rationale as in
     // adma2_single_block_read (descriptor mapping is now Normal
     // Cacheable post-C1; dsb sy alone doesn't flush the line).
