@@ -1,5 +1,16 @@
 #![no_std]
 #![no_main]
+// Driver-crate body writes zero `unsafe` blocks AND zero
+// `#[allow(unsafe_code)]` attributes. The macro-generated boot
+// stub in `lockjaw_userlib::boot_stub!` is the single audited
+// location for the boot-entry attributes.
+//
+// `#![deny]` (not `#![forbid]`) so the macro-emitted per-item
+// allows on `#[no_mangle]` and `#[link_section]` are honoured.
+// Acceptance grep:
+// `grep -rn 'allow(unsafe_code)' user/emmc2-driver/src/`
+// MUST return nothing.
+#![deny(unsafe_code)]
 
 use lockjaw_userlib::*;
 use lockjaw_userlib::clock::{ClockClient, ClockError};
