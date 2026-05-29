@@ -1,9 +1,10 @@
 //! DMA cache-maintenance syscall wrappers.
 //!
 //! Pairs with the kernel-side `src/arch/aarch64/cache.rs` primitive
-//! and `lockjaw-types/src/cache.rs` range math. Drivers call these
-//! at device handoff points so a cacheable DMA buffer's data is
-//! visible to the right side of the transfer:
+//! and `lockjaw-types/src/cache.rs` range math. These are `pub(crate)`:
+//! the DMA coherence envelope (`dma_transfer::run_dma_transfer`) is the
+//! sole caller, at the device handoff points it owns, so a cacheable DMA
+//! buffer's data is visible to the right side of the transfer:
 //!
 //! - After a device DMA write completes and BEFORE the CPU reads
 //!   the buffer: `sys_dma_sync_for_cpu(pageset, offset, len)`
@@ -40,7 +41,7 @@ use crate::handle::PageSetHandle;
 /// pageset isn't a valid DmaPool-origin handle, `INVALID_PARAMETER`
 /// if `offset+len` exceeds the pageset's byte size, or
 /// `NOT_SUPPORTED` at C0 (handler not yet implemented).
-pub fn sys_dma_sync_for_cpu(pageset: PageSetHandle, offset: u64, len: u64) -> SyscallError {
+pub(crate) fn sys_dma_sync_for_cpu(pageset: PageSetHandle, offset: u64, len: u64) -> SyscallError {
     let err: u64;
     unsafe {
         asm!(
@@ -60,7 +61,7 @@ pub fn sys_dma_sync_for_cpu(pageset: PageSetHandle, offset: u64, len: u64) -> Sy
 ///
 /// Returns `SyscallError::OK` on success, error otherwise (same
 /// shape as `sys_dma_sync_for_cpu`).
-pub fn sys_dma_sync_for_device(pageset: PageSetHandle, offset: u64, len: u64) -> SyscallError {
+pub(crate) fn sys_dma_sync_for_device(pageset: PageSetHandle, offset: u64, len: u64) -> SyscallError {
     let err: u64;
     unsafe {
         asm!(

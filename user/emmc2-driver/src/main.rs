@@ -11,9 +11,11 @@ use lockjaw_userlib::driver_runtime::{
 };
 use lockjaw_userlib::dma::{
     alloc_dma_backing_dma_pool, close_dma_backing, BorrowedDmaMapping,
-    DmaMappingView, DmaPoolOrigin, OwnedDmaMapping,
+    DmaBacking, DmaMappingView, DmaPoolOrigin, OwnedDmaMapping,
 };
-use lockjaw_userlib::dma_sync::{sys_dma_sync_for_cpu, sys_dma_sync_for_device};
+use lockjaw_userlib::dma_transfer::{
+    run_dma_transfer, DmaCompletion, DmaDir, DmaTransferError, Immediate,
+};
 use lockjaw_mmio::region::MappedRegs;
 use lockjaw_regs::sdhci::{
     ClockControl, Command, ErrorIntSignalEnable, ErrorIntStatus, ErrorIntStatusEnable,
@@ -327,9 +329,9 @@ enum Emmc2Error {
     /// (alloc, phys query, VA reservation, or map — the typed mapping
     /// collapses these into a single SyscallError).
     DescAllocFailed,
-    /// sys_dma_sync_for_device on the descriptor table failed
-    /// (per-transfer, after writing the descriptor and before
-    /// kicking the controller).
+    /// The coherence envelope's descriptor clean (a `ToDevice` region
+    /// sync, per-transfer after writing the descriptor and before
+    /// kicking the controller) failed.
     DescSyncFailed,
 }
 
@@ -1116,12 +1118,146 @@ fn emmc2_entry() -> ! {
 /// MULTI, no BLK_CNT_EN, no Auto-CMD23 — those belong to the
 /// multi-block path. Mirrors the M6 sub-commit 2b sequence.
 ///
-/// `desc_map` is the `OwnedDmaMapping` backing the descriptor table;
-/// needed to sync the descriptor write down to DRAM via
-/// `sys_dma_sync_for_device(desc_map.pageset(), ..)` before kicking
-/// the controller (cacheable-DMA migration C1: the descriptor mapping
-/// is Normal Cacheable post-migration, so a `dsb sy` alone is not
-/// enough to flush the cache line).
+/// SDHCI data-transfer completion — the device-done signal the
+/// coherence envelope awaits between the `kick` and the post-transfer
+/// invalidate. Wraps the IRQ-driven CMD_COMPLETE/DATA_COMPLETE wait
+/// plus the B4.1 post-DATA_COMPLETE `DAT_INHIBIT` drain. This is the
+/// one piece of the transfer only the driver knows; supplying it as a
+/// `DmaCompletion` is what makes "invalidate before the device
+/// finished" unrepresentable. Device-specific by nature — it lives in
+/// the driver/family layer (the seed of a future `SdhciCommandInit`),
+/// never in the generic `dma_transfer` module.
+struct SdhciDataCompletion<'a> {
+    sdhci: &'a Sdhci,
+    bound_irq: &'a mut lockjaw_userlib::irq::BoundIrq,
+}
+
+impl DmaCompletion for SdhciDataCompletion<'_> {
+    type Error = Emmc2Error;
+
+    fn await_complete(self) -> Result<(), Emmc2Error> {
+        // IRQ-driven completion (m7-irq-experiment graft).
+        //
+        // SDHCI is configured LEVEL_HIGH. Each IRQ delivery:
+        //   1. Kernel ACKs+EOIRs in GIC, masks the intid (level-triggered),
+        //      signals our notification (counter += 1).
+        //   2. bound_irq.wait_until wakes the driver and advances the
+        //      threshold by 1 so the next call expects a fresh IRQ.
+        //   3. We read NORMAL_INT_STATUS to see what fired (CMD_COMPLETE,
+        //      DATA_COMPLETE, ERROR — could be one, could be all).
+        //   4. We clear the latched bits (W1C). DEVICE-SPECIFIC; stays
+        //      here. The framework owns the wait/unmask wiring; the
+        //      driver owns its own status-register protocol.
+        //   5. bound_irq.unmask so the GIC re-enables delivery.
+        //
+        // The loop handles both "two separate IRQs" (CMD then DATA arrive
+        // far apart) and "one IRQ with both bits set" (fast transfer where
+        // CMD and DATA latch close together). cmd_complete_seen tracks
+        // whether we've already cleared CMD_COMPLETE so an ERROR mid-data
+        // is reported as DataError, not CmdError.
+        //
+        // Deadline-bounded wait: a wedged IRQ path would hang the block
+        // server forever. BoundIrq::wait_until returns IrqWaitError::Timeout
+        // when the deadline expires; we surface it as
+        // CmdCompleteTimeout / TransferCompleteTimeout exactly like the
+        // original polling shape did. Single 1-second budget covers both
+        // CMD_COMPLETE (typical < 1 ms) and DATA_COMPLETE (typical < 100 ms
+        // for one block).
+        let freq = cntfreq_hz();
+        let mut cmd_complete_seen = false;
+        let deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
+        loop {
+            if self.bound_irq.wait_until(deadline).is_err() {
+                return Err(if cmd_complete_seen {
+                    Emmc2Error::TransferCompleteTimeout
+                } else {
+                    Emmc2Error::CmdCompleteTimeout
+                });
+            }
+
+            // P9.6: typed NormalIntStatus snapshot + clear methods.
+            let status = self.sdhci.normal_int_status();
+
+            if status.contains(NormalIntStatus::ERROR) {
+                let err_int_status = self.sdhci.error_int_status().bits();
+                self.sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF));
+                self.sdhci.clear_normal_int_status(NormalIntStatus(0xFFFF));
+                let _ = self.bound_irq.unmask();
+                return Err(if cmd_complete_seen {
+                    Emmc2Error::DataError { err_int_status }
+                } else {
+                    Emmc2Error::CmdError { err_int_status }
+                });
+            }
+
+            if status.contains(NormalIntStatus::CMD_COMPLETE) {
+                self.sdhci.clear_normal_int_status(NormalIntStatus::CMD_COMPLETE);
+                cmd_complete_seen = true;
+            }
+
+            if status.contains(NormalIntStatus::DATA_COMPLETE) {
+                self.sdhci.clear_normal_int_status(NormalIntStatus::DATA_COMPLETE);
+                let _ = self.bound_irq.unmask();
+                // Fall through to the B4.1 DAT_INHIBIT drain below before
+                // returning Ok.
+                break;
+            }
+
+            // Status had no relevant bits set (spurious wake, or
+            // CMD_COMPLETE alone with DATA still in flight). Unmask the
+            // GIC so the next IRQ can be delivered and loop back to
+            // wait_until — the deadline still bounds total time spent.
+            let _ = self.bound_irq.unmask();
+        }
+
+        // B4.1 — post-DATA_COMPLETE DAT_INHIBIT drain.
+        //
+        // DATA_COMPLETE signals card-side transfer end, but the BCM2711
+        // Arasan controller can keep outbound AXI writes in flight to
+        // DRAM for a tail period after asserting it. The post-completion
+        // invalidate (the envelope's sync_for_cpu) only orders CPU-cache
+        // operations; it does not arbitrate against the controller's
+        // outstanding bus writes. Returning Ok before those writes have
+        // committed lets the caller (e.g. emmc2 selftest) read the buffer
+        // and see pre-DMA zeros.
+        //
+        // PRESENT_STATE.DAT_INHIBIT is the controller's own "data
+        // path genuinely idle" bit: it stays set while the data path
+        // has any outstanding activity — including the post-DATA_COMPLETE
+        // AXI write tail. Polling it here forces the read call to wait
+        // for the controller to actually drain.
+        //
+        // Pre-B4.1 history: the existing pre-command CMD_INHIBIT |
+        // DAT_INHIBIT poll at the top of adma2_single_block_read (kept in
+        // place as defensive double-coverage) implicitly drained the
+        // PREVIOUS transfer on every subsequent read — which is why long
+        // FAT32 / posix read chains worked while the standalone selftest
+        // failed. M7-era diagnostic dumps that "fixed" the selftest
+        // worked for the same reason: their MMIO reads serialised
+        // against the controller's outstanding writes. This is the
+        // principled replacement.
+        //
+        // 10 ms deadline matches the plan's B4.1 budget; the actual
+        // drain is microseconds in normal operation.
+        if poll_until(
+            || !self.sdhci.present_state().contains(PresentState::DAT_INHIBIT),
+            Nanos::from_millis(10),
+        ).is_err() {
+            return Err(Emmc2Error::DatInhibitStuck {
+                present_state: self.sdhci.present_state().bits(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// `desc_map` is the `OwnedDmaMapping` backing the descriptor table.
+/// The coherence envelope cleans the descriptor write down to DRAM
+/// (a `ToDevice` region) before the controller's DMA fetches it
+/// (cacheable-DMA migration C1: the descriptor mapping is Normal
+/// Cacheable post-migration, so a `dsb sy` alone is not enough to
+/// flush the cache line — the envelope's clean does `dc cvac` + dsb).
 fn adma2_single_block_read(
     sdhci: &Sdhci,
     sector: u64,
@@ -1164,169 +1300,69 @@ fn adma2_single_block_read(
     desc_map
         .cell::<Adma2Descriptor>(0)
         .write(Adma2Descriptor::tran_end(buf_phys as u32, 512));
-    // Flush the descriptor's cache line to DRAM before the
-    // controller's DMA fetches it. Post cacheable-DMA migration
-    // C1 the descriptor mapping is Normal Cacheable, so the
-    // M6-era `dsb sy` here is no longer sufficient — DSB orders
-    // CPU stores against subsequent CPU operations, but the
-    // store may still sit in the L1 cache when the controller
-    // reads memory. sys_dma_sync_for_device does `dc cvac` + dsb
-    // sy, which writes the line back to DRAM.
-    if !sys_dma_sync_for_device(desc_map.pageset(), 0, 8).is_ok() {
-        return Err(Emmc2Error::DescSyncFailed);
-    }
+    // Coherence envelope: clean the descriptor down to DRAM (a
+    // `ToDevice` region — post-C1 the descriptor mapping is Normal
+    // Cacheable, so the clean does `dc cvac` + dsb to write the line
+    // back before the controller's DMA fetches it), then `kick` the
+    // controller, then await the SDHCI data completion (IRQ wait +
+    // B4.1 drain). The framework owns the clean -> kick -> await
+    // ordering; this driver no longer hand-sequences sync calls.
+    let desc_region = desc_map.dma_region(0, 8, DmaDir::ToDevice);
+    run_dma_transfer(
+        &[desc_region],
+        SdhciDataCompletion { sdhci, bound_irq },
+        || -> Result<(), Emmc2Error> {
+            // Re-select ADMA2-32 in HOST_CONTROL_1. Preserve the 4-bit bus
+            // width bit (set during M3 ACMD6); replace the DMA_SEL field
+            // bits only. Idempotent (engine.new already set it) but kept for
+            // safety against any other code path that might have changed it.
+            // P9.5: typed modify-in-place via the generated enum field
+            // accessor — `with_dma_sel(HostControlDmaSel::Adma2_32)` masks
+            // and shifts the DMA_SEL field correctly without driver-side
+            // hand-rolled mask arithmetic.
+            sdhci.modify_host_control(|hc| hc.with_dma_sel(HostControlDmaSel::Adma2_32));
 
-    // Re-select ADMA2-32 in HOST_CONTROL_1. Preserve the 4-bit bus
-    // width bit (set during M3 ACMD6); replace the DMA_SEL field
-    // bits only. Idempotent (engine.new already set it) but kept for
-    // safety against any other code path that might have changed it.
-    // P9.5: typed modify-in-place via the generated enum field
-    // accessor — `with_dma_sel(HostControlDmaSel::Adma2_32)` masks
-    // and shifts the DMA_SEL field correctly without driver-side
-    // hand-rolled mask arithmetic.
-    sdhci.modify_host_control(|hc| hc.with_dma_sel(HostControlDmaSel::Adma2_32));
+            sdhci.write_adma_address(desc_map.pa() as u32);
 
-    sdhci.write_adma_address(desc_map.pa() as u32);
+            // Typed BLOCK_SIZE/BLOCK_COUNT writes (regspec generates raw u16
+            // write_* accessors — the registers have no named bit fields).
+            sdhci.write_block_size(512);
+            sdhci.write_block_count(1);
+            // ARGUMENT must be latched before the COMMAND half of the
+            // combined write triggers the command on the bus.
+            sdhci.write_argument(sector as u32);
 
-    // Typed BLOCK_SIZE/BLOCK_COUNT writes (regspec generates raw u16
-    // write_* accessors — the registers have no named bit fields).
-    sdhci.write_block_size(512);
-    sdhci.write_block_count(1);
-    // ARGUMENT must be latched before the COMMAND half of the
-    // combined write triggers the command on the bus.
-    sdhci.write_argument(sector as u32);
-
-    let cmd17 = sd_command_word(
-        SdCommand::ReadSingleBlock.index(),
-        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
-    );
-    let freq = cntfreq_hz();
-    // P9.7: single-u32 combined_trigger write of TRANSFER_MODE
-    // (TRNS_READ | TRNS_DMA) + COMMAND (cmd17). This makes the M7
-    // controller-ordering fix mechanical: the BCM2711 Arasan
-    // controller REQUIRES TRANSFER_MODE and COMMAND to arrive as one
-    // 32-bit store or it silently drops the command. #131 stabilised
-    // this by hand-disciplining the write order; the generated
-    // set_transfer_mode_command setter now enforces the single-store
-    // shape structurally (P9.0 emitter; verified by the codegen test
-    // transfer_mode_command_combined_trigger_single_u32_store).
-    sdhci.set_transfer_mode_command(
-        TransferMode(SDHCI_TRNS_READ | SDHCI_TRNS_DMA),
-        Command(cmd17),
-    );
-
-    // IRQ-driven completion (m7-irq-experiment graft).
-    //
-    // SDHCI is configured LEVEL_HIGH. Each IRQ delivery:
-    //   1. Kernel ACKs+EOIRs in GIC, masks the intid (level-triggered),
-    //      signals our notification (counter += 1).
-    //   2. bound_irq.wait_until wakes the driver and advances the
-    //      threshold by 1 so the next call expects a fresh IRQ.
-    //   3. We read NORMAL_INT_STATUS to see what fired (CMD_COMPLETE,
-    //      DATA_COMPLETE, ERROR — could be one, could be all).
-    //   4. We clear the latched bits (W1C). DEVICE-SPECIFIC; stays
-    //      here. The framework owns the wait/unmask wiring; the
-    //      driver owns its own status-register protocol.
-    //   5. bound_irq.unmask so the GIC re-enables delivery.
-    //
-    // The loop handles both "two separate IRQs" (CMD then DATA arrive
-    // far apart) and "one IRQ with both bits set" (fast transfer where
-    // CMD and DATA latch close together). cmd_complete_seen tracks
-    // whether we've already cleared CMD_COMPLETE so an ERROR mid-data
-    // is reported as DataError, not CmdError.
-    //
-    // Deadline-bounded wait: a wedged IRQ path would hang the block
-    // server forever. BoundIrq::wait_until returns IrqWaitError::Timeout
-    // when the deadline expires; we surface it as
-    // CmdCompleteTimeout / TransferCompleteTimeout exactly like the
-    // original polling shape did. Single 1-second budget covers both
-    // CMD_COMPLETE (typical < 1 ms) and DATA_COMPLETE (typical < 100 ms
-    // for one block).
-    let mut cmd_complete_seen = false;
-    let deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
-    loop {
-        if bound_irq.wait_until(deadline).is_err() {
-            return Err(if cmd_complete_seen {
-                Emmc2Error::TransferCompleteTimeout
-            } else {
-                Emmc2Error::CmdCompleteTimeout
-            });
-        }
-
-        // P9.6: typed NormalIntStatus snapshot + clear methods.
-        let status = sdhci.normal_int_status();
-
-        if status.contains(NormalIntStatus::ERROR) {
-            let err_int_status = sdhci.error_int_status().bits();
-            sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF));
-            sdhci.clear_normal_int_status(NormalIntStatus(0xFFFF));
-            let _ = bound_irq.unmask();
-            return Err(if cmd_complete_seen {
-                Emmc2Error::DataError { err_int_status }
-            } else {
-                Emmc2Error::CmdError { err_int_status }
-            });
-        }
-
-        if status.contains(NormalIntStatus::CMD_COMPLETE) {
-            sdhci.clear_normal_int_status(NormalIntStatus::CMD_COMPLETE);
-            cmd_complete_seen = true;
-        }
-
-        if status.contains(NormalIntStatus::DATA_COMPLETE) {
-            sdhci.clear_normal_int_status(NormalIntStatus::DATA_COMPLETE);
-            let _ = bound_irq.unmask();
-            // Fall through to B4.1 DAT_INHIBIT drain below before
-            // returning Ok.
-            break;
-        }
-
-        // Status had no relevant bits set (spurious wake, or
-        // CMD_COMPLETE alone with DATA still in flight). Unmask the
-        // GIC so the next IRQ can be delivered and loop back to
-        // wait_until — the deadline still bounds total time spent.
-        let _ = bound_irq.unmask();
-    }
-
-    // B4.1 — post-DATA_COMPLETE DAT_INHIBIT drain.
-    //
-    // DATA_COMPLETE signals card-side transfer end, but the BCM2711
-    // Arasan controller can keep outbound AXI writes in flight to
-    // DRAM for a tail period after asserting it. The CPU's
-    // sys_dma_sync_for_cpu (`dc civac` + `dsb sy`) only orders
-    // CPU-cache operations; it does not arbitrate against the
-    // controller's outstanding bus writes. Returning Ok before
-    // those writes have committed lets the caller (e.g. emmc2
-    // selftest) read the buffer and see pre-DMA zeros.
-    //
-    // PRESENT_STATE.DAT_INHIBIT is the controller's own "data
-    // path genuinely idle" bit: it stays set while the data path
-    // has any outstanding activity — including the post-DATA_COMPLETE
-    // AXI write tail. Polling it here forces the read call to wait
-    // for the controller to actually drain.
-    //
-    // Pre-B4.1 history: the existing pre-command CMD_INHIBIT |
-    // DAT_INHIBIT poll at the top of this function (kept in place
-    // as defensive double-coverage) implicitly drained the PREVIOUS
-    // transfer on every subsequent read — which is why long FAT32
-    // / posix read chains worked while the standalone selftest
-    // failed. M7-era diagnostic dumps that "fixed" the selftest
-    // worked for the same reason: their MMIO reads serialised
-    // against the controller's outstanding writes. This is the
-    // principled replacement.
-    //
-    // 10 ms deadline matches the plan's B4.1 budget; the actual
-    // drain is microseconds in normal operation.
-    if poll_until(
-        || !sdhci.present_state().contains(PresentState::DAT_INHIBIT),
-        Nanos::from_millis(10),
-    ).is_err() {
-        return Err(Emmc2Error::DatInhibitStuck {
-            present_state: sdhci.present_state().bits(),
-        });
-    }
-
-    Ok(())
+            let cmd17 = sd_command_word(
+                SdCommand::ReadSingleBlock.index(),
+                SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
+            );
+            // P9.7: single-u32 combined_trigger write of TRANSFER_MODE
+            // (TRNS_READ | TRNS_DMA) + COMMAND (cmd17). This makes the M7
+            // controller-ordering fix mechanical: the BCM2711 Arasan
+            // controller REQUIRES TRANSFER_MODE and COMMAND to arrive as one
+            // 32-bit store or it silently drops the command. #131 stabilised
+            // this by hand-disciplining the write order; the generated
+            // set_transfer_mode_command setter now enforces the single-store
+            // shape structurally (P9.0 emitter; verified by the codegen test
+            // transfer_mode_command_combined_trigger_single_u32_store).
+            sdhci.set_transfer_mode_command(
+                TransferMode(SDHCI_TRNS_READ | SDHCI_TRNS_DMA),
+                Command(cmd17),
+            );
+            Ok(())
+        },
+    )
+    .map_err(|e| match e {
+        // The pre-kick clean of the descriptor region failed.
+        DmaTransferError::CleanFailed(_) => Emmc2Error::DescSyncFailed,
+        // The `kick` (register programming) returned an error.
+        DmaTransferError::Kick(k) => k,
+        // The SDHCI completion (IRQ wait / B4.1 drain) failed.
+        DmaTransferError::Completion(c) => c,
+        // The descriptor region is `ToDevice`, never invalidated, so
+        // this arm is unreachable; map it for totality.
+        DmaTransferError::InvalidateFailed(_) => Emmc2Error::DescSyncFailed,
+    })
 }
 
 /// Result of an ADMA2 multi-block read with phase-split timing.
@@ -1390,98 +1426,113 @@ fn adma2_transfer(
     desc_map
         .cell::<Adma2Descriptor>(0)
         .write(Adma2Descriptor::tran_end(buf_phys as u32, bytes as u16));
-    // Sync descriptor down to DRAM — same rationale as in
-    // adma2_single_block_read (descriptor mapping is now Normal
-    // Cacheable post-C1; dsb sy alone doesn't flush the line).
-    if !sys_dma_sync_for_device(desc_map.pageset(), 0, 8).is_ok() {
-        return Err(Emmc2Error::DescSyncFailed);
-    }
+    // Coherence envelope: clean the reused descriptor down to DRAM (a
+    // `ToDevice` region — same C1 rationale as adma2_single_block_read),
+    // then `kick` the controller and run the polled CMD/TRANSFER
+    // completion. Dead path (CMD18+Auto-CMD23 disabled), kept on the
+    // envelope so a future re-enable inherits the clean -> kick ordering
+    // and the single-store TRANSFER_MODE+COMMAND discipline. Completion
+    // here is polled inside `kick` (so `Immediate`), not IRQ-driven like
+    // the single-block path.
+    let desc_region = desc_map.dma_region(0, 8, DmaDir::ToDevice);
+    run_dma_transfer(
+        &[desc_region],
+        Immediate,
+        || -> Result<AdmaTiming, Emmc2Error> {
+            sdhci.write_adma_address(desc_map.pa() as u32);
+            sdhci.write_argument2(n_blocks as u32);
 
-    sdhci.write_adma_address(desc_map.pa() as u32);
-    sdhci.write_argument2(n_blocks as u32);
+            // P9.6: typed BLOCK_SIZE/BLOCK_COUNT writes (mirror of the
+            // single-block path).
+            sdhci.write_block_size(512);
+            sdhci.write_block_count(n_blocks);
+            let trns_dir = match direction {
+                AdmaDirection::Read => SDHCI_TRNS_READ,
+                AdmaDirection::Write => 0, // absence of TRNS_READ = write
+            };
+            let trns = trns_dir | SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN
+                | SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD23;
+            // CMD18/CMD25 argument is the LBA (SDHC/SDXC blocks-as-units).
+            // ARGUMENT before the combined TRANSFER_MODE+COMMAND write
+            // (P9.7 reorder — same rationale as adma2_single_block_read).
+            sdhci.write_argument(sector as u32);
 
-    // P9.6: typed BLOCK_SIZE/BLOCK_COUNT writes (mirror of the
-    // single-block path).
-    sdhci.write_block_size(512);
-    sdhci.write_block_count(n_blocks);
-    let trns_dir = match direction {
-        AdmaDirection::Read => SDHCI_TRNS_READ,
-        AdmaDirection::Write => 0, // absence of TRNS_READ = write
-    };
-    let trns = trns_dir | SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN
-        | SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD23;
-    // CMD18/CMD25 argument is the LBA (SDHC/SDXC blocks-as-units).
-    // ARGUMENT before the combined TRANSFER_MODE+COMMAND write
-    // (P9.7 reorder — same rationale as adma2_single_block_read).
-    sdhci.write_argument(sector as u32);
+            let cmd = sd_command_word(
+                match direction {
+                    AdmaDirection::Read => SdCommand::ReadMultipleBlock.index(),
+                    AdmaDirection::Write => SdCommand::WriteMultipleBlock.index(),
+                },
+                SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
+            );
 
-    let cmd = sd_command_word(
-        match direction {
-            AdmaDirection::Read => SdCommand::ReadMultipleBlock.index(),
-            AdmaDirection::Write => SdCommand::WriteMultipleBlock.index(),
+            let freq = cntfreq_hz();
+            let t0 = monotonic_now();
+            // P9.7: single-u32 combined_trigger write (TRANSFER_MODE +
+            // COMMAND). Mirror of the single-block path; keeps the
+            // multi-block dead-code path on the same write discipline so a
+            // future CMD18 re-enable doesn't reintroduce the split-write
+            // Arasan errata exposure.
+            sdhci.set_transfer_mode_command(TransferMode(trns), Command(cmd));
+
+            // Poll CMD_COMPLETE (P9.6: typed status snapshot + clear).
+            let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
+            loop {
+                let status = sdhci.normal_int_status();
+                if status.contains(NormalIntStatus::ERROR) {
+                    let err_int_status = sdhci.error_int_status().bits();
+                    sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF));
+                    sdhci.clear_normal_int_status(
+                        NormalIntStatus::ERROR | NormalIntStatus::CMD_COMPLETE,
+                    );
+                    return Err(Emmc2Error::CmdError { err_int_status });
+                }
+                if status.contains(NormalIntStatus::CMD_COMPLETE) {
+                    sdhci.clear_normal_int_status(NormalIntStatus::CMD_COMPLETE);
+                    break;
+                }
+                if monotonic_now() >= cmd_deadline {
+                    return Err(Emmc2Error::CmdCompleteTimeout);
+                }
+                core::hint::spin_loop();
+            }
+            let t_cmd = monotonic_now();
+
+            // Poll TRANSFER_COMPLETE — for multi-block ADMA, the controller
+            // signals once after the FULL descriptor's transfer ends.
+            let xfer_deadline = monotonic_now().deadline_in(Nanos::from_millis(500), freq);
+            loop {
+                let status = sdhci.normal_int_status();
+                if status.contains(NormalIntStatus::ERROR) {
+                    let err_int_status = sdhci.error_int_status().bits();
+                    sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF));
+                    sdhci.clear_normal_int_status(
+                        NormalIntStatus::ERROR | NormalIntStatus::DATA_COMPLETE,
+                    );
+                    return Err(Emmc2Error::DataError { err_int_status });
+                }
+                if status.contains(NormalIntStatus::DATA_COMPLETE) {
+                    sdhci.clear_normal_int_status(NormalIntStatus::DATA_COMPLETE);
+                    break;
+                }
+                if monotonic_now() >= xfer_deadline {
+                    return Err(Emmc2Error::TransferCompleteTimeout);
+                }
+                core::hint::spin_loop();
+            }
+            let t1 = monotonic_now();
+            Ok(AdmaTiming {
+                total: t1.0.saturating_sub(t0.0),
+                cmd_to_complete: t_cmd.0.saturating_sub(t0.0),
+                data_to_complete: t1.0.saturating_sub(t_cmd.0),
+            })
         },
-        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
-    );
-
-    let freq = cntfreq_hz();
-    let t0 = monotonic_now();
-    // P9.7: single-u32 combined_trigger write (TRANSFER_MODE +
-    // COMMAND). Mirror of the single-block path; keeps the
-    // multi-block dead-code path on the same write discipline so a
-    // future CMD18 re-enable doesn't reintroduce the split-write
-    // Arasan errata exposure.
-    sdhci.set_transfer_mode_command(TransferMode(trns), Command(cmd));
-
-    // Poll CMD_COMPLETE (P9.6: typed status snapshot + clear).
-    let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
-    loop {
-        let status = sdhci.normal_int_status();
-        if status.contains(NormalIntStatus::ERROR) {
-            let err_int_status = sdhci.error_int_status().bits();
-            sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF));
-            sdhci.clear_normal_int_status(
-                NormalIntStatus::ERROR | NormalIntStatus::CMD_COMPLETE,
-            );
-            return Err(Emmc2Error::CmdError { err_int_status });
-        }
-        if status.contains(NormalIntStatus::CMD_COMPLETE) {
-            sdhci.clear_normal_int_status(NormalIntStatus::CMD_COMPLETE);
-            break;
-        }
-        if monotonic_now() >= cmd_deadline {
-            return Err(Emmc2Error::CmdCompleteTimeout);
-        }
-        core::hint::spin_loop();
-    }
-    let t_cmd = monotonic_now();
-
-    // Poll TRANSFER_COMPLETE — for multi-block ADMA, the controller
-    // signals once after the FULL descriptor's transfer ends.
-    let xfer_deadline = monotonic_now().deadline_in(Nanos::from_millis(500), freq);
-    loop {
-        let status = sdhci.normal_int_status();
-        if status.contains(NormalIntStatus::ERROR) {
-            let err_int_status = sdhci.error_int_status().bits();
-            sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF));
-            sdhci.clear_normal_int_status(
-                NormalIntStatus::ERROR | NormalIntStatus::DATA_COMPLETE,
-            );
-            return Err(Emmc2Error::DataError { err_int_status });
-        }
-        if status.contains(NormalIntStatus::DATA_COMPLETE) {
-            sdhci.clear_normal_int_status(NormalIntStatus::DATA_COMPLETE);
-            break;
-        }
-        if monotonic_now() >= xfer_deadline {
-            return Err(Emmc2Error::TransferCompleteTimeout);
-        }
-        core::hint::spin_loop();
-    }
-    let t1 = monotonic_now();
-    Ok(AdmaTiming {
-        total: t1.0.saturating_sub(t0.0),
-        cmd_to_complete: t_cmd.0.saturating_sub(t0.0),
-        data_to_complete: t1.0.saturating_sub(t_cmd.0),
+    )
+    .map_err(|e| match e {
+        DmaTransferError::CleanFailed(_) => Emmc2Error::DescSyncFailed,
+        DmaTransferError::Kick(k) => k,
+        // Immediate completion is infallible.
+        DmaTransferError::Completion(inf) => match inf {},
+        DmaTransferError::InvalidateFailed(_) => Emmc2Error::DescSyncFailed,
     })
 }
 
@@ -1526,15 +1577,15 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 const MAX_DMA_BUFFERS: usize = 8;
 
-#[derive(Clone, Copy)]
+/// A DMA buffer slot. Owns the DmaPool-origin backing — move-only,
+/// because it holds a closable pageset handle and is the only token
+/// that can mint a coherence `DmaRegion` over the buffer. Stored as
+/// `Option<DmaBuf>` per slot; the `None` slot replaces the old all-zero
+/// `DmaBuf` sentinel, which a move-only owner cannot have.
 struct DmaBuf {
-    /// Handle (0 marks the slot empty).
-    handle: u64,
-    pa: u64,
+    backing: DmaBacking<DmaPoolOrigin>,
     sector_count: u64,
 }
-
-const DMA_BUF_EMPTY: DmaBuf = DmaBuf { handle: 0, pa: 0, sector_count: 0 };
 
 struct Emmc2BlockEngine {
     /// Typed MMIO handle for the SDHCI register region. Replaces the
@@ -1548,13 +1599,13 @@ struct Emmc2BlockEngine {
     /// descriptor is rewritten per transfer. Allocated from the
     /// DMA pool and (post cacheable-DMA migration C1) mapped
     /// Normal Cacheable. The `OwnedDmaMapping` retains the pageset
-    /// so every per-transfer descriptor write can be followed by a
-    /// `sys_dma_sync_for_device(desc_map.pageset(), ..)` call to
-    /// flush the cache line down to DRAM before the controller
-    /// fetches the descriptor. Its `Drop` unmaps the VA and closes
+    /// so each per-transfer descriptor write feeds a `ToDevice`
+    /// coherence region in the envelope, which cleans the cache line
+    /// down to DRAM before the controller fetches the descriptor. Its
+    /// `Drop` unmaps the VA and closes
     /// the pageset when the engine is torn down.
     desc_map: OwnedDmaMapping<DmaPoolOrigin>,
-    dma_buffers: [DmaBuf; MAX_DMA_BUFFERS],
+    dma_buffers: [Option<DmaBuf>; MAX_DMA_BUFFERS],
     dma_count: usize,
     /// IRQ-driven completion state (m7-irq-experiment graft).
     /// Framework-owned: the BoundIrq bundles the notification, the
@@ -1587,9 +1638,9 @@ impl Emmc2BlockEngine {
         // Descriptor table: 1 page from the DMA pool, allocated and
         // mapped via the typed OwnedDmaMapping (Normal Cacheable
         // post-C1 of the cacheable-DMA migration). The matching
-        // sys_dma_sync_for_device call before each controller kick is
-        // in adma2_single_block_read. The mapping owns the pageset;
-        // its Drop unmaps + closes it when the engine is torn down.
+        // descriptor clean is the `ToDevice` region of the coherence
+        // envelope inside adma2_single_block_read. The mapping owns the
+        // pageset; its Drop unmaps + closes it when the engine is torn down.
         let desc_map = OwnedDmaMapping::alloc_dma_pool().map_err(|_| Emmc2Error::DescAllocFailed)?;
         if desc_map.pa() >= (1u64 << 32) {
             return Err(Emmc2Error::DescPhysAbove4Gib(desc_map.pa()));
@@ -1664,16 +1715,16 @@ impl Emmc2BlockEngine {
             regs,
             capacity_sectors,
             desc_map,
-            dma_buffers: [DMA_BUF_EMPTY; MAX_DMA_BUFFERS],
+            dma_buffers: core::array::from_fn(|_| None),
             dma_count: 0,
             irq,
         })
     }
 
-    fn find_buf(&self, ps: PageSetHandle) -> Result<DmaBuf, BlockError> {
-        for slot in &self.dma_buffers {
-            if slot.handle == ps.0 && slot.pa != 0 {
-                return Ok(*slot);
+    fn find_buf(&self, ps: PageSetHandle) -> Result<&DmaBuf, BlockError> {
+        for slot in self.dma_buffers.iter().flatten() {
+            if slot.backing.pageset.0 == ps.0 {
+                return Ok(slot);
             }
         }
         Err(BlockError::InvalidBuffer)
@@ -1689,16 +1740,16 @@ impl BlockEngine for Emmc2BlockEngine {
             // origin). Post cacheable-DMA migration C1 the kernel
             // accepts only Normal (Cacheable) mappings for DmaPool
             // PageSets. Cross-process coherence is the ENGINE's
-            // responsibility: `Engine::read` invokes
-            // `sys_dma_sync_for_cpu` over the read range before
-            // returning, so by the time control reaches the client
-            // (over IPC) the buffer's cache lines for that range
-            // are already invalidated and the next CPU load reads
-            // fresh DRAM. Clients DO NOT need to issue their own
-            // sync after `read` returns; they DO need to call
-            // `sys_dma_sync_for_device` before any write-direction
-            // request (not exercised today — writes are disabled
-            // until CMD18+Auto-CMD23 cold-boot is validated).
+            // responsibility: `Engine::read` wraps the transfer in the
+            // coherence envelope, which invalidates the read range (a
+            // `FromDevice` region) before returning, so by the time
+            // control reaches the client (over IPC) the buffer's cache
+            // lines for that range are already invalidated and the next
+            // CPU load reads fresh DRAM. Clients DO NOT need to issue
+            // their own sync after `read` returns; a future write path
+            // would clean its `ToDevice` region through the same
+            // envelope (not exercised today — writes are disabled until
+            // CMD18+Auto-CMD23 cold-boot is validated).
             buffer_attribute: MapMemoryAttribute::Normal,
         }
     }
@@ -1724,16 +1775,14 @@ impl BlockEngine for Emmc2BlockEngine {
             close_dma_backing(backing.pageset);
             return Err(BlockError::AllocFailed);
         }
-        // Track this buffer in the slot table; on success the slot
-        // takes ownership of the pageset (close happens in free_buffer).
-        // On failure (table full) close immediately so the allocation
-        // doesn't leak.
-        for slot in self.dma_buffers.iter_mut() {
-            if slot.pa == 0 {
-                *slot = DmaBuf { handle: backing.pageset.0, pa: backing.pa, sector_count };
-                self.dma_count += 1;
-                return Ok(backing.pageset);
-            }
+        // Track this buffer in the slot table; on success the slot owns
+        // the backing (its pageset is closed in free_buffer). On failure
+        // (table full) close immediately so the allocation doesn't leak.
+        let ps = backing.pageset;
+        if let Some(slot) = self.dma_buffers.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(DmaBuf { backing, sector_count });
+            self.dma_count += 1;
+            return Ok(ps);
         }
         close_dma_backing(backing.pageset);
         Err(BlockError::AllocFailed)
@@ -1748,79 +1797,90 @@ impl BlockEngine for Emmc2BlockEngine {
         {
             return Err(BlockError::InvalidParameter);
         }
-        // B2.2 (docs/post-c1-fix-plan.md): clean any pre-DMA dirty
-        // cache lines in the destination buffer to DRAM BEFORE the
-        // controller writes it. Without this, lines dirtied by an
-        // earlier CPU write to the same buffer (e.g. the selftest's
-        // pre-DMA `zero_range(0, 512)`, or a previous read's
-        // partial overwrite) can later be written back over the
-        // device's DMA-deposited bytes, leaving the post-DMA
-        // sys_dma_sync_for_cpu (below) returning stale zeros. This is
-        // the load-bearing fix for the C1 Pi-flash `0xAA55` gate;
-        // B2.1's kernel `dc civac` upgrade alone cannot recover
-        // dirty-pre-DMA lines (the writeback step would overwrite
-        // the device bytes). Mirrors Linux's
-        // `dma_map_single(DMA_FROM_DEVICE)` contract.
         let sync_bytes = count * 512;
-        if !sys_dma_sync_for_device(buffer, 0, sync_bytes).is_ok() {
-            puts("[EMMC2:READ] sync_for_device FAILED\n");
-            return Err(BlockError::IoError);
-        }
-        // Reads always use CMD17 (single-block). Multi-sector reads
-        // loop one block at a time, advancing buf.pa by 512 bytes per
-        // sector. The CMD18+Auto-CMD23 path in adma2_transfer is dead
-        // for reads until the cold-boot CMD18 question is settled;
-        // we want every fat32 / partition-manager read to exercise
-        // the proven M6 sub-commit 2b sequence.
+        // The destination buffer is a `FromDevice` coherence region; the
+        // envelope owns its clean-before / invalidate-after ordering:
         //
-        // Performance cost on Pi: one CMD17 round-trip per sector for
-        // multi-sector reads. Acceptable while the read path is being
-        // validated end-to-end with the partition-manager layer.
-        for i in 0..count {
-            let buf_sector_pa = buf.pa + i * 512;
-            let res = adma2_single_block_read(
-                self.regs.regs(), sector + i, buf_sector_pa,
-                &self.desc_map,
-                &mut self.irq,
-            );
-            if let Err(err) = res {
-                // Surface the typed Emmc2Error so silent-return cases
-                // (inhibit stuck / cmd or xfer timeout) aren't lost behind
-                // the BlockError::IoError facade. One canonical log line
-                // per failure, identifying which sector in the loop died.
-                puts("[EMMC2:READ] iter=");
-                put_decimal(i);
-                puts("/");
-                put_decimal(count);
-                puts(" sector=");
-                put_decimal(sector + i);
-                puts(" buf_pa=");
-                put_hex(buf_sector_pa);
-                puts(" FAILED: ");
-                put_emmc2_error(&err);
-                puts("\n");
-                return Err(BlockError::IoError);
+        // - B2.2 (docs/post-c1-fix-plan.md): clean any pre-DMA dirty
+        //   cache lines to DRAM BEFORE the controller writes. Lines
+        //   dirtied by an earlier CPU write (e.g. the selftest's pre-DMA
+        //   `zero_range(0, 512)`, or a previous read's partial overwrite)
+        //   would otherwise be written back over the device's DMA-
+        //   deposited bytes, leaving stale zeros. This is the load-bearing
+        //   fix for the C1 Pi-flash `0xAA55` gate; B2.1's kernel `dc
+        //   civac` upgrade alone cannot recover dirty-pre-DMA lines.
+        // - C1: the buffer is Normal Cacheable, so AFTER the controller's
+        //   DMA write the envelope invalidates the lines so subsequent
+        //   CPU loads read fresh DRAM, not stale pre-DMA cache state
+        //   (the principled replacement for the M7-era incidental drain).
+        //
+        // Mirrors Linux's dma_map_single(DMA_FROM_DEVICE) +
+        // dma_sync_sg_for_cpu contract; the driver no longer issues
+        // sync_for_{device,cpu} by hand. One region covers count*512 bytes.
+        let buf_region = buf.backing.dma_region(0, sync_bytes, DmaDir::FromDevice);
+        let buf_pa = buf.backing.pa;
+        // `buf`'s borrow of self.dma_buffers ends here; take the disjoint
+        // controller / descriptor / IRQ borrows for the per-block loop.
+        let regs = self.regs.regs();
+        let desc_map = &self.desc_map;
+        let irq = &mut self.irq;
+        run_dma_transfer(
+            &[buf_region],
+            Immediate,
+            || -> Result<(), BlockError> {
+                // Reads always use CMD17 (single-block). Multi-sector reads
+                // loop one block at a time, advancing buf_pa by 512 bytes per
+                // sector. The CMD18+Auto-CMD23 path in adma2_transfer is dead
+                // for reads until the cold-boot CMD18 question is settled;
+                // we want every fat32 / partition-manager read to exercise
+                // the proven M6 sub-commit 2b sequence. Performance cost on
+                // Pi: one CMD17 round-trip per sector. Each block runs its
+                // own inner descriptor envelope (IRQ wait + B4.1 drain), so
+                // this kick blocks until every block finishes and the outer
+                // buffer completion is `Immediate`.
+                for i in 0..count {
+                    let buf_sector_pa = buf_pa + i * 512;
+                    let res = adma2_single_block_read(
+                        regs, sector + i, buf_sector_pa, desc_map, irq,
+                    );
+                    if let Err(err) = res {
+                        // Surface the typed Emmc2Error so silent-return cases
+                        // (inhibit stuck / cmd or xfer timeout) aren't lost behind
+                        // the BlockError::IoError facade. One canonical log line
+                        // per failure, identifying which sector in the loop died.
+                        puts("[EMMC2:READ] iter=");
+                        put_decimal(i);
+                        puts("/");
+                        put_decimal(count);
+                        puts(" sector=");
+                        put_decimal(sector + i);
+                        puts(" buf_pa=");
+                        put_hex(buf_sector_pa);
+                        puts(" FAILED: ");
+                        put_emmc2_error(&err);
+                        puts("\n");
+                        return Err(BlockError::IoError);
+                    }
+                }
+                Ok(())
+            },
+        )
+        .map_err(|e| match e {
+            // Pre-kick clean (B2.2) of the buffer region failed.
+            DmaTransferError::CleanFailed(_) => {
+                puts("[EMMC2:READ] sync_for_device FAILED\n");
+                BlockError::IoError
             }
-        }
-        // Cacheable-DMA migration C1: the buffer is now mapped
-        // Normal Cacheable. After the controller has finished
-        // writing it via DMA, invalidate the CPU cache lines so
-        // subsequent CPU loads read fresh DRAM rather than stale
-        // pre-DMA cached state. This is the principled replacement
-        // for the M7-era incidental drain (32-byte diagnostic dump
-        // / sdhci_read32(PRESENT_STATE)) — see
-        // docs/cacheable-dma-migration-plan.md and Linux's
-        // dma_sync_sg_for_cpu in sdhci_adma_table_post.
-        //
-        // Sync at engine level (after the inner loop) rather than
-        // per-iteration because no caller code touches the buffer
-        // between iterations; one sync covers count*512 bytes.
-        // sync_bytes computed once at the top of the function.
-        if !sys_dma_sync_for_cpu(buffer, 0, sync_bytes).is_ok() {
-            puts("[EMMC2:READ] sync_for_cpu FAILED\n");
-            return Err(BlockError::IoError);
-        }
-        Ok(())
+            // A per-block read failed (already logged in the loop).
+            DmaTransferError::Kick(be) => be,
+            // Immediate completion is infallible.
+            DmaTransferError::Completion(inf) => match inf {},
+            // Post-transfer invalidate (C1) of the buffer region failed.
+            DmaTransferError::InvalidateFailed(_) => {
+                puts("[EMMC2:READ] sync_for_cpu FAILED\n");
+                BlockError::IoError
+            }
+        })
     }
 
     fn write(&mut self, _sector: u64, _count: u64, _buffer: PageSetHandle)
@@ -1838,9 +1898,10 @@ impl BlockEngine for Emmc2BlockEngine {
 
     fn free_buffer(&mut self, buffer: PageSetHandle) {
         for slot in self.dma_buffers.iter_mut() {
-            if slot.handle == buffer.0 && slot.pa != 0 {
-                close_dma_backing(PageSetHandle(slot.handle));
-                *slot = DMA_BUF_EMPTY;
+            if matches!(slot.as_ref(), Some(b) if b.backing.pageset.0 == buffer.0) {
+                if let Some(buf) = slot.take() {
+                    close_dma_backing(buf.backing.pageset);
+                }
                 self.dma_count -= 1;
                 return;
             }
