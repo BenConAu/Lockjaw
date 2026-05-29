@@ -37,8 +37,8 @@
 
 use crate::handle::{PageSetGuard, PageSetHandle};
 use crate::syscall::{
-    sys_alloc_pages, sys_alloc_pages_contiguous, sys_close_handle,
-    sys_map_pages, sys_query_pageset_phys,
+    sys_alloc_dma_pages, sys_alloc_pages, sys_alloc_pages_contiguous,
+    sys_close_handle, sys_map_pages, sys_query_pageset_phys,
 };
 use crate::virtual_memory::{unmap_pages_tracked, VMEM};
 use core::marker::PhantomData;
@@ -46,6 +46,54 @@ use lockjaw_mmio::dma::{DmaCell, DmaSliceDyn, DmaValue};
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_types::syscall::SyscallError;
 use lockjaw_types::vmem::MapMemoryAttribute;
+
+// ---------------------------------------------------------------------------
+// DMA allocation origin + cache-sync capability (type-level).
+//
+// The kernel's `sys_dma_sync_*` cache-maintenance syscalls accept ONLY
+// DmaPool-origin pagesets (`src/syscall/handler.rs`: `origin != DmaPool
+// -> INVALID_PARAMETER`). Buddy-origin pages are coherent only on a
+// coherent bus (QEMU virtio) and the kernel rejects syncing them.
+//
+// The origin is encoded in the mapping's TYPE. Today (P9.10) this types
+// the ALLOCATION: emmc2 allocates `DmaPoolOrigin` mappings, so its
+// pagesets are accepted by the sync gate instead of failing with a
+// runtime `INVALID_PARAMETER` only on a hardware flash. The sync surface
+// itself (`sys_dma_sync_*`) still takes raw handles; P9.11 adds a
+// `SyncCapable`-gated coherence envelope that makes handing a
+// `BuddyOrigin` mapping to a sync a compile error. Until then the origin
+// marker constrains allocation, not the sync call.
+// ---------------------------------------------------------------------------
+
+mod origin_sealed {
+    pub trait Sealed {}
+}
+
+/// Marker: Buddy-allocator origin (general RAM). Coherent only on a
+/// coherent bus (QEMU); NOT accepted by `sys_dma_sync_*`, so it is not
+/// `SyncCapable`. The default origin — use for coherent-bus DMA.
+pub struct BuddyOrigin;
+
+/// Marker: DmaPool origin (the cache-maintenance-managed pool). The only
+/// origin `sys_dma_sync_*` accepts; required for real-hardware
+/// (non-coherent) DMA. Implements `SyncCapable`.
+pub struct DmaPoolOrigin;
+
+impl origin_sealed::Sealed for BuddyOrigin {}
+impl origin_sealed::Sealed for DmaPoolOrigin {}
+
+/// A DMA allocation origin. Sealed — drivers cannot define new origins.
+pub trait DmaOrigin: origin_sealed::Sealed {}
+impl DmaOrigin for BuddyOrigin {}
+impl DmaOrigin for DmaPoolOrigin {}
+
+/// Origins whose pagesets the kernel's `sys_dma_sync_*` syscalls accept
+/// (DmaPool only). P9.11's cache-coherence envelope will require this
+/// bound, making a `BuddyOrigin` mapping handed to a sync a compile
+/// error; until that lands the bound is declared but not yet enforced on
+/// the sync surface. `BuddyOrigin` deliberately does NOT implement it.
+pub trait SyncCapable: DmaOrigin {}
+impl SyncCapable for DmaPoolOrigin {}
 
 // ---------------------------------------------------------------------------
 // Lifetime-bound DMA views.
@@ -211,6 +259,19 @@ pub trait DmaMappingView {
             view.write(i, 0);
         }
     }
+
+    /// Zero `len` bytes starting at `byte_offset` via volatile writes.
+    /// Use this — not `zero()` — when only a sub-range of the mapping
+    /// will be cache-synced. Zeroing (dirtying) cache lines beyond the
+    /// range a driver later cleans/invalidates leaves them dirty and
+    /// unmanaged; on a DmaPool page that is subsequently closed/freed,
+    /// those lines can write back into a reallocated physical page.
+    fn zero_range(&self, byte_offset: u64, len: usize) {
+        let view = self.slice::<u8>(byte_offset, len);
+        for i in 0..len {
+            view.write(i, 0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +283,7 @@ pub trait DmaMappingView {
 /// `Drop` unmaps the VA range, returns it to the allocator, AND
 /// closes the underlying pageset handle. Use for driver-owned
 /// allocations (request headers, virtqueue backing).
-pub struct OwnedDmaMapping {
+pub struct OwnedDmaMapping<O: DmaOrigin = BuddyOrigin> {
     pageset: PageSetHandle,
     va: u64,
     pa: u64,
@@ -231,24 +292,57 @@ pub struct OwnedDmaMapping {
     // consumer already released the resources). Internal flag, not
     // exposed on the API.
     armed: bool,
+    // Zero-size origin marker (Buddy vs DmaPool). Determines at the type
+    // level whether this mapping is `SyncCapable`.
+    _origin: PhantomData<O>,
 }
 
-impl OwnedDmaMapping {
-    /// Allocate one Normal-mapped page (DMA-coherent on the platforms
-    /// Lockjaw targets), map it, and return the handle.
+impl OwnedDmaMapping<BuddyOrigin> {
+    /// Allocate one Normal-mapped Buddy page (coherent on a coherent
+    /// bus, e.g. QEMU), map it, and return the handle. NOT cache-sync
+    /// capable; for DMA that issues `sys_dma_sync_*` (real hardware)
+    /// use `OwnedDmaMapping::<DmaPoolOrigin>::alloc_dma_pool`.
     pub fn alloc() -> Result<Self, SyscallError> {
-        let pageset = sys_alloc_pages(1)?;
-        Self::finish_alloc(pageset, 1)
+        let m = Self::alloc_and_map(sys_alloc_pages(1)?, 1)?;
+        m.zero();
+        Ok(m)
     }
 
-    /// Allocate `pages` physically-contiguous pages, map them, and
-    /// return the handle. Used for virtqueue allocations.
+    /// Allocate `pages` physically-contiguous Buddy pages, map them,
+    /// zero them, and return the handle. Used for virtqueue allocations.
     pub fn alloc_contiguous(pages: u64) -> Result<Self, SyscallError> {
-        let pageset = sys_alloc_pages_contiguous(pages)?;
-        Self::finish_alloc(pageset, pages)
+        let m = Self::alloc_and_map(sys_alloc_pages_contiguous(pages)?, pages)?;
+        m.zero();
+        Ok(m)
     }
+}
 
-    fn finish_alloc(pageset: PageSetHandle, pages: u64) -> Result<Self, SyscallError> {
+impl OwnedDmaMapping<DmaPoolOrigin> {
+    /// Allocate one Normal-mapped DmaPool page and return the handle.
+    /// DmaPool origin is `SyncCapable` — required for DMA on a
+    /// non-coherent bus (real hardware) whose driver issues
+    /// `sys_dma_sync_*` around transfers.
+    ///
+    /// Deliberately NOT zeroed (unlike the Buddy `alloc`): whole-page
+    /// zeroing would dirty cache lines for the whole page, but a driver
+    /// only cleans/invalidates the range it transfers; the unused tail
+    /// would stay dirty until the pageset is closed/freed, then write
+    /// back into a reallocated page. Zero only the range you will sync,
+    /// via `DmaMappingView::zero_range`.
+    pub fn alloc_dma_pool() -> Result<Self, SyscallError> {
+        Self::alloc_and_map(sys_alloc_dma_pages(1)?, 1)
+    }
+}
+
+impl<O: DmaOrigin> OwnedDmaMapping<O> {
+    /// Allocate + Normal-map the pageset. Does NOT zero the region —
+    /// zeroing is the constructor's choice. Whole-page zeroing a DmaPool
+    /// page via cacheable writes dirties every line; for the unused tail
+    /// beyond a driver's per-transfer synced range those lines are never
+    /// cleaned before the pageset is closed/freed and reused (a writeback
+    /// hazard). Buddy constructors zero (coherent bus, no hazard);
+    /// DmaPool constructors leave it unzeroed.
+    fn alloc_and_map(pageset: PageSetHandle, pages: u64) -> Result<Self, SyscallError> {
         // PageSetGuard closes the pageset on early return; .take() on
         // the success path passes ownership into the mapping (whose
         // Drop is the new owner).
@@ -263,9 +357,7 @@ impl OwnedDmaMapping {
             return Err(err);
         }
         let pageset = guard.take();
-        let m = Self { pageset, va, pa, pages, armed: true };
-        m.zero();
-        Ok(m)
+        Ok(Self { pageset, va, pa, pages, armed: true, _origin: PhantomData })
     }
 
     /// Underlying pageset handle (for export, IRQ binding, etc.).
@@ -301,7 +393,7 @@ impl OwnedDmaMapping {
     }
 }
 
-impl DmaMappingView for OwnedDmaMapping {
+impl<O: DmaOrigin> DmaMappingView for OwnedDmaMapping<O> {
     fn va(&self) -> u64 { self.va }
     fn pa(&self) -> u64 { self.pa }
     fn size_bytes(&self) -> usize {
@@ -309,7 +401,7 @@ impl DmaMappingView for OwnedDmaMapping {
     }
 }
 
-impl Drop for OwnedDmaMapping {
+impl<O: DmaOrigin> Drop for OwnedDmaMapping<O> {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -430,23 +522,40 @@ impl Drop for BorrowedDmaMapping {
 // gate.
 // ---------------------------------------------------------------------------
 
-/// Result of `alloc_dma_backing`: the pageset handle (caller owns)
-/// and the first-page physical address (for device programming).
-pub struct DmaBacking {
+/// Result of `alloc_dma_backing*`: the pageset handle (caller owns)
+/// and the first-page physical address (for device programming). The
+/// `O` marker records the origin (`BuddyOrigin` vs `DmaPoolOrigin`);
+/// only `DmaPoolOrigin` backings are `SyncCapable`.
+pub struct DmaBacking<O: DmaOrigin = BuddyOrigin> {
     pub pageset: PageSetHandle,
     pub pa: u64,
     pub pages: u64,
+    _origin: PhantomData<O>,
 }
 
-/// Allocate a contiguous DMA-coherent backing region without
-/// mapping it locally. Returns the pageset handle (transfer of
-/// ownership to caller) and the first-page PA.
-pub fn alloc_dma_backing(pages: u64) -> Result<DmaBacking, SyscallError> {
-    let pageset = sys_alloc_pages_contiguous(pages)?;
+/// Allocate a contiguous Buddy-origin DMA backing region without
+/// mapping it locally. Coherent-bus only (QEMU); NOT `SyncCapable`.
+/// Returns the pageset handle (transfer of ownership to caller) and
+/// the first-page PA.
+pub fn alloc_dma_backing(pages: u64) -> Result<DmaBacking<BuddyOrigin>, SyscallError> {
+    finish_dma_backing(sys_alloc_pages_contiguous(pages)?, pages)
+}
+
+/// Allocate a contiguous DmaPool-origin DMA backing region without
+/// mapping it locally. `SyncCapable` — for non-coherent (real
+/// hardware) DMA whose driver issues `sys_dma_sync_*` around transfers.
+pub fn alloc_dma_backing_dma_pool(pages: u64) -> Result<DmaBacking<DmaPoolOrigin>, SyscallError> {
+    finish_dma_backing(sys_alloc_dma_pages(pages)?, pages)
+}
+
+fn finish_dma_backing<O: DmaOrigin>(
+    pageset: PageSetHandle,
+    pages: u64,
+) -> Result<DmaBacking<O>, SyscallError> {
     let guard = PageSetGuard::new(pageset);
     let pa = sys_query_pageset_phys(pageset, 0)?;
     let pageset = guard.take();
-    Ok(DmaBacking { pageset, pa, pages })
+    Ok(DmaBacking { pageset, pa, pages, _origin: PhantomData })
 }
 
 /// Close a `DmaBacking`'s pageset handle. Use when the caller is

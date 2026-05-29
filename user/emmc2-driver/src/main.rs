@@ -1,7 +1,6 @@
 #![no_std]
 #![no_main]
 
-use core::ptr;
 use lockjaw_userlib::*;
 use lockjaw_userlib::clock::{ClockClient, ClockError};
 use lockjaw_userlib::block::{
@@ -10,8 +9,11 @@ use lockjaw_userlib::block::{
 use lockjaw_userlib::driver_runtime::{
     standard_driver_init_level, LevelDriverCtx, LevelDriverInitError,
 };
+use lockjaw_userlib::dma::{
+    alloc_dma_backing_dma_pool, close_dma_backing, BorrowedDmaMapping,
+    DmaMappingView, DmaPoolOrigin, OwnedDmaMapping,
+};
 use lockjaw_userlib::dma_sync::{sys_dma_sync_for_cpu, sys_dma_sync_for_device};
-use lockjaw_mmio::dma::DmaCell;
 use lockjaw_mmio::region::MappedRegs;
 use lockjaw_regs::sdhci::{
     ClockControl, Command, ErrorIntSignalEnable, ErrorIntStatus, ErrorIntStatusEnable,
@@ -320,14 +322,11 @@ enum Emmc2Error {
     /// emmc2 selftest) can race ahead of the controller's outbound
     /// AXI writes.
     DatInhibitStuck { present_state: u32 },
-    /// sys_alloc_dma_pages for the descriptor table failed.
+    /// Allocating + mapping the descriptor table via
+    /// `OwnedDmaMapping::<DmaPoolOrigin>::alloc_dma_pool()` failed
+    /// (alloc, phys query, VA reservation, or map — the typed mapping
+    /// collapses these into a single SyscallError).
     DescAllocFailed,
-    /// sys_query_pageset_phys for the descriptor table failed.
-    DescPhysQueryFailed,
-    /// VMEM.alloc(1) for the descriptor table VA returned None.
-    DescVaExhausted,
-    /// sys_map_pages for the descriptor table failed.
-    DescMapFailed,
     /// sys_dma_sync_for_device on the descriptor table failed
     /// (per-transfer, after writing the descriptor and before
     /// kicking the controller).
@@ -350,9 +349,6 @@ impl Emmc2Error {
             Self::TransferCompleteTimeout      => "transfer_complete timeout",
             Self::DatInhibitStuck { .. }       => "dat_inhibit stuck post-completion",
             Self::DescAllocFailed              => "desc alloc failed",
-            Self::DescPhysQueryFailed          => "desc phys query failed",
-            Self::DescVaExhausted              => "desc VA exhausted",
-            Self::DescMapFailed                => "desc map failed",
             Self::DescSyncFailed               => "desc sync_for_device failed",
         }
     }
@@ -385,9 +381,6 @@ fn put_emmc2_error(err: &Emmc2Error) {
         Emmc2Error::CmdCompleteTimeout
         | Emmc2Error::TransferCompleteTimeout
         | Emmc2Error::DescAllocFailed
-        | Emmc2Error::DescPhysQueryFailed
-        | Emmc2Error::DescVaExhausted
-        | Emmc2Error::DescMapFailed
         | Emmc2Error::DescSyncFailed => {}
     }
 }
@@ -1032,7 +1025,7 @@ fn emmc2_entry() -> ! {
     // emmc2_entry must go through `engine.regs.regs()` (used by the
     // selftest below).
     let _ = sdhci;
-    let engine = match unsafe { Emmc2BlockEngine::new(ctx.regs, capacity_sectors, ctx.irq) } {
+    let engine = match Emmc2BlockEngine::new(ctx.regs, capacity_sectors, ctx.irq) {
         Ok(e) => e,
         Err(err) => {
             puts("[EMMC2:BLK] engine init FAILED: ");
@@ -1050,47 +1043,47 @@ fn emmc2_entry() -> ! {
         Ok(b) => b,
         Err(_) => { puts("[EMMC2:BLK] selftest alloc FAILED\n"); halt(); }
     };
-    let selftest_va = VMEM.alloc(1).expect("[EMMC2:BLK] selftest VA alloc FAILED");
-    if !sys_map_pages(selftest_buf, selftest_va, MapMemoryAttribute::Normal).is_ok() {
-        puts("[EMMC2:BLK] selftest map FAILED\n");
-        halt();
-    }
-    // Diagnostic: print buf_phys (queried via the handle) and desc_phys
-    // so the post-read buffer contents can be correlated with the
-    // descriptor wire encoding the controller saw. Same handle was
-    // queried in alloc_buffer to stash buf.pa; if these differ, that
-    // would explain a silent zero-data read (DMA goes to a different
-    // PA than the CPU's mapping).
-    let buf_phys_check = sys_query_pageset_phys(selftest_buf, 0)
-        .unwrap_or(0xDEAD_BEEF);
+    // Adopt the engine-owned buffer pageset for local inspection. The
+    // BorrowedDmaMapping unmaps its VA on Drop but does NOT close the
+    // pageset — engine.free_buffer (below) owns the close.
+    let selftest_map = match BorrowedDmaMapping::map_existing(selftest_buf, 1) {
+        Ok(m) => m,
+        Err(_) => { puts("[EMMC2:BLK] selftest map FAILED\n"); halt(); }
+    };
+    // Diagnostic: print buf_phys (the mapping's first-page PA) and
+    // desc_phys so the post-read buffer contents can be correlated
+    // with the descriptor wire encoding the controller saw. The same
+    // PA was queried in alloc_buffer to stash buf.pa; if these differ,
+    // that would explain a silent zero-data read (DMA goes to a
+    // different PA than the CPU's mapping).
     puts("[EMMC2:DIAG] buf_phys=");
-    put_hex(buf_phys_check);
+    put_hex(selftest_map.pa());
     puts(" desc_phys=");
-    put_hex(engine.desc_phys);
+    put_hex(engine.desc_map.pa());
     puts("\n");
-    // Zero the buffer to distinguish read data from any prior content.
-    unsafe { ptr::write_bytes(selftest_va as *mut u8, 0, 512); }
+    // Zero only the 512-byte range this selftest reads + syncs (one
+    // sector). Zeroing the whole mapped page would dirty cache lines
+    // past the synced range that are never cleaned/invalidated before
+    // the buffer is closed — a writeback hazard on the freed DmaPool page.
+    selftest_map.zero_range(0, 512);
     if engine.read(0, 1, selftest_buf).is_err() {
         puts("[EMMC2:BLK] selftest read FAILED\n");
         halt();
     }
     // MBR boot signature lives at bytes 510-511 = 0x55 0xAA (little-endian).
-    let sig = unsafe {
-        let p = selftest_va as *const u8;
-        let lo = ptr::read_volatile(p.add(510)) as u16;
-        let hi = ptr::read_volatile(p.add(511)) as u16;
-        (hi << 8) | lo
-    };
+    // Read each byte through the mapping's bounds-checked cell accessor.
+    let lo = selftest_map.cell::<u8>(510).read() as u16;
+    let hi = selftest_map.cell::<u8>(511).read() as u16;
+    let sig = (hi << 8) | lo;
     if sig != 0xAA55 {
         puts("[EMMC2:BLK] selftest MBR signature=");
         put_hex(sig as u64);
         puts(" BAD (expected 0xAA55)\n");
         halt();
     }
-    // Proof-token teardown: VA returns to VMEM only on successful unmap.
-    if let Ok(p) = unmap_pages_tracked(selftest_buf, selftest_va, 1) {
-        VMEM.free_unmapped(p);
-    }
+    // Drop the borrowed mapping (unmaps the VA, returns it to VMEM).
+    // The pageset stays open — engine.free_buffer closes it next.
+    drop(selftest_map);
     engine.free_buffer(selftest_buf);
 
     puts("[BLOCKDEV] /dev/sd0 ready: 512B x ");
@@ -1123,19 +1116,17 @@ fn emmc2_entry() -> ! {
 /// MULTI, no BLK_CNT_EN, no Auto-CMD23 — those belong to the
 /// multi-block path. Mirrors the M6 sub-commit 2b sequence.
 ///
-/// `desc_ps` is the DmaPool PageSet handle backing the descriptor
-/// table; needed to sync the descriptor write down to DRAM via
-/// `sys_dma_sync_for_device` before kicking the controller
-/// (cacheable-DMA migration C1: the descriptor mapping is Normal
-/// Cacheable post-migration, so a `dsb sy` alone is not enough to
-/// flush the cache line).
-unsafe fn adma2_single_block_read(
+/// `desc_map` is the `OwnedDmaMapping` backing the descriptor table;
+/// needed to sync the descriptor write down to DRAM via
+/// `sys_dma_sync_for_device(desc_map.pageset(), ..)` before kicking
+/// the controller (cacheable-DMA migration C1: the descriptor mapping
+/// is Normal Cacheable post-migration, so a `dsb sy` alone is not
+/// enough to flush the cache line).
+fn adma2_single_block_read(
     sdhci: &Sdhci,
     sector: u64,
     buf_phys: u64,
-    desc_ps: PageSetHandle,
-    desc_va: u64,
-    desc_phys: u64,
+    desc_map: &OwnedDmaMapping<DmaPoolOrigin>,
     bound_irq: &mut lockjaw_userlib::irq::BoundIrq,
 ) -> Result<(), Emmc2Error> {
     if buf_phys >= (1u64 << 32) {
@@ -1167,11 +1158,12 @@ unsafe fn adma2_single_block_read(
     // above), so we can safely overwrite the previous descriptor.
     // Typed Adma2Descriptor wire DTO (tran_end = VALID | END | ACT_TRAN,
     // a construction-safe shape per lockjaw_types::sdhci) written through
-    // a DmaCell. The descriptor page is a raw sys_map_pages mapping, so we
-    // wrap its VA with DmaCell::at — the lone remaining unsafe on this
-    // path; a bounds-checked OwnedDmaMapping cell accessor would remove it.
-    let desc = Adma2Descriptor::tran_end(buf_phys as u32, 512);
-    DmaCell::<Adma2Descriptor>::at(desc_va).write(desc);
+    // the OwnedDmaMapping's `cell()` accessor — bounds-checked and
+    // alignment-checked, so the write is fully safe (this removed the
+    // lone remaining `DmaCell::at` unsafe on this path).
+    desc_map
+        .cell::<Adma2Descriptor>(0)
+        .write(Adma2Descriptor::tran_end(buf_phys as u32, 512));
     // Flush the descriptor's cache line to DRAM before the
     // controller's DMA fetches it. Post cacheable-DMA migration
     // C1 the descriptor mapping is Normal Cacheable, so the
@@ -1180,7 +1172,7 @@ unsafe fn adma2_single_block_read(
     // store may still sit in the L1 cache when the controller
     // reads memory. sys_dma_sync_for_device does `dc cvac` + dsb
     // sy, which writes the line back to DRAM.
-    if !sys_dma_sync_for_device(desc_ps, 0, 8).is_ok() {
+    if !sys_dma_sync_for_device(desc_map.pageset(), 0, 8).is_ok() {
         return Err(Emmc2Error::DescSyncFailed);
     }
 
@@ -1194,7 +1186,7 @@ unsafe fn adma2_single_block_read(
     // hand-rolled mask arithmetic.
     sdhci.modify_host_control(|hc| hc.with_dma_sel(HostControlDmaSel::Adma2_32));
 
-    sdhci.write_adma_address(desc_phys as u32);
+    sdhci.write_adma_address(desc_map.pa() as u32);
 
     // Typed BLOCK_SIZE/BLOCK_COUNT writes (regspec generates raw u16
     // write_* accessors — the registers have no named bit fields).
@@ -1359,15 +1351,13 @@ pub enum AdmaDirection {
 }
 
 #[allow(dead_code)]  // Disabled until CMD18+Auto-CMD23 cold-boot is validated. See doc/tech-debt.md.
-unsafe fn adma2_transfer(
+fn adma2_transfer(
     sdhci: &Sdhci,
     direction: AdmaDirection,
     sector: u64,
     n_blocks: u16,
     buf_phys: u64,
-    desc_ps: PageSetHandle,
-    desc_va: u64,
-    desc_phys: u64,
+    desc_map: &OwnedDmaMapping<DmaPoolOrigin>,
 ) -> Result<AdmaTiming, Emmc2Error> {
     if buf_phys >= (1u64 << 32) {
         return Err(Emmc2Error::BufferPhysAbove4Gib(buf_phys));
@@ -1393,18 +1383,21 @@ unsafe fn adma2_transfer(
     }
 
     // One descriptor covers the whole multi-block transfer. Descriptor
-    // table from the single-block path is reused (still mapped at
-    // desc_va); overwrite its 8 bytes for this transfer.
-    let desc = Adma2Descriptor::tran_end(buf_phys as u32, bytes as u16);
-    DmaCell::<Adma2Descriptor>::at(desc_va).write(desc);
+    // table from the single-block path is reused (still mapped via
+    // desc_map); overwrite its 8 bytes for this transfer. Written
+    // through the OwnedDmaMapping's bounds-checked `cell()` accessor
+    // (safe — mirrors adma2_single_block_read).
+    desc_map
+        .cell::<Adma2Descriptor>(0)
+        .write(Adma2Descriptor::tran_end(buf_phys as u32, bytes as u16));
     // Sync descriptor down to DRAM — same rationale as in
     // adma2_single_block_read (descriptor mapping is now Normal
     // Cacheable post-C1; dsb sy alone doesn't flush the line).
-    if !sys_dma_sync_for_device(desc_ps, 0, 8).is_ok() {
+    if !sys_dma_sync_for_device(desc_map.pageset(), 0, 8).is_ok() {
         return Err(Emmc2Error::DescSyncFailed);
     }
 
-    sdhci.write_adma_address(desc_phys as u32);
+    sdhci.write_adma_address(desc_map.pa() as u32);
     sdhci.write_argument2(n_blocks as u32);
 
     // P9.6: typed BLOCK_SIZE/BLOCK_COUNT writes (mirror of the
@@ -1554,13 +1547,13 @@ struct Emmc2BlockEngine {
     /// Persistent ADMA2-32 descriptor table. One 8-byte tran+end
     /// descriptor is rewritten per transfer. Allocated from the
     /// DMA pool and (post cacheable-DMA migration C1) mapped
-    /// Normal Cacheable. The `desc_ps` handle is retained so
-    /// every per-transfer descriptor write can be followed by a
-    /// `sys_dma_sync_for_device` call to flush the cache line
-    /// down to DRAM before the controller fetches the descriptor.
-    desc_ps: PageSetHandle,
-    desc_va: u64,
-    desc_phys: u64,
+    /// Normal Cacheable. The `OwnedDmaMapping` retains the pageset
+    /// so every per-transfer descriptor write can be followed by a
+    /// `sys_dma_sync_for_device(desc_map.pageset(), ..)` call to
+    /// flush the cache line down to DRAM before the controller
+    /// fetches the descriptor. Its `Drop` unmaps the VA and closes
+    /// the pageset when the engine is torn down.
+    desc_map: OwnedDmaMapping<DmaPoolOrigin>,
     dma_buffers: [DmaBuf; MAX_DMA_BUFFERS],
     dma_count: usize,
     /// IRQ-driven completion state (m7-irq-experiment graft).
@@ -1581,7 +1574,7 @@ impl Emmc2BlockEngine {
     /// enables are turned on HERE (not at boot) so the ID-phase
     /// polling path in `issue_command` continues to work without IRQ
     /// interference.
-    unsafe fn new(
+    fn new(
         regs: MappedRegs<Sdhci>,
         capacity_sectors: u64,
         irq: lockjaw_userlib::irq::BoundIrq,
@@ -1591,19 +1584,15 @@ impl Emmc2BlockEngine {
         // sdhci_read*/write* shims). regs is moved into the engine
         // at the end of this function.
         let sdhci = regs.regs();
-        // Descriptor table: 1 page from the DMA pool. Post-C1 of
-        // the cacheable-DMA migration this is mapped Normal
-        // Cacheable; the matching sys_dma_sync_for_device call
-        // before each controller kick is in adma2_single_block_read.
-        let desc_ps = sys_alloc_dma_pages(1).map_err(|_| Emmc2Error::DescAllocFailed)?;
-        let desc_phys = sys_query_pageset_phys(desc_ps, 0)
-            .map_err(|_| Emmc2Error::DescPhysQueryFailed)?;
-        let desc_va = VMEM.alloc(1).ok_or(Emmc2Error::DescVaExhausted)?;
-        if !sys_map_pages(desc_ps, desc_va, MapMemoryAttribute::Normal).is_ok() {
-            return Err(Emmc2Error::DescMapFailed);
-        }
-        if desc_phys >= (1u64 << 32) {
-            return Err(Emmc2Error::DescPhysAbove4Gib(desc_phys));
+        // Descriptor table: 1 page from the DMA pool, allocated and
+        // mapped via the typed OwnedDmaMapping (Normal Cacheable
+        // post-C1 of the cacheable-DMA migration). The matching
+        // sys_dma_sync_for_device call before each controller kick is
+        // in adma2_single_block_read. The mapping owns the pageset;
+        // its Drop unmaps + closes it when the engine is torn down.
+        let desc_map = OwnedDmaMapping::alloc_dma_pool().map_err(|_| Emmc2Error::DescAllocFailed)?;
+        if desc_map.pa() >= (1u64 << 32) {
+            return Err(Emmc2Error::DescPhysAbove4Gib(desc_map.pa()));
         }
         // Switch HOST_CONTROL_1.DMA_SEL to ADMA2-32; preserve the
         // 4-bit bus width from ACMD6 (P9.5 — typed
@@ -1611,7 +1600,7 @@ impl Emmc2BlockEngine {
         sdhci.modify_host_control(|hc| hc.with_dma_sel(HostControlDmaSel::Adma2_32));
         // Program the descriptor table address once; the same table
         // is reused across every transfer.
-        sdhci.write_adma_address(desc_phys as u32);
+        sdhci.write_adma_address(desc_map.pa() as u32);
         // Clear any latched STATUS bits before enabling signaling.
         //
         // ID-phase polling can leave NORMAL_INT_STATUS bits set —
@@ -1674,9 +1663,7 @@ impl Emmc2BlockEngine {
         Ok(Self {
             regs,
             capacity_sectors,
-            desc_ps,
-            desc_va,
-            desc_phys,
+            desc_map,
             dma_buffers: [DMA_BUF_EMPTY; MAX_DMA_BUFFERS],
             dma_count: 0,
             irq,
@@ -1698,7 +1685,7 @@ impl BlockEngine for Emmc2BlockEngine {
         BlockInfo {
             capacity_sectors: self.capacity_sectors,
             sector_size: 512,
-            // emmc2 allocs buffers via `sys_alloc_dma_pages` (DmaPool
+            // emmc2 allocs buffers via `alloc_dma_backing_dma_pool` (DmaPool
             // origin). Post cacheable-DMA migration C1 the kernel
             // accepts only Normal (Cacheable) mappings for DmaPool
             // PageSets. Cross-process coherence is the ENGINE's
@@ -1727,22 +1714,28 @@ impl BlockEngine for Emmc2BlockEngine {
             return Err(BlockError::InvalidParameter);
         }
         let pages = (sector_count * 512 + (PAGE_SIZE - 1)) / PAGE_SIZE;
-        let guard = PageSetGuard::new(
-            sys_alloc_dma_pages(pages).map_err(|_| BlockError::AllocFailed)?
-        );
-        let pa = sys_query_pageset_phys(guard.handle(), 0)
-            .map_err(|_| BlockError::AllocFailed)?;
-        if pa >= (1u64 << 32) {
+        let backing = alloc_dma_backing_dma_pool(pages).map_err(|_| BlockError::AllocFailed)?;
+        // ADMA2-32 programs a 32-bit ADMA_ADDRESS, so the buffer's
+        // physical base must sit below 4 GiB. Close the backing on the
+        // reject path so the rejected allocation doesn't leak (the
+        // PageSetGuard that previously auto-closed on early return is
+        // subsumed by alloc_dma_backing_dma_pool's own success-only handoff).
+        if backing.pa >= (1u64 << 32) {
+            close_dma_backing(backing.pageset);
             return Err(BlockError::AllocFailed);
         }
+        // Track this buffer in the slot table; on success the slot
+        // takes ownership of the pageset (close happens in free_buffer).
+        // On failure (table full) close immediately so the allocation
+        // doesn't leak.
         for slot in self.dma_buffers.iter_mut() {
             if slot.pa == 0 {
-                let ps = guard.take();
-                *slot = DmaBuf { handle: ps.0, pa, sector_count };
+                *slot = DmaBuf { handle: backing.pageset.0, pa: backing.pa, sector_count };
                 self.dma_count += 1;
-                return Ok(ps);
+                return Ok(backing.pageset);
             }
         }
+        close_dma_backing(backing.pageset);
         Err(BlockError::AllocFailed)
     }
 
@@ -1759,7 +1752,7 @@ impl BlockEngine for Emmc2BlockEngine {
         // cache lines in the destination buffer to DRAM BEFORE the
         // controller writes it. Without this, lines dirtied by an
         // earlier CPU write to the same buffer (e.g. the selftest's
-        // pre-DMA `ptr::write_bytes(.., 0, ..)`, or a previous read's
+        // pre-DMA `zero_range(0, 512)`, or a previous read's
         // partial overwrite) can later be written back over the
         // device's DMA-deposited bytes, leaving the post-DMA
         // sys_dma_sync_for_cpu (below) returning stale zeros. This is
@@ -1785,13 +1778,11 @@ impl BlockEngine for Emmc2BlockEngine {
         // validated end-to-end with the partition-manager layer.
         for i in 0..count {
             let buf_sector_pa = buf.pa + i * 512;
-            let res = unsafe {
-                adma2_single_block_read(
-                    self.regs.regs(), sector + i, buf_sector_pa,
-                    self.desc_ps, self.desc_va, self.desc_phys,
-                    &mut self.irq,
-                )
-            };
+            let res = adma2_single_block_read(
+                self.regs.regs(), sector + i, buf_sector_pa,
+                &self.desc_map,
+                &mut self.irq,
+            );
             if let Err(err) = res {
                 // Surface the typed Emmc2Error so silent-return cases
                 // (inhibit stuck / cmd or xfer timeout) aren't lost behind
@@ -1848,7 +1839,7 @@ impl BlockEngine for Emmc2BlockEngine {
     fn free_buffer(&mut self, buffer: PageSetHandle) {
         for slot in self.dma_buffers.iter_mut() {
             if slot.handle == buffer.0 && slot.pa != 0 {
-                sys_close_handle(PageSetHandle(slot.handle));
+                close_dma_backing(PageSetHandle(slot.handle));
                 *slot = DMA_BUF_EMPTY;
                 self.dma_count -= 1;
                 return;
