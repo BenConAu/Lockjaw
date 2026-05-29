@@ -20,7 +20,7 @@
 //! etc/acpi/tables, …) inherit the same shapes by calling these
 //! helpers instead of re-implementing.
 
-use crate::dma::{DmaMappingView, OwnedDmaMapping};
+use crate::dma::{BuddyOrigin, DmaMappingView, OwnedDmaMapping};
 use lockjaw_regs::fw_cfg::FwCfg;
 use lockjaw_types::fwcfg::{FwCfgDmaAccess, FwCfgFile, FW_CFG_FILE_DIR};
 
@@ -85,7 +85,7 @@ pub enum FwCfgDmaError {
 /// when that lands, this poll loop is a candidate user.
 pub fn dma_write(
     regs: &FwCfg,
-    scratch: &OwnedDmaMapping,
+    scratch: &OwnedDmaMapping<BuddyOrigin>,
     header_offset: u64,
     payload_offset: u64,
     selector: u16,

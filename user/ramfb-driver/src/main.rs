@@ -16,7 +16,7 @@ use lockjaw_userlib::display::{
     run_display_server, DisplayEngine, DisplayError, ModeInfo, PIXEL_FORMAT_XRGB8888,
 };
 use lockjaw_userlib::dma::{
-    alloc_dma_backing, close_dma_backing, DmaMappingView, OwnedDmaMapping,
+    alloc_dma_backing, close_dma_backing, BuddyOrigin, DmaMappingView, OwnedDmaMapping,
 };
 use lockjaw_userlib::driver_runtime::standard_init_no_irq;
 use lockjaw_userlib::fwcfg::{dma_write, find_file};
@@ -62,7 +62,7 @@ const SELFTEST_SIZE_BYTES: u64 = SELFTEST_STRIDE as u64 * SELFTEST_HEIGHT as u64
 /// lives in `lockjaw_userlib::fwcfg::dma_write`.
 fn program_ramfb(
     regs: &FwCfg,
-    dma_page: &OwnedDmaMapping,
+    dma_page: &OwnedDmaMapping<BuddyOrigin>,
     ramfb_sel: u16,
     fb_phys: u64,
     width: u32,
@@ -107,7 +107,7 @@ struct EngineBuffer {
 /// to the engine, the self-test buffer won't appear. By design.
 struct RamfbEngine {
     regs: MappedRegs<FwCfg>,
-    dma_page: OwnedDmaMapping,
+    dma_page: OwnedDmaMapping<BuddyOrigin>,
     ramfb_sel: u16,
     session_active: bool,
     current_mode: Option<usize>,

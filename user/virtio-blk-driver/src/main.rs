@@ -16,7 +16,7 @@
 use core::mem::size_of;
 use lockjaw_userlib::block::{BlockEngine, BlockError, BlockInfo, run_block_server};
 use lockjaw_userlib::dma::{
-    alloc_dma_backing, close_dma_backing, BorrowedDmaMapping, DmaMappingView,
+    alloc_dma_backing, close_dma_backing, BorrowedDmaMapping, BuddyOrigin, DmaMappingView,
     OwnedDmaMapping,
 };
 use lockjaw_userlib::driver_runtime::DriverCtx;
@@ -56,7 +56,7 @@ struct VirtioBlkEngine {
     /// at offset 0; the status byte lives immediately after at
     /// `size_of::<VirtioBlkReqHeader>()`. Views are computed per-use
     /// so they stay lifetime-bound to `&req_page`.
-    req_page: OwnedDmaMapping,
+    req_page: OwnedDmaMapping<BuddyOrigin>,
     /// IRQ notification handle (for waiting on completion).
     irq_notif: NotificationHandle,
     /// IRQ threshold (monotonic, incremented after each IRQ).

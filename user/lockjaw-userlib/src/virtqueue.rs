@@ -20,7 +20,7 @@
 //! escape the mapping's. Computing per-access is the same machine
 //! code after inlining and avoids both problems.
 
-use crate::dma::{CellRef, DmaMappingView, OwnedDmaMapping, SliceRef};
+use crate::dma::{BuddyOrigin, CellRef, DmaMappingView, OwnedDmaMapping, SliceRef};
 use crate::handle::NotificationHandle;
 use crate::syscall::sys_wait_notification;
 use crate::virtio::VirtioTransport;
@@ -81,7 +81,7 @@ pub enum VirtqueueError {
 pub struct Virtqueue {
     /// Owns the backing DMA region; keeps the mapping alive and
     /// closes the pageset on Drop.
-    backing: OwnedDmaMapping,
+    backing: OwnedDmaMapping<BuddyOrigin>,
     /// Cached layout for the device-register PAs.
     layout: VirtqueueLayout,
     /// Head of the free descriptor chain.
@@ -95,7 +95,7 @@ pub struct Virtqueue {
 impl Virtqueue {
     /// Initialize a virtqueue inside `backing`. Panics if `backing`
     /// is too small for the layout of `queue_size`.
-    pub fn new(backing: OwnedDmaMapping, queue_size: u16) -> Self {
+    pub fn new(backing: OwnedDmaMapping<BuddyOrigin>, queue_size: u16) -> Self {
         let layout = virtqueue_layout(queue_size);
         assert!(
             layout.total_size <= backing.size_bytes(),

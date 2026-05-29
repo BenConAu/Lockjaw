@@ -71,7 +71,7 @@ mod origin_sealed {
 
 /// Marker: Buddy-allocator origin (general RAM). Coherent only on a
 /// coherent bus (QEMU); NOT accepted by `sys_dma_sync_*`, so it is not
-/// `SyncCapable`. The default origin — use for coherent-bus DMA.
+/// `SyncCapable`. Use for coherent-bus DMA.
 pub struct BuddyOrigin;
 
 /// Marker: DmaPool origin (the cache-maintenance-managed pool). The only
@@ -283,7 +283,7 @@ pub trait DmaMappingView {
 /// `Drop` unmaps the VA range, returns it to the allocator, AND
 /// closes the underlying pageset handle. Use for driver-owned
 /// allocations (request headers, virtqueue backing).
-pub struct OwnedDmaMapping<O: DmaOrigin = BuddyOrigin> {
+pub struct OwnedDmaMapping<O: DmaOrigin> {
     pageset: PageSetHandle,
     va: u64,
     pa: u64,
@@ -526,7 +526,7 @@ impl Drop for BorrowedDmaMapping {
 /// and the first-page physical address (for device programming). The
 /// `O` marker records the origin (`BuddyOrigin` vs `DmaPoolOrigin`);
 /// only `DmaPoolOrigin` backings are `SyncCapable`.
-pub struct DmaBacking<O: DmaOrigin = BuddyOrigin> {
+pub struct DmaBacking<O: DmaOrigin> {
     pub pageset: PageSetHandle,
     pub pa: u64,
     pub pages: u64,
