@@ -9,6 +9,7 @@ pub mod clock;
 pub mod devmgr;
 pub mod dma;
 pub mod dma_sync;
+pub mod dma_transfer;
 pub mod display;
 pub mod driver_runtime;
 pub mod fs;

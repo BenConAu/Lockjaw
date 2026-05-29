@@ -34,6 +34,7 @@ pub mod virtio;
 pub mod fwcfg;
 pub mod block;
 pub mod dma;
+pub mod dma_coherence;
 pub mod wire;
 pub mod sdhci;
 pub mod clock;
