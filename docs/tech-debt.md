@@ -413,18 +413,6 @@ Until that's diagnosed, all reads use CMD17 single-block (validated on Pi as M6 
 
 ---
 
-## Phase 9 prerequisite: widen `check-driver-unsafe` to also forbid raw `sys_*`
-
-**Where:** `xtask/src/check_driver_unsafe.rs` (Phase 9 deliverable). The Phase 5 audit established the principle in `CLAUDE.md`: "User-mode drivers consume `lockjaw-userlib`, period. No raw `sys_*` calls in driver source except `sys_exit` and `sys_debug_puts`."
-
-**What:** Today the principle is in `CLAUDE.md` and the two converted drivers (uart, virtio-blk) pass it by manual audit (`grep -rEn 'sys_[a-z]' user/<driver>/src/`). Phase 9's `check-driver-unsafe` xtask currently checks only `#![forbid(unsafe_code)]` + `#[allow(unsafe_code)]` absence; it does not enforce the no-raw-`sys_*` rule. Without enforcement, a future driver (Phase 6/7/8 conversions, or a new device-family driver) can quietly re-introduce raw `sys_*` calls.
-
-**Fix:** Extend `check_driver_unsafe.rs` to also walk every `user/<driver>/src/**/*.rs`, parse for `sys_[a-z_]+\(` identifiers, and fail if any appear outside the `sys_exit` / `sys_debug_puts` allowlist. Same shape as the `#[allow(unsafe_code)]` check — one regex per file, allowlist as a Vec<&str>. Wire into `make build` alongside the existing checks.
-
-**Why bootstrap:** the rule exists today; only two drivers exist today; both already pass the manual grep. The xtask enforcement is best added in Phase 9 alongside the other lockdown checks rather than introducing a partial enforcement now.
-
----
-
 ## PL011 TX wait is unbounded
 
 **Where:** `user/uart-driver/src/main.rs::uart_putc` (and the parallel pattern any future serial / console / device-with-a-FIFO driver will copy).
@@ -476,3 +464,22 @@ This already bit us once: the P9.6 typed-accessor conversion dropped `| ERROR` f
 - **Shared "IRQ-driven SDHCI mandatory signal set" const** in a host-tested crate that both the driver consumes and a unit test asserts contains ERROR. Smallest, but a layering smell (emmc2-specific data in shared lockjaw-regs) and only the rule-of-two would justify it — deferred until a second IRQ-driven SDHCI consumer exists.
 
 **Why bootstrap:** emmc2 is the only IRQ-driven SDHCI consumer today and the only block backend on Pi 4B. The error path is correct as written (verified against SDHCI 3.0 §2.2.21 + Linux's `host->ier`); the gap is test-coverage, not behaviour. Tracked here so the next person who touches the signal-enable composition or the regspec int-enable flags knows the change is invisible to `make test` and must be reasoned about against the spec.
+
+---
+
+## `SdhciCommandInit<S>`: no-bypass operation layer (rubric R3 remainder)
+
+**Where:** `user/emmc2-driver` + a future `lockjaw-userlib::sdhci` family helper. The architectural next move after P9.11's coherence envelope.
+
+**What:** Phase 9.11 closed R1/R2/R4 of the DMA-coherence rubric — forgot-to-sync / wrong-direction / wrong-range / invalidate-before-device-done are all unrepresentable now, and the raw `sys_dma_sync_*` wrappers are `pub(crate)` so a driver cannot hand-sequence cache ops at all. What it does NOT yet deliver is rubric R3 ("the sanctioned transfer path is the only path"): emmc2 still holds raw DMA PAs (`buf.backing.pa`, `desc_map.pa()`) and a typed command accessor (`sdhci.set_transfer_mode_command(...)` exposed directly), so a future mis-write could program `ADMA_ADDRESS` or fire a CMD *outside* `run_dma_transfer`. The envelope still owns coherence around every transfer that *uses* it; the gap is "what stops someone from issuing a transfer that doesn't use it."
+
+**Fix:** An `SdhciCommandInit<S>` type-state operation layer in the SDHCI family that *holds* the coherence envelope (R6 layer separation — the envelope is generic, this layer is SDHCI-specific) and:
+- Hands out `DmaAddr<S>` opaque PA tokens that can only be programmed into `ADMA_ADDRESS` via the operation layer, not via bare `.pa()`.
+- Gates command issuance (`set_transfer_mode_command`) behind the layer so the controller cannot be kicked without the layer's coherence wrapping.
+- Carries the SDHCI-specific completion (`SdhciDataCompletion`, already factored in P9.11b) as the layer's await step.
+
+The type-state phantom `<S>` tracks operation lifecycle (programmed → kicked → completed) so reading a stale buffer between states is a compile error.
+
+**Why bootstrap:** emmc2 is the only SDHCI consumer today; the rule-of-two for the family helper hasn't fired. The envelope already catches the bug class that has actually bitten us (cache-coherence ordering — the stale-zeros / B4.1-drain class). The remaining no-bypass property is theoretical until a future mis-write in a new SDHCI driver or a refactor that loses the envelope around a direct-PA call site. Track here so the next SDHCI consumer (a second BCM2711 instance like emmc1, or an eMMC chip on a different SoC) forces the layer to land before the second mis-write becomes possible.
+
+**Acceptance:** every `ADMA_ADDRESS` write and every command-issuing setter in driver source flows through `SdhciCommandInit::<S>` rather than through bare `sdhci.write_adma_address` / `set_transfer_mode_command`; the type system rejects programming the controller without first opening the operation layer (which contains the coherence envelope).
