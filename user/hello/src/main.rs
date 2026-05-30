@@ -7,7 +7,8 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 #[link_section = ".lockjaw_hash"]
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
-use lockjaw_userlib::{puts, sys_debug_puts, sys_exit, sys_call_ret4, sys_alloc_pages, sys_map_pages, sys_create_reply, sys_create_thread, sys_yield, MapMemoryAttribute, VMEM, bootstrap_endpoint};
+use lockjaw_userlib::{puts, sys_debug_puts, sys_exit, MapMemoryAttribute, VMEM, bootstrap_endpoint};
+use lockjaw_userlib::syscall::{sys_call_ret4, sys_alloc_pages, sys_map_pages, sys_create_reply, sys_create_thread, sys_yield};
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {

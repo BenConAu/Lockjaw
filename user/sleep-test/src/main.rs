@@ -8,9 +8,9 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 
 use lockjaw_userlib::{
-    bootstrap_endpoint, put_decimal, puts, sys_alloc_pages, sys_call_ret4,
-    sys_create_reply, sys_exit,
+    bootstrap_endpoint, put_decimal, puts, sys_exit,
 };
+use lockjaw_userlib::syscall::{sys_alloc_pages, sys_call_ret4, sys_create_reply};
 use lockjaw_userlib::time::{
     cntfreq_hz, monotonic_now, sleep_for, ticks_to_nanos, MonoTicks, Nanos,
 };

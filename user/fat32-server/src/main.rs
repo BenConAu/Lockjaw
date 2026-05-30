@@ -8,6 +8,7 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 
 use lockjaw_userlib::*;
+use lockjaw_userlib::syscall::*;
 use lockjaw_userlib::block::BlockClient;
 use lockjaw_types::fat32::{
     cluster_to_sector, decode_fat_entry_value, fat_entry_location, iter_dir, match_8_3,

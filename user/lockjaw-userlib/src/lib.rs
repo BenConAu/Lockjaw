@@ -37,7 +37,21 @@ pub use lockjaw_types::device::{
     CMD_CLAIM_DEVICE, CLAIM_OK, CLAIM_ERR,
 };
 
-pub use syscall::*;
+// Selective re-export — only the driver-regime allowlist surfaces at
+// the crate root. Forbidden `sys_*` wrappers are reachable only via the
+// explicit `lockjaw_userlib::syscall::` module path (or an aliased
+// `use ...::syscall::sys_x as y`, which still names the path in the
+// import). A driver writing `use lockjaw_userlib::*` therefore cannot
+// pull any forbidden syscall into scope -- the regime's construction
+// half. The follow-up `check-driver-unsafe` xtask adds a textual
+// `syscall::` scan over driver source that catches the explicit-path
+// escape too.
+//
+// Non-driver userspace crates (init, servers, tests) `use
+// lockjaw_userlib::syscall::*;` for the full surface; everything they
+// need beyond the allowlist (BootInfo, SchedTelemetry, IRQ_FLAG_EDGE,
+// park_forever, the rest of sys_*) lives there.
+pub use syscall::{sys_exit, sys_debug_puts};
 pub use print::*;
 pub use process::{ProcessMapping, FLAG_EXECUTABLE};
 pub use lockjaw_types::process::PROCESS_MAPPINGS_PER_PAGE;

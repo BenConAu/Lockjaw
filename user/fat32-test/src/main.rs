@@ -8,6 +8,7 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 
 use lockjaw_userlib::*;
+use lockjaw_userlib::syscall::*;
 use lockjaw_userlib::fs::FsClient;
 
 fn die(msg: &str) -> ! {

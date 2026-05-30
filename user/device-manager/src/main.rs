@@ -8,6 +8,7 @@ const LOCKJAW_SOURCE_HASH: u64 = include!(concat!(env!("OUT_DIR"), "/source_hash
 static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::cell::UnsafeCell;
 use lockjaw_userlib::*;
+use lockjaw_userlib::syscall::*;
 use lockjaw_types::fdt::{parse_fdt_into, FdtDevices};
 use lockjaw_types::device::{
     CMD_PROBE_DEVICE, CMD_CLAIM_BY_ADDR, CMD_RELEASE_BY_ADDR, CLAIM_OK, CLAIM_ERR,

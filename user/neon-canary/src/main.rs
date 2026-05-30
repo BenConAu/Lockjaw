@@ -53,9 +53,12 @@ static LOCKJAW_HASH_SECTION: u64 = LOCKJAW_SOURCE_HASH;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 use lockjaw_userlib::{
-    bootstrap_endpoint, put_decimal, puts, sys_alloc_pages, sys_call_ret4,
-    sys_create_reply, sys_create_thread, sys_exit, sys_map_pages, sys_yield,
+    bootstrap_endpoint, put_decimal, puts, sys_exit,
     MapMemoryAttribute, VMEM,
+};
+use lockjaw_userlib::syscall::{
+    sys_alloc_pages, sys_call_ret4, sys_create_reply, sys_create_thread,
+    sys_map_pages, sys_yield,
 };
 
 /// Number of load → yield → check iterations per thread. With two
