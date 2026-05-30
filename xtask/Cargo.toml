@@ -10,3 +10,8 @@ edition = "2021"
 # binaries.
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+# `syn` + `proc-macro2` power the `check-driver-unsafe` xtask's
+# attribute and span analysis. They are host-only build-tool deps,
+# never linked into kernel or driver binaries.
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }

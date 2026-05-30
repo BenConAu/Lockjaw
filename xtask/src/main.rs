@@ -4,6 +4,7 @@ use std::process::{self, Command, Stdio};
 
 mod gen_regs;
 mod gen_wires;
+mod check_driver_unsafe;
 
 /// Per-function stack frame cap in bytes. Any single function exceeding
 /// this fails immediately — catches large locals before they interact
@@ -36,6 +37,7 @@ fn main() {
         Some("check-init-size") => check_init_size(),
         Some("check-linker-symbols") => check_linker_symbols(),
         Some("check-kernel-no-neon") => check_kernel_no_neon(),
+        Some("check-driver-unsafe") => check_driver_unsafe::run(),
         Some("gen-regs") => {
             let check = rest.iter().any(|a| a == "--check");
             gen_regs::run(check);
@@ -53,6 +55,7 @@ fn main() {
             eprintln!("  check-init-size        Verify init ELF fits in kernel mapping buffer");
             eprintln!("  check-linker-symbols   Enforce docs/linker-symbol-audit.md allowlist");
             eprintln!("  check-kernel-no-neon   Verify kernel binary emits no NEON/FP instructions");
+            eprintln!("  check-driver-unsafe    Enforce #![deny(unsafe_code)] + no raw syscalls in drivers");
             eprintln!("  gen-regs [--check]     Generate lockjaw-regs from user/regspecs/*.toml");
             eprintln!("  gen-wires [--check]    Generate lockjaw-types::wire from user/wirespecs/*.toml");
             process::exit(1);
