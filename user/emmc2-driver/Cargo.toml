@@ -9,7 +9,14 @@ edition = "2021"
 lockjaw-userlib = { path = "../lockjaw-userlib" }
 lockjaw-types = { path = "../../lockjaw-types" }
 lockjaw-mmio = { path = "../lockjaw-mmio" }
-lockjaw-regs = { path = "../lockjaw-regs" }
+# O7: lockjaw-regs dependency removed. Driver crates consume Sdhci +
+# register-field newtypes via the `lockjaw-userlib::sdhci` re-export;
+# the xtask `check-driver-unsafe` regime forbids naming `lockjaw_regs`
+# anywhere in `user/*-driver` source (any of: `use lockjaw_regs::...`,
+# `lockjaw_regs::...` path-qualified call, `extern crate lockjaw_regs`,
+# `use lockjaw_regs as alias`, `r#lockjaw_regs`, or macro expansions
+# of any of the above). The dependency removal makes the import
+# physically unresolvable from this crate's source tree.
 
 [profile.release]
 panic = "abort"

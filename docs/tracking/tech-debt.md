@@ -479,19 +479,25 @@ This already bit us once: the P9.6 typed-accessor conversion dropped `| ERROR` f
 
 ---
 
-## `SdhciCommandInit<S>`: no-bypass operation layer (rubric R3 remainder)
+## `SdhciCommandInit<S>`: no-bypass operation layer — **DONE (O1–O7, 2026-05-31)**
 
-**Where:** `user/emmc2-driver` + a future `lockjaw-userlib::sdhci` family helper. The architectural next move after P9.11's coherence envelope.
+Acceptance met: every `ADMA_ADDRESS` write and every command-issuing
+setter in driver source flows through
+`lockjaw_userlib::sdhci::SdhciCommandInit` rather than through bare
+`sdhci.write_adma_address` / `set_transfer_mode_command`; the type
+system + the `check-driver-unsafe` xtask reject programming the
+controller without first opening the operation layer. See
+[`../architecture/patterns/operation-envelope.md`](../architecture/patterns/operation-envelope.md)
+for the family pattern + the canonical SDHCI consumer.
 
-**What:** Phase 9.11 closed R1/R2/R4 of the DMA-coherence rubric — forgot-to-sync / wrong-direction / wrong-range / invalidate-before-device-done are all unrepresentable now, and the raw `sys_dma_sync_*` wrappers are `pub(crate)` so a driver cannot hand-sequence cache ops at all. What it does NOT yet deliver is rubric R3 ("the sanctioned transfer path is the only path"): emmc2 still holds raw DMA PAs (`buf.backing.pa`, `desc_map.pa()`) and a typed command accessor (`sdhci.set_transfer_mode_command(...)` exposed directly), so a future mis-write could program `ADMA_ADDRESS` or fire a CMD *outside* `run_dma_transfer`. The envelope still owns coherence around every transfer that *uses* it; the gap is "what stops someone from issuing a transfer that doesn't use it."
-
-**Fix:** An `SdhciCommandInit<S>` type-state operation layer in the SDHCI family that *holds* the coherence envelope (R6 layer separation — the envelope is generic, this layer is SDHCI-specific) and:
-- Hands out `DmaAddr<S>` opaque PA tokens that can only be programmed into `ADMA_ADDRESS` via the operation layer, not via bare `.pa()`.
-- Gates command issuance (`set_transfer_mode_command`) behind the layer so the controller cannot be kicked without the layer's coherence wrapping.
-- Carries the SDHCI-specific completion (`SdhciDataCompletion`, already factored in P9.11b) as the layer's await step.
-
-The type-state phantom `<S>` tracks operation lifecycle (programmed → kicked → completed) so reading a stale buffer between states is a compile error.
-
-**Why bootstrap:** emmc2 is the only SDHCI consumer today; the rule-of-two for the family helper hasn't fired. The envelope already catches the bug class that has actually bitten us (cache-coherence ordering — the stale-zeros / B4.1-drain class). The remaining no-bypass property is theoretical until a future mis-write in a new SDHCI driver or a refactor that loses the envelope around a direct-PA call site. Track here so the next SDHCI consumer (a second BCM2711 instance like emmc1, or an eMMC chip on a different SoC) forces the layer to land before the second mis-write becomes possible.
-
-**Acceptance:** every `ADMA_ADDRESS` write and every command-issuing setter in driver source flows through `SdhciCommandInit::<S>` rather than through bare `sdhci.write_adma_address` / `set_transfer_mode_command`; the type system rejects programming the controller without first opening the operation layer (which contains the coherence envelope).
+Outstanding follow-up: extend the `lockjaw-userlib::*` re-export
+regime to the four non-SDHCI device families that still import
+`lockjaw_regs::<module>` directly in driver source — `cprman`,
+`fw_cfg`, `pl011`, `virtio_mmio`. The `check-driver-unsafe` ban
+in `xtask/src/check_driver_unsafe.rs::BANNED_DRIVER_MODULE_PATHS`
+currently lists only `(lockjaw_regs, sdhci)`; each non-SDHCI
+driver's framework-side migration adds its module to that list and
+removes the corresponding `lockjaw_regs::<module>` import from the
+driver. Rule-of-two extraction for the operation-envelope pattern
+fires when a second consumer (emmc1, a NIC, etc.) needs the same
+shape — see the pattern doc's "Variants" section.

@@ -12,7 +12,7 @@ taxonomy that names it, the principles behind it — read
 [`../01-architecture.md`](../01-architecture.md).
 This catalog is the *how*.
 
-## The four patterns
+## The five patterns
 
 | Pattern | Shape | Use when |
 |---|---|---|
@@ -20,29 +20,36 @@ This catalog is the *how*.
 | [Pure State Machines](pure-state-machines.md) | Types own iteration, kernel does I/O | Multi-step walk where each step depends on the last |
 | [Plan / Apply](plan-apply.md) | Kernel builds, types validates, kernel commits | Multi-input operation with a point-of-no-return |
 | [Pure Data Structures](pure-data-structures.md) | Types own layout and ops, kernel owns memory | Non-trivial operations on a kernel-owned data structure |
+| [Operation Envelope](operation-envelope.md) | Typestate-gated operation layer + capability token + generic ordering envelope | A device with both a multi-step protocol and a DMA path |
 
 ## How to pick
 
-Three questions, in order:
+Four questions, in order:
 
-1. **Does the work iterate?**
+1. **Is the work driving an external device with both a multi-step
+   protocol AND a DMA path** (e.g., SDHCI, NICs)?
+   - **Yes** — [Operation Envelope](operation-envelope.md)
+   - **No** — go to question 2
+
+2. **Does the work iterate?**
    - **No** — single decision → [Pure Decisions](pure-decisions.md)
-   - **Yes** — go to question 2
+   - **Yes** — go to question 3
 
-2. **Does the iteration build up state across many inputs that all
+3. **Does the iteration build up state across many inputs that all
    need to commit together?**
    - **Yes** — [Plan / Apply](plan-apply.md)
-   - **No** — go to question 3
+   - **No** — go to question 4
 
-3. **Does each iteration step depend on a value the previous step
+4. **Does each iteration step depend on a value the previous step
    produced (e.g., reading a PTE to know the next address)?**
    - **Yes** — [Pure State Machine](pure-state-machines.md)
    - **No** — you probably want to operate on a data structure
      directly → [Pure Data Structures](pure-data-structures.md)
 
-The four patterns blur at the edges — a plan is a data structure with
-operations, a state machine is a sequence of decisions. The shapes
-above describe the *primary* axis of each pattern. When in doubt, pick
+The five patterns blur at the edges — a plan is a data structure with
+operations, a state machine is a sequence of decisions, an operation
+envelope contains a typestate and a plan/apply. The shapes above
+describe the *primary* axis of each pattern. When in doubt, pick
 the pattern whose canonical example most resembles your problem and
 read its "Recognizing push-shaped code that wants this pattern"
 section.

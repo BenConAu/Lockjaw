@@ -75,13 +75,35 @@ const DRIVER_CRATES: &[&str] = &[
 /// abstraction.
 const SYSCALL_ALLOWLIST: &[&str] = &["sys_exit", "sys_debug_puts"];
 
+/// Specific `<crate>::<module>` prefixes a driver MAY NOT name (any of:
+/// `use crate::module::...`, `crate::module::...` path-qualified, raw-
+/// ident form, macro body containing the consecutive pair). Driver
+/// source must consume these via a `lockjaw_userlib::<module>`
+/// re-export rather than naming the underlying crate directly.
+///
+/// Today: `lockjaw_regs::sdhci` — `lockjaw-userlib::sdhci` re-exports
+/// every safe SDHCI surface (Sdhci, register-field newtypes, the
+/// operation envelope, init helpers) WITHOUT re-exporting the gated
+/// `__sdhci_internal_mint`. The ban makes the mint unreachable from
+/// driver source, structurally enforcing the R3 ("sanctioned transfer
+/// path is the only path") property from the P9.11/SdhciCommandInit
+/// effort (O7 of the operation-level construction safety plan).
+///
+/// Not banned yet (other drivers still import `lockjaw_regs::<module>`
+/// directly): `cprman`, `fw_cfg`, `pl011`, `virtio_mmio`. Tracked as
+/// tech-debt — when each non-SDHCI driver's family helper lands in
+/// lockjaw-userlib, its module gets added here and the corresponding
+/// `lockjaw_regs::<module>` import in the driver gets removed.
+const BANNED_DRIVER_MODULE_PATHS: &[(&str, &str)] = &[("lockjaw_regs", "sdhci")];
+
 pub fn run() {
     println!("=== Driver-unsafe regime check ===");
     println!(
         "  invariant: every user/*-driver crate is #![deny(unsafe_code)]\n  \
-         with zero allow(unsafe_code) attributes and no `syscall::*`\n  \
-         path reference beyond {SYSCALL_ALLOWLIST:?} — drivers consume\n  \
-         lockjaw-userlib."
+         with zero allow(unsafe_code) attributes, no `syscall::*`\n  \
+         path reference beyond {SYSCALL_ALLOWLIST:?}, and no reference\n  \
+         to {BANNED_DRIVER_MODULE_PATHS:?} via any path/use/macro\n  \
+         shape — drivers consume lockjaw-userlib."
     );
 
     let mut findings: Vec<String> = Vec::new();
@@ -215,6 +237,65 @@ impl<'a, 'ast> Visit<'ast> for DriverVisitor<'a> {
                     leaf.leaf,
                 ));
             }
+            // Banned-module-path check (O7): walk the leaf's full
+            // path (prefix segments + leaf-name) for any consecutive
+            // (crate, module) pair matching BANNED_DRIVER_MODULE_PATHS.
+            // E.g. `use lockjaw_regs::sdhci::Sdhci;` has segments
+            // `[lockjaw_regs, sdhci, Sdhci]` and the pair `(lockjaw_regs,
+            // sdhci)` is banned.
+            //
+            // Bare-crate alias also banned: `use lockjaw_regs as lr;`
+            // has `full = [lockjaw_regs]` (the rename leaves the
+            // original ident in the leaf-name). Without this check, a
+            // driver could alias the crate root and then write
+            // `lr::sdhci::Foo` — visit_path sees `lr`, not the banned
+            // pair, so the pair-match misses entirely. Banning every
+            // use-statement that names a banned-pair crate by name
+            // closes that alias-bypass (codex round-1 Fix-now).
+            let full: Vec<&str> = leaf
+                .path
+                .iter()
+                .chain(core::iter::once(&leaf.leaf))
+                .map(|s| s.as_str())
+                .collect();
+            if let Some(banned) = first_banned_pair(&full) {
+                self.findings.push(format!(
+                    "{}:{line}: driver use statement references banned module path \
+                     `{}::{}` (full leaf path `{}`). Drivers consume these via \
+                     `lockjaw_userlib::*` re-exports.",
+                    self.file_path.display(),
+                    banned.0,
+                    banned.1,
+                    full.join("::"),
+                ));
+            } else if full.len() == 1 {
+                // Bare-crate-root use: `use lockjaw_regs;` or `use
+                // lockjaw_regs as lr;`. The pair-match couldn't fire
+                // because there's no second segment to pair with —
+                // but the use brings the crate ROOT into scope, and
+                // any follow-up `lr::sdhci::Foo` would slip past
+                // visit_path's pair-match (it sees `lr`, not
+                // `lockjaw_regs`). Block the bare-crate use at the
+                // use site instead. Multi-segment uses like `use
+                // lockjaw_regs::cprman::Cprman;` are NOT caught here
+                // — they're allowed today (non-banned module) and
+                // the pair-match owns the banned-module case above.
+                if let Some(banned_crate) = full
+                    .iter()
+                    .find(|s| BANNED_DRIVER_MODULE_PATHS.iter().any(|(c, _)| c == *s))
+                {
+                    self.findings.push(format!(
+                        "{}:{line}: driver use statement names banned-pair crate `{}` \
+                         directly (`use {}`). Aliasing the crate root would let \
+                         a follow-up path reach a banned module under a different \
+                         name; drivers consume via `lockjaw_userlib::*` re-exports \
+                         instead.",
+                        self.file_path.display(),
+                        banned_crate,
+                        full.join("::"),
+                    ));
+                }
+            }
         }
         // Don't recurse with the default visitor: we've handled this use
         // tree's leaves. (Default visit_item_use would recurse into
@@ -223,6 +304,34 @@ impl<'a, 'ast> Visit<'ast> for DriverVisitor<'a> {
         // trees anyway, but skipping the default body keeps the contract
         // explicit.)
         let _ = item;
+    }
+
+    fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+        // `extern crate foo;` — `syn::ItemExternCrate` is a distinct
+        // AST item from `ItemUse`, so visit_item_use doesn't cover this
+        // shape. Module-path bans don't apply to a bare `extern crate
+        // foo` (only the crate name is named, not a module path inside
+        // it), but if any banned-pair's crate appears as the
+        // extern-crate target the import declares the WHOLE crate
+        // available — including the banned module. Conservative: flag
+        // any extern_crate whose ident matches a banned-pair crate.
+        // Raw-ident normalized via ident_str.
+        let name = ident_str(&item.ident);
+        if BANNED_DRIVER_MODULE_PATHS
+            .iter()
+            .any(|(crate_name, _)| *crate_name == name)
+        {
+            let line = item.span().start().line;
+            self.findings.push(format!(
+                "{}:{line}: driver `extern crate {}` makes a banned module path \
+                 reachable (banned-pair crates: {:?}). Drivers consume these via \
+                 `lockjaw_userlib::*` re-exports.",
+                self.file_path.display(),
+                name,
+                banned_crate_names(),
+            ));
+        }
+        syn::visit::visit_item_extern_crate(self, item);
     }
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
@@ -239,6 +348,24 @@ impl<'a, 'ast> Visit<'ast> for DriverVisitor<'a> {
                 ));
             }
         }
+        // Banned-module-path check (O7): walk path segments for any
+        // consecutive (crate, module) pair matching
+        // BANNED_DRIVER_MODULE_PATHS. Catches
+        // `lockjaw_regs::sdhci::Sdhci::new()` and similar path-
+        // qualified references that aren't `use` items.
+        let seg_strs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
+        if let Some(banned) = first_banned_pair(&seg_strs) {
+            let line = path.segments.first().unwrap().ident.span().start().line;
+            self.findings.push(format!(
+                "{}:{line}: driver path `{}` references banned module path \
+                 `{}::{}`. Drivers consume these via `lockjaw_userlib::*` \
+                 re-exports.",
+                self.file_path.display(),
+                segs.join("::"),
+                banned.0,
+                banned.1,
+            ));
+        }
         syn::visit::visit_path(self, path);
     }
 
@@ -250,7 +377,7 @@ impl<'a, 'ast> Visit<'ast> for DriverVisitor<'a> {
         // flag any `syscall` ident: strict, but consistent with the
         // regime (drivers reach the allowlist via the root re-export
         // with bare names, never via `syscall::` in a macro).
-        if token_stream_contains_syscall(&m.tokens) {
+        if token_stream_contains_ident(&m.tokens, "syscall") {
             let line = m.span().start().line;
             self.findings.push(format!(
                 "{}:{line}: driver macro body / invocation contains the \
@@ -259,8 +386,57 @@ impl<'a, 'ast> Visit<'ast> for DriverVisitor<'a> {
                 self.file_path.display(),
             ));
         }
+        // Banned-module-path check (O7): the same macro-opacity gap
+        // applies. The macro body is an opaque token stream, so walk
+        // it for any consecutive ident pair matching
+        // BANNED_DRIVER_MODULE_PATHS. Token-level "consecutive" means
+        // adjacent in the linear token sequence, possibly separated by
+        // `::` punctuation — `token_stream_contains_pair` strips
+        // punctuation when comparing.
+        for (crate_name, module) in BANNED_DRIVER_MODULE_PATHS {
+            if token_stream_contains_pair(&m.tokens, crate_name, module) {
+                let line = m.span().start().line;
+                self.findings.push(format!(
+                    "{}:{line}: driver macro body / invocation contains the \
+                     `{}::{}` ident pair -- drivers may not reach banned \
+                     module paths via macros.",
+                    self.file_path.display(),
+                    crate_name,
+                    module,
+                ));
+            }
+        }
         syn::visit::visit_macro(self, m);
     }
+}
+
+/// Find the first `(crate, module)` pair from
+/// `BANNED_DRIVER_MODULE_PATHS` that appears as two consecutive
+/// segments in `segs`. Returns `None` if no pair matches. Linear
+/// scan over `segs.windows(2)` × `BANNED_DRIVER_MODULE_PATHS` —
+/// small constant on each side.
+fn first_banned_pair(segs: &[&str]) -> Option<(&'static str, &'static str)> {
+    for window in segs.windows(2) {
+        for (crate_name, module) in BANNED_DRIVER_MODULE_PATHS {
+            if window[0] == *crate_name && window[1] == *module {
+                return Some((crate_name, module));
+            }
+        }
+    }
+    None
+}
+
+/// Collect the unique crate names from `BANNED_DRIVER_MODULE_PATHS`
+/// (the first element of each pair, deduplicated). Used by the
+/// `extern crate` diagnostic.
+fn banned_crate_names() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = BANNED_DRIVER_MODULE_PATHS
+        .iter()
+        .map(|(c, _)| *c)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// One leaf of a use tree: the segments from the use root down to the
@@ -326,17 +502,67 @@ fn push_use_leaf(prefix: Vec<String>, name: String, leaves: &mut Vec<UseLeaf>) {
     }
 }
 
-/// Recursively check whether a `TokenStream` contains any `syscall`
-/// identifier (at any depth, including inside grouped tokens like
-/// braces / parens / brackets). Used by `visit_macro` to backstop the
-/// macro opacity gap -- `syn` does not parse macro token streams into
-/// structured `Path` nodes.
-fn token_stream_contains_syscall(ts: &proc_macro2::TokenStream) -> bool {
+/// Recursively check whether a `TokenStream` contains the identifier
+/// `name` (at any depth, including inside grouped tokens like braces
+/// / parens / brackets). Used by `visit_macro` to backstop the macro
+/// opacity gap -- `syn` does not parse macro token streams into
+/// structured `Path` nodes, so a forbidden segment hidden inside a
+/// `macro_rules!` body or a macro-invocation arg would slip past the
+/// AST visitors above. Raw-ident normalized via `ident_str`.
+fn token_stream_contains_ident(ts: &proc_macro2::TokenStream, name: &str) -> bool {
     ts.clone().into_iter().any(|t| match t {
-        proc_macro2::TokenTree::Ident(i) => ident_str(&i) == "syscall",
-        proc_macro2::TokenTree::Group(g) => token_stream_contains_syscall(&g.stream()),
+        proc_macro2::TokenTree::Ident(i) => ident_str(&i) == name,
+        proc_macro2::TokenTree::Group(g) => token_stream_contains_ident(&g.stream(), name),
         _ => false,
     })
+}
+
+/// Recursively check whether a `TokenStream` contains the adjacent
+/// ident pair `first :: second` (with `::` punctuation between, since
+/// path segments in token streams are separated by Punct(':') Punct(':')).
+/// Walks groups too. Raw-ident normalized via `ident_str`.
+///
+/// Used for banned-module-path detection in macro bodies (O7) —
+/// catches `lockjaw_regs::sdhci::Foo` hidden in a `macro_rules!` rule
+/// or a macro-invocation arg.
+fn token_stream_contains_pair(
+    ts: &proc_macro2::TokenStream,
+    first: &str,
+    second: &str,
+) -> bool {
+    let flat: Vec<proc_macro2::TokenTree> = ts.clone().into_iter().collect();
+    // Look for the sequence: Ident(first), Punct(':' joint), Punct(':' alone),
+    // Ident(second). The two-colon `::` lexes as two Punct tokens, the
+    // first joint, the second alone.
+    let n = flat.len();
+    let mut i = 0;
+    while i + 3 < n {
+        if let (
+            proc_macro2::TokenTree::Ident(a),
+            proc_macro2::TokenTree::Punct(p1),
+            proc_macro2::TokenTree::Punct(p2),
+            proc_macro2::TokenTree::Ident(b),
+        ) = (&flat[i], &flat[i + 1], &flat[i + 2], &flat[i + 3])
+        {
+            if ident_str(a) == first
+                && p1.as_char() == ':'
+                && p2.as_char() == ':'
+                && ident_str(b) == second
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    // Recurse into grouped tokens (braces / parens / brackets).
+    for t in &flat {
+        if let proc_macro2::TokenTree::Group(g) = t {
+            if token_stream_contains_pair(&g.stream(), first, second) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// All `.rs` files under `dir`, recursively, sorted for stable output.
@@ -657,5 +883,139 @@ mod tests {
             "use lockjaw_userlib::syscall::r#sys_exit;\nfn _f() {}",
         );
         assert!(f.is_empty(), "{f:?}");
+    }
+
+    // --- banned-module-path ban (O7: lockjaw_regs::sdhci forbidden) -----
+
+    #[test]
+    fn flags_banned_module_use_tree() {
+        // `use lockjaw_regs::sdhci::Sdhci;` — segments
+        // [lockjaw_regs, sdhci, Sdhci] contain the banned (lockjaw_regs,
+        // sdhci) pair.
+        let f = syscall_findings("use lockjaw_regs::sdhci::Sdhci;\nfn _f() {}");
+        assert!(
+            f.iter().any(|s| s.contains("banned module path") && s.contains("lockjaw_regs::sdhci")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn flags_banned_module_path_call() {
+        let f = syscall_findings(
+            "fn _f() { let _ = lockjaw_regs::sdhci::Sdhci::some_method(); }",
+        );
+        assert!(
+            f.iter().any(|s| s.contains("banned module path") && s.contains("lockjaw_regs::sdhci")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn flags_banned_module_raw_ident_crate() {
+        // `r#lockjaw_regs::sdhci::Sdhci` — raw-ident on the banned
+        // crate; ident_str normalization strips r# before pair-match.
+        let f = syscall_findings(
+            "use r#lockjaw_regs::sdhci::Sdhci;\nfn _f() {}",
+        );
+        assert!(
+            f.iter().any(|s| s.contains("banned module path") && s.contains("lockjaw_regs::sdhci")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn flags_banned_module_raw_ident_module() {
+        // `lockjaw_regs::r#sdhci::Sdhci` — raw-ident on the banned
+        // module name.
+        let f = syscall_findings(
+            "use lockjaw_regs::r#sdhci::Sdhci;\nfn _f() {}",
+        );
+        assert!(
+            f.iter().any(|s| s.contains("banned module path") && s.contains("lockjaw_regs::sdhci")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn flags_extern_crate_banned_crate() {
+        // `extern crate lockjaw_regs;` makes the banned module path
+        // reachable. visit_item_extern_crate fires on the crate name.
+        let f = syscall_findings("extern crate lockjaw_regs;\nfn _f() {}");
+        assert!(
+            f.iter().any(|s| s.contains("extern crate") && s.contains("lockjaw_regs")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn flags_extern_crate_banned_with_raw_ident() {
+        let f = syscall_findings("extern crate r#lockjaw_regs;\nfn _f() {}");
+        assert!(
+            f.iter().any(|s| s.contains("extern crate") && s.contains("lockjaw_regs")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn flags_banned_module_in_macro() {
+        // Macro body containing the banned ident pair — token-stream
+        // scan via token_stream_contains_pair.
+        let f = syscall_findings(
+            "macro_rules! m { () => { lockjaw_regs::sdhci::Sdhci }; }\nfn _f() { m!(); }",
+        );
+        assert!(
+            f.iter().any(|s| s.contains("macro") && s.contains("lockjaw_regs::sdhci")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn allows_lockjaw_userlib_sdhci_re_export() {
+        // Drivers consume Sdhci via the lockjaw-userlib re-export.
+        // This is the canonical path; must NOT flag.
+        let f = syscall_findings(
+            "use lockjaw_userlib::sdhci::{Sdhci, SdhciOpToken};\nfn _f() {}",
+        );
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn allows_lockjaw_regs_non_banned_module() {
+        // `lockjaw_regs::cprman::*` is NOT in the banned-pair list
+        // (cprman-driver hasn't been migrated yet). Other drivers can
+        // still consume their own lockjaw_regs modules directly.
+        // When cprman-driver migrates, the pair gets added here.
+        let f = syscall_findings(
+            "use lockjaw_regs::cprman::Cprman;\nfn _f() {}",
+        );
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn flags_alias_bypass_of_banned_pair_crate() {
+        // codex round-1 Fix-now: `use lockjaw_regs as lr;` aliases the
+        // crate root, then `lr::sdhci::Foo` would reach the banned
+        // module under a different name — visit_path sees `lr`, not
+        // `lockjaw_regs`, so the pair-match misses. Block the alias
+        // at the `use` site instead.
+        let f = syscall_findings("use lockjaw_regs as lr;\nfn _f() {}");
+        assert!(
+            f.iter().any(|s| s.contains("names banned-pair crate") && s.contains("lockjaw_regs")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn flags_bare_use_of_banned_pair_crate() {
+        // `use lockjaw_regs;` (without an alias) is the same shape —
+        // brings the crate root into scope and lets later code write
+        // `lockjaw_regs::sdhci::Foo`, but visit_item_use's pair-match
+        // sees only `["lockjaw_regs"]` (no module segment). Catch it
+        // at the `use` site via the bare-crate fallback.
+        let f = syscall_findings("use lockjaw_regs;\nfn _f() {}");
+        assert!(
+            f.iter().any(|s| s.contains("names banned-pair crate") && s.contains("lockjaw_regs")),
+            "{f:?}"
+        );
     }
 }

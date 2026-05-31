@@ -227,6 +227,47 @@ in the read path is the substrate's emission of `dc cvac` (clean) or
 unpredictable-on-dirty-lines `dc ivac`) against ranges the driver
 named once, in the type system.
 
+## The operation envelope — closing R3
+
+The DMA-coherence envelope (above) is correct by construction *as
+long as the driver uses it*. The remaining gap is **R3** ("the
+sanctioned transfer path is the only path"): nothing structural
+prevents the driver from kicking the controller *outside* the
+envelope. Pre-operation-envelope emmc2 held raw DMA PAs in scope
+across multiple function calls and could fire
+`set_transfer_mode_command` directly; an inattentive refactor could
+drop the surrounding clean→kick→await→invalidate sequence without
+the compiler complaining.
+
+The **operation envelope** is the structural fix. It composes three
+layers:
+
+- A **capability token** on the dangerous register accessors
+  (`SdhciOpToken<'_>` for SDHCI) whose only mint path is xtask-
+  blacklisted in driver source. Drivers physically cannot reach the
+  mint, so they cannot call the gated setters.
+- An **operation-layer envelope** (`SdhciCommandInit<'a, S>`) that
+  holds the only legal mint of the capability token and wraps the
+  register-program → kick → await → status-cleanup sequence behind
+  typed methods (`issue_no_data::<R>`, `issue_data_transfer`).
+  Inside `issue_data_transfer` lives the DMA-coherence envelope —
+  the operation layer composes the generic envelope rather than
+  exposing the seams.
+- An **outer device-state typestate** (`MmcCard<'a, S>`) that
+  drives the multi-step protocol with consumed-self transitions —
+  calling `engine.read()` before `select()` is a compile error
+  because `Emmc2BlockEngine::new` requires a `CardInfo` token
+  whose only mint is `MmcCard::<Tran>::into_parts()`.
+
+Result: every SDHCI command in driver source flows through the
+framework's typed methods. The driver expresses *intent* (issue this
+command, transition to this state); the framework owns every
+register access, every status poll, every IRQ wait, every coherence
+operation. See
+[`patterns/operation-envelope.md`](patterns/operation-envelope.md)
+for the family pattern, the canonical SDHCI consumer, and the
+extension trigger for the second consumer.
+
 ## What the substrate is for
 
 The kernel-side story in this book has been about narrowing what the
@@ -271,9 +312,10 @@ ceremony, audited and locked.
 
 The [pattern catalog](patterns/) is the technique reference for
 the pure-side decisions the substrate composes — pure decisions,
-pure state machines, plan/apply, pure data structures. Driver
-authors should know they exist; the substrate uses all four
-underneath.
+pure state machines, plan/apply, pure data structures, plus the
+[operation envelope](patterns/operation-envelope.md) for devices
+with both a multi-step protocol AND a DMA path. Driver authors
+should know they exist; the substrate uses all five underneath.
 
 `CLAUDE.md` is the load-bearing summary of the regime. This chapter
 is the why; that file is the rule.

@@ -28,18 +28,16 @@ use lockjaw_userlib::dma_transfer::{
     run_dma_transfer, DmaDir, DmaTransferError, Immediate,
 };
 use lockjaw_mmio::region::MappedRegs;
-use lockjaw_regs::sdhci::{
+// O7: driver consumes Sdhci + register-field newtypes via
+// `lockjaw-userlib::sdhci`'s re-export rather than naming `lockjaw_regs`
+// directly. The xtask `check-driver-unsafe` ban (also added in O7)
+// forbids `lockjaw_regs` import in `user/*-driver` source; this import
+// goes through the framework's safe surface and stays compliant.
+use lockjaw_userlib::sdhci::{
     ErrorIntSignalEnable, ErrorIntStatusEnable,
     NormalIntSignalEnable, NormalIntStatusEnable,
     PowerControlBusVoltage, Sdhci,
 };
-// O5: `__temp_unguarded_mint` removed — every gated-setter call site
-// in this driver now flows through `lockjaw_userlib::sdhci` (the
-// SdhciCommandInit envelope for commands, the init helpers for
-// non-command writes). O5 also deletes the temp mint from
-// `lockjaw-regs::sdhci` itself, so the only mint paths remaining are
-// `__sdhci_internal_mint` (lockjaw-userlib's internal use) and zero
-// driver-reachable mints.
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_userlib::time::{sleep_for, Nanos};
 // `monotonic_now` returns `MonoTicks`, which is `Ord`; the comparisons in the
