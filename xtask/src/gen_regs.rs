@@ -226,6 +226,20 @@ struct Register {
     aliases: Vec<String>,
     #[serde(default)]
     endian: Option<Endian>,
+    /// O2: operation-layer capability gate. When set (e.g.
+    /// `requires_token = "sdhci_op"`), this register's accessors take
+    /// an extra `&<TokenTy><'_>` parameter; the only mint path for
+    /// `<TokenTy>` is `__<token>_internal_mint`, which the xtask
+    /// `check-driver-unsafe` regime forbids in `user/*-driver`
+    /// source. The capability prevents driver code from kicking
+    /// the controller outside the operation envelope in lockjaw-
+    /// userlib — same enforcement model as the existing syscall
+    /// allowlist. The string is the snake_case stem; the codegen
+    /// derives the type name (`SdhciOpToken`) and the mint
+    /// function names (`__sdhci_internal_mint`, `__temp_unguarded_mint`)
+    /// from it. Currently only `sdhci_op` is used.
+    #[serde(default)]
+    requires_token: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -924,11 +938,144 @@ fn emit_device(spec: &Spec) -> String {
         }
     }
     emit_reserved_bits(&mut out, spec);
+    emit_token_capabilities(&mut out, spec);
     emit_accessors(&mut out, spec);
     emit_u64_pairs(&mut out, spec);
     emit_windowed(&mut out, spec);
     emit_tests(&mut out, spec);
     out
+}
+
+// ---------------------------------------------------------------------------
+// Token-capability emission (O2: SdhciCommandInit operation-layer gate)
+// ---------------------------------------------------------------------------
+//
+// When a register declares `requires_token = "<kind>"`, the emitter
+// threads a `&<KindPascal>Token<'_>` parameter through every accessor
+// for that register. The token's only mint paths are:
+//   - `__<device_snake>_internal_mint(&Device) -> <Token>` — for the
+//     lockjaw-userlib operation envelope (e.g. SdhciCommandInit).
+//   - `__temp_unguarded_mint(&Device) -> <Token>` — #[deprecated]
+//     escape valve for O2 driver-side migration, removed in O5.
+// Both are `pub` so lockjaw-userlib can reach them; the xtask
+// `check-driver-unsafe` regime backstops by forbidding
+// `lockjaw_regs` import in `user/*-driver` source.
+//
+// The accessor is gated by capability, not visibility — the method
+// itself stays `pub`, but the token parameter has no constructor
+// reachable from driver source.
+
+/// Collect the unique `requires_token` values across the spec, in
+/// stable BTreeSet order. Empty when no register is gated.
+fn token_kinds_used(spec: &Spec) -> BTreeSet<String> {
+    spec.registers
+        .iter()
+        .filter_map(|r| r.requires_token.clone())
+        .collect()
+}
+
+/// Token type name derived from the `requires_token` string. `"sdhci_op"`
+/// becomes `"SdhciOpToken"`.
+fn token_type_name(kind: &str) -> String {
+    format!("{}Token", to_pascal(kind))
+}
+
+/// The token-parameter fragment for a register's accessors, including
+/// the leading `, ` separator. Returns `""` when the register isn't
+/// gated. The lifetime `'_` ties the token's borrow to the call site;
+/// the token cannot escape the function it was minted in.
+fn token_param(reg: &Register) -> String {
+    match reg.requires_token.as_deref() {
+        Some(kind) => format!(", _tk: &{}<'_>", token_type_name(kind)),
+        None => String::new(),
+    }
+}
+
+/// The token argument fragment for an alias's delegation call: forwards
+/// the token through. Returns `""` when the primary isn't gated.
+fn token_arg_forward(reg: &Register) -> String {
+    if reg.requires_token.is_some() { ", _tk".to_string() } else { String::new() }
+}
+
+/// The token argument fragment to use when calling a gated accessor
+/// from generated TEST code, which mints `_tk` via the internal mint.
+/// Returns `""` when the primary isn't gated.
+fn token_arg_test(reg: &Register) -> String {
+    if reg.requires_token.is_some() { ", &_tk".to_string() } else { String::new() }
+}
+
+/// Internal mint function name, derived from the device. `"Sdhci"` →
+/// `"__sdhci_internal_mint"`. The `__` prefix mirrors the syscall
+/// allowlist's grep-target convention — easy to spot in driver source
+/// and easy for the xtask to deny.
+fn token_internal_mint_name(spec: &Spec) -> String {
+    format!("__{}_internal_mint", to_snake(&spec.device.name))
+}
+
+/// Emit the token type(s) + mint functions when any register is gated.
+/// No-op when no register declares `requires_token`.
+fn emit_token_capabilities(out: &mut String, spec: &Spec) {
+    let kinds = token_kinds_used(spec);
+    if kinds.is_empty() {
+        return;
+    }
+    let dev = &spec.device.name;
+    let internal_mint = token_internal_mint_name(spec);
+    writeln!(out, "// ---------- {} operation-layer capability tokens ----------", dev).unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "// Capability gate for the dangerous {} accessors. The token has", dev).unwrap();
+    writeln!(out, "// no public struct-literal constructor; its only mint paths are the").unwrap();
+    writeln!(out, "// two `pub fn`s below, both `pub` so `lockjaw-userlib` can reach").unwrap();
+    writeln!(out, "// them. Drivers cannot import `lockjaw_regs` (enforced by the").unwrap();
+    writeln!(out, "// `check-driver-unsafe` xtask), so the mint paths are unreachable").unwrap();
+    writeln!(out, "// from driver source. Generated by `cargo xtask gen-regs` from the").unwrap();
+    writeln!(out, "// `requires_token = \"...\"` annotations in the regspec.").unwrap();
+    writeln!(out).unwrap();
+    for kind in &kinds {
+        let ty = token_type_name(kind);
+        writeln!(out, "/// Capability token for the `{}` gated-accessor regime.", kind).unwrap();
+        writeln!(out, "///").unwrap();
+        writeln!(out, "/// The lifetime `'a` ties the token to a specific `&'a {}` borrow,", dev).unwrap();
+        writeln!(out, "/// so a token cannot outlive the controller reference it was minted").unwrap();
+        writeln!(out, "/// against. The private `_no_ctor` field blocks struct-literal").unwrap();
+        writeln!(out, "/// construction from outside this module.").unwrap();
+        writeln!(out, "pub struct {}<'a> {{", ty).unwrap();
+        writeln!(out, "    _life: core::marker::PhantomData<&'a {}>,", dev).unwrap();
+        writeln!(out, "    _no_ctor: (),").unwrap();
+        writeln!(out, "}}").unwrap();
+        writeln!(out).unwrap();
+    }
+    // The internal mint — used by lockjaw-userlib::sdhci's SdhciCommandInit
+    // and the init-time helpers (soft_reset_all, configure_clock, etc.).
+    // Pub so lockjaw-userlib can reach it across crate boundary; xtask
+    // forbids drivers from naming it (or naming the `lockjaw_regs` crate
+    // at all) in their source.
+    let one_kind = kinds.iter().next().expect("non-empty checked above");
+    let ty = token_type_name(one_kind);
+    writeln!(out, "/// Mint a `{}` for use inside `lockjaw-userlib`'s operation-layer", ty).unwrap();
+    writeln!(out, "/// envelope. **Do not call this from driver source.** The xtask").unwrap();
+    writeln!(out, "/// `check-driver-unsafe` denies any `lockjaw_regs` import in driver").unwrap();
+    writeln!(out, "/// crates, so this name is unreachable from `user/*-driver/`.").unwrap();
+    writeln!(out, "#[inline(always)]").unwrap();
+    writeln!(out, "pub fn {}(_dev: &{}) -> {}<'_> {{", internal_mint, dev, ty).unwrap();
+    writeln!(out, "    {} {{ _life: core::marker::PhantomData, _no_ctor: () }}", ty).unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+    // The temp escape valve — exists only between O2 and O5 of the
+    // SdhciCommandInit plan. Driver code mints via this during the
+    // mechanical signature-threading commit; O4/O5 migrate to
+    // SdhciCommandInit::open + lockjaw-userlib helpers, and O5 deletes
+    // this fn (and the xtask exemption that allows emmc2 to call it).
+    writeln!(out, "/// Temporary unguarded mint — exists ONLY for the O2-O5 migration").unwrap();
+    writeln!(out, "/// window. emmc2-driver calls this while its gated-setter sites are").unwrap();
+    writeln!(out, "/// being rewritten to flow through `lockjaw-userlib::sdhci::SdhciCommandInit`").unwrap();
+    writeln!(out, "/// and the init-time helpers. Deleted in O5 once data-phase migrates.").unwrap();
+    writeln!(out, "#[deprecated(note = \"O2-O5 migration escape; removed in O5\")]").unwrap();
+    writeln!(out, "#[inline(always)]").unwrap();
+    writeln!(out, "pub fn __temp_unguarded_mint(_dev: &{}) -> {}<'_> {{", dev, ty).unwrap();
+    writeln!(out, "    {} {{ _life: core::marker::PhantomData, _no_ctor: () }}", ty).unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
 }
 
 fn emit_header(out: &mut String, spec: &Spec) {
@@ -1423,6 +1570,12 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
         let wty = format!("u{}", reg.width);
         let has_typed = !reg.flags.is_empty() || !reg.fields.is_empty();
         let ty = if has_typed { to_pascal(&reg.name) } else { wty.clone() };
+        // O2 capability gate: when this register has `requires_token`,
+        // every accessor (read / write / set / modify / clear) takes
+        // an additional `, _tk: &<TokenTy><'_>` parameter. Aliases of
+        // a gated register inherit the gate (forward `_tk` through).
+        let tp = token_param(reg);
+        let tfwd = token_arg_forward(reg);
         // Phase 6 BE handling: BE registers wrap reads in `uN::from_be`
         // and writes in `v.to_be()`. LE is the default (no wrap; matches
         // the AArch64 host byte order Lockjaw runs on). The byte-swap
@@ -1473,19 +1626,19 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
         let raw_read = |out: &mut String| {
             writeln!(out, "    /// Volatile read of `{}` as `{wty}`{}.", reg.name, endian_note).unwrap();
             writeln!(out, "    #[inline(always)]").unwrap();
-            writeln!(out, "    pub fn read_{}(&self) -> {wty} {{ {read_expr} }}", reg.name).unwrap();
+            writeln!(out, "    pub fn read_{}(&self{tp}) -> {wty} {{ {read_expr} }}", reg.name).unwrap();
         };
         let raw_write = |out: &mut String| {
             writeln!(out, "    /// Volatile write of `{}`{}.", reg.name, endian_note).unwrap();
             writeln!(out, "    #[inline(always)]").unwrap();
-            writeln!(out, "    pub fn write_{}(&self, v: {wty}) {{ self.{}.write({write_expr}); }}", reg.name, reg.name).unwrap();
+            writeln!(out, "    pub fn write_{}(&self, v: {wty}{tp}) {{ self.{}.write({write_expr}); }}", reg.name, reg.name).unwrap();
         };
         match reg.access {
             Access::Ro => {
                 if has_typed {
                     writeln!(out, "    /// Read a typed snapshot of `{}`.", reg.name).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn {}(&self) -> {ty} {{ {ty}(self.{}.read()) }}", reg.name, reg.name).unwrap();
+                    writeln!(out, "    pub fn {}(&self{tp}) -> {ty} {{ {ty}(self.{}.read()) }}", reg.name, reg.name).unwrap();
                 } else {
                     raw_read(out);
                 }
@@ -1494,14 +1647,14 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                 if has_typed {
                     writeln!(out, "    /// Read a typed snapshot of `{}`.", reg.name).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn {}(&self) -> {ty} {{ {ty}(self.{}.read()) }}", reg.name, reg.name).unwrap();
+                    writeln!(out, "    pub fn {}(&self{tp}) -> {ty} {{ {ty}(self.{}.read()) }}", reg.name, reg.name).unwrap();
                     writeln!(out, "    /// Write the value back to `{}`{}.", reg.name, endian_note).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
                     let set_val = wrap_write("v.0");
-                    writeln!(out, "    pub fn set_{}(&self, v: {ty}) {{ self.{}.write({set_val}); }}", reg.name, reg.name).unwrap();
+                    writeln!(out, "    pub fn set_{}(&self, v: {ty}{tp}) {{ self.{}.write({set_val}); }}", reg.name, reg.name).unwrap();
                     writeln!(out, "    /// Read-modify-write `{}` via a typed closure{}.", reg.name, endian_note).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn modify_{}<F: FnOnce({ty}) -> {ty}>(&self, f: F) {{", reg.name).unwrap();
+                    writeln!(out, "    pub fn modify_{}<F: FnOnce({ty}) -> {ty}>(&self, f: F{tp}) {{", reg.name).unwrap();
                     // No-transform path stays direct (`f(...).0`) so the
                     // generated file doesn't churn for non-passwd / non-BE
                     // registers. The wrap_write-applied path needs an
@@ -1523,7 +1676,7 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                     raw_write(out);
                     writeln!(out, "    /// Read-modify-write `{}`{}.", reg.name, endian_note).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn modify_{}<F: FnOnce({wty}) -> {wty}>(&self, f: F) {{", reg.name).unwrap();
+                    writeln!(out, "    pub fn modify_{}<F: FnOnce({wty}) -> {wty}>(&self, f: F{tp}) {{", reg.name).unwrap();
                     if is_passwd || is_be {
                         let inner = wrap_write("f(v)");
                         writeln!(out, "        self.{}.modify(|v| {inner});", reg.name).unwrap();
@@ -1575,14 +1728,14 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                     writeln!(out, "    /// `Wo<u32>::write(...)` call so the driver cannot accidentally produce two.").unwrap();
                     writeln!(out, "    /// Typed per-part newtypes (P9.0b) make positional swap a compile error.").unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn set_{}(&self, {params}) {{", reg.name).unwrap();
+                    writeln!(out, "    pub fn set_{}(&self, {params}{tp}) {{", reg.name).unwrap();
                     writeln!(out, "        self.{}.write({compose});", reg.name).unwrap();
                     writeln!(out, "    }}").unwrap();
                 } else if has_typed {
                     writeln!(out, "    /// Write a typed value to `{}`{}.", reg.name, endian_note).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
                     let set_val = wrap_write("v.0");
-                    writeln!(out, "    pub fn set_{}(&self, v: {ty}) {{ self.{}.write({set_val}); }}", reg.name, reg.name).unwrap();
+                    writeln!(out, "    pub fn set_{}(&self, v: {ty}{tp}) {{ self.{}.write({set_val}); }}", reg.name, reg.name).unwrap();
                 } else {
                     raw_write(out);
                 }
@@ -1600,11 +1753,11 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                 if has_typed {
                     writeln!(out, "    /// Clear bits in `{}` (write-1-to-clear).", reg.name).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn clear_{}(&self, mask: {ty}) {{ self.{}.clear(mask.0); }}", reg.name, reg.name).unwrap();
+                    writeln!(out, "    pub fn clear_{}(&self, mask: {ty}{tp}) {{ self.{}.clear(mask.0); }}", reg.name, reg.name).unwrap();
                 } else {
                     writeln!(out, "    /// Clear bits in `{}` (write-1-to-clear).", reg.name).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn clear_{}(&self, mask: {wty}) {{ self.{}.clear(mask); }}", reg.name, reg.name).unwrap();
+                    writeln!(out, "    pub fn clear_{}(&self, mask: {wty}{tp}) {{ self.{}.clear(mask); }}", reg.name, reg.name).unwrap();
                 }
             }
             Access::Rw1c => {
@@ -1623,17 +1776,17 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                 if has_typed {
                     writeln!(out, "    /// Read a typed snapshot of `{}` (which bits are currently latched).", reg.name).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn {}(&self) -> {ty} {{ {ty}(self.{}.read()) }}", reg.name, reg.name).unwrap();
+                    writeln!(out, "    pub fn {}(&self{tp}) -> {ty} {{ {ty}(self.{}.read()) }}", reg.name, reg.name).unwrap();
                     writeln!(out, "    /// Clear bits in `{}` (write-1-to-clear); pass the typed mask of bits to ack.", reg.name).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn clear_{}(&self, mask: {ty}) {{ self.{}.clear(mask.0); }}", reg.name, reg.name).unwrap();
+                    writeln!(out, "    pub fn clear_{}(&self, mask: {ty}{tp}) {{ self.{}.clear(mask.0); }}", reg.name, reg.name).unwrap();
                 } else {
                     writeln!(out, "    /// Volatile read of `{}` as `{wty}` (which bits are currently latched).", reg.name).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn read_{}(&self) -> {wty} {{ self.{}.read() }}", reg.name, reg.name).unwrap();
+                    writeln!(out, "    pub fn read_{}(&self{tp}) -> {wty} {{ self.{}.read() }}", reg.name, reg.name).unwrap();
                     writeln!(out, "    /// Clear bits in `{}` (write-1-to-clear).", reg.name).unwrap();
                     writeln!(out, "    #[inline(always)]").unwrap();
-                    writeln!(out, "    pub fn clear_{}(&self, mask: {wty}) {{ self.{}.clear(mask); }}", reg.name, reg.name).unwrap();
+                    writeln!(out, "    pub fn clear_{}(&self, mask: {wty}{tp}) {{ self.{}.clear(mask); }}", reg.name, reg.name).unwrap();
                 }
             }
         }
@@ -1653,27 +1806,27 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                     Access::Ro => {
                         if has_typed {
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn {alias}(&self) -> {ty} {{ self.{}() }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn {alias}(&self{tp}) -> {ty} {{ self.{}({tfwd_no_comma}) }}", reg.name, tfwd_no_comma = tfwd.trim_start_matches(", ")).unwrap();
                         } else {
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn read_{alias}(&self) -> {wty} {{ self.read_{}() }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn read_{alias}(&self{tp}) -> {wty} {{ self.read_{}({tfwd_no_comma}) }}", reg.name, tfwd_no_comma = tfwd.trim_start_matches(", ")).unwrap();
                         }
                     }
                     Access::Rw => {
                         if has_typed {
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn {alias}(&self) -> {ty} {{ self.{}() }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn {alias}(&self{tp}) -> {ty} {{ self.{}({tfwd_no_comma}) }}", reg.name, tfwd_no_comma = tfwd.trim_start_matches(", ")).unwrap();
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn set_{alias}(&self, v: {ty}) {{ self.set_{}(v); }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn set_{alias}(&self, v: {ty}{tp}) {{ self.set_{}(v{tfwd}); }}", reg.name).unwrap();
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn modify_{alias}<F: FnOnce({ty}) -> {ty}>(&self, f: F) {{ self.modify_{}(f); }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn modify_{alias}<F: FnOnce({ty}) -> {ty}>(&self, f: F{tp}) {{ self.modify_{}(f{tfwd}); }}", reg.name).unwrap();
                         } else {
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn read_{alias}(&self) -> {wty} {{ self.read_{}() }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn read_{alias}(&self{tp}) -> {wty} {{ self.read_{}({tfwd_no_comma}) }}", reg.name, tfwd_no_comma = tfwd.trim_start_matches(", ")).unwrap();
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn write_{alias}(&self, v: {wty}) {{ self.write_{}(v); }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn write_{alias}(&self, v: {wty}{tp}) {{ self.write_{}(v{tfwd}); }}", reg.name).unwrap();
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn modify_{alias}<F: FnOnce({wty}) -> {wty}>(&self, f: F) {{ self.modify_{}(f); }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn modify_{alias}<F: FnOnce({wty}) -> {wty}>(&self, f: F{tp}) {{ self.modify_{}(f{tfwd}); }}", reg.name).unwrap();
                         }
                     }
                     Access::Wo | Access::Trigger => {
@@ -1688,16 +1841,16 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                         // plain delegation.
                         if has_typed {
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn set_{alias}(&self, v: {ty}) {{ self.set_{}(v); }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn set_{alias}(&self, v: {ty}{tp}) {{ self.set_{}(v{tfwd}); }}", reg.name).unwrap();
                         } else {
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn write_{alias}(&self, v: {wty}) {{ self.write_{}(v); }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn write_{alias}(&self, v: {wty}{tp}) {{ self.write_{}(v{tfwd}); }}", reg.name).unwrap();
                         }
                     }
                     Access::W1c => {
                         let arg_ty = if has_typed { ty.clone() } else { wty.clone() };
                         writeln!(out, "    #[inline(always)]").unwrap();
-                        writeln!(out, "    pub fn clear_{alias}(&self, mask: {arg_ty}) {{ self.clear_{}(mask); }}", reg.name).unwrap();
+                        writeln!(out, "    pub fn clear_{alias}(&self, mask: {arg_ty}{tp}) {{ self.clear_{}(mask{tfwd}); }}", reg.name).unwrap();
                     }
                     Access::Rw1c => {
                         // Rw1c aliases delegate both the typed-read and
@@ -1707,14 +1860,14 @@ fn emit_accessors(out: &mut String, spec: &Spec) {
                         // branch above for the rationale).
                         if has_typed {
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn {alias}(&self) -> {ty} {{ self.{}() }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn {alias}(&self{tp}) -> {ty} {{ self.{}({tfwd_no_comma}) }}", reg.name, tfwd_no_comma = tfwd.trim_start_matches(", ")).unwrap();
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn clear_{alias}(&self, mask: {ty}) {{ self.clear_{}(mask); }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn clear_{alias}(&self, mask: {ty}{tp}) {{ self.clear_{}(mask{tfwd}); }}", reg.name).unwrap();
                         } else {
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn read_{alias}(&self) -> {wty} {{ self.read_{}() }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn read_{alias}(&self{tp}) -> {wty} {{ self.read_{}({tfwd_no_comma}) }}", reg.name, tfwd_no_comma = tfwd.trim_start_matches(", ")).unwrap();
                             writeln!(out, "    #[inline(always)]").unwrap();
-                            writeln!(out, "    pub fn clear_{alias}(&self, mask: {wty}) {{ self.clear_{}(mask); }}", reg.name).unwrap();
+                            writeln!(out, "    pub fn clear_{alias}(&self, mask: {wty}{tp}) {{ self.clear_{}(mask{tfwd}); }}", reg.name).unwrap();
                         }
                     }
                 }
@@ -2216,14 +2369,21 @@ fn emit_tests(out: &mut String, spec: &Spec) {
         for p in &spans {
             expected |= p.val << p.lo;
         }
+        let tk_mint = if reg.requires_token.is_some() {
+            format!("        let _tk = {}(regs.regs());\n", token_internal_mint_name(spec))
+        } else {
+            String::new()
+        };
+        let tk_arg = token_arg_test(reg);
         writeln!(out, "    #[test]").unwrap();
         writeln!(out, "    fn {}_combined_trigger_single_u32_store() {{", reg.name).unwrap();
         writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
         writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+        write!(out, "{}", tk_mint).unwrap();
         writeln!(out, "        // Drain any construction-time log entries; the only ops").unwrap();
         writeln!(out, "        // asserted below are the ones the setter call produces.").unwrap();
         writeln!(out, "        let _ = region.take_ops();").unwrap();
-        writeln!(out, "        regs.regs().set_{}({call_args});", reg.name).unwrap();
+        writeln!(out, "        regs.regs().set_{}({call_args}{tk_arg});", reg.name).unwrap();
         writeln!(out, "        let ops = region.take_ops();").unwrap();
         writeln!(out, "        // Single u32 store at the register's offset is the load-").unwrap();
         writeln!(out, "        // bearing property — BCM2711 SDHCI silently drops the").unwrap();
@@ -2274,25 +2434,41 @@ fn emit_tests(out: &mut String, spec: &Spec) {
                 raw.to_string()
             }
         };
+        // O2 capability gate: when this aliased register is gated,
+        // every alias accessor call in the generated tests needs a
+        // `&_tk` argument. Mint once per test using the internal
+        // mint (host-test scope; xtask doesn't lint test files in
+        // lockjaw-regs because they live in the same crate as the
+        // mint function).
+        let tk_mint_line = if reg.requires_token.is_some() {
+            format!("        let _tk = {}(regs.regs());\n", token_internal_mint_name(spec))
+        } else {
+            String::new()
+        };
+        let tk_arg = token_arg_test(reg);
+        // For getters that return a value (e.g. `{alias}().0`), the
+        // token is inserted INSIDE the parens before the `.0` chain.
+        let tk_arg_no_comma = if reg.requires_token.is_some() { "&_tk" } else { "" };
         for alias in &reg.aliases {
             match reg.access {
                 Access::Rw => {
                     let alias_set_arg = typed_ctor(sample_a);
                     let primary_set_arg = typed_ctor(sample_b);
                     let (alias_setter, primary_setter, alias_getter) = if has_typed_w {
-                        (format!("set_{alias}"), format!("set_{}", reg.name), format!("regs.regs().{alias}().0"))
+                        (format!("set_{alias}"), format!("set_{}", reg.name), format!("regs.regs().{alias}({tk_arg_no_comma}).0"))
                     } else {
-                        (format!("write_{alias}"), format!("write_{}", reg.name), format!("regs.regs().read_{alias}()"))
+                        (format!("write_{alias}"), format!("write_{}", reg.name), format!("regs.regs().read_{alias}({tk_arg_no_comma})"))
                     };
                     writeln!(out, "    #[test]").unwrap();
                     writeln!(out, "    fn {}_{}_alias_round_trips_through_same_cell() {{", reg.name, alias).unwrap();
                     writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
                     writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+                    write!(out, "{}", tk_mint_line).unwrap();
                     writeln!(out, "        // Write via the alias setter; peek raw at the primary's struct-field offset.").unwrap();
-                    writeln!(out, "        regs.regs().{alias_setter}({alias_set_arg});").unwrap();
+                    writeln!(out, "        regs.regs().{alias_setter}({alias_set_arg}{tk_arg});").unwrap();
                     writeln!(out, "        assert_eq!(region.{peek_method}(offset_of!({dev}, {})), {sample_a});", reg.name).unwrap();
                     writeln!(out, "        // Vice versa: write via the primary, read through the alias getter.").unwrap();
-                    writeln!(out, "        regs.regs().{primary_setter}({primary_set_arg});").unwrap();
+                    writeln!(out, "        regs.regs().{primary_setter}({primary_set_arg}{tk_arg});").unwrap();
                     writeln!(out, "        assert_eq!({alias_getter}, {sample_b});").unwrap();
                     writeln!(out, "    }}").unwrap();
                     writeln!(out).unwrap();
@@ -2302,14 +2478,15 @@ fn emit_tests(out: &mut String, spec: &Spec) {
                     // backing memory at the primary's offset and
                     // read through the alias accessor.
                     let alias_getter = if has_typed_w {
-                        format!("regs.regs().{alias}().0")
+                        format!("regs.regs().{alias}({tk_arg_no_comma}).0")
                     } else {
-                        format!("regs.regs().read_{alias}()")
+                        format!("regs.regs().read_{alias}({tk_arg_no_comma})")
                     };
                     writeln!(out, "    #[test]").unwrap();
                     writeln!(out, "    fn {}_{}_alias_reads_same_cell() {{", reg.name, alias).unwrap();
                     writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
                     writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+                    write!(out, "{}", tk_mint_line).unwrap();
                     writeln!(out, "        region.{poke_method}(offset_of!({dev}, {}), {sample_a});", reg.name).unwrap();
                     writeln!(out, "        assert_eq!({alias_getter}, {sample_a});").unwrap();
                     writeln!(out, "    }}").unwrap();
@@ -2328,7 +2505,8 @@ fn emit_tests(out: &mut String, spec: &Spec) {
                     writeln!(out, "    fn {}_{}_alias_writes_same_cell() {{", reg.name, alias).unwrap();
                     writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
                     writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
-                    writeln!(out, "        regs.regs().{alias_setter}({alias_set_arg});").unwrap();
+                    write!(out, "{}", tk_mint_line).unwrap();
+                    writeln!(out, "        regs.regs().{alias_setter}({alias_set_arg}{tk_arg});").unwrap();
                     writeln!(out, "        assert_eq!(region.{peek_method}(offset_of!({dev}, {})), {sample_a});", reg.name).unwrap();
                     writeln!(out, "    }}").unwrap();
                     writeln!(out).unwrap();
@@ -2361,6 +2539,7 @@ fn emit_tests(out: &mut String, spec: &Spec) {
                     writeln!(out, "    fn {}_{}_alias_clears_same_cell() {{", reg.name, alias).unwrap();
                     writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
                     writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+                    write!(out, "{}", tk_mint_line).unwrap();
                     writeln!(out, "        // Call clear({sample_b}) via the alias accessor; the cell's W1C").unwrap();
                     writeln!(out, "        // clear() volatile-writes the mask to memory. Peek at the").unwrap();
                     writeln!(out, "        // primary's struct-field offset must return the mask — proving").unwrap();
@@ -2369,7 +2548,7 @@ fn emit_tests(out: &mut String, spec: &Spec) {
                     writeln!(out, "        // clears\" semantics don't apply to the store, so the assertion").unwrap();
                     writeln!(out, "        // is on bytes written, not bits cleared. The routing property").unwrap();
                     writeln!(out, "        // is what this test pins down regardless.)").unwrap();
-                    writeln!(out, "        regs.regs().{alias_clear}({mask_arg});").unwrap();
+                    writeln!(out, "        regs.regs().{alias_clear}({mask_arg}{tk_arg});").unwrap();
                     writeln!(out, "        assert_eq!(region.{peek_method}(offset_of!({dev}, {})), {sample_b});", reg.name).unwrap();
                     writeln!(out, "    }}").unwrap();
                     writeln!(out).unwrap();
@@ -2386,15 +2565,16 @@ fn emit_tests(out: &mut String, spec: &Spec) {
                     // CPU memory, not W1C hardware).
                     let mask_arg = typed_ctor(sample_b);
                     let alias_read = if has_typed_w {
-                        format!("{alias}().bits()")
+                        format!("{alias}({tk_arg_no_comma}).bits()")
                     } else {
-                        format!("read_{alias}()")
+                        format!("read_{alias}({tk_arg_no_comma})")
                     };
                     let alias_clear = format!("clear_{alias}");
                     writeln!(out, "    #[test]").unwrap();
                     writeln!(out, "    fn {}_{}_alias_reads_same_cell() {{", reg.name, alias).unwrap();
                     writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
                     writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
+                    write!(out, "{}", tk_mint_line).unwrap();
                     writeln!(out, "        region.{poke_method}(offset_of!({dev}, {}), {sample_a});", reg.name).unwrap();
                     writeln!(out, "        assert_eq!(regs.regs().{alias_read}, {sample_a});").unwrap();
                     writeln!(out, "    }}").unwrap();
@@ -2403,7 +2583,8 @@ fn emit_tests(out: &mut String, spec: &Spec) {
                     writeln!(out, "    fn {}_{}_alias_clears_same_cell() {{", reg.name, alias).unwrap();
                     writeln!(out, "        let region = MockMmioRegion::for_layout::<{dev}>();").unwrap();
                     writeln!(out, "        let regs = region.as_mapped_regs::<{dev}>();").unwrap();
-                    writeln!(out, "        regs.regs().{alias_clear}({mask_arg});").unwrap();
+                    write!(out, "{}", tk_mint_line).unwrap();
+                    writeln!(out, "        regs.regs().{alias_clear}({mask_arg}{tk_arg});").unwrap();
                     writeln!(out, "        assert_eq!(region.{peek_method}(offset_of!({dev}, {})), {sample_b});", reg.name).unwrap();
                     writeln!(out, "    }}").unwrap();
                     writeln!(out).unwrap();

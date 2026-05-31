@@ -50,6 +50,11 @@ width = 32
 access = "rw"
 kind = "aliased"
 aliases = ["argument2"]
+# O2: capability-gate. Both `sysaddr` and `argument2` are aliases over
+# the same cell — gating one without the other (per Opus tech-debt #1)
+# would be a sham. The aliased emission inherits the gate, so the
+# generated `write_argument2` also takes &SdhciOpToken.
+requires_token = "sdhci_op"
 description = "SDMA system address / ARGUMENT2 alias (Auto-CMD23 block count)"
 
 # ---------------------------------------------------------------------------
@@ -63,6 +68,7 @@ name = "block_size"
 offset = 0x004
 width = 16
 access = "rw"
+requires_token = "sdhci_op"  # O2: controller samples during data transfer.
 description = "Block size in bytes (bits[11:0] = size; max 4 KiB per spec)"
 
 # ---------------------------------------------------------------------------
@@ -75,6 +81,7 @@ name = "block_count"
 offset = 0x006
 width = 16
 access = "rw"
+requires_token = "sdhci_op"  # O2: controller samples during data transfer.
 description = "Block count for the current transfer"
 
 # ---------------------------------------------------------------------------
@@ -88,6 +95,7 @@ name = "argument"
 offset = 0x008
 width = 32
 access = "rw"
+requires_token = "sdhci_op"  # O2: command argument — programmed pre-trigger.
 description = "Command argument (sector index for CMD17, OCR for ACMD41, etc.)"
 
 # ---------------------------------------------------------------------------
@@ -107,6 +115,12 @@ offset = 0x00c
 width = 32
 access = "wo"
 kind = "combined_trigger"
+# O2: capability-gate the combined trigger. Writing this register is
+# what kicks the controller — the load-bearing "is the operation
+# layer the only path?" gate for R3 of the DMA-coherence rubric.
+# The generated setter takes `&SdhciOpToken<'_>`; drivers can only
+# obtain a token via `SdhciCommandInit::open()` in lockjaw-userlib.
+requires_token = "sdhci_op"
 description = "TRANSFER_MODE (low u16) + COMMAND (high u16) — single u32 store triggers the command"
 parts = [
     { name = "transfer_mode", bits = "15:0" },
@@ -124,6 +138,7 @@ name = "response_0"
 offset = 0x010
 width = 32
 access = "ro"
+requires_token = "sdhci_op"  # O2: response read mediated by operation layer.
 description = "Response slot 0 (short response payload; long-response low 32)"
 
 [[registers]]
@@ -131,6 +146,7 @@ name = "response_1"
 offset = 0x014
 width = 32
 access = "ro"
+requires_token = "sdhci_op"  # O2: response read mediated by operation layer.
 description = "Response slot 1 (long-response bits 63:32)"
 
 [[registers]]
@@ -138,6 +154,7 @@ name = "response_2"
 offset = 0x018
 width = 32
 access = "ro"
+requires_token = "sdhci_op"  # O2: response read mediated by operation layer.
 description = "Response slot 2 (long-response bits 95:64)"
 
 [[registers]]
@@ -145,6 +162,7 @@ name = "response_3"
 offset = 0x01c
 width = 32
 access = "ro"
+requires_token = "sdhci_op"  # O2: response read mediated by operation layer.
 description = "Response slot 3 (long-response bits 127:96)"
 
 # ---------------------------------------------------------------------------
@@ -159,6 +177,12 @@ name = "buffer_data_port"
 offset = 0x020
 width = 32
 access = "rw"
+# O2: PIO data window — the controller reads/writes this during PIO
+# data transfers (BUF_WR_READY / BUF_RD_READY in NORMAL_INT_STATUS
+# gate access). Lockjaw uses ADMA2 today so this is unused, but it's
+# in the operation data path per the property rule; gating it now
+# closes the bypass before a future PIO path opens it.
+requires_token = "sdhci_op"
 description = "PIO data window (unused — Lockjaw uses ADMA2 for all data transfers)"
 
 # ---------------------------------------------------------------------------
@@ -194,6 +218,12 @@ name = "host_control"
 offset = 0x028
 width = 8
 access = "rw"
+# O2: DMA_SEL bits are sampled by the controller during ADMA transfers;
+# DAT_4BIT flip is local to Tran-state init. The whole register is
+# gated rather than splitting into per-bit safe/unsafe accessors —
+# init helpers in lockjaw-userlib (e.g. set_bus_width_4bit) provide
+# the safe one-shot wrappers.
+requires_token = "sdhci_op"
 description = "Host Control 1 (bus width + DMA engine select)"
 fields = [
     { name = "led_on", bits = "0:0", description = "Slot LED on" },
@@ -217,6 +247,7 @@ name = "power_control"
 offset = 0x029
 width = 8
 access = "rw"
+requires_token = "sdhci_op"  # O2: bus power state controls controller behavior.
 description = "Power Control (bus power enable + voltage select)"
 fields = [
     { name = "bus_power_on", bits = "0:0", description = "Bus power on" },
@@ -263,6 +294,10 @@ name = "clock_control"
 offset = 0x02c
 width = 16
 access = "rw"
+# O2: controller samples clock divisor + enable bits during commands;
+# mutating mid-operation corrupts the SD line clock. Init-time setup
+# goes through `lockjaw-userlib::sdhci::configure_clock`.
+requires_token = "sdhci_op"
 description = "Clock Control (internal/SD clock enables + frequency divisor)"
 fields = [
     { name = "int_clk_en", bits = "0:0", description = "Internal clock generator enable" },
@@ -282,7 +317,15 @@ name = "timeout_control"
 offset = 0x02e
 width = 8
 access = "rw"
+requires_token = "sdhci_op"  # O2: controller uses this timeout on every data transfer.
 description = "Data-line timeout exponent (bits[3:0]: timeout = base_clk × 2^(13+N))"
+# O2 (per Opus review): add typed flags so codegen emits the typed
+# `set_timeout_control(TimeoutControl)` setter instead of the raw-u8
+# `write_timeout_control(u8)`. Keeps the gated tier uniformly
+# newtype-wrapped — no raw-u8 escape hatches in the operation surface.
+fields = [
+    { name = "dat_timeout_counter", bits = "3:0", description = "Timeout exponent: timeout = base_clk × 2^(13+N); 0xE = max ~10s at 200 MHz" },
+]
 
 # ---------------------------------------------------------------------------
 # SOFTWARE_RESET — u8. RW. Driver writes SW_RST_ALL at init then
@@ -295,6 +338,9 @@ name = "software_reset"
 offset = 0x02f
 width = 8
 access = "rw"
+# O2: a reset mid-operation tears down the controller's command state.
+# Init-time soft_reset_all goes through `lockjaw-userlib::sdhci::soft_reset_all`.
+requires_token = "sdhci_op"
 description = "Software Reset (write to assert; controller auto-clears when reset completes)"
 flags = [
     { name = "sw_rst_all", bit = 0, description = "Reset entire controller" },
@@ -317,6 +363,7 @@ name = "normal_int_status"
 offset = 0x030
 width = 16
 access = "rw1c"
+requires_token = "sdhci_op"  # O2: read+W1C of operation completion bits.
 description = "Normal Interrupt Status (read latched events, write 1s to acknowledge)"
 flags = [
     { name = "cmd_complete", bit = 0, description = "CMD/response phase finished" },
@@ -342,6 +389,7 @@ name = "error_int_status"
 offset = 0x032
 width = 16
 access = "rw1c"
+requires_token = "sdhci_op"  # O2: read+W1C of operation error bits.
 description = "Error Interrupt Status (read latched error class, write 1s to acknowledge)"
 flags = [
     { name = "cmd_timeout", bit = 0, description = "Command response timeout" },
@@ -367,6 +415,7 @@ name = "normal_int_status_enable"
 offset = 0x034
 width = 16
 access = "rw"
+requires_token = "sdhci_op"  # O2: controller samples during operations.
 description = "Gate for which NORMAL_INT_STATUS bits the controller latches"
 flags = [
     { name = "cmd_complete", bit = 0 },
@@ -395,6 +444,7 @@ name = "error_int_status_enable"
 offset = 0x036
 width = 16
 access = "rw"
+requires_token = "sdhci_op"  # O2: controller samples during operations.
 description = "Gate for which ERROR_INT_STATUS bits the controller latches"
 flags = [
     { name = "cmd_timeout", bit = 0 },
@@ -421,6 +471,7 @@ name = "normal_int_signal_enable"
 offset = 0x038
 width = 16
 access = "rw"
+requires_token = "sdhci_op"  # O2: controller samples during operations.
 description = "Gate for which NORMAL_INT_STATUS bits raise the IRQ line"
 flags = [
     { name = "cmd_complete", bit = 0 },
@@ -451,6 +502,7 @@ name = "error_int_signal_enable"
 offset = 0x03a
 width = 16
 access = "rw"
+requires_token = "sdhci_op"  # O2: controller samples during operations.
 description = "Gate for which ERROR_INT_STATUS bits raise the IRQ line"
 flags = [
     { name = "cmd_timeout", bit = 0 },
@@ -518,6 +570,11 @@ name = "adma_address"
 offset = 0x058
 width = 32
 access = "rw"
+# O2: programming the ADMA2 descriptor table address mid-operation is
+# undefined; the controller fetches descriptors from this address every
+# data transfer. Gated so only `SdhciCommandInit::issue_data_transfer`
+# (O5) can program it inside the run_dma_transfer envelope.
+requires_token = "sdhci_op"
 description = "ADMA2 descriptor table physical address (32-bit ADMA2 mode)"
 
 # ---------------------------------------------------------------------------
