@@ -12,7 +12,7 @@ For *how* to apply each pattern, read [`patterns/`](../architecture/patterns/).
 This file replaces the older `types-extraction-plan.md` and
 `codex-kernel-architecture-work-items.md`. It is the single roadmap.
 
-Last refreshed: 2026-05-04. Host test count at refresh: 523.
+Last refreshed: 2026-05-30. Host test count at refresh: 523.
 
 ---
 
@@ -52,6 +52,11 @@ exemplars in the codebase:
 - **wait validation** — `validate_wait_count`, `WaitEntry`,
   `MAX_WAIT_OBJECTS` are in `lockjaw-types/src/wait.rs`; kernel
   imports them directly.
+- **MAX_CPUS unification** — `src/arch/aarch64/platform.rs:28`
+  re-exports `lockjaw_types::scheduler::MAX_CPUS` (single source of
+  truth, defined at `lockjaw-types/src/scheduler.rs:183`). The kernel
+  duplicate is gone; the "must match" comment invariant is now a
+  compile-time fact.
 
 ### Userspace extractions (canonical exemplars)
 
@@ -84,36 +89,8 @@ These are functions where the kernel orchestrates multi-step
 sequencing inline. Sequencing bugs in this shape have historically
 needed multiple review rounds to catch.
 
-#### 1. `create_process` outer orchestration — DONE
-
-`ProcessCreationPlanBuilder` and `ValidatedProcessCreationPlan` live
-in `lockjaw-types/src/process.rs`. `validate(self)` consumes the
-builder and returns an owned token; apply takes the token by value.
-The pure layer carries only structural facts (counts, parent-copy
-metadata) — the deduplicated header list lives in the proc page
-(`ProcessObject::consumed_headers`), kept off the kernel sync-
-exception stack. `validate` takes `unique_header_count` as an
-explicit parameter sourced from the proc-page storage, so the
-"how many unique headers were consumed" count has a single source
-of truth and cannot drift between the kernel storage and a builder
-mirror. Per-mapping/per-stack registration goes through one kernel
-helper (`record_mapping_into_plan` / `record_stack_into_plan`) that
-wraps the proc-page write and the builder count update — callers
-can't accidentally do one without the other.
-
-The kernel splits the work between `provision_resources` (heavy
-frame: address-space builder, scratch state, per-iteration locals,
-kernel-page allocation) and `create_process` (orchestrator: holds
-the builder, the guards, runs validate + apply). The plan token is
-constructible only by the pure validate, so a future edit cannot
-move a fallible step past the point-of-no-return without
-restructuring the type seam.
-
-Test gain: ~16 host tests (at-most-once invariants, post-consume
-handle-table capacity, caller_token / rights preservation, dedup
-ordering and overflow). Pure dedup logic factored into the free
-function `dedup_add_header(header, &mut [u64], &mut usize)` which
-the kernel calls with the proc page's storage slice.
+_(Item 1 — `create_process` outer orchestration — landed; see
+"What's already done" above.)_
 
 #### 2. `sys_map_pages` VA decision
 
@@ -257,23 +234,9 @@ implementing item 12.
 
 ### Priority 4: Constants, helpers, cleanups
 
-#### 14. `MAX_CPUS` unification
-
-**Source**: `src/arch/aarch64/platform.rs` (line 24)
-
-`MAX_CPUS = 4` in the kernel and `MAX_CPUS_MODEL = 4` in
-`lockjaw-types/src/scheduler.rs` (line 140) are the same constant
-with different names and a "must match" comment. Consolidate to one
-`MAX_CPUS` in lockjaw-types and delete the kernel duplicate.
-
-Note: the MMIO base addresses (`uart0_base`, `gicd_base`, etc.) are
-*not* compile-time constants — they are discovered at runtime from the
-DTB and stored in `PlatformInfo`. The previous roadmap item about
-extracting `UART0_BASE_PHYS` etc. as constants is obsolete and has
-been removed.
-
-**Effort**: low. **Test gain**: ~1 (assertion that the two are equal,
-turning a comment invariant into a compile error).
+_(Item 14 — `MAX_CPUS` unification — landed; see "What's already
+done" above. The kernel's `platform::MAX_CPUS` is now a `pub use`
+re-export of `lockjaw_types::scheduler::MAX_CPUS`.)_
 
 #### 15. Scheduler predicates
 

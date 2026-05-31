@@ -368,15 +368,25 @@ Deferred to follow-on phases: `lseek`, `fstat`, `newfstatat`,
   in shared bytes.
 - `getcwd` / `readlinkat` — stub ENOENT initially.
 
-### Phase 2: Memory Management
+### Phase 2: Memory Management — DONE
 
-**Gate:** Rust binary with `Vec<u64>` of 1M elements.
+**Gate met:** musl `malloc(1MiB)` (Phase 2.3) and `malloc(8MiB)`
+(Phase 2.4) via mmap; integration tests assert both.
 
-Personality server: mmap handler with client-assisted mapping
-(export PageSet, reply with instructions, client does
-`sys_map_pages`). munmap. mprotect stub.
+**What landed** (commits `87149a4` → `376dedb`, Phase 2.K through
+Phase 2.5): variable-size PageSet header (`pageset_table.rs`), VA
+layout extension with `mmap_base` (`lockjaw-types/src/posix.rs`),
+pure dispatch arms, posix-server runtime `MmapTable` /
+`MmapVaAllocator` (`user/posix-server/src/main.rs`), mmap tracker in
+`musl-lockjaw/src/shim.c`, fopen/fread/malloc gates in
+`user/posix-hello/hello.c`. Full subphase breakdown preserved in
+`docs/history/posix-phase2-mmap-plan.md`.
 
-Syscalls: `mmap`, `munmap`, `mprotect`, `madvise` (stub)
+**Out of scope / deferred** (sketched at the bottom of the history
+plan, not yet built): `MAP_FIXED`, `MAP_SHARED`, file-backed mmap,
+`PROT_EXEC`, partial munmap, `mremap`, `mprotect` on non-mmap
+ranges. Tracked in `docs/tracking/tech-debt.md` when promoted from
+"deferred" to "needed".
 
 ### Phase 3: Time and Random
 
@@ -429,41 +439,29 @@ Syscalls: `ioctl` (TIOCGWINSZ, TCGETS, TCSETS), `poll`/`ppoll`,
 
 Socket stubs return ENOSYS. Requires smoltcp or similar.
 
-## New Files
+## As-built layout
+
+The original "New Files" sketch (separate `fd_table.rs`,
+`process_table.rs`, per-syscall-group modules under
+`src/syscall/*`, and a `user/ramfs-server/` for cpio-backed FS) was
+deliberately not built. The simpler shape that landed:
 
 ```
 user/posix-server/
   Cargo.toml
-  src/main.rs              # bootstrap, main loop, dispatch
-  src/fd_table.rs          # per-process FD table
-  src/process_table.rs     # PID table, per-process state
-  src/syscall/mod.rs       # dispatch table
-  src/syscall/io.rs        # write, read, writev, lseek
-  src/syscall/fs.rs        # open, close, stat, getdents
-  src/syscall/mem.rs       # brk, mmap, munmap
-  src/syscall/proc.rs      # exit, spawn, waitpid
-  src/syscall/thread.rs    # clone, futex
-  src/syscall/signal.rs    # sigaction, kill
-  src/elf_loader.rs        # Linux ELF loader (auxv)
-  src/shared_buffer.rs     # per-client shared page management
+  src/main.rs              # everything: bootstrap, dispatch, FD table, mmap, process state
+                           # (single file by design — re-evaluate split when it exceeds
+                           # what one person can hold in head, not before)
 
-user/ramfs-server/
-  Cargo.toml
-  src/main.rs              # bootstrap, IPC loop
-  src/cpio.rs              # cpio archive parser
-  src/fs.rs                # inodes, dirents, read/write
+user/fat32-server/         # replaces the planned ramfs-server
+user/partition-manager/    # added during the eMMC bring-up (M5)
 
-musl-lockjaw/              # patched musl (or patch files)
-  arch/aarch64/syscall_arch.h
-  src/lockjaw/shim.c
+musl-lockjaw/
+  patches/                 # arch + crt + syscall_arch patches over upstream 1.2.5
+  src/shim.c               # lockjaw_syscall + bootstrap handshake + local brk + mmap tracker
 
-tests/posix/               # C test programs
-  hello.c
-  test_write.c
-  test_malloc.c
-  test_open_read.c
-  test_thread.c
-  test_spawn.c
+user/posix-hello/
+  hello.c                  # musl-built test: fopen + fread + malloc(1MiB/8MiB) gates
 ```
 
 ## Testing Strategy

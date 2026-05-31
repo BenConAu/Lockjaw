@@ -401,18 +401,6 @@ Until that's diagnosed, all reads use CMD17 single-block (validated on Pi as M6 
 
 ---
 
-## Phase 5 follow-up: compiled `escape_valve_cprman` example before Phase 7
-
-**Where:** `user/lockjaw-userlib/examples/escape_valve_cprman.rs` (does not yet exist) or an equivalent doctest on `driver_runtime::boot_stub!`.
-
-**What:** The Phase 4B docs chapter promises a compiled example demonstrating the Tier-A escape-valve composition (`boot_stub!` + `driver_bootstrap` + `probe_by_hash` + `claim_typed`) for the no-IRQ cprman shape. Today the pattern only exists as a markdown snippet in the docs chapter. Without a compiled artifact, `cargo check --examples` cannot catch when an API change to Tier-A breaks the documented pattern.
-
-**Fix:** Add `user/lockjaw-userlib/examples/escape_valve_cprman.rs` (or a doctest on `boot_stub!`) that compiles the cprman-style flow against a placeholder layout struct. Land before Phase 7 (cprman conversion) so the actual driver picks up a known-compiling reference.
-
-**Why bootstrap:** the markdown snippet matches reality today; Phase 5 (uart) and Phase 6 (ramfb) use the standard `driver_main!` / `virtio_driver_main!` paths and don't exercise the escape valve. The drift risk is real but lags the actual driver conversion that needs the pattern.
-
----
-
 ## PL011 TX wait is unbounded
 
 **Where:** `user/uart-driver/src/main.rs::uart_putc` (and the parallel pattern any future serial / console / device-with-a-FIFO driver will copy).
@@ -464,6 +452,30 @@ This already bit us once: the P9.6 typed-accessor conversion dropped `| ERROR` f
 - **Shared "IRQ-driven SDHCI mandatory signal set" const** in a host-tested crate that both the driver consumes and a unit test asserts contains ERROR. Smallest, but a layering smell (emmc2-specific data in shared lockjaw-regs) and only the rule-of-two would justify it — deferred until a second IRQ-driven SDHCI consumer exists.
 
 **Why bootstrap:** emmc2 is the only IRQ-driven SDHCI consumer today and the only block backend on Pi 4B. The error path is correct as written (verified against SDHCI 3.0 §2.2.21 + Linux's `host->ier`); the gap is test-coverage, not behaviour. Tracked here so the next person who touches the signal-enable composition or the regspec int-enable flags knows the change is invisible to `make test` and must be reasoned about against the spec.
+
+---
+
+## emmc2: pre-CMD `NORMAL_INT_STATUS` write-all clear (B4.2)
+
+**Where:** `user/emmc2-driver/src/main.rs::adma2_single_block_read` and `adma2_transfer`, before the `SDHCI_COMMAND` write.
+
+**What:** U-Boot writes `0xFFFF` to `NORMAL_INT_STATUS` before issuing `COMMAND` to guard against stale `CMD_COMPLETE` / `DATA_COMPLETE` bits from a prior operation. Lockjaw only w1c-clears specific bits it observed. Latent: today's interleaving doesn't surface stale-bit races, but a future async/timeout/recovery path could.
+
+**Fix:** Before each command-issuing write in `adma2_single_block_read` and `adma2_transfer`, call `sdhci.clear_normal_int_status(NormalIntStatus(0xFFFF))` (`user/lockjaw-regs/src/sdhci.rs:938`) and `sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF))` (`:944`) to ack any leftover bits. The existing W1C-all idiom is already in use at `user/emmc2-driver/src/main.rs:1195` for the normal-status register. Originally planned in `docs/history/post-c1-fix-plan.md` §B4.2; deferred there because the C1 gate was met without it.
+
+**Why bootstrap:** the current call paths don't observe stale interrupts; only matters when a future caller restarts after a previous abort. Pair with the SdhciCommandInit gating below — both are latent-hygiene items the type-state layer will subsume.
+
+---
+
+## emmc2: `SIGNAL_ENABLE = 0` after soft reset (B4.4)
+
+**Where:** `user/emmc2-driver/src/main.rs` bootstrap, immediately after `soft_reset_all`.
+
+**What:** After `soft_reset_all`, `SDHCI_SIGNAL_ENABLE` carries whatever value the firmware / reset left behind. Today nothing exercises the phantom-IRQ path because IRQ binding is explicit per-bit. Latent: if a future revision enables IRQ mode without writing `SIGNAL_ENABLE` first, stale firmware bits could deliver phantom IRQs.
+
+**Fix:** After `soft_reset_all`, mask both signal-enable registers (SDHCI splits them — normal at 0x038, error at 0x03A — and both have to be zeroed for a full mask): `sdhci.set_normal_int_signal_enable(NormalIntSignalEnable(0))` (`user/lockjaw-regs/src/sdhci.rs:972`) and `sdhci.set_error_int_signal_enable(ErrorIntSignalEnable(0))` (`:983`). Leave a comment that per-bit unmasking is the responsibility of each IRQ binding site. Originally planned in `docs/history/post-c1-fix-plan.md` §B4.4; deferred there because the C1 gate was polling-only.
+
+**Why bootstrap:** the polling path doesn't use SIGNAL_ENABLE; the explicit-write hygiene only matters when IRQ mode is reactivated for a path that doesn't already write the register itself. Land with the next emmc2 IRQ-conversion edit.
 
 ---
 

@@ -53,14 +53,20 @@ Type-level lockdown:
   one page, mapping scratch buffers, future objects) onto the same
   allocator. Each migration shrinks the surface that depends on the
   linear map.
-- Relinking the kernel binary (`linker.ld` ORIGIN currently
-  `0x40200000`) into the KVM range. The pure `KvmFreeList`,
-  `KvmMapWalk`, and `KvmFreeWalk` machinery is reusable for the
-  larger mappings the relink needs.
+- Relinking the kernel binary into the higher-half. **Done**
+  (commits `17baed3` + `c70c417`): the kernel image now lives in a
+  dedicated L0[1] VA region; `linker.ld` no longer pins the kernel
+  to physical addresses. See
+  `docs/history/relink-notes.md` for the Phase 0 diagnostic
+  notebook + the `KernelImageVa` / `KernelStackBase` audit
+  scaffolding.
 - Removing the kernel identity map from user TTBR0
   (`AddressSpaceBuilder::new` at `src/arch/aarch64/vmem.rs`).
-  Currently blocked by the kernel binary still being linked at
-  physical addresses; unblocked by the relink above.
+  Precondition (the kernel relink) is met; remaining work is to
+  zero TTBR0 on kernel-thread context switch and audit that no
+  kernel code path still depends on the identity map. Tracked
+  in `docs/tracking/tech-debt.md` "Kernel threads leave stale user
+  TTBR0 in hardware".
 
 ## What's deferred
 
