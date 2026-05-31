@@ -54,7 +54,7 @@ That shortfall appears in several distinct forms.
 
 ## 1. Pattern discipline is real, but not yet universal
 
-The pattern catalog in `docs/patterns/README.md` is real and useful.
+The pattern catalog in `docs/architecture/patterns/README.md` is real and useful.
 The problem is not that the patterns are weak. The problem is that not
 every subsystem is yet forced into one of those shapes.
 
@@ -67,7 +67,7 @@ Concrete examples in the current tree:
   `create_process()`: user-memory reads, scratch pagination, drop-guard
   sequencing, address-space construction, TCB creation, child-table
   setup, and scheduler commit all live in one long function.
-- `docs/extraction-roadmap.md` already names this exact gap under
+- `docs/tracking/extraction-roadmap.md` already names this exact gap under
   "Priority 1: create_process outer orchestration". That is good, but
   it also proves the subsystem is not finished yet.
 
@@ -87,7 +87,7 @@ What the hardening pass should do:
   data structures
 - require new subsystem work to identify its pattern up front, not
   after the fact
-- keep `docs/extraction-roadmap.md` live until the remaining
+- keep `docs/tracking/extraction-roadmap.md` live until the remaining
   push-shaped shells are either converted or explicitly justified
 
 ## 2. Too many invariants are still comments, not type shape
@@ -121,7 +121,7 @@ Concrete examples in the current tree:
   followed by "apply phase: all infallible commits." That is better
   than nothing, but it is still a comment-level phase boundary, not a
   separate type or state token.
-- `docs/book-of-lockjaw/01-architecture.md` explicitly argues for
+- `docs/architecture/01-architecture.md` explicitly argues for
   making illegal states unrepresentable. The fact that several active
   subsystems still need review to detect "this branch should be
   impossible after validate" means the principle is not yet enforced as
@@ -170,7 +170,7 @@ Concrete examples in the current tree:
   much better structure than before, but it is still the kind of long
   function where a future edit could move a fallible step below the
   point of no return without a type error stopping it.
-- `docs/handle-revocation-plan.md` is the best recent example of how
+- `docs/history/handle-revocation-plan.md` is the best recent example of how
   fragile this boundary still is in live design work. Multiple review
   rounds were spent forcing the plan to stop hand-waving around partial
   revoke failure, child-table timing, deduplication, and the exact
@@ -218,7 +218,7 @@ Concrete examples in the current tree:
   increasingly looks like "read raw PTE, call pure helper, perform TLB
   side effect."
 - `src/syscall/handler.rs:sys_map_pages()` is explicitly called out in
-  `docs/extraction-roadmap.md` as still having inline policy:
+  `docs/tracking/extraction-roadmap.md` as still having inline policy:
   "can this handle be mapped at this VA?" is still decided in the
   syscall handler rather than returned by a pure decision function.
 - `src/syscall/handler.rs:create_kernel_object()` is a mixed example:
@@ -239,7 +239,7 @@ What the hardening pass should do:
 - whenever a wrapper branches for semantic rather than mechanical
   reasons, ask whether the branch belongs in `lockjaw-types`
 - prioritize the wrapper-level items already named in
-  `docs/extraction-roadmap.md`, especially `sys_map_pages()` and other
+  `docs/tracking/extraction-roadmap.md`, especially `sys_map_pages()` and other
   syscall handlers that still mix validation and mutation inline
 
 ## 5. Documentation is strong, but doc drift is still a real architectural bug
@@ -257,15 +257,15 @@ docs are active implementation inputs.
 
 Concrete examples in the current tree:
 
-- `docs/handle-revocation-plan.md` required multiple review rounds just
+- `docs/history/handle-revocation-plan.md` required multiple review rounds just
   to eliminate contradictions between the core algorithm, the
   `sys_create_process` pseudocode, and the phasing summary. The plan
   repeatedly fixed the main design while leaving old fallback or timing
   language alive further down.
-- `docs/extraction-roadmap.md` is good because it is honest about what
+- `docs/tracking/extraction-roadmap.md` is good because it is honest about what
   is done versus still push-shaped. That should be the standard: name
   the residual gap directly, not just the end state.
-- The original `docs/ai-native-hardening-pass.md` version that prompted
+- The original `docs/history/ai-native-hardening-pass.md` version that prompted
   this rewrite is itself an example of the problem in a softer form: it
   claimed concrete shortfalls existed but did not cite them, which made
   it less actionable than it needed to be.
@@ -305,7 +305,7 @@ Concrete examples in the current tree:
   value around deduplication and header planning, but the outer
   `create_process()` sequencing that makes those plans safe is still not
   equally pinned by a pure model.
-- `docs/book-of-lockjaw/01-architecture.md` correctly argues that the
+- `docs/architecture/01-architecture.md` correctly argues that the
   kernel should increasingly read like execution glue. The hardening gap
   is that some glue contracts are still only locally asserted, not yet
   lifted into a host-testable state machine or phase object.
@@ -380,10 +380,10 @@ environment because too little of the method is machine-checkable.
 
 Concrete examples:
 
-- `docs/patterns/README.md` and `docs/book-of-lockjaw/01-architecture.md`
+- `docs/architecture/patterns/README.md` and `docs/architecture/01-architecture.md`
   explain the right shapes, but nothing in the repo currently forces a
   new architectural doc to say which pattern it is using
-- `docs/extraction-roadmap.md` names residual push-shaped shells, but
+- `docs/tracking/extraction-roadmap.md` names residual push-shaped shells, but
   there is no lightweight CI or checklist that prevents a converted
   subsystem from quietly regaining one
 - recent document reviews had to catch internal contradictions manually;
@@ -415,7 +415,7 @@ Typical failure mode:
 
 Concrete examples in the current tree:
 
-- `docs/extraction-roadmap.md` already admits that `create_process`
+- `docs/tracking/extraction-roadmap.md` already admits that `create_process`
   outer orchestration, `sys_map_pages()`, PageSet allocation rollback,
   and page-table teardown are still active extraction targets
 - these are not cosmetic leftovers; they are lifecycle and ownership
@@ -520,7 +520,7 @@ It should be done when:
 
 Concrete examples in the current tree:
 
-- `docs/extraction-roadmap.md` is valuable precisely because it refuses
+- `docs/tracking/extraction-roadmap.md` is valuable precisely because it refuses
   to call `create_process` finished just because `ProcessTransferPlan`,
   `AddressSpaceBuilder`, and `ScratchCursor` already exist
 - the recent page-table work shows the same lesson: the extraction was

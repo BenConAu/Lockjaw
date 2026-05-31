@@ -440,7 +440,7 @@ pub fn dec_both_and_maybe_free(header_kva: KernelVa) {
 /// Used by `create_kernel_object` (one PageSet → one new endpoint
 /// / notification / reply / TCB) and by `sys_create_process`
 /// (per consumed PageSet header). See
-/// `docs/handle-revocation-plan.md`.
+/// `docs/history/handle-revocation-plan.md`.
 pub fn consume_pageset_validate(
     header_kva: KernelVa,
 ) -> Result<(), super::revoke::RevokeError> {

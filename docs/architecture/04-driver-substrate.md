@@ -132,7 +132,7 @@ The pre-substrate emmc2 driver issued `sys_dma_sync_for_cpu` and
 `sys_dma_sync_for_device` by hand around every transfer. Five things
 had to be right: the right pageset, the right offset, the right
 direction, the right *number* of syncs (the `FromDevice` pre-clean
-in B2.2 was missed for months — see `docs/post-c1-fix-plan.md`), and
+in B2.2 was missed for months — see `docs/history/post-c1-fix-plan.md`), and
 the right *order* relative to the device's completion signal
 (invalidate had to run *after* the device finished, not after the
 kick returned — see B4.1, the DAT_INHIBIT drain). It was a
@@ -259,7 +259,7 @@ ceremony, audited and locked.
 
 ## Where to go next
 
-The [pattern catalog](../patterns/) is the technique reference for
+The [pattern catalog](patterns/) is the technique reference for
 the pure-side decisions the substrate composes — pure decisions,
 pure state machines, plan/apply, pure data structures. Driver
 authors should know they exist; the substrate uses all four
@@ -269,8 +269,8 @@ underneath.
 is the why; that file is the rule.
 
 The format references for register specs and wire DTOs —
-[`../regspec-format.md`](../regspec-format.md) and
-[`../wirespec-format.md`](../wirespec-format.md) — describe the TOML
+[`../reference/regspec-format.md`](../reference/regspec-format.md) and
+[`../reference/wirespec-format.md`](../reference/wirespec-format.md) — describe the TOML
 shapes that generate the typed MMIO surfaces (`lockjaw_regs::*`,
 `Sdhci`, `Pl011`, `FwCfg`) and the typed wire DTOs
 (`lockjaw_types::wire::*`, `VirtioBlkReqHeader`, `Adma2Descriptor`,

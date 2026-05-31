@@ -185,7 +185,7 @@ pub const CLAIM_ERR: u64 = 1;
 /// `claim_typed` enforces the ordering (drops the guard, then
 /// releases); other callers must follow the same discipline.
 ///
-/// The verified release path is tracked in `docs/tech-debt.md`.
+/// The verified release path is tracked in `docs/tracking/tech-debt.md`.
 /// Request:  msg = [CMD_RELEASE_BY_ADDR, mmio_addr, 0, 0]
 /// Response: msg = [status, 0, 0, 0] where status = CLAIM_OK if the
 ///   address matched a claimed device whose claim_token matches the

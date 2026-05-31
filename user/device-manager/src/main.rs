@@ -163,7 +163,7 @@ pub extern "C" fn _start() -> ! {
     // a real registered controller. On QEMU the cprman device is
     // absent; the phandle stays 0 and every CMD_GET_CLOCK_HANDLE
     // returns NoProvider. See
-    // docs/book-of-lockjaw/03-non-virtualizable-hardware.md for the
+    // docs/architecture/03-non-virtualizable-hardware.md for the
     // arbitration model.
     let cprman_phandle: u32 = {
         let mut found: u32 = 0;
@@ -273,7 +273,7 @@ pub extern "C" fn _start() -> ! {
 // Clock-handle binding + op forwarding (proxy through device-manager)
 // ---------------------------------------------------------------------------
 //
-// See docs/book-of-lockjaw/03-non-virtualizable-hardware.md for the
+// See docs/architecture/03-non-virtualizable-hardware.md for the
 // architectural reasoning. Drivers never receive a direct handle to
 // the clock provider; device-manager is the sole arbiter and forwards
 // validated ops to cprman with the clock_id encoded in the message
@@ -288,7 +288,7 @@ pub extern "C" fn _start() -> ! {
 /// Validates that `controller_phandle` names a registered provider.
 /// Today the only registered provider is cprman (when present in the
 /// DTB); any other phandle returns CLOCK_ERR_NO_PROVIDER. See
-/// docs/book-of-lockjaw/03-non-virtualizable-hardware.md for why
+/// docs/architecture/03-non-virtualizable-hardware.md for why
 /// device-manager is the gatekeeper for non-virtualizable hardware.
 fn handle_get_clock_handle(cprman_phandle: u32, msg: &[u64; 4]) {
     let controller_phandle = msg[1] as u32;

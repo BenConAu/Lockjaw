@@ -153,7 +153,7 @@ Working rules that aren't directly about correctness.
     so its baseline taste is "idiomatic Rust", not "Lockjaw
     architectural rules". Every review prompt (review of a plan,
     review of a staged diff, follow-up via `codex exec resume`)
-    must point Codex at `docs/ben_principles.md` and call out
+    must point Codex at `docs/process/ben_principles.md` and call out
     the principles most relevant to that review (correctness by
     construction, explicit init / no-zero-default discriminants,
     reach for userspace before reaching for the kernel, etc.).
@@ -164,7 +164,7 @@ Working rules that aren't directly about correctness.
     plan v3 sign-off and only surfaced when the human reviewed
     the implementation. Prompt template:
 
-    > "Reviewing <diff/plan>. See `docs/ben_principles.md` for
+    > "Reviewing <diff/plan>. See `docs/process/ben_principles.md` for
     > Lockjaw's architectural rules — especially Tier 3 #13
     > (explicit init / no zero-default discriminants) and Tier 2
     > #6 (reach for userspace before reaching for the kernel).

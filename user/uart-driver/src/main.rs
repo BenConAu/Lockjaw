@@ -98,7 +98,7 @@ fn uart_main(ctx: DriverCtx<Pl011>) -> ! {
     // TXFF spin-loop. On a board with a marginal PL011 (or any TX-
     // broken state) the spin would otherwise hang the driver here
     // and the "server ready" log line would never appear, leading
-    // to a misdiagnosis as init failure. See docs/tech-debt.md
+    // to a misdiagnosis as init failure. See docs/tracking/tech-debt.md
     // ("PL011 TX wait is unbounded") for the deadline-bounded
     // follow-up that makes the spin itself fail-fast.
     puts("uart-driver: server ready\n");

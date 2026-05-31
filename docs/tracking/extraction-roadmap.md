@@ -6,8 +6,8 @@ plan/apply structure, decision function, or pure data structure. It
 also documents what stays kernel-only and why.
 
 For *why* extraction matters and the philosophy behind the architecture,
-read [`book-of-lockjaw/01-architecture.md`](book-of-lockjaw/01-architecture.md).
-For *how* to apply each pattern, read [`patterns/`](patterns/).
+read [`../architecture/01-architecture.md`](../architecture/01-architecture.md).
+For *how* to apply each pattern, read [`patterns/`](../architecture/patterns/).
 
 This file replaces the older `types-extraction-plan.md` and
 `codex-kernel-architecture-work-items.md`. It is the single roadmap.

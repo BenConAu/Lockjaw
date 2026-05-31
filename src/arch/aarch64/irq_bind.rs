@@ -6,7 +6,7 @@ use lockjaw_types::addr::KernelVa;
 /// BCM2711 SPI peripherals which can extend to INTID ~190 (emmc2 is
 /// SPI 126 → INTID 158). 256 leaves comfortable headroom for the
 /// rest of the BCM2711 SPI range. Known limitation: static table,
-/// see docs/tech-debt.md.
+/// see docs/tracking/tech-debt.md.
 ///
 /// (Constant was raised from 96 to 256 in commit ba13c18 as B4.3 of
 /// the post-c1 fix plan, ahead of this IRQ-framework graft, so the

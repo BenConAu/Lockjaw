@@ -4,7 +4,7 @@
 - Shared types belong in lockjaw-types, not duplicated across crates.
 - No `unsafe` unless there is genuinely no alternative. Prefer locals and parameters over `static mut`.
 - Every asm line commented.
-- Delete dead code. Track deferred ideas in `docs/yagni-parking-lot.md`.
+- Delete dead code. Track deferred ideas in `docs/tracking/yagni-parking-lot.md`.
 - Never remove existing comments during refactors. Verify they survive edits.
 - Stage for Codex review before committing non-trivial changes.
 - Instrument before guessing. Test bugs by construction.
@@ -15,7 +15,7 @@
 - Use drop guards for resource cleanup on failure paths, not manual rollback in each error branch.
 - Push pure state and logic into lockjaw-types where possible so it can be tested on the host.
 - QEMU requires dual UARTs + GICv3. Use the Makefile, not bare `-nographic`.
-- **User-mode drivers consume `lockjaw-userlib`, period.** No raw `sys_*` calls in driver source except `sys_exit` (panic-handler termination) and `sys_debug_puts` (diagnostic puts). Boot ceremony goes through `driver_main!` / `virtio_driver_main!` (or composed Tier-A pieces for escape valves). DMA allocation goes through `OwnedDmaMapping` / `BorrowedDmaMapping` / `alloc_dma_backing`; DMA cache-coherence goes through `run_dma_transfer` — for every transfer that runs through the envelope, the framework owns the clean→kick→await→invalidate ordering and the `SyncCapable` gate makes "hand a coherence-incapable mapping to a sync" a compile error, so the driver cannot forget a sync, sync the wrong direction, or invalidate before the device is done (the raw `sys_dma_sync_*` wrappers are `pub(crate)` and not in driver scope). The no-bypass remainder — the driver cannot kick the controller *outside* the envelope — is the `SdhciCommandInit<S>` direction tracked in `docs/tech-debt.md`. Event loops go through `run_event_server` / `run_block_server`. IPC framing is the framework's job. The regime is enforced by construction (the `lockjaw-userlib` root re-export gives driver scope only the allowlist, so forbidden `sys_*` are unreachable from `use lockjaw_userlib::*;`) and backstopped by `cargo xtask check-driver-unsafe` (run inside `make build`; syn AST + macro token scan + raw-ident normalization). If a driver wants to do something the framework doesn't expose, fix the framework — copying raw syscalls into a driver is debt accrual that the next driver author will inherit.
+- **User-mode drivers consume `lockjaw-userlib`, period.** No raw `sys_*` calls in driver source except `sys_exit` (panic-handler termination) and `sys_debug_puts` (diagnostic puts). Boot ceremony goes through `driver_main!` / `virtio_driver_main!` (or composed Tier-A pieces for escape valves). DMA allocation goes through `OwnedDmaMapping` / `BorrowedDmaMapping` / `alloc_dma_backing`; DMA cache-coherence goes through `run_dma_transfer` — for every transfer that runs through the envelope, the framework owns the clean→kick→await→invalidate ordering and the `SyncCapable` gate makes "hand a coherence-incapable mapping to a sync" a compile error, so the driver cannot forget a sync, sync the wrong direction, or invalidate before the device is done (the raw `sys_dma_sync_*` wrappers are `pub(crate)` and not in driver scope). The no-bypass remainder — the driver cannot kick the controller *outside* the envelope — is the `SdhciCommandInit<S>` direction tracked in `docs/tracking/tech-debt.md`. Event loops go through `run_event_server` / `run_block_server`. IPC framing is the framework's job. The regime is enforced by construction (the `lockjaw-userlib` root re-export gives driver scope only the allowlist, so forbidden `sys_*` are unreachable from `use lockjaw_userlib::*;`) and backstopped by `cargo xtask check-driver-unsafe` (run inside `make build`; syn AST + macro token scan + raw-ident normalization). If a driver wants to do something the framework doesn't expose, fix the framework — copying raw syscalls into a driver is debt accrual that the next driver author will inherit.
 
 # Prioritization: correctness over speed
 
@@ -25,17 +25,17 @@ achieve at this scale. Development speed is already 100x a human
 team — use that leverage for correctness, not throughput.
 
 The architecture is documented in three places:
-- `docs/book-of-lockjaw/01-architecture.md` — philosophy and the
+- `docs/architecture/01-architecture.md` — philosophy and the
   push/pull/plan-apply taxonomy.
-- `docs/patterns/` — technique catalog with canonical examples.
-- `docs/extraction-roadmap.md` — what's left to extract, ranked.
+- `docs/architecture/patterns/` — technique catalog with canonical examples.
+- `docs/tracking/extraction-roadmap.md` — what's left to extract, ranked.
 
 When choosing what to work on next:
 - **Prefer hard wins over fast wins.** The value is in making the
   architecture safer, not in inflating test counts with easy
   extractions.
 - **Follow the push→pull rubric.** Convert the riskiest push-shaped
-  kernel code to pull or plan/apply first. See `docs/patterns/` for
+  kernel code to pull or plan/apply first. See `docs/architecture/patterns/` for
   the four shapes and how to recognize them.
 - **Make illegal states unrepresentable.** If the type system can
   prevent a bug class, prefer that over runtime assertions. Narrow

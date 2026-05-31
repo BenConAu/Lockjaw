@@ -16,7 +16,7 @@ a host-testable core.
 This chapter is the philosophical foundation. It explains *why* the
 architecture is shaped the way it is, what bugs that shape prevents,
 and what the taxonomy of integration patterns means in practice. The
-sibling [pattern catalog](../patterns/) shows you *how* to apply it.
+sibling [pattern catalog](patterns/) shows you *how* to apply it.
 
 ## The realization came from a review cycle
 
@@ -191,12 +191,12 @@ context behind them.
 ## Where to go next
 
 If you're refactoring existing code into this architecture, start
-with [`../patterns/README.md`](../patterns/README.md) — the catalog
+with [`patterns/README.md`](patterns/README.md) — the catalog
 has a decision flowchart and four pattern docs, each with a canonical
 example.
 
 If you're choosing what to extract next, see
-[`../extraction-roadmap.md`](../extraction-roadmap.md) — the ranked
+[`../tracking/extraction-roadmap.md`](../tracking/extraction-roadmap.md) — the ranked
 list of remaining push-shaped subsystems.
 
 If you want the historical narrative — how the architecture was

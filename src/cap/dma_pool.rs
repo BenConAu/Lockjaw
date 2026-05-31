@@ -11,7 +11,7 @@
 ///
 /// **Cacheable direct-map participation** (post C1 of the
 /// cacheable-DMA migration — see
-/// `docs/cacheable-dma-migration-plan.md`): the pool's 2 MiB L2
+/// `docs/history/cacheable-dma-migration-plan.md`): the pool's 2 MiB L2
 /// block participates in the kernel TTBR1 direct map as Normal
 /// Cacheable Inner+Outer WB. Per-process user mappings of pool
 /// pages are also Normal Cacheable, enforced by the rejection

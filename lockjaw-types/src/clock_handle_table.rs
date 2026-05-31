@@ -2,7 +2,7 @@
 ///
 /// device-manager arbitrates non-virtualizable clock hardware on
 /// behalf of drivers (see
-/// `docs/book-of-lockjaw/03-non-virtualizable-hardware.md`). Each
+/// `docs/architecture/03-non-virtualizable-hardware.md`). Each
 /// `acquire` from a driver yields an opaque `handle_id` that maps to
 /// `(controller_phandle, clock_id)`; subsequent `CLOCK_OP_*` calls
 /// look up the binding by `(caller_token, handle_id)` and forward
@@ -20,7 +20,7 @@
 ///    another driver's `handle_id` and pivot to its clock.
 /// 3. `caller_token` is `NonZeroU64`. Token 0 is the kernel's
 ///    "no caller" sentinel (the master / receive-only side of an
-///    Endpoint, see `docs/book-of-lockjaw/02-handle-identity-tokens.md`)
+///    Endpoint, see `docs/architecture/02-handle-identity-tokens.md`)
 ///    and would alias the empty-slot sentinel inside this table —
 ///    the type makes that case unrepresentable instead of relying
 ///    on every call site to validate.

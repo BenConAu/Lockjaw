@@ -41,7 +41,7 @@ impl BootstrapBuf {
     fn set_va(&mut self, va: u64) { self.va = va; }
 
     /// Full 4-step teardown. Must be called on the normal (non-halt) path.
-    /// Order matches docs/partition-manager-plan.md §6 and fat32-server:
+    /// Order matches docs/history/partition-manager-plan.md §6 and fat32-server:
     ///   sys_unmap → VMEM.free_unmapped → upstream.free_buffer → sys_close_handle
     ///
     /// Type-level VA-leak-on-unmap-failure invariant: VMEM accepts

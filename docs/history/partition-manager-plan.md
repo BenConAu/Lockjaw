@@ -411,7 +411,7 @@ MBR-layout regressions without flashing.
 ## File layout
 
 ```
-docs/partition-manager-plan.md                      (this doc)
+docs/history/partition-manager-plan.md                      (this doc)
 lockjaw-types/src/partition.rs                      (~150 LOC + tests)
 lockjaw-types/src/lib.rs                            (mod partition;)
 user/partition-manager/Cargo.toml

@@ -8,7 +8,7 @@
 //! No allocation — the storage is the TCB's own page.
 //!
 //! `remove`, `is_empty`, and `peek_head` have no callers yet — retained
-//! for process teardown (see docs/yagni-parking-lot.md).
+//! for process teardown (see docs/tracking/yagni-parking-lot.md).
 
 use crate::ipc::endpoint::EndpointObject;
 use crate::mm::kernel_ptr::KernelMut;

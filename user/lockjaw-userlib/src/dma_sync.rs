@@ -18,7 +18,7 @@
 //! the ABI surface is reserved, no behaviour yet. C1 lands the
 //! real handlers along with the substrate flip (DmaPool cacheable +
 //! kernel direct-map inclusion). See
-//! `docs/cacheable-dma-migration-plan.md`.
+//! `docs/history/cacheable-dma-migration-plan.md`.
 //!
 //! Both syscalls accept any handle the kernel can validate as a
 //! DmaPool-origin PageSet. Buddy-origin Cacheable PageSets (used

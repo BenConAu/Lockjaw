@@ -20,7 +20,7 @@ pub mod cprman;
 // ---------------------------------------------------------------------------
 //
 // Two legs of the same logical clock op (see
-// `docs/book-of-lockjaw/03-non-virtualizable-hardware.md` for why
+// `docs/architecture/03-non-virtualizable-hardware.md` for why
 // device-manager proxies):
 //
 // 1. driver  →  device-manager:

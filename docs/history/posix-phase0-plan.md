@@ -2,7 +2,7 @@
 
 ## Context
 
-First step of the POSIX personality server plan (`docs/posix-musl-plan.md`).
+First step of the POSIX personality server plan (`docs/plans/posix-musl-plan.md`).
 A C program compiled with `aarch64-linux-musl-gcc -static` that calls
 `puts("hello, lockjaw")` runs on Lockjaw in QEMU.
 

@@ -2,13 +2,13 @@
 ///
 /// The DMA pool is a physically-contiguous region of RAM reserved at
 /// kernel boot. Post-C1 of the cacheable-DMA migration (see
-/// `docs/cacheable-dma-migration-plan.md`) it participates in the
+/// `docs/history/cacheable-dma-migration-plan.md`) it participates in the
 /// kernel TTBR1 direct map as Cacheable Inner+Outer WB and user
 /// processes map it Cacheable as well (single-attribute invariant
 /// preserved: Cacheable everywhere). Coherence with devices is
 /// maintained via `sys_dma_sync_for_cpu` (`dc civac` —
 /// clean-and-invalidate before CPU reads device-written data — see
-/// docs/post-c1-fix-plan.md §B2.1 for why civac, not ivac) and
+/// docs/history/post-c1-fix-plan.md §B2.1 for why civac, not ivac) and
 /// `sys_dma_sync_for_device` (`dc cvac` — clean before device reads
 /// CPU-written data) at handoff points, mirroring Linux's
 /// `dma_sync_for_cpu` / `dma_sync_for_device` API.

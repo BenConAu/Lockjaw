@@ -9,7 +9,7 @@ function lives in lockjaw-types and is host-tested.
 
 For *why* this architecture exists — the bugs that motivated it, the
 taxonomy that names it, the principles behind it — read
-[`../book-of-lockjaw/01-architecture.md`](../book-of-lockjaw/01-architecture.md).
+[`../01-architecture.md`](../01-architecture.md).
 This catalog is the *how*.
 
 ## The four patterns
@@ -75,7 +75,7 @@ with "must come before X" comments is a plan/apply.
   (`PhysAddr`, `Rights`, `HandleEntry`) are pure data — useful to
   share, but no architectural pattern.
 - It isn't a roadmap of what to extract next. See
-  [`../extraction-roadmap.md`](../extraction-roadmap.md) for that.
+  [`../../tracking/extraction-roadmap.md`](../../tracking/extraction-roadmap.md) for that.
 - It isn't a substitute for reading the canonical examples. Each
   pattern doc points you at one — the code is the most precise
   teaching available.

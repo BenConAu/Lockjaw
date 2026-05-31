@@ -571,7 +571,7 @@ pub unsafe fn setup_guard_pages(guard_pages: &[PhysAddr]) {
 
 // M6 sub-commit 2a step 2's `exclude_dma_pool_from_direct_map`
 // was deleted in C1 of the cacheable-DMA migration (see
-// docs/cacheable-dma-migration-plan.md). The pool now
+// docs/history/cacheable-dma-migration-plan.md). The pool now
 // participates in the kernel TTBR1 direct map as Cacheable
 // Inner+Outer WB; sync syscalls maintain coherency at the
 // device-handoff points instead of preventing the alias by

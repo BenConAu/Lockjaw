@@ -118,7 +118,7 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
 /// `ht.insert` failure the guard drops and unmaps, returning the
 /// VA range to the KVM free list (the donated physical frame still
 /// leaks in that path — same as the pre-migration leak when no
-/// destroy path exists; tracked in `docs/tech-debt.md`).
+/// destroy path exists; tracked in `docs/tracking/tech-debt.md`).
 fn create_kernel_object_kvm(
     ps_handle: u32,
     make_kind: fn(lockjaw_types::addr::KernelVa) -> lockjaw_types::object::HandleKind,
@@ -490,7 +490,7 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     // is the second allowed attribute for ExternallyOwned because
     // MMIO physical regions are intrinsically Device) — only the
     // chosen attribute changes from NormalNonCacheable to Normal
-    // for DmaPool. See docs/cacheable-dma-migration-plan.md.
+    // for DmaPool. See docs/history/cacheable-dma-migration-plan.md.
     use lockjaw_types::pageset_table::PageSetOrigin;
     use lockjaw_types::vmem::MapMemoryAttribute;
     let origin = match header.raw().origin() {
@@ -748,7 +748,7 @@ fn sys_recv_nb(ctx: &mut ExceptionContext) -> SyscallReturn {
 /// Returns: standard 2-register syscall convention — x0 = SyscallError
 /// code (0 on success), x1 = bitmask. Bit N set = entry N became ready;
 /// mask == 0 = deadline expired before any object fired (timeout
-/// encoding — see docs/syscalls.md S6 for the eternal-truth caveat).
+/// encoding — see docs/reference/syscalls.md S6 for the eternal-truth caveat).
 ///
 /// Two roles deliberately collapse onto this one syscall:
 /// - `count > 0`: wait on objects, optionally with a timeout.
@@ -968,7 +968,7 @@ fn sys_export_handle(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         // so each recipient gets a distinct identity the server can
         // distinguish via sys_query_caller_token.
         //
-        // See docs/book-of-lockjaw/02-handle-identity-tokens.md for the
+        // See docs/architecture/02-handle-identity-tokens.md for the
         // requirement → implementation mapping.
         let export_kind = match export_entry.kind {
             lockjaw_types::object::HandleKind::Endpoint { kva, .. } => {
@@ -1367,7 +1367,7 @@ fn sys_query_caller_token() -> u64 {
 ///
 /// Internally clean-and-invalidates the covering cache lines via
 /// `dc civac` (B2.1 — see `src/arch/aarch64/cache.rs` module doc
-/// and `docs/post-c1-fix-plan.md` §B2.1 for the rationale; `dc
+/// and `docs/history/post-c1-fix-plan.md` §B2.1 for the rationale; `dc
 /// ivac` was the pre-B2.1 mnemonic but is UNPREDICTABLE on dirty
 /// lines per ARM DDI 0487 §D7.4.2). **The device's DMA write
 /// drain is the device's own responsibility**, signalled by its

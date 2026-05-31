@@ -67,7 +67,7 @@ impl KernelStackBase {
 /// live), so the scheduler must preserve the entire architectural V
 /// register file v0-v31 plus FPCR/FPSR — AAPCS64 caller/callee-saved
 /// discipline does not apply at a preempt boundary, only at an
-/// explicit function-call boundary. See docs/post-c1-fix-plan.md B1.1
+/// explicit function-call boundary. See docs/history/post-c1-fix-plan.md B1.1
 /// for the path-walk that proves saving only v8-v15 leaves the bug.
 ///
 /// Field order is constrained by the AArch64 load/store-pair encoding:

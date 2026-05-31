@@ -78,7 +78,7 @@ pub enum HandleKind {
     ///   handle with token 0" unrepresentable.
     ///
     /// See `lockjaw_types::ipc_token::mint_caller_token` and
-    /// `docs/book-of-lockjaw/02-handle-identity-tokens.md` for the requirement.
+    /// `docs/architecture/02-handle-identity-tokens.md` for the requirement.
     Endpoint { kva: crate::addr::KernelVa, caller_token: Option<core::num::NonZeroU64> } = 3,
     Notification { kva: crate::addr::KernelVa } = 4,
     Reply { kva: crate::addr::KernelVa } = 5,

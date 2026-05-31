@@ -25,8 +25,8 @@ Phases 1-8 summary section for the link back here.
 ## Context
 
 After Phase 3 commit `597db1f`, paired architectural review
-(`docs/typed-mmio-feedback-597db1f.md` Codex,
-`docs/typed-mmio-feedback-597db1f-claude.md` Claude) converged
+(`docs/history/typed-mmio-feedback-597db1f.md` Codex,
+`docs/history/typed-mmio-feedback-597db1f-claude.md` Claude) converged
 independently on the same set of framework shortcomings. Subsequent
 review of *this plan's first draft* added a tighter set of corrections
 about scope, abstraction-layer mixing, naming, and acceptance gates.

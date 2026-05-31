@@ -230,7 +230,7 @@ pub fn create_process(
         // master or a previously-minted sender. The child gets its own
         // identity that the server can distinguish from the parent's.
         //
-        // See docs/book-of-lockjaw/02-handle-identity-tokens.md.
+        // See docs/architecture/02-handle-identity-tokens.md.
         let child_kind = match parent.kind {
             lockjaw_types::object::HandleKind::Endpoint { kva, .. } => {
                 let token = {

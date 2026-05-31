@@ -84,7 +84,7 @@ impl AddressSpaceBuilder {
         // No kernel identity in user TTBR0 anymore. Pre-relink, every
         // user TTBR0 carried L1[1] (1 GB block of kernel RAM) + L2[4]
         // (device MMIO) because some kernel-mode code path on EL0
-        // entry depended on it (see docs/relink-notes.md "Phase 0:
+        // entry depended on it (see docs/history/relink-notes.md "Phase 0:
         // what depended on the user-TTBR0 kernel identity"). After
         // the relink (commit 1b), the kernel image lives in L0[1]
         // (TTBR1) and no longer references lower-half PAs, so the

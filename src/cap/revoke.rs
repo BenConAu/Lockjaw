@@ -5,7 +5,7 @@
 //! revocation can succeed, then (in a paired apply call) clears the
 //! PTEs and slots.
 //!
-//! See `docs/handle-revocation-plan.md` for the design rationale.
+//! See `docs/history/handle-revocation-plan.md` for the design rationale.
 //! Caller must hold the GKL across the validate→apply pair; under
 //! GKL, no other thread can mutate handle tables or page tables, so
 //! the apply walk's action stream matches the validate walk's

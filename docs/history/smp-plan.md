@@ -18,7 +18,7 @@ Before SMP work begins, the scheduler must properly handle idle threads.
 Currently, threads that call `sys_yield` in a loop remain Ready and consume
 a full time slice every scheduling round. The scheduler needs a `sys_exit`
 or `sys_park` syscall that marks a thread as Blocked so idle threads do not
-burn CPU cycles. See `docs/tech-debt.md` for the tracking entry.
+burn CPU cycles. See `docs/tracking/tech-debt.md` for the tracking entry.
 
 ## Architecture decisions
 

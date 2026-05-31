@@ -10,7 +10,7 @@ mod check_driver_unsafe;
 /// this fails immediately — catches large locals before they interact
 /// with call depth. Set to 1600 to accommodate create_process's frame
 /// (~1552 in debug) — the AddressSpaceBuilder struct lives on its stack.
-/// See docs/stack-budget.md.
+/// See docs/reference/stack-budget.md.
 const PER_FUNCTION_CAP: u64 = 1600;
 
 /// Total kernel stack budget: normal path + worst-case nested exception.
@@ -53,7 +53,7 @@ fn main() {
             eprintln!("  check-pointers         Verify all pointer casts have SAFETY comments");
             eprintln!("  check-vtables          Scan data sections for absolute code pointers");
             eprintln!("  check-init-size        Verify init ELF fits in kernel mapping buffer");
-            eprintln!("  check-linker-symbols   Enforce docs/linker-symbol-audit.md allowlist");
+            eprintln!("  check-linker-symbols   Enforce docs/reference/linker-symbol-audit.md allowlist");
             eprintln!("  check-kernel-no-neon   Verify kernel binary emits no NEON/FP instructions");
             eprintln!("  check-driver-unsafe    Enforce #![deny(unsafe_code)] + no raw syscalls in drivers");
             eprintln!("  gen-regs [--check]     Generate lockjaw-regs from user/regspecs/*.toml");
@@ -1439,7 +1439,7 @@ fn has_pointer_cast(line: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Enforce that every linker-symbol-to-integer site in `src/` is
-/// classified in `docs/linker-symbol-audit.md`. Catches the
+/// classified in `docs/reference/linker-symbol-audit.md`. Catches the
 /// regression class where a future PR adds a `&__symbol as u64`
 /// (or a function-pointer cast for `_secondary_start`) that
 /// silently feeds a PA consumer and breaks after the kernel relink.
@@ -1453,7 +1453,7 @@ fn check_linker_symbols() {
 
     println!("=== Linker-Symbol Audit Check ===");
     println!("  Every &__symbol / &raw const __symbol / fn-ptr cast in src/");
-    println!("  must be classified in docs/linker-symbol-audit.md.");
+    println!("  must be classified in docs/reference/linker-symbol-audit.md.");
     println!();
 
     let src_dir = Path::new("src");
@@ -1461,9 +1461,9 @@ fn check_linker_symbols() {
         eprintln!("ERROR: src/ directory not found (run from project root)");
         process::exit(1);
     }
-    let audit_path = Path::new("docs/linker-symbol-audit.md");
+    let audit_path = Path::new("docs/reference/linker-symbol-audit.md");
     if !audit_path.exists() {
-        eprintln!("ERROR: docs/linker-symbol-audit.md not found");
+        eprintln!("ERROR: docs/reference/linker-symbol-audit.md not found");
         process::exit(1);
     }
 
@@ -1531,7 +1531,7 @@ fn check_linker_symbols() {
     eprintln!("=== Linker-symbol audit check FAILED ===");
     if !missing.is_empty() {
         eprintln!();
-        eprintln!("Source sites missing from docs/linker-symbol-audit.md:");
+        eprintln!("Source sites missing from docs/reference/linker-symbol-audit.md:");
         for (f, l) in &missing {
             eprintln!("  {}:{}", f, l);
         }
@@ -1544,7 +1544,7 @@ fn check_linker_symbols() {
         }
     }
     eprintln!();
-    eprintln!("Add a row in the right table of docs/linker-symbol-audit.md");
+    eprintln!("Add a row in the right table of docs/reference/linker-symbol-audit.md");
     eprintln!("for any new linker-symbol-to-integer site, classified as");
     eprintln!("VA-image / PA / PA-prepivot-static / DISPLAY.");
     process::exit(1);
@@ -1654,7 +1654,7 @@ fn check_kernel_no_neon() {
     eprintln!("If a kernel feature genuinely needs FP/SIMD, either move it");
     eprintln!("to a user-mode server (microkernel-coherent choice) or extend");
     eprintln!("SAVE_REGS/RESTORE_REGS and switch the target back. The current");
-    eprintln!("design choice (commit e52450c + docs/post-c1-fix-plan.md B1.1)");
+    eprintln!("design choice (commit e52450c + docs/history/post-c1-fix-plan.md B1.1)");
     eprintln!("is no kernel FP/SIMD.");
     process::exit(1);
 }

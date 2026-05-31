@@ -70,14 +70,14 @@ Type-level lockdown:
   size; reclamation is a closed-form optimization for later.
 - ASID-based TLB management. Single-core today, no ASIDs allocated.
 - Per-CPU KVM pools. Will matter when GKL breaks up.
-- Freelist overflow buffer (`docs/tech-debt.md` — KVM free path: 64-
+- Freelist overflow buffer (`docs/tracking/tech-debt.md` — KVM free path: 64-
   page deferred-dealloc buffer). Safe under today's call patterns;
   will become unsafe when more migrations land.
 
 ## Cross-references
 
-- `docs/yagni-parking-lot.md` — features built ahead of the call
+- `docs/tracking/yagni-parking-lot.md` — features built ahead of the call
   sites that need them, to be removed if they don't.
-- `docs/tech-debt.md` — features needed but not yet built.
-- `docs/patterns/` — push/pull/plan-apply pattern catalog the KVM
+- `docs/tracking/tech-debt.md` — features needed but not yet built.
+- `docs/architecture/patterns/` — push/pull/plan-apply pattern catalog the KVM
   allocator was built against.

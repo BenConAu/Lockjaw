@@ -19,7 +19,7 @@
 //! composes its SIGNAL_ENABLE set without one of these bits" is NOT
 //! catchable here (the composition lives in the driver binary, which
 //! has no host-test harness, and QEMU does not emulate SDHCI error
-//! IRQs) — see docs/tech-debt.md "emmc2 error-IRQ enable is
+//! IRQs) — see docs/tracking/tech-debt.md "emmc2 error-IRQ enable is
 //! Pi-fault-path-only" for that gap.
 
 use lockjaw_regs::sdhci::{

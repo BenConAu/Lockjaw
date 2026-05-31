@@ -106,7 +106,7 @@ posix-server: child exit
 
 **Phase 19 -- Kernel Image Relink + Pi 4B Bring-Up Validation.** Kernel image relinked at a fixed higher-half VA in a dedicated L0[1] region (`0xFFFF_0080_0000_0000`), decoupled from the physical load address. Boot trampoline discovers actual load PA via PC-relative (`adr _start`) and computes `KERNEL_PHYS_OFFSET = load_PA - LINKER_BASE`. `init_kernel_image_map` walks every kernel image page and writes 4 KB L3 PTEs mapping `load_PA + offset` → `LINKER_BASE + offset` (4 KB granule chosen specifically so any load-PA alignment works, including Pi 4B's `0x80000`). Pivot uses the boot-discovered shift instead of a constant `KERNEL_VA_OFFSET`. New `KernelImageVa` newtype keeps the kernel-image VA regime distinct from the KVM pool's `KernelVa`. New `KernelStackBase` enum (`Image` / `Pool` variants) makes the kernel-stack regime explicit at the type level so `finish_exit`'s free-path choice cannot regress. New `xtask check-linker-symbols` enforces an audit doc listing every linker-symbol-to-integer site with classification. Userspace TTBR0 no longer carries the kernel identity map (L1[1] kernel RAM block + L2[4] device MMIO are gone — userspace device drivers still get MMIO via the normal `sys_map_pages` + `MAP_FLAG_DEVICE` path). Same binary boots end-to-end on QEMU virt and a real Pi 4B (firmware relocates to PA `0x80000`); the only PA-aware input is the DTB.
 
-**Phase 20 -- Typed MMIO Substrate + Driver Regime by Construction.** Drivers no longer hand-pack register bits, hand-byteswap wire DTOs, hand-sequence DMA cache ops, or touch raw syscalls. Typed register accessors generated from regspecs (`lockjaw-regs::{pl011, sdhci, virtio_mmio, fw_cfg, cprman}`); typed wire DTOs generated from wirespecs (`lockjaw-types::wire::{virtio, fwcfg, ramfb}`); each TOML format documented at `docs/regspec-format.md` and `docs/wirespec-format.md`. `OwnedDmaMapping<O>` / `DmaBacking<O>` carry the DMA allocation origin in the type (sealed `DmaOrigin`: `BuddyOrigin` for coherent-bus pages, `DmaPoolOrigin` for the cache-maintenance pool — only the latter implements the sealed `SyncCapable` trait). `run_dma_transfer` (`lockjaw-userlib::dma_transfer`) is the coherence envelope: the driver declares the `DmaRegion`s + a `DmaCompletion` impl that says "when is the device done" + a `kick` closure that programs and issues; the framework owns the clean→kick→await→invalidate ordering, including the B2.2 pre-clean of `FromDevice` regions and the post-completion invalidate. Handing a `BuddyOrigin` mapping to a sync is a compile error (the `dma_region` method is `impl<O: SyncCapable>`); forgetting the pre-clean or running the invalidate before the device finished is structurally impossible. emmc2's ADMA2 read converted to a two-envelope shape — outer buffer (`FromDevice` / `Immediate` / per-block kick loop) + per-block inner descriptor (`ToDevice` / `SdhciDataCompletion` wrapping the IRQ wait + the load-bearing B4.1 `DAT_INHIBIT` drain). The driver `DmaBuf` slot now owns a move-only `DmaBacking<DmaPoolOrigin>` and hands out `&`-borrows; the old all-zero sentinel is gone. `#![deny(unsafe_code)]` at every driver crate root (the boot-stub macro expansion is the single audited `#[allow(unsafe_code)]` site). `lockjaw-userlib`'s root `pub use syscall::*` trimmed to the two-name allowlist (`sys_exit`, `sys_debug_puts`); forbidden `sys_*` are no longer reachable from `use lockjaw_userlib::*;`. The only remaining path is the explicit `lockjaw_userlib::syscall::sys_foo`, which the `check-driver-unsafe` xtask flags via `syn` AST analysis (covers brace imports, renames, UFCS qself, spaced paths, turbofish), a `visit_macro` token-stream walk (covers `macro_rules!` bodies and macro invocation args), and an `ident_str` raw-ident normalization (`r#syscall` matches `syscall`). Wired into `make build` alongside the existing gen-regs / gen-wires `--check` steps. Driver-substrate book chapter at `docs/book-of-lockjaw/04-driver-substrate.md` frames DMA coherence by construction as the worked example; the `SdhciCommandInit<S>` no-bypass operation layer (the rubric R3 remainder — gating raw DMA PAs and command issuance behind a type-state layer) is tracked in `docs/tech-debt.md` against the second SDHCI consumer. Pi 4B re-validated after the userspace-wide re-export restructure: `[BLOCKDEV] /dev/sd0 ready ... selftest read OK`, `[FAT32-TEST] read 17 bytes: hello from fat32`, `posix-hello: hello from fat32`, `[NEON-CANARY] PASS`.
+**Phase 20 -- Typed MMIO Substrate + Driver Regime by Construction.** Drivers no longer hand-pack register bits, hand-byteswap wire DTOs, hand-sequence DMA cache ops, or touch raw syscalls. Typed register accessors generated from regspecs (`lockjaw-regs::{pl011, sdhci, virtio_mmio, fw_cfg, cprman}`); typed wire DTOs generated from wirespecs (`lockjaw-types::wire::{virtio, fwcfg, ramfb}`); each TOML format documented at `docs/reference/regspec-format.md` and `docs/reference/wirespec-format.md`. `OwnedDmaMapping<O>` / `DmaBacking<O>` carry the DMA allocation origin in the type (sealed `DmaOrigin`: `BuddyOrigin` for coherent-bus pages, `DmaPoolOrigin` for the cache-maintenance pool — only the latter implements the sealed `SyncCapable` trait). `run_dma_transfer` (`lockjaw-userlib::dma_transfer`) is the coherence envelope: the driver declares the `DmaRegion`s + a `DmaCompletion` impl that says "when is the device done" + a `kick` closure that programs and issues; the framework owns the clean→kick→await→invalidate ordering, including the B2.2 pre-clean of `FromDevice` regions and the post-completion invalidate. Handing a `BuddyOrigin` mapping to a sync is a compile error (the `dma_region` method is `impl<O: SyncCapable>`); forgetting the pre-clean or running the invalidate before the device finished is structurally impossible. emmc2's ADMA2 read converted to a two-envelope shape — outer buffer (`FromDevice` / `Immediate` / per-block kick loop) + per-block inner descriptor (`ToDevice` / `SdhciDataCompletion` wrapping the IRQ wait + the load-bearing B4.1 `DAT_INHIBIT` drain). The driver `DmaBuf` slot now owns a move-only `DmaBacking<DmaPoolOrigin>` and hands out `&`-borrows; the old all-zero sentinel is gone. `#![deny(unsafe_code)]` at every driver crate root (the boot-stub macro expansion is the single audited `#[allow(unsafe_code)]` site). `lockjaw-userlib`'s root `pub use syscall::*` trimmed to the two-name allowlist (`sys_exit`, `sys_debug_puts`); forbidden `sys_*` are no longer reachable from `use lockjaw_userlib::*;`. The only remaining path is the explicit `lockjaw_userlib::syscall::sys_foo`, which the `check-driver-unsafe` xtask flags via `syn` AST analysis (covers brace imports, renames, UFCS qself, spaced paths, turbofish), a `visit_macro` token-stream walk (covers `macro_rules!` bodies and macro invocation args), and an `ident_str` raw-ident normalization (`r#syscall` matches `syscall`). Wired into `make build` alongside the existing gen-regs / gen-wires `--check` steps. Driver-substrate book chapter at `docs/architecture/04-driver-substrate.md` frames DMA coherence by construction as the worked example; the `SdhciCommandInit<S>` no-bypass operation layer (the rubric R3 remainder — gating raw DMA PAs and command issuance behind a type-state layer) is tracked in `docs/tracking/tech-debt.md` against the second SDHCI consumer. Pi 4B re-validated after the userspace-wide re-export restructure: `[BLOCKDEV] /dev/sd0 ready ... selftest read OK`, `[FAT32-TEST] read 17 bytes: hello from fat32`, `posix-hello: hello from fat32`, `[NEON-CANARY] PASS`.
 
 ### Unsafe reduction
 
@@ -173,7 +173,7 @@ make test-qemu        # QEMU integration tests only
 make check-stack            # Stack depth and call graph analysis
 make check-pointers         # Pointer cast SAFETY annotation check
 make check-vtables          # Scan .rodata/.data for unauthorized code pointers
-make check-linker-symbols   # Enforce docs/linker-symbol-audit.md allowlist
+make check-linker-symbols   # Enforce docs/reference/linker-symbol-audit.md allowlist
 make objdump                # Disassemble the kernel
 ```
 
@@ -276,34 +276,16 @@ musl-lockjaw/                # Patched musl 1.2.5 (downloaded by build.sh)
   patches/                   # crt_arch.h (SP adjust), syscall_arch.h (SVC redirect)
   src/shim.c                 # lockjaw_syscall: bootstrap handshake + IPC dispatch + local brk
 
-docs/                        # Book of Lockjaw -- design documentation
-  book-of-lockjaw/           # Architecture chapters (philosophy + taxonomy)
-  patterns/                  # Pattern catalog: 4 shapes for kernel↔types integration
-  memory-model.md            # Why the kernel never allocates
-  object-model.md            # PageSets, handles, the create-info pattern
-  higher-half-kernel.md      # Why the kernel lives in the upper VA half
-  kernel-drivers.md          # Why GIC and timer are the only kernel drivers
-  threads.md                 # Context switching and preemptive scheduling
-  syscalls.md                # Syscall ABI, EL0 drop, yield
-  ipc.md                     # IPC design, the two ABIs, message registers
-  process-creation.md        # Userspace-driven process creation
-  stack-budget.md            # Stack budget analysis and rationale for 8KB
-  tech-debt.md               # Known limitations and planned fixes
-  extraction-roadmap.md      # Push-shaped code remaining to extract, ranked
-  yagni-parking-lot.md       # Removed code tracked for future phases
-  development-journal.md     # Journal entries from the AI collaborator (1-11)
-  paired-review-workflow.md  # Orchestrator-side guide to running codex + opus paired review on staged diffs
-  regspec-format.md          # Reference for the regspec TOML schema (consumed by xtask gen-regs)
-  wirespec-format.md         # Reference for the wirespec TOML schema (consumed by xtask gen-wires)
-  reviewer-mode.md           # Operating instructions the opus reviewer reads at the start of every paired review
-  reviewer-mode-codex.md     # Operating instructions the codex reviewer reads at the start of every paired review
-  kernel-vmem-roadmap.md     # Kernel VA allocator + relink roadmap
-  linker-symbol-audit.md     # Every linker-symbol-to-integer site classified
-  relink-notes.md            # Phase 0 diagnostic: what depended on the user-TTBR0 kernel identity
-  ben_principles.md          # Personal engineering principles (Tier 1-4)
-  handle-revocation-plan.md  # Plan for two-phase consume_pageset + sys_create_process restructure
-  posix-musl-plan.md         # Multi-phase plan for the musl personality (Phase 0/1/2 done)
-  posix-phase2-mmap-plan.md  # Phase 2 mmap design + sub-phase breakdown
+docs/                        # Project documentation (see docs/README.md for the full index)
+  architecture/              # Book of Lockjaw chapters + pattern catalog (durable design)
+  reference/                 # How the code works today: memory model, IPC, syscalls, scheduler, regspec/wirespec format, etc.
+  process/                   # Principles, paired-review workflow, reviewer-agent system prompts
+  tracking/                  # Living backlogs: tech-debt, yagni-parking-lot, extraction-roadmap, todos
+  plans/                     # Active multi-phase plans (currently posix-musl-plan.md)
+  journals/                  # Chronological development journals (1-11), preserved verbatim
+  history/                   # Completed plans, preserved verbatim for design rationale
+  references/                # External materials: BCM2711 datasheet, u-boot SDHCI source
+  archive/                   # Shelved-but-revivable internal work (patches)
 
 xtask/                       # Build tools
   src/main.rs                # check-stack and check-pointers commands

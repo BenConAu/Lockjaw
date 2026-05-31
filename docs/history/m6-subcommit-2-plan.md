@@ -2,7 +2,7 @@
 
 ## Open design problem (must resolve before coding)
 
-The M6 plan (`docs/emmc2-block-storage-plan.md`, lines 549–559) says
+The M6 plan (`docs/history/emmc2-block-storage-plan.md`, lines 549–559) says
 "audit the MAIR table; add a Normal-Non-Cacheable entry if not present"
 and map ADMA2 buffers with `NormalNonCacheable` via `sys_map_pages`.
 
@@ -190,7 +190,7 @@ edit:
 - Update *all* comments that name "16 bytes" or "byte offset 16" in
   `pageset_table.rs` (lines 26, 27, 57, 63, 721, plus any others
   the audit catches).
-- Update `docs/posix-phase2-mmap-plan.md:65` and
+- Update `docs/history/posix-phase2-mmap-plan.md:65` and
   `docs/development-journal-9.md:103` if they pin the same number.
 - Re-run the size-pin tests — `header_metadata_size_is_16_bytes`
   becomes `header_metadata_size_is_24_bytes` (or whatever the new
@@ -294,7 +294,7 @@ rejection fires.
     rejection points).
   - `create_process` with a DmaPool PageSet in the mapping list
     returns INVALID_PARAMETER.
-- `docs/syscalls.md`: SYS_ALLOC_DMA_PAGES row added with note about
+- `docs/reference/syscalls.md`: SYS_ALLOC_DMA_PAGES row added with note about
   using `sys_query_pageset_phys` for the address; sys_map_pages row
   updated for the third attr variant + the cacheable-vs-pool origin
   matrix.

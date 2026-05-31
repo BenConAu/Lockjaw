@@ -115,7 +115,7 @@ pub const SYS_SCHED_TELEMETRY: u64 = 28;
 /// Make DMA writes visible to the CPU. Invalidates the cache lines
 /// covering `[offset, offset+len)` within the named DmaPool-origin
 /// PageSet so a subsequent CPU load reads fresh DRAM rather than a
-/// stale cache line. See `docs/cacheable-dma-migration-plan.md`.
+/// stale cache line. See `docs/history/cacheable-dma-migration-plan.md`.
 /// Returns `NOT_SUPPORTED` until C1 lands the real handler.
 pub const SYS_DMA_SYNC_FOR_CPU: u64 = 29;
 /// Make pending CPU writes visible to the device. Cleans

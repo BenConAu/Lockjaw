@@ -225,7 +225,7 @@ and would mislead more than help. The Pi tooling (kernel8.img
 ## Required principles update (prerequisite)
 
 The "minimize kernel work" rule needs to be explicit in
-`docs/ben_principles.md` before this plan implements. The
+`docs/process/ben_principles.md` before this plan implements. The
 current principles say "use strong typing wherever possible"
 and "fix substrate debt aggressively" — both pulled toward a
 typed `HandleKind::Clock` variant on first reading, even

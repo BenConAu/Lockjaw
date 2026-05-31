@@ -521,7 +521,7 @@ pub fn create_process(...) -> Result<(), &'static str> {
     //        minted sender (Some). The child gets its own identity
     //        the server can distinguish from the parent's. Mutation
     //        happens in apply, fully transactional. See
-    //        docs/book-of-lockjaw/02-handle-identity-tokens.md for
+    //        docs/architecture/02-handle-identity-tokens.md for
     //        the requirement-to-implementation mapping.
     //      - child_ht.insert(object_paddr, rights, child_kind)
     //        Cannot fail: child table was freshly allocated in
@@ -904,7 +904,7 @@ src/sched/scheduler.rs            — Commit 2: NEW pub fn has_room()
                                     free entry. Bounded; under GKL the
                                     answer is stable until the next
                                     add_thread.
-docs/extraction-roadmap.md        — optional: add revocation as a
+docs/tracking/extraction-roadmap.md        — optional: add revocation as a
                                     completed kernel item
 ```
 

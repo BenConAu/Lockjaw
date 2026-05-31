@@ -77,8 +77,8 @@ Note: `AP_RW_ALL` was restored in Phase 6.
 - Runtime stepping detection: read board revision from DTB (`/proc/cpuinfo`-equivalent in Linux land; in Lockjaw, the device-tree property `/compatible` or `/model` plus the firmware-exposed revision register).
 - If stepping is `< C0`: enforce `buf_phys < 1 << 30` instead of `< 1 << 32` in `adma2_single_block_read` (and any other ADMA2 caller).
 - New error variant `Emmc2Error::BufferPhysAboveStepping1Gib`.
-- `docs/tech-debt.md` note: "board-stepping detection is best-effort; if DTB doesn't expose revision, default to the stricter check (safe but rejects buffers that newer boards would accept)."
+- `docs/tracking/tech-debt.md` note: "board-stepping detection is best-effort; if DTB doesn't expose revision, default to the stricter check (safe but rejects buffers that newer boards would accept)."
 
 **When needed:** When (a) a B0-stepping Pi 4B is in the test fleet, OR (b) Lockjaw is shipped/distributed to users who might have older boards. Today: the user's board is C0+, no B0 board is on hand, and there's no distribution surface.
 
-**Why parked, not in `post-c1-fix-plan.md`:** The post-C1 plan's theme is "C1's Pi-flash gate finally met" — adding speculative stepping-detection scaffolding for hardware nobody owns dilutes that theme. CLAUDE.md ("delete dead code, track deferred ideas in `docs/yagni-parking-lot.md`") makes this the right home.
+**Why parked, not in `post-c1-fix-plan.md`:** The post-C1 plan's theme is "C1's Pi-flash gate finally met" — adding speculative stepping-detection scaffolding for hardware nobody owns dilutes that theme. CLAUDE.md ("delete dead code, track deferred ideas in `docs/tracking/yagni-parking-lot.md`") makes this the right home.

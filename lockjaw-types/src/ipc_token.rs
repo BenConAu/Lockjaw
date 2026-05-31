@@ -19,7 +19,7 @@
 /// 3. Counter monotonicity. Wrap-around (which would re-issue 0 next
 ///    mint) panics rather than silently violating invariant 1.
 ///
-/// See `docs/book-of-lockjaw/02-handle-identity-tokens.md` for the
+/// See `docs/architecture/02-handle-identity-tokens.md` for the
 /// requirement → implementation mapping.
 
 use core::num::NonZeroU64;

@@ -7,7 +7,7 @@ the per-CPU `__stack_*` / `__guard_page_*`, `__exception_vectors`,
 `KERNEL_IMAGE_*`) is listed here with a classification. The
 classification determines what — if anything — has to change when
 the kernel image is relinked into a fixed higher-half VA region
-(see `docs/relink-notes.md` and the relink plan).
+(see `docs/history/relink-notes.md` and the relink plan).
 
 The `xtask check-linker-symbols` command enforces this list:
 every linker-symbol-to-integer site in `src/` must appear here,

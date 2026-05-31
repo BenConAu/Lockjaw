@@ -33,7 +33,7 @@ Primary files:
 
 - [src/process.rs](/Users/Ben/Code/Lockjaw/src/process.rs)
 - [lockjaw-types/src/process.rs](/Users/Ben/Code/Lockjaw/lockjaw-types/src/process.rs)
-- [docs/extraction-roadmap.md](/Users/Ben/Code/Lockjaw/docs/extraction-roadmap.md)
+- [docs/tracking/extraction-roadmap.md](/Users/Ben/Code/Lockjaw/docs/tracking/extraction-roadmap.md)
 
 Why this is still a target:
 
@@ -73,7 +73,7 @@ Primary files:
 - [src/cap/handle_table.rs](/Users/Ben/Code/Lockjaw/src/cap/handle_table.rs)
 - [lockjaw-types/src/handle_ops.rs](/Users/Ben/Code/Lockjaw/lockjaw-types/src/handle_ops.rs)
 - [lockjaw-types/src/page_table.rs](/Users/Ben/Code/Lockjaw/lockjaw-types/src/page_table.rs)
-- [docs/handle-revocation-plan.md](/Users/Ben/Code/Lockjaw/docs/handle-revocation-plan.md)
+- [docs/history/handle-revocation-plan.md](/Users/Ben/Code/Lockjaw/docs/history/handle-revocation-plan.md)
 
 Why this is still a target:
 
@@ -140,7 +140,7 @@ Priority: `P1`
 Primary files:
 
 - [src/syscall/handler.rs](/Users/Ben/Code/Lockjaw/src/syscall/handler.rs)
-- [docs/extraction-roadmap.md](/Users/Ben/Code/Lockjaw/docs/extraction-roadmap.md)
+- [docs/tracking/extraction-roadmap.md](/Users/Ben/Code/Lockjaw/docs/tracking/extraction-roadmap.md)
 
 Why this is still a target:
 
@@ -370,9 +370,9 @@ Priority: `P1`
 
 Primary files:
 
-- [docs/handle-revocation-plan.md](/Users/Ben/Code/Lockjaw/docs/handle-revocation-plan.md)
-- [docs/posix-phase2-mmap-plan.md](/Users/Ben/Code/Lockjaw/docs/posix-phase2-mmap-plan.md)
-- [docs/extraction-roadmap.md](/Users/Ben/Code/Lockjaw/docs/extraction-roadmap.md)
+- [docs/history/handle-revocation-plan.md](/Users/Ben/Code/Lockjaw/docs/history/handle-revocation-plan.md)
+- [docs/history/posix-phase2-mmap-plan.md](/Users/Ben/Code/Lockjaw/docs/history/posix-phase2-mmap-plan.md)
+- [docs/tracking/extraction-roadmap.md](/Users/Ben/Code/Lockjaw/docs/tracking/extraction-roadmap.md)
 - other active subsystem plans
 
 Why this is still a target:
@@ -440,7 +440,7 @@ Primary files:
 
 - [src/syscall/handler.rs](/Users/Ben/Code/Lockjaw/src/syscall/handler.rs)
 - relevant `lockjaw-types` validation modules
-- [docs/extraction-roadmap.md](/Users/Ben/Code/Lockjaw/docs/extraction-roadmap.md)
+- [docs/tracking/extraction-roadmap.md](/Users/Ben/Code/Lockjaw/docs/tracking/extraction-roadmap.md)
 
 Why this is still a target:
 

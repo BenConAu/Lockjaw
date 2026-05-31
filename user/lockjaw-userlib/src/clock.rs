@@ -1,7 +1,7 @@
 /// Typed client wrapper for clock operations brokered through the
 /// device-manager.
 ///
-/// Per `docs/book-of-lockjaw/03-non-virtualizable-hardware.md`,
+/// Per `docs/architecture/03-non-virtualizable-hardware.md`,
 /// drivers do **not** receive a direct handle to the clock provider
 /// (cprman-driver et al.). Instead they call device-manager:
 /// `acquire` exchanges (controller_phandle, clock_id) for an opaque

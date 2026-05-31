@@ -1119,7 +1119,7 @@ fn emmc2_entry() -> ! {
 //     Auto-CMD23. **Dead code, do not call.** The cold-boot CMD18 +
 //     Auto-CMD23 path returned signature=0x0 on first Pi flash with
 //     no preceding PIO primer to mask the issue. Until that's
-//     diagnosed (see docs/tech-debt.md: "CMD18+Auto-CMD23 cold-boot
+//     diagnosed (see docs/tracking/tech-debt.md: "CMD18+Auto-CMD23 cold-boot
 //     validation"), no production path may dispatch through it.
 //     `#[allow(dead_code)]` keeps it as a reference but the compiler
 //     enforces no callers.
@@ -1379,7 +1379,7 @@ fn adma2_single_block_read(
 /// Result of an ADMA2 multi-block read with phase-split timing.
 /// `cmd_to_complete` is the controller's response latency; the rest
 /// is card-side data delivery. Useful for distinguishing controller
-/// bugs from card-side stalls — see `docs/tech-debt.md` for the
+/// bugs from card-side stalls — see `docs/tracking/tech-debt.md` for the
 /// 2026-05-17 card-stall investigation.
 pub struct AdmaTiming {
     pub total: u64,
@@ -1582,7 +1582,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 // Emmc2BlockEngine — implements lockjaw_userlib::block::BlockEngine
 // against the SDHCI controller. `read` loops `adma2_single_block_read`
 // (CMD17) one block at a time. `write` returns `Unsupported` until the
-// CMD18+Auto-CMD23 cold-boot issue is diagnosed (see docs/tech-debt.md).
+// CMD18+Auto-CMD23 cold-boot issue is diagnosed (see docs/tracking/tech-debt.md).
 // Plus per-buffer PageSet tracking.
 // ---------------------------------------------------------------------------
 
@@ -1711,7 +1711,7 @@ impl Emmc2BlockEngine {
         // CRC/timeout — those would surface only as the 1-second
         // TransferCompleteTimeout fallback. The three bits here must
         // match the three the loop's status decode checks; see
-        // docs/tech-debt.md "emmc2 error-IRQ enable is Pi-fault-path-
+        // docs/tracking/tech-debt.md "emmc2 error-IRQ enable is Pi-fault-path-
         // only" for why make test cannot guard this set.
         let normal_sig = NormalIntSignalEnable::CMD_COMPLETE
             | NormalIntSignalEnable::DATA_COMPLETE
@@ -1812,7 +1812,7 @@ impl BlockEngine for Emmc2BlockEngine {
         // The destination buffer is a `FromDevice` coherence region; the
         // envelope owns its clean-before / invalidate-after ordering:
         //
-        // - B2.2 (docs/post-c1-fix-plan.md): clean any pre-DMA dirty
+        // - B2.2 (docs/history/post-c1-fix-plan.md): clean any pre-DMA dirty
         //   cache lines to DRAM BEFORE the controller writes. Lines
         //   dirtied by an earlier CPU write (e.g. the selftest's pre-DMA
         //   `zero_range(0, 512)`, or a previous read's partial overwrite)
@@ -1899,7 +1899,7 @@ impl BlockEngine for Emmc2BlockEngine {
     {
         // Writes are disabled until CMD18+Auto-CMD23 (read) and
         // CMD25+Auto-CMD23 (write) are validated on cold boot — see
-        // docs/tech-debt.md "CMD18+Auto-CMD23 cold-boot validation".
+        // docs/tracking/tech-debt.md "CMD18+Auto-CMD23 cold-boot validation".
         // The Pi 4B end-to-end target (#131) is FAT32 read through
         // POSIX, which does not write; rejecting writes prevents
         // accidental dispatch through the multi-block path while the

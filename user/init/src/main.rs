@@ -449,7 +449,7 @@ pub extern "C" fn _start() -> ! {
     let display_ep = alloc_endpoint("display srv");
     // CPRMAN clock-provider endpoint. The only legitimate caller is
     // device-manager (the arbiter for non-virtualizable hardware —
-    // see docs/book-of-lockjaw/03-non-virtualizable-hardware.md);
+    // see docs/architecture/03-non-virtualizable-hardware.md);
     // drivers never receive a handle to this.
     let cprman_srv_ep = alloc_endpoint("cprman srv");
     let hello_boot_ep = alloc_endpoint("hello boot");
@@ -577,7 +577,7 @@ pub extern "C" fn _start() -> ! {
     // Bootstrap device-manager: export devmgr_ep (its server) plus
     // cprman_srv_ep (its only path to forward clock ops to the
     // clock provider — see
-    // docs/book-of-lockjaw/03-non-virtualizable-hardware.md). cprman
+    // docs/architecture/03-non-virtualizable-hardware.md). cprman
     // hasn't bootstrapped yet at this point; that's fine, the
     // sys_call inside devmgr's clock-op forwarding will block until
     // cprman is alive and receiving.

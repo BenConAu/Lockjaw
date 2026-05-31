@@ -24,11 +24,11 @@ fix findings, re-stage, iterate, commit. You don't write a
 
 The reviewer instructions live in two files (already committed):
 
-- `docs/reviewer-mode.md` — the opus / Claude reviewer's operating
+- `docs/process/reviewer-mode.md` — the opus / Claude reviewer's operating
   instructions. The opus agent reads this; **you don't**. Ben was
   explicit: "The reviewer-mode is for the reviewer to read, not you.
   Don't pollute yourself with the wrong context."
-- `docs/reviewer-mode-codex.md` — codex's version of the same.
+- `docs/process/reviewer-mode-codex.md` — codex's version of the same.
   Reference it from codex prompts, don't read it yourself either.
 
 You should know the files exist and where to find them. You should not
@@ -78,8 +78,8 @@ the same output file via `; echo "codex exit $?"`.
 
 ### What to put in the prompt
 
-The Codex-reminder rule in `docs/ben_principles.md` Tier 4 #17 is
-load-bearing: *every* prompt points at `docs/ben_principles.md` and
+The Codex-reminder rule in `docs/process/ben_principles.md` Tier 4 #17 is
+load-bearing: *every* prompt points at `docs/process/ben_principles.md` and
 calls out the relevant tier (most commonly Tier 1 #1 correctness-by-
 construction, Tier 3 #13 explicit-init / no-coincidental-defaults,
 Tier 2 #6 reach-for-userspace-before-kernel). Without the reminder,
@@ -92,7 +92,7 @@ A working prompt has, in order:
    (driver regime, envelope, push→pull, etc. — codex has the project
    context from prior rounds but a re-orientation paragraph keeps it
    sharp).
-3. A pointer to `docs/ben_principles.md` and the tier(s) most relevant.
+3. A pointer to `docs/process/ben_principles.md` and the tier(s) most relevant.
 4. The specific questions you want answered (a/b/c lettered, concrete:
    "does X close the prior gap?", "is there a Y evasion?").
 5. The staged diff (inline `$(git diff --cached)` for diffs ≲200 lines)
@@ -143,9 +143,9 @@ rounds. You give it the full context every time.
 You are reviewing a STAGED git diff in the Lockjaw kernel repo at
 /Users/Ben/Code/Lockjaw. Do NOT edit any files — review only.
 
-First read docs/reviewer-mode.md in full and adopt it as your operating
+First read docs/process/reviewer-mode.md in full and adopt it as your operating
 instructions (it defines your review format and standard). Also read
-docs/ben_principles.md (especially Tier 1 #1 correctness-by-
+docs/process/ben_principles.md (especially Tier 1 #1 correctness-by-
 construction, Tier 3 #13 explicit init).
 
 Context: <one paragraph: what this commit does in Lockjaw vocabulary>.
@@ -180,7 +180,7 @@ The transcript file is for the framework, not for you.
 
 ### Reviewer-mode primer
 
-`docs/reviewer-mode.md` and its codex sibling are the reviewer's
+`docs/process/reviewer-mode.md` and its codex sibling are the reviewer's
 operating instructions: how to format findings (Fix-now / Tech-debt /
 no-finding), what scrutiny level, what stale-comment / behavior-drift
 patterns to flag. You don't need to know them — but knowing they exist
@@ -318,10 +318,10 @@ Three places to spend or save cycles:
 
 ## Where reviewer instructions live (recap)
 
-- `docs/reviewer-mode.md` — opus reviewer instructions. **Reviewer reads.**
-- `docs/reviewer-mode-codex.md` — codex reviewer instructions.
+- `docs/process/reviewer-mode.md` — opus reviewer instructions. **Reviewer reads.**
+- `docs/process/reviewer-mode-codex.md` — codex reviewer instructions.
   **Reviewer reads** (you reference from prompts).
-- `docs/paired-review-workflow.md` — *this file*. The orchestrator's
+- `docs/process/paired-review-workflow.md` — *this file*. The orchestrator's
   side. **You read.**
-- `docs/ben_principles.md` — both reviewers read. **You point at it from
+- `docs/process/ben_principles.md` — both reviewers read. **You point at it from
   every prompt** (Tier 4 #17).

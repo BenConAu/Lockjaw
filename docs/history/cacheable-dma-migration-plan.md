@@ -551,8 +551,8 @@ states cost the same scrutiny as permanent ones") applies.
 - Document the post-migration shape in `docs/book-of-lockjaw/`
   (the DMA chapter, if it exists; otherwise add a short section
   to the architecture chapter).
-- Update `docs/yagni-parking-lot.md` to remove any items now
-  obsolete; add `docs/tech-debt.md` entries for deferred pieces.
+- Update `docs/tracking/yagni-parking-lot.md` to remove any items now
+  obsolete; add `docs/tracking/tech-debt.md` entries for deferred pieces.
 
 ### Tech debt carry-forward (not in scope)
 
@@ -561,7 +561,7 @@ states cost the same scrutiny as permanent ones") applies.
   unsafe on real hardware with a non-coherent DMA bus. Out of
   scope for this migration because virtio-blk never runs on real
   hardware in Lockjaw's current device set. Tracked in
-  `docs/tech-debt.md` post-C3 with a note that any future
+  `docs/tracking/tech-debt.md` post-C3 with a note that any future
   hardware running virtio-blk-driver would need either DmaPool
   conversion or a new sync API that accepts Buddy-origin
   cacheable PageSets.

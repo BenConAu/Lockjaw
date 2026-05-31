@@ -81,7 +81,7 @@ pub enum FwCfgDmaError {
 /// This is the canonical fw_cfg DMA write sequence — the barrier
 /// + poll discipline lives here so every fw_cfg consumer inherits
 /// it. Lockjaw doesn't have a deadline-bounded spin primitive yet
-/// (tracked in docs/tech-debt.md as "PL011 TX wait is unbounded");
+/// (tracked in docs/tracking/tech-debt.md as "PL011 TX wait is unbounded");
 /// when that lands, this poll loop is a candidate user.
 pub fn dma_write(
     regs: &FwCfg,

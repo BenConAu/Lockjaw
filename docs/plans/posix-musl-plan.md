@@ -88,7 +88,7 @@ server creates a notification per POSIX process. Kernel's
   far more than POSIX phases will ever push against; sized to match
   what aarch64 hardware can comfortably schedule. Was 16 originally
   but the cap collapsed `SchedulerFull` and `OutOfMemory` into one
-  syscall return — see `docs/tech-debt.md` for the full story.
+  syscall return — see `docs/tracking/tech-debt.md` for the full story.
 
 ## The Shared Buffer
 

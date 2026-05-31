@@ -3,8 +3,8 @@
 //! Hosts the `dc civac` (clean-and-invalidate to point-of-coherency)
 //! and `dc cvac` (clean to point-of-coherency) asm loops the
 //! cacheable-DMA migration relies on (see
-//! `docs/cacheable-dma-migration-plan.md` and
-//! `docs/post-c1-fix-plan.md` §B2.1).
+//! `docs/history/cacheable-dma-migration-plan.md` and
+//! `docs/history/post-c1-fix-plan.md` §B2.1).
 //!
 //! Post C1 of the migration these primitives back the
 //! `sys_dma_sync_for_cpu` / `sys_dma_sync_for_device` handlers in
@@ -177,7 +177,7 @@ pub unsafe fn invalidate_range(start_kva: u64, len: u64) {
         // bytes may evict over freshly DMA-written DRAM, the
         // post-condition where the CPU reads device bytes is not
         // guaranteed). `dc civac` is well-defined on any line
-        // state. See module doc and `docs/post-c1-fix-plan.md`
+        // state. See module doc and `docs/history/post-c1-fix-plan.md`
         // §B2.1 for the full rationale.
         asm!(
             "dc civac, {addr}",

@@ -183,7 +183,7 @@ pub extern "C" fn kmain() -> ! {
     // Read CTR_EL0.DminLine and verify the silicon's data cache
     // line size matches `lockjaw_types::cache::CACHE_LINE_BYTES`.
     // The cacheable-DMA sync primitives (see
-    // docs/cacheable-dma-migration-plan.md) build their range math
+    // docs/history/cacheable-dma-migration-plan.md) build their range math
     // against the constant; mismatch would either miss lines or
     // operate on adjacent buffers. C0: read + check only; the asm
     // primitives are compiled but unreferenced until C1 lands.
@@ -279,7 +279,7 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("Guard pages active (unmapped).");
 
         // C1 of the cacheable-DMA migration (see
-        // docs/cacheable-dma-migration-plan.md): the DMA pool now
+        // docs/history/cacheable-dma-migration-plan.md): the DMA pool now
         // participates in the kernel TTBR1 direct map as Cacheable
         // Inner+Outer WB. Any firmware-era cache lines for the
         // pool's PAs become reachable via the direct map the

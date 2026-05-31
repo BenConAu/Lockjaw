@@ -188,7 +188,7 @@ impl fmt::LowerHex for KernelVa {
 /// higher-half VA chosen at link time, not to a paddr-shifted view
 /// of the linear map and not to a runtime-allocated KVM pool slot.
 ///
-/// The relink work (see `docs/relink-notes.md`,
+/// The relink work (see `docs/history/relink-notes.md`,
 /// `~/.claude/plans/nifty-rolling-naur.md`) moves the kernel image
 /// into a dedicated L0[1] region; until that lands, the runtime
 /// values still happen to coincide with `paddr + KERNEL_VA_OFFSET`

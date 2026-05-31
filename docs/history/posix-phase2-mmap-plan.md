@@ -2,7 +2,7 @@
 
 ## Context
 
-The first Phase 2 plan (`docs/posix-phase2-mmap-plan.md`) had three
+The first Phase 2 plan (`docs/history/posix-phase2-mmap-plan.md`) had three
 load-bearing assumptions that don't survive contact with the current
 kernel ABI. Codex flagged each one:
 
@@ -509,8 +509,8 @@ user/posix-hello/hello.c           — Phase 2.3: malloc(1 MiB) test
                                      Phase 2.4: malloc(8 MiB) test
                                      Phase 2.5: stdio (fopen) test
 tests/qemu_integration.sh          — Phase 2.3/2.4/2.5 assertions
-docs/posix-musl-plan.md            — mark Phase 2 done at the end
-docs/posix-phase2-mmap-plan.md     — replace with this plan
+docs/plans/posix-musl-plan.md            — mark Phase 2 done at the end
+docs/history/posix-phase2-mmap-plan.md     — replace with this plan
 ```
 
 ## Existing code to reuse

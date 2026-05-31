@@ -215,7 +215,7 @@ The endpoint/notification/reply syscalls already follow the seL4-style "user don
 
 **Where:** Kernel-side modules in `src/` that contain pure state machines, data structures, or decision logic with no hardware or `unsafe` dependencies.
 
-**What:** Substantial progress: lockjaw-types has grown to ~16 K LOC across 25+ modules covering IPC state machine, scheduler model, process lifecycle/transfer/teardown, PageSet table + variable-size header, POSIX dispatch + VA layout, FAT32, FDT, and ELF loader. Kernel-side `src/cap` + `src/ipc` + `src/sched` together still hold ~3300 LOC. `docs/extraction-roadmap.md` lists the remaining priority targets.
+**What:** Substantial progress: lockjaw-types has grown to ~16 K LOC across 25+ modules covering IPC state machine, scheduler model, process lifecycle/transfer/teardown, PageSet table + variable-size header, POSIX dispatch + VA layout, FAT32, FDT, and ELF loader. Kernel-side `src/cap` + `src/ipc` + `src/sched` together still hold ~3300 LOC. `docs/tracking/extraction-roadmap.md` lists the remaining priority targets.
 
 **Outstanding push-shaped kernel code:**
 - `sys_map_pages` VA decision (Priority 1 in extraction-roadmap)
@@ -224,7 +224,7 @@ The endpoint/notification/reply syscalls already follow the seL4-style "user don
 - Scheduler context-switch integration (~730 LOC)
 - Revocation walks (~260 LOC) — recently added; could likely have parts extracted
 
-**Fix:** Continue the push→pull conversion per `docs/extraction-roadmap.md`. Each new feature should land its decision logic in lockjaw-types first; the kernel mechanically executes.
+**Fix:** Continue the push→pull conversion per `docs/tracking/extraction-roadmap.md`. Each new feature should land its decision logic in lockjaw-types first; the kernel mechanically executes.
 
 ---
 
