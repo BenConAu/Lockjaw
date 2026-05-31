@@ -1,85 +1,193 @@
 # Object Model
 
-Lockjaw's object model defines how kernel resources are created, accessed, and secured. It draws inspiration from multiple sources but is its own design.
+Lockjaw's object model defines how kernel resources are created,
+addressed, and secured. It draws on seL4 (capabilities, no kernel
+heap) and Vulkan (typed create-info per object) but is its own design.
 
-## The Problem
+## The problem
 
-Every kernel needs objects — threads, IPC endpoints, page tables, memory regions. The question is: who allocates memory for them?
+Every kernel needs objects — threads, IPC endpoints, page tables,
+memory regions. The question is: who allocates memory for them?
 
-**Traditional kernels (Linux, Windows):** The kernel has an internal heap. When userspace asks for a resource, the kernel mallocs memory from its heap, creates the object, and returns a file descriptor or handle. Userspace has no control over where objects live or how much memory the kernel uses. The kernel can run out of heap memory and fail allocations unpredictably.
+**Traditional kernels (Linux, Windows):** the kernel has an internal
+heap. `malloc` whenever a syscall needs a new object. Userspace has
+no control; the kernel can fail allocations unpredictably.
 
-**seL4:** Userspace owns *all* physical memory via "Untyped" capabilities. To create a kernel object, userspace "retypes" an untyped region — telling the kernel to initialize an object in memory that userspace already owns. The kernel never allocates. This is powerful and fully deterministic, but complex — userspace must manage memory watermarks and revocation trees.
+**seL4:** userspace owns *all* physical memory via "Untyped"
+capabilities. To create a kernel object, userspace "retypes" an
+untyped region — telling the kernel to initialize an object in
+memory userspace already owns. The kernel never allocates. Powerful,
+fully deterministic; the userspace API is heavy.
 
-**Zircon (Fuchsia):** The kernel allocates objects from its own heap, tracks them via reference-counted handles. Simple API, but the kernel can OOM, and userspace has no control over memory placement.
+**Zircon (Fuchsia):** kernel-allocated, refcounted handles. Simple
+API; the kernel can OOM and userspace has no placement control.
 
-## Lockjaw's Approach
+## Lockjaw's split
 
-Lockjaw splits the problem into two clean steps, inspired by how Vulkan handles GPU resources:
+Lockjaw lands in between, with a deliberate split of "where do
+pages come from" (userspace allocates) from "where do object bytes
+live" (kernel manages):
 
-### Step 1: Allocate physical pages
+### Step 1 — userspace allocates a PageSet
 
-Userspace asks the kernel for physical pages. The kernel allocates from its page bitmap and returns a **PageSet** — a handle representing 1 to N physical pages.
-
-```
-sys_alloc_pages(count: 3) → PageSet handle
-```
-
-The kernel tracks which pages are taken. Userspace holds a handle to a set of pages but cannot access them yet.
-
-### Step 2: Choose what to do with the pages
-
-A PageSet has exactly two fates, and they are mutually exclusive:
-
-- **Donate for a kernel object.** The pages become kernel-owned. The kernel initializes an object (handle table, thread, endpoint, etc.) in that memory. Userspace gets a handle to the object but can never see the raw memory again.
-
-- **Map as MappedPages (Phase 6).** The pages are mapped into the process's virtual address space. Userspace gets a pointer and can read/write freely. This is how userspace gets heap memory, buffers, and shared memory regions.
-
-A PageSet cannot be both donated and mapped. This is a security invariant: if userspace could map pages that contain kernel objects, it could overwrite kernel state and escalate privileges.
-
-### One PageSet = One Object
-
-When you donate a PageSet for object creation, the *entire* PageSet is consumed. You cannot donate half a PageSet or create two objects in the same PageSet. This prevents overlap attacks where two objects share memory and one corrupts the other.
-
-A future optimization ("object pools") could pack multiple small objects into a single PageSet, but only if the kernel manages the packing internally — userspace would still see one handle per object.
-
-## The Vulkan Create-Info Pattern
-
-Each object type has its own "create-info" struct that describes the object's configuration. The same struct is used for both querying the required size and creating the object:
-
-```
-// Step 1: How much memory?
-let info = HandleTableCreateInfo { slot_count: 64 };
-let size = query_handle_table_size(&info);    // → 1 page
-
-// Step 2: Allocate pages
-let pages = sys_alloc_pages(size.pages);
-
-// Step 3: Donate and create
-sys_donate(pages);
-sys_create_handle_table(&info, pages) → handle
+```text
+sys_alloc_pages(count, flags)            // Buddy-origin PageSet
+sys_alloc_dma_pages(count)               // DmaPool-origin PageSet
 ```
 
-There is no generic `ObjectCreateInfo` — each type has its own struct. This means:
-- No ignored fields (unlike a union-style generic struct)
-- No runtime dispatch on object type
-- Adding a new object type just means adding a new create-info struct and a new pair of query/create functions
-- The query and create steps cannot disagree about what is being built, because they use the same struct
+The kernel hands back a handle to a 1..N-page PageSet. Userspace
+holds the handle but has not yet decided what the pages are for.
 
-## Handles
+### Step 2 — the PageSet's fate is one of two paths
 
-Once an object is created, userspace interacts with it through an integer **handle**. Handles index into a handle table (itself a kernel object created via PageSet donation). Each handle entry records:
+A PageSet can be **mapped** (becomes user-readable/writable VA
+range) or **consumed by object creation** (becomes the storage for
+a kernel object). The two paths are mutually exclusive and
+construction-enforced: once a PageSet is consumed, its header is
+gone and no future `sys_map_pages` can find it; once mapped, the
+handle's `mapped_va_page` is non-zero and the consume path rejects
+it.
 
-- The physical address of the object
-- The object's type
-- A rights bitmask (Read, Write, Grant)
+```text
+// Fate A: map into the address space
+sys_map_pages(pageset_handle, va, flags)
 
-Rights are checked on every operation. If you hold a handle with Read but not Grant, you cannot pass that handle to another process.
-
-## Memory Lifecycle
-
+// Fate B: consume into a kernel object — no separate sys_donate
+sys_create_endpoint(pageset_handle)      -> EndpointHandle
+sys_create_notification(pageset_handle)  -> NotificationHandle
+sys_create_reply(pageset_handle)         -> ReplyHandle
 ```
-Physical pages: free → allocated (PageSet) → donated (kernel object) → destroyed → free
-                                            → mapped (MappedPages)   → unmapped  → free
+
+The earlier two-step `sys_donate` + `sys_create_*(info, pages)` API
+described in older versions of this doc is gone; the create syscalls
+take the PageSet handle directly.
+
+### One PageSet = one object
+
+When a PageSet is consumed for object creation, the *entire*
+PageSet becomes the object's storage. You cannot consume half a
+PageSet or create two objects in the same PageSet. This is the
+security invariant: two kernel objects can never overlap in memory
+(no aliasing == no cross-object corruption).
+
+## The Vulkan create-info pattern (typed configuration)
+
+Where an object has configurable size or per-instance parameters,
+its create-info struct lives in `lockjaw-types/src/object.rs` and is
+shared between the size-querying path and the creation path. The
+canonical example is `HandleTableCreateInfo` (`object.rs:43`):
+
+```rust
+pub struct HandleTableCreateInfo {
+    pub slot_count: u64,
+}
 ```
 
-Memory always returns to the free pool when the object or mapping is destroyed. The kernel's page bitmap is the single source of truth for physical memory ownership.
+The query function answers "how many pages do I need to back a
+table of N slots?"; the create function takes the same struct and
+initializes the table. Same struct in both, so the query and create
+phases cannot disagree about what is being built.
+
+For objects with fixed sizes (Endpoint, Notification, Reply), the
+create-info struct is empty (`EndpointCreateInfo` is `;`,
+`NotificationCreateInfo` is `;`, etc.) — they exist as type-level
+markers for the create-helper signatures, not as runtime
+configuration.
+
+## HandleKind: the typed object variants
+
+A `HandleEntry` (`object.rs:150`) contains a `HandleKind` —
+each non-empty variant carries the typed address of the underlying
+object. The full enum (`object.rs:67`):
+
+```rust
+pub enum HandleKind {
+    Empty = 0,
+    HandleTable        { kva: KernelVa }                                                 = 1,
+    ThreadControlBlock { paddr: PhysAddr }                                               = 2,
+    Endpoint           { kva: KernelVa, caller_token: Option<NonZeroU64> }               = 3,
+    Notification       { kva: KernelVa }                                                 = 4,
+    Reply              { kva: KernelVa }                                                 = 5,
+    Process            { kva: KernelVa }                                                 = 6,
+    PageSet            { kva: KernelVa, mapped_va_page: u32 }                            = 7,
+}
+```
+
+Two things to notice:
+
+1. **Each variant carries the address regime in its type.** Most
+   kernel objects live in the KVM higher-half pool (`KernelVa`); the
+   one exception today is `ThreadControlBlock`, which is still a
+   buddy-allocated `PhysAddr`. The type system rules out crossing
+   the two regimes — a handler that takes `kva: KernelVa` cannot
+   accidentally be handed a `PhysAddr`. See
+   [`memory-model.md`](memory-model.md) for the KVM allocator;
+   [`../tracking/kernel-vmem-roadmap.md`](../tracking/kernel-vmem-roadmap.md)
+   tracks the rest-of-objects migration to KVA.
+2. **Endpoint carries an identity token.** The `caller_token` field
+   distinguishes the master / receive-only handle (`None`) from
+   sender handles minted via `sys_export_handle` or by
+   `sys_create_process`'s parent-copy path (`Some(t)`). The
+   `NonZeroU64` makes a sender-handle-with-token-zero unrepresentable.
+   See [`../architecture/02-handle-identity-tokens.md`](../architecture/02-handle-identity-tokens.md)
+   for the model.
+
+## Handles, rights, and ownership
+
+Once an object is created, userspace addresses it through a
+**handle** — an integer index into the calling thread's handle
+table. The HandleTable itself is a kernel object (its
+`HandleKind::HandleTable { kva }` variant).
+
+Each `HandleEntry` carries a typed `kind` (above) plus a `Rights`
+bitmask (`lockjaw-types/src/rights.rs:4`):
+
+```rust
+pub const RIGHT_READ:  u8 = 1 << 0;
+pub const RIGHT_WRITE: u8 = 1 << 1;
+pub const RIGHT_GRANT: u8 = 1 << 2;
+```
+
+Rights are checked on every operation that consumes a handle. A
+handle without `RIGHT_GRANT` cannot be passed to another process via
+`sys_export_handle`; a handle without `RIGHT_WRITE` cannot be
+written through.
+
+Handle table sizing is fixed today: `HANDLE_SLOTS_PER_PAGE = 127`
+slots per page (`object.rs:256`), backed by a single page. Multi-page
+handle tables are possible per the `HandleTableCreateInfo` shape but
+no current syscall path exercises them.
+
+## Revocation
+
+When a PageSet is consumed by another path (or its underlying object
+is destroyed), the kernel walks every process's handle table and
+clears stale entries. This is `src/cap/revoke.rs`:
+
+```rust
+pub fn revoke_validate(header_kva: KernelVa) -> Result<(), RevokeError>;
+pub fn revoke_apply(header_kva: KernelVa) -> RevokeStats;
+```
+
+The two-phase shape (validate before apply) means a consume that
+would leave inconsistent state can be rejected before any change is
+made. The full design rationale is in
+[`../history/handle-revocation-plan.md`](../history/handle-revocation-plan.md).
+
+## Memory lifecycle
+
+```text
+Physical pages: free
+            ── sys_alloc_pages / sys_alloc_dma_pages
+              -> PageSet (Buddy or DmaPool origin)
+                ── sys_create_*(pageset_handle)
+                  -> kernel object   ── object destroyed -> free
+                ── sys_map_pages
+                  -> mapped VA range -> sys_unmap_pages -> free
+```
+
+Memory always returns to the originating allocator (buddy or DMA
+pool) when the object is destroyed or the mapping unmapped. The
+allocators (page bitmap is gone; see
+[`memory-model.md`](memory-model.md)) are the single source of
+truth for physical memory ownership.
