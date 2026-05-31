@@ -35,9 +35,18 @@ pub trait ResponseShape: sealed::Sealed {
     /// OR of `SDHCI_CMD_RESP_*` / `SDHCI_CMD_CRC` / `SDHCI_CMD_INDEX`
     /// bits to write into the low byte of `COMMAND_REG`.
     const FLAGS: u8;
+    /// True for the long (R2) response that spans `RESPONSE_0..3`;
+    /// false for the short and no-response shapes that only need
+    /// `RESPONSE_0` (or nothing). Lets the issue path skip the 3
+    /// extra MMIO reads when the response is short — keeping wire
+    /// effects identical to the hand-written `issue_command`
+    /// `read_response_0`-only pattern in `user/emmc2-driver/src/main.rs`.
+    const READS_LONG_RESPONSE: bool;
     /// Pure decode from the four RESPONSE register reads, passed in
     /// register-address order (`r[0]` = RESPONSE_0 at 0x010,
-    /// `r[3]` = RESPONSE_3 at 0x01c).
+    /// `r[3]` = RESPONSE_3 at 0x01c). For short-response shapes the
+    /// caller may pass zeros for `r[1..3]` since `decode` ignores
+    /// them; the convention keeps the trait signature uniform.
     fn decode(r: [u32; 4]) -> Self::Decoded;
 }
 
@@ -51,6 +60,7 @@ impl sealed::Sealed for R0 {}
 impl ResponseShape for R0 {
     type Decoded = ();
     const FLAGS: u8 = SDHCI_CMD_RESP_NONE;
+    const READS_LONG_RESPONSE: bool = false;
     fn decode(_r: [u32; 4]) {}
 }
 
@@ -62,6 +72,7 @@ impl sealed::Sealed for R1 {}
 impl ResponseShape for R1 {
     type Decoded = u32;
     const FLAGS: u8 = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX;
+    const READS_LONG_RESPONSE: bool = false;
     fn decode(r: [u32; 4]) -> u32 {
         r[0]
     }
@@ -76,6 +87,7 @@ impl sealed::Sealed for R1b {}
 impl ResponseShape for R1b {
     type Decoded = u32;
     const FLAGS: u8 = SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX;
+    const READS_LONG_RESPONSE: bool = false;
     fn decode(r: [u32; 4]) -> u32 {
         r[0]
     }
@@ -94,6 +106,7 @@ impl sealed::Sealed for R2 {}
 impl ResponseShape for R2 {
     type Decoded = [u32; 4];
     const FLAGS: u8 = SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC;
+    const READS_LONG_RESPONSE: bool = true;
     fn decode(r: [u32; 4]) -> [u32; 4] {
         r
     }
@@ -108,6 +121,7 @@ impl sealed::Sealed for R3 {}
 impl ResponseShape for R3 {
     type Decoded = OcrRegister;
     const FLAGS: u8 = SDHCI_CMD_RESP_SHORT;
+    const READS_LONG_RESPONSE: bool = false;
     fn decode(r: [u32; 4]) -> OcrRegister {
         OcrRegister::decode(r[0])
     }
@@ -129,6 +143,7 @@ impl sealed::Sealed for R6 {}
 impl ResponseShape for R6 {
     type Decoded = R6Response;
     const FLAGS: u8 = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX;
+    const READS_LONG_RESPONSE: bool = false;
     fn decode(r: [u32; 4]) -> R6Response {
         R6Response {
             rca: r6_rca(r[0]),
@@ -145,6 +160,7 @@ impl sealed::Sealed for R7 {}
 impl ResponseShape for R7 {
     type Decoded = u32;
     const FLAGS: u8 = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX;
+    const READS_LONG_RESPONSE: bool = false;
     fn decode(r: [u32; 4]) -> u32 {
         r[0]
     }
