@@ -381,3 +381,15 @@ pub fn set_timeout_dat_counter(sdhci: &Sdhci, value: u8) {
         &tk,
     );
 }
+
+/// Set `HOST_CONTROL_1.DAT_4BIT` to mirror the 4-bit bus width
+/// negotiated with the card via ACMD6 SET_BUS_WIDTH. The host side
+/// MUST match the card side or every data transfer drops three
+/// quarters of its bits.
+///
+/// One-shot init helper — typed `modify_host_control(|hc|
+/// hc.with_dat_4bit(true))` with the token minted internally.
+pub fn set_bus_width_4bit(sdhci: &Sdhci) {
+    let tk = __sdhci_internal_mint(sdhci);
+    sdhci.modify_host_control(|hc| hc.with_dat_4bit(true), &tk);
+}
