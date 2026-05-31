@@ -25,22 +25,21 @@ use lockjaw_userlib::dma::{
     DmaBacking, DmaMappingView, DmaPoolOrigin, OwnedDmaMapping,
 };
 use lockjaw_userlib::dma_transfer::{
-    run_dma_transfer, DmaCompletion, DmaDir, DmaTransferError, Immediate,
+    run_dma_transfer, DmaDir, DmaTransferError, Immediate,
 };
 use lockjaw_mmio::region::MappedRegs;
 use lockjaw_regs::sdhci::{
-    Command, ErrorIntSignalEnable, ErrorIntStatus, ErrorIntStatusEnable,
-    HostControlDmaSel, NormalIntSignalEnable, NormalIntStatus, NormalIntStatusEnable,
-    PowerControlBusVoltage, PresentState, Sdhci, TransferMode,
+    ErrorIntSignalEnable, ErrorIntStatusEnable,
+    NormalIntSignalEnable, NormalIntStatusEnable,
+    PowerControlBusVoltage, PresentState, Sdhci,
 };
-// O2: temporary escape for the SdhciCommandInit migration window.
-// Every gated-setter call site mints a token via this fn until O4/O5
-// migrate them to `SdhciCommandInit::open()` and the init helpers in
-// `lockjaw_userlib::sdhci`. O5 deletes `__temp_unguarded_mint` from
-// `lockjaw-regs` and the temporary xtask exemption that allows the
-// emmc2-driver crate to name it.
-#[allow(deprecated)]
-use lockjaw_regs::sdhci::__temp_unguarded_mint;
+// O5: `__temp_unguarded_mint` removed — every gated-setter call site
+// in this driver now flows through `lockjaw_userlib::sdhci` (the
+// SdhciCommandInit envelope for commands, the init helpers for
+// non-command writes). O5 also deletes the temp mint from
+// `lockjaw-regs::sdhci` itself, so the only mint paths remaining are
+// `__sdhci_internal_mint` (lockjaw-userlib's internal use) and zero
+// driver-reachable mints.
 use lockjaw_types::addr::PAGE_SIZE;
 use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, sleep_for, Nanos};
 // `monotonic_now` returns `MonoTicks`, which is `Ord`; the comparisons in the
@@ -56,10 +55,7 @@ use lockjaw_types::sdhci::{
     SDHCI_INT_CMD_TIMEOUT, SDHCI_INT_CMD_CRC,
     SDHCI_INT_CMD_END_BIT, SDHCI_INT_CMD_INDEX,
     SDHCI_INT_DATA_TIMEOUT, SDHCI_INT_DATA_CRC, SDHCI_INT_DATA_END_BIT,
-    SDHCI_CMD_CRC, SDHCI_CMD_INDEX, SDHCI_CMD_DATA,
-    SDHCI_CMD_RESP_SHORT,
-    SDHCI_TRNS_READ, SDHCI_TRNS_DMA, SDHCI_TRNS_BLK_CNT_EN, SDHCI_TRNS_MULTI, SDHCI_TRNS_AUTO_CMD23,
-    SdCommand, compute_clock_divisor, sd_command_word,
+    SdCommand, compute_clock_divisor,
 };
 use lockjaw_types::sdhci::response::{R0, R1, R1b, R2, R3, R6, R7};
 use lockjaw_types::wire::sdhci::Adma2Descriptor;
@@ -253,8 +249,6 @@ enum Emmc2Error {
     BufferPhysAbove4Gib(u64),
     /// Descriptor table physical address exceeds the 32-bit ADMA2-32 limit.
     DescPhysAbove4Gib(u64),
-    /// Descriptor segment length exceeds 65535-byte single-descriptor cap.
-    DescriptorLengthOverflow(u32),
     /// CMD or DAT inhibit didn't clear within the 100ms pre-poll deadline.
     InhibitStuck { present_state: u32 },
     /// Controller-reported error during command phase (CMD17/CMD18/CMD25).
@@ -295,7 +289,6 @@ impl Emmc2Error {
         match self {
             Self::BufferPhysAbove4Gib(_)       => "buffer phys > 4GiB",
             Self::DescPhysAbove4Gib(_)         => "desc phys > 4GiB",
-            Self::DescriptorLengthOverflow(_)  => "descriptor length > 65535",
             Self::InhibitStuck { .. }          => "inhibit stuck",
             Self::CmdError { .. }              => "cmd phase error",
             Self::DataError { .. }             => "data phase error",
@@ -317,10 +310,6 @@ fn put_emmc2_error(err: &Emmc2Error) {
         Emmc2Error::BufferPhysAbove4Gib(pa) | Emmc2Error::DescPhysAbove4Gib(pa) => {
             puts(" pa=");
             put_hex(*pa);
-        }
-        Emmc2Error::DescriptorLengthOverflow(len) => {
-            puts(" len=");
-            put_decimal(*len as u64);
         }
         Emmc2Error::InhibitStuck { present_state }
         | Emmc2Error::DatInhibitStuck { present_state } => {
@@ -852,170 +841,26 @@ fn emmc2_entry() -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// ADMA2 transfer primitives. The CMD17 single-block path is the only
-// one currently wired into BlockEngine reads:
+// ADMA2 single-block read primitive. Wraps the framework's
+// SdhciCommandInit::issue_data_transfer envelope for the CMD17 path
+// that Emmc2BlockEngine::read loops one block at a time. The dead
+// CMD18+Auto-CMD23 multi-block path (adma2_transfer / AdmaTiming /
+// AdmaDirection) was deleted in O5 — YAGNI, single-block has been
+// the only production path since the engine landed.
 //
-//   * `adma2_single_block_read` — CMD17 + plain TRNS_READ|TRNS_DMA.
-//     Mirrors the M6 sub-commit 2b sequence proven on Pi under the
-//     perf-sweep path. No Auto-CMD23, no BLK_CNT_EN, no MULTI.
-//     `Emmc2BlockEngine::read` loops this one block at a time for
-//     multi-sector reads.
-//   * `adma2_transfer`          — CMD18 (read) / CMD25 (write) +
-//     Auto-CMD23. **Dead code, do not call.** The cold-boot CMD18 +
-//     Auto-CMD23 path returned signature=0x0 on first Pi flash with
-//     no preceding PIO primer to mask the issue. Until that's
-//     diagnosed (see docs/tracking/tech-debt.md: "CMD18+Auto-CMD23 cold-boot
-//     validation"), no production path may dispatch through it.
-//     `#[allow(dead_code)]` keeps it as a reference but the compiler
-//     enforces no callers.
+// SdhciDataCompletion (IRQ wait + B4.1 DAT_INHIBIT drain) lives in
+// lockjaw-userlib::sdhci as part of the family-generic surface; the
+// driver constructs one and hands it to issue_data_transfer.
 // ---------------------------------------------------------------------------
-
-/// Single-block ADMA2 read of `sector`. CMD17 + READ|DMA only. No
-/// MULTI, no BLK_CNT_EN, no Auto-CMD23 — those belong to the
-/// multi-block path. Mirrors the M6 sub-commit 2b sequence.
+/// Single-block ADMA2-32 CMD17 read of `sector` into `buf_phys`.
 ///
-/// SDHCI data-transfer completion — the device-done signal the
-/// coherence envelope awaits between the `kick` and the post-transfer
-/// invalidate. Wraps the IRQ-driven CMD_COMPLETE/DATA_COMPLETE wait
-/// plus the B4.1 post-DATA_COMPLETE `DAT_INHIBIT` drain. This is the
-/// one piece of the transfer only the driver knows; supplying it as a
-/// `DmaCompletion` is what makes "invalidate before the device
-/// finished" unrepresentable. Device-specific by nature — it lives in
-/// the driver/family layer (the seed of a future `SdhciCommandInit`),
-/// never in the generic `dma_transfer` module.
-struct SdhciDataCompletion<'a> {
-    sdhci: &'a Sdhci,
-    bound_irq: &'a mut lockjaw_userlib::irq::BoundIrq,
-}
-
-impl DmaCompletion for SdhciDataCompletion<'_> {
-    type Error = Emmc2Error;
-
-    fn await_complete(self) -> Result<(), Emmc2Error> {
-        #[allow(deprecated)]
-        let tk = __temp_unguarded_mint(self.sdhci);
-        // IRQ-driven completion (m7-irq-experiment graft).
-        //
-        // SDHCI is configured LEVEL_HIGH. Each IRQ delivery:
-        //   1. Kernel ACKs+EOIRs in GIC, masks the intid (level-triggered),
-        //      signals our notification (counter += 1).
-        //   2. bound_irq.wait_until wakes the driver and advances the
-        //      threshold by 1 so the next call expects a fresh IRQ.
-        //   3. We read NORMAL_INT_STATUS to see what fired (CMD_COMPLETE,
-        //      DATA_COMPLETE, ERROR — could be one, could be all).
-        //   4. We clear the latched bits (W1C). DEVICE-SPECIFIC; stays
-        //      here. The framework owns the wait/unmask wiring; the
-        //      driver owns its own status-register protocol.
-        //   5. bound_irq.unmask so the GIC re-enables delivery.
-        //
-        // The loop handles both "two separate IRQs" (CMD then DATA arrive
-        // far apart) and "one IRQ with both bits set" (fast transfer where
-        // CMD and DATA latch close together). cmd_complete_seen tracks
-        // whether we've already cleared CMD_COMPLETE so an ERROR mid-data
-        // is reported as DataError, not CmdError.
-        //
-        // Deadline-bounded wait: a wedged IRQ path would hang the block
-        // server forever. BoundIrq::wait_until returns IrqWaitError::Timeout
-        // when the deadline expires; we surface it as
-        // CmdCompleteTimeout / TransferCompleteTimeout exactly like the
-        // original polling shape did. Single 1-second budget covers both
-        // CMD_COMPLETE (typical < 1 ms) and DATA_COMPLETE (typical < 100 ms
-        // for one block).
-        let freq = cntfreq_hz();
-        let mut cmd_complete_seen = false;
-        let deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
-        loop {
-            if self.bound_irq.wait_until(deadline).is_err() {
-                return Err(if cmd_complete_seen {
-                    Emmc2Error::TransferCompleteTimeout
-                } else {
-                    Emmc2Error::CmdCompleteTimeout
-                });
-            }
-
-            // P9.6: typed NormalIntStatus snapshot + clear methods.
-            let status = self.sdhci.normal_int_status(&tk);
-
-            if status.contains(NormalIntStatus::ERROR) {
-                let err_int_status = self.sdhci.error_int_status(&tk).bits();
-                self.sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF), &tk);
-                self.sdhci.clear_normal_int_status(NormalIntStatus(0xFFFF), &tk);
-                let _ = self.bound_irq.unmask();
-                return Err(if cmd_complete_seen {
-                    Emmc2Error::DataError { err_int_status }
-                } else {
-                    Emmc2Error::CmdError { err_int_status }
-                });
-            }
-
-            if status.contains(NormalIntStatus::CMD_COMPLETE) {
-                self.sdhci.clear_normal_int_status(NormalIntStatus::CMD_COMPLETE, &tk);
-                cmd_complete_seen = true;
-            }
-
-            if status.contains(NormalIntStatus::DATA_COMPLETE) {
-                self.sdhci.clear_normal_int_status(NormalIntStatus::DATA_COMPLETE, &tk);
-                let _ = self.bound_irq.unmask();
-                // Fall through to the B4.1 DAT_INHIBIT drain below before
-                // returning Ok.
-                break;
-            }
-
-            // Status had no relevant bits set (spurious wake, or
-            // CMD_COMPLETE alone with DATA still in flight). Unmask the
-            // GIC so the next IRQ can be delivered and loop back to
-            // wait_until — the deadline still bounds total time spent.
-            let _ = self.bound_irq.unmask();
-        }
-
-        // B4.1 — post-DATA_COMPLETE DAT_INHIBIT drain.
-        //
-        // DATA_COMPLETE signals card-side transfer end, but the BCM2711
-        // Arasan controller can keep outbound AXI writes in flight to
-        // DRAM for a tail period after asserting it. The post-completion
-        // invalidate (the envelope's sync_for_cpu) only orders CPU-cache
-        // operations; it does not arbitrate against the controller's
-        // outstanding bus writes. Returning Ok before those writes have
-        // committed lets the caller (e.g. emmc2 selftest) read the buffer
-        // and see pre-DMA zeros.
-        //
-        // PRESENT_STATE.DAT_INHIBIT is the controller's own "data
-        // path genuinely idle" bit: it stays set while the data path
-        // has any outstanding activity — including the post-DATA_COMPLETE
-        // AXI write tail. Polling it here forces the read call to wait
-        // for the controller to actually drain.
-        //
-        // Pre-B4.1 history: the existing pre-command CMD_INHIBIT |
-        // DAT_INHIBIT poll at the top of adma2_single_block_read (kept in
-        // place as defensive double-coverage) implicitly drained the
-        // PREVIOUS transfer on every subsequent read — which is why long
-        // FAT32 / posix read chains worked while the standalone selftest
-        // failed. M7-era diagnostic dumps that "fixed" the selftest
-        // worked for the same reason: their MMIO reads serialised
-        // against the controller's outstanding writes. This is the
-        // principled replacement.
-        //
-        // 10 ms deadline matches the plan's B4.1 budget; the actual
-        // drain is microseconds in normal operation.
-        if poll_until(
-            || !self.sdhci.present_state().contains(PresentState::DAT_INHIBIT),
-            Nanos::from_millis(10),
-        ).is_err() {
-            return Err(Emmc2Error::DatInhibitStuck {
-                present_state: self.sdhci.present_state().bits(),
-            });
-        }
-
-        Ok(())
-    }
-}
-
-/// `desc_map` is the `OwnedDmaMapping` backing the descriptor table.
-/// The coherence envelope cleans the descriptor write down to DRAM
-/// (a `ToDevice` region) before the controller's DMA fetches it
-/// (cacheable-DMA migration C1: the descriptor mapping is Normal
-/// Cacheable post-migration, so a `dsb sy` alone is not enough to
-/// flush the cache line — the envelope's clean does `dc cvac` + dsb).
+/// Writes the descriptor into `desc_map` then hands the transfer to
+/// `SdhciCommandInit::issue_data_transfer`, which owns the inhibit
+/// poll, the coherence-envelope clean→kick→await→invalidate, and the
+/// gated-setter sequence (DMA_SEL → ADMA_ADDRESS → BLOCK_SIZE →
+/// BLOCK_COUNT → ARGUMENT → single-store TRANSFER_MODE+COMMAND).
+/// `SdhciDataCompletion` (IRQ wait + B4.1 DAT_INHIBIT drain) lives in
+/// `lockjaw-userlib::sdhci` and is constructed inline.
 fn adma2_single_block_read(
     sdhci: &Sdhci,
     sector: u64,
@@ -1023,282 +868,60 @@ fn adma2_single_block_read(
     desc_map: &OwnedDmaMapping<DmaPoolOrigin>,
     bound_irq: &mut lockjaw_userlib::irq::BoundIrq,
 ) -> Result<(), Emmc2Error> {
-    #[allow(deprecated)]
-    let tk = __temp_unguarded_mint(sdhci);
     if buf_phys >= (1u64 << 32) {
         return Err(Emmc2Error::BufferPhysAbove4Gib(buf_phys));
     }
 
-    // Inhibit poll FIRST, before touching any controller config registers.
-    // Per SDHCI spec, writing HOST_CONTROL.DMA_SEL or ADMA_ADDRESS while a
-    // transfer is in progress has undefined behaviour — for back-to-back
-    // CMD17s on BCM2711 emmc2 it wedges the state machine such that
-    // PRESENT_STATE bits 1/2/9 (CMD_INHIBIT_DAT, DAT_LINE_ACTIVE,
-    // READ_TRANSFER_ACTIVE) never clear. Polling inhibit before any
-    // writes is what Linux's sdhci_send_command does.
-    if poll_until(
-        || {
-            let ps = sdhci.present_state();
-            !ps.contains(PresentState::CMD_INHIBIT) && !ps.contains(PresentState::DAT_INHIBIT)
-        },
-        Nanos::from_millis(100),
-    ).is_err() {
-        return Err(Emmc2Error::InhibitStuck {
-            present_state: sdhci.present_state().bits(),
-        });
-    }
-
-    // One descriptor covers the whole 512-byte transfer. Same descriptor
-    // table memory is reused across calls; the controller has either not
-    // started yet (first call) or has fully released (inhibit cleared
-    // above), so we can safely overwrite the previous descriptor.
-    // Typed Adma2Descriptor wire DTO (tran_end = VALID | END | ACT_TRAN,
-    // a construction-safe shape per lockjaw_types::sdhci) written through
-    // the OwnedDmaMapping's `cell()` accessor — bounds-checked and
-    // alignment-checked, so the write is fully safe (this removed the
-    // lone remaining `DmaCell::at` unsafe on this path).
+    // Write the descriptor before the envelope's clean fires — same
+    // typed Adma2Descriptor wire DTO as before. The single tran_end
+    // shape (VALID | END | ACT_TRAN) is construction-safe per
+    // lockjaw_types::sdhci's named constructor; bounds + alignment
+    // are checked by the OwnedDmaMapping cell accessor.
     desc_map
         .cell::<Adma2Descriptor>(0)
         .write(Adma2Descriptor::tran_end(buf_phys as u32, 512));
-    // Coherence envelope: clean the descriptor down to DRAM (a
-    // `ToDevice` region — post-C1 the descriptor mapping is Normal
-    // Cacheable, so the clean does `dc cvac` + dsb to write the line
-    // back before the controller's DMA fetches it), then `kick` the
-    // controller, then await the SDHCI data completion (IRQ wait +
-    // B4.1 drain). The framework owns the clean -> kick -> await
-    // ordering; this driver no longer hand-sequences sync calls.
+
+    // ToDevice region for the descriptor — the envelope cleans it
+    // down to DRAM before the controller's DMA fetches.
     let desc_region = desc_map.dma_region(0, 8, DmaDir::ToDevice);
-    run_dma_transfer(
-        &[desc_region],
-        SdhciDataCompletion { sdhci, bound_irq },
-        || -> Result<(), Emmc2Error> {
-            // Re-select ADMA2-32 in HOST_CONTROL_1. Preserve the 4-bit bus
-            // width bit (set during M3 ACMD6); replace the DMA_SEL field
-            // bits only. Idempotent (engine.new already set it) but kept for
-            // safety against any other code path that might have changed it.
-            // P9.5: typed modify-in-place via the generated enum field
-            // accessor — `with_dma_sel(HostControlDmaSel::Adma2_32)` masks
-            // and shifts the DMA_SEL field correctly without driver-side
-            // hand-rolled mask arithmetic.
-            sdhci.modify_host_control(|hc| hc.with_dma_sel(HostControlDmaSel::Adma2_32), &tk);
 
-            sdhci.write_adma_address(desc_map.pa() as u32, &tk);
+    let params = sdhci_lib::SdhciDataTransfer {
+        cmd: SdCommand::ReadSingleBlock,
+        arg: sector as u32,
+        direction: sdhci_lib::DataDirection::Read,
+        adma_descriptor_pa: desc_map.pa() as u32,
+    };
+    let completion = sdhci_lib::SdhciDataCompletion::new(sdhci, bound_irq);
 
-            // Typed BLOCK_SIZE/BLOCK_COUNT writes (regspec generates raw u16
-            // write_* accessors — the registers have no named bit fields).
-            sdhci.write_block_size(512, &tk);
-            sdhci.write_block_count(1, &tk);
-            // ARGUMENT must be latched before the COMMAND half of the
-            // combined write triggers the command on the bus.
-            sdhci.write_argument(sector as u32, &tk);
-
-            let cmd17 = sd_command_word(
-                SdCommand::ReadSingleBlock.index(),
-                SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
-            );
-            // P9.7: single-u32 combined_trigger write of TRANSFER_MODE
-            // (TRNS_READ | TRNS_DMA) + COMMAND (cmd17). This makes the M7
-            // controller-ordering fix mechanical: the BCM2711 Arasan
-            // controller REQUIRES TRANSFER_MODE and COMMAND to arrive as one
-            // 32-bit store or it silently drops the command. #131 stabilised
-            // this by hand-disciplining the write order; the generated
-            // set_transfer_mode_command setter now enforces the single-store
-            // shape structurally (P9.0 emitter; verified by the codegen test
-            // transfer_mode_command_combined_trigger_single_u32_store).
-            sdhci.set_transfer_mode_command(
-                TransferMode(SDHCI_TRNS_READ | SDHCI_TRNS_DMA),
-                Command(cmd17),
-                &tk,
-            );
-            Ok(())
-        },
-    )
-    .map_err(|e| match e {
-        // The pre-kick clean of the descriptor region failed.
-        DmaTransferError::CleanFailed(_) => Emmc2Error::DescSyncFailed,
-        // The `kick` (register programming) returned an error.
-        DmaTransferError::Kick(k) => k,
-        // The SDHCI completion (IRQ wait / B4.1 drain) failed.
-        DmaTransferError::Completion(c) => c,
-        // The descriptor region is `ToDevice`, never invalidated, so
-        // this arm is unreachable; map it for totality.
-        DmaTransferError::InvalidateFailed(_) => Emmc2Error::DescSyncFailed,
-    })
-}
-
-/// Result of an ADMA2 multi-block read with phase-split timing.
-/// `cmd_to_complete` is the controller's response latency; the rest
-/// is card-side data delivery. Useful for distinguishing controller
-/// bugs from card-side stalls — see `docs/tracking/tech-debt.md` for the
-/// 2026-05-17 card-stall investigation.
-pub struct AdmaTiming {
-    pub total: u64,
-    pub cmd_to_complete: u64,
-    pub data_to_complete: u64,
-}
-
-/// Direction selector for ADMA2 transfers. `Read` programs CMD18
-/// (READ_MULTIPLE_BLOCK) with TRNS_READ; `Write` programs CMD25
-/// (WRITE_MULTIPLE_BLOCK) without TRNS_READ. Both use Auto-CMD23
-/// to set BLOCK_COUNT in a single command pair (no post-data CMD12).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AdmaDirection {
-    Read,
-    Write,
-}
-
-#[allow(dead_code)]  // Disabled until CMD18+Auto-CMD23 cold-boot is validated. See doc/tech-debt.md.
-fn adma2_transfer(
-    sdhci: &Sdhci,
-    direction: AdmaDirection,
-    sector: u64,
-    n_blocks: u16,
-    buf_phys: u64,
-    desc_map: &OwnedDmaMapping<DmaPoolOrigin>,
-) -> Result<AdmaTiming, Emmc2Error> {
-    #[allow(deprecated)]
-    let tk = __temp_unguarded_mint(sdhci);
-    if buf_phys >= (1u64 << 32) {
-        return Err(Emmc2Error::BufferPhysAbove4Gib(buf_phys));
-    }
-    let bytes = (n_blocks as u32) * 512;
-    if bytes > 65535 {
-        return Err(Emmc2Error::DescriptorLengthOverflow(bytes));
-    }
-
-    // Inhibit poll FIRST — see adma2_single_block_read for rationale.
-    // Writing ADMA_ADDRESS or other transfer-affecting registers while
-    // a previous transfer is still active wedges the controller.
-    if poll_until(
-        || {
-            let ps = sdhci.present_state();
-            !ps.contains(PresentState::CMD_INHIBIT) && !ps.contains(PresentState::DAT_INHIBIT)
-        },
-        Nanos::from_millis(100),
-    ).is_err() {
-        return Err(Emmc2Error::InhibitStuck {
-            present_state: sdhci.present_state().bits(),
-        });
-    }
-
-    // One descriptor covers the whole multi-block transfer. Descriptor
-    // table from the single-block path is reused (still mapped via
-    // desc_map); overwrite its 8 bytes for this transfer. Written
-    // through the OwnedDmaMapping's bounds-checked `cell()` accessor
-    // (safe — mirrors adma2_single_block_read).
-    desc_map
-        .cell::<Adma2Descriptor>(0)
-        .write(Adma2Descriptor::tran_end(buf_phys as u32, bytes as u16));
-    // Coherence envelope: clean the reused descriptor down to DRAM (a
-    // `ToDevice` region — same C1 rationale as adma2_single_block_read),
-    // then `kick` the controller and run the polled CMD/TRANSFER
-    // completion. Dead path (CMD18+Auto-CMD23 disabled), kept on the
-    // envelope so a future re-enable inherits the clean -> kick ordering
-    // and the single-store TRANSFER_MODE+COMMAND discipline. Completion
-    // here is polled inside `kick` (so `Immediate`), not IRQ-driven like
-    // the single-block path.
-    let desc_region = desc_map.dma_region(0, 8, DmaDir::ToDevice);
-    run_dma_transfer(
-        &[desc_region],
-        Immediate,
-        || -> Result<AdmaTiming, Emmc2Error> {
-            sdhci.write_adma_address(desc_map.pa() as u32, &tk);
-            sdhci.write_argument2(n_blocks as u32, &tk);
-
-            // P9.6: typed BLOCK_SIZE/BLOCK_COUNT writes (mirror of the
-            // single-block path).
-            sdhci.write_block_size(512, &tk);
-            sdhci.write_block_count(n_blocks, &tk);
-            let trns_dir = match direction {
-                AdmaDirection::Read => SDHCI_TRNS_READ,
-                AdmaDirection::Write => 0, // absence of TRNS_READ = write
-            };
-            let trns = trns_dir | SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN
-                | SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD23;
-            // CMD18/CMD25 argument is the LBA (SDHC/SDXC blocks-as-units).
-            // ARGUMENT before the combined TRANSFER_MODE+COMMAND write
-            // (P9.7 reorder — same rationale as adma2_single_block_read).
-            sdhci.write_argument(sector as u32, &tk);
-
-            let cmd = sd_command_word(
-                match direction {
-                    AdmaDirection::Read => SdCommand::ReadMultipleBlock.index(),
-                    AdmaDirection::Write => SdCommand::WriteMultipleBlock.index(),
-                },
-                SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
-            );
-
-            let freq = cntfreq_hz();
-            let t0 = monotonic_now();
-            // P9.7: single-u32 combined_trigger write (TRANSFER_MODE +
-            // COMMAND). Mirror of the single-block path; keeps the
-            // multi-block dead-code path on the same write discipline so a
-            // future CMD18 re-enable doesn't reintroduce the split-write
-            // Arasan errata exposure.
-            sdhci.set_transfer_mode_command(TransferMode(trns), Command(cmd), &tk);
-
-            // Poll CMD_COMPLETE (P9.6: typed status snapshot + clear).
-            let cmd_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
-            loop {
-                let status = sdhci.normal_int_status(&tk);
-                if status.contains(NormalIntStatus::ERROR) {
-                    let err_int_status = sdhci.error_int_status(&tk).bits();
-                    sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF), &tk);
-                    sdhci.clear_normal_int_status(
-                        NormalIntStatus::ERROR | NormalIntStatus::CMD_COMPLETE,
-                        &tk,
-                    );
-                    return Err(Emmc2Error::CmdError { err_int_status });
-                }
-                if status.contains(NormalIntStatus::CMD_COMPLETE) {
-                    sdhci.clear_normal_int_status(NormalIntStatus::CMD_COMPLETE, &tk);
-                    break;
-                }
-                if monotonic_now() >= cmd_deadline {
-                    return Err(Emmc2Error::CmdCompleteTimeout);
-                }
-                core::hint::spin_loop();
+    SdhciCommandInit::open(sdhci)
+        .issue_data_transfer(params, &[desc_region], completion)
+        .map(|_| ())
+        .map_err(|e| match e {
+            sdhci_lib::SdhciDataTransferError::InhibitStuck { present_state } => {
+                Emmc2Error::InhibitStuck { present_state }
             }
-            let t_cmd = monotonic_now();
-
-            // Poll TRANSFER_COMPLETE — for multi-block ADMA, the controller
-            // signals once after the FULL descriptor's transfer ends.
-            let xfer_deadline = monotonic_now().deadline_in(Nanos::from_millis(500), freq);
-            loop {
-                let status = sdhci.normal_int_status(&tk);
-                if status.contains(NormalIntStatus::ERROR) {
-                    let err_int_status = sdhci.error_int_status(&tk).bits();
-                    sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF), &tk);
-                    sdhci.clear_normal_int_status(
-                        NormalIntStatus::ERROR | NormalIntStatus::DATA_COMPLETE,
-                        &tk,
-                    );
-                    return Err(Emmc2Error::DataError { err_int_status });
+            sdhci_lib::SdhciDataTransferError::CleanFailed(_) => Emmc2Error::DescSyncFailed,
+            // The descriptor region is `ToDevice`, never invalidated, so
+            // this arm is unreachable; map it for totality.
+            sdhci_lib::SdhciDataTransferError::InvalidateFailed(_) => Emmc2Error::DescSyncFailed,
+            sdhci_lib::SdhciDataTransferError::Completion(c) => match c {
+                sdhci_lib::SdhciDataCompletionError::CmdCompleteTimeout => {
+                    Emmc2Error::CmdCompleteTimeout
                 }
-                if status.contains(NormalIntStatus::DATA_COMPLETE) {
-                    sdhci.clear_normal_int_status(NormalIntStatus::DATA_COMPLETE, &tk);
-                    break;
+                sdhci_lib::SdhciDataCompletionError::TransferCompleteTimeout => {
+                    Emmc2Error::TransferCompleteTimeout
                 }
-                if monotonic_now() >= xfer_deadline {
-                    return Err(Emmc2Error::TransferCompleteTimeout);
+                sdhci_lib::SdhciDataCompletionError::CmdError { err_int_status } => {
+                    Emmc2Error::CmdError { err_int_status }
                 }
-                core::hint::spin_loop();
-            }
-            let t1 = monotonic_now();
-            Ok(AdmaTiming {
-                total: t1.0.saturating_sub(t0.0),
-                cmd_to_complete: t_cmd.0.saturating_sub(t0.0),
-                data_to_complete: t1.0.saturating_sub(t_cmd.0),
-            })
-        },
-    )
-    .map_err(|e| match e {
-        DmaTransferError::CleanFailed(_) => Emmc2Error::DescSyncFailed,
-        DmaTransferError::Kick(k) => k,
-        // Immediate completion is infallible.
-        DmaTransferError::Completion(inf) => match inf {},
-        DmaTransferError::InvalidateFailed(_) => Emmc2Error::DescSyncFailed,
-    })
+                sdhci_lib::SdhciDataCompletionError::DataError { err_int_status } => {
+                    Emmc2Error::DataError { err_int_status }
+                }
+                sdhci_lib::SdhciDataCompletionError::DatInhibitStuck { present_state } => {
+                    Emmc2Error::DatInhibitStuck { present_state }
+                }
+            },
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,84 +1019,49 @@ impl Emmc2BlockEngine {
         irq: lockjaw_userlib::irq::BoundIrq,
     ) -> Result<Self, Emmc2Error>
     {
-        // Reborrow as &Sdhci for the rest of init (passed to
-        // sdhci_read*/write* shims). regs is moved into the engine
-        // at the end of this function.
+        // Reborrow as &Sdhci for the init-helper calls. regs is moved
+        // into the engine at the end of this function.
         let sdhci = regs.regs();
-        #[allow(deprecated)]
-        let tk = __temp_unguarded_mint(sdhci);
         // Descriptor table: 1 page from the DMA pool, allocated and
         // mapped via the typed OwnedDmaMapping (Normal Cacheable
         // post-C1 of the cacheable-DMA migration). The matching
         // descriptor clean is the `ToDevice` region of the coherence
-        // envelope inside adma2_single_block_read. The mapping owns the
-        // pageset; its Drop unmaps + closes it when the engine is torn down.
+        // envelope inside `SdhciCommandInit::issue_data_transfer`. The
+        // mapping owns the pageset; its Drop unmaps + closes it when
+        // the engine is torn down.
         let desc_map = OwnedDmaMapping::alloc_dma_pool().map_err(|_| Emmc2Error::DescAllocFailed)?;
         if desc_map.pa() >= (1u64 << 32) {
             return Err(Emmc2Error::DescPhysAbove4Gib(desc_map.pa()));
         }
-        // Switch HOST_CONTROL_1.DMA_SEL to ADMA2-32; preserve the
-        // 4-bit bus width from ACMD6 (P9.5 — typed
-        // `with_dma_sel(HostControlDmaSel::Adma2_32)`).
-        sdhci.modify_host_control(|hc| hc.with_dma_sel(HostControlDmaSel::Adma2_32), &tk);
-        // Program the descriptor table address once; the same table
-        // is reused across every transfer.
-        sdhci.write_adma_address(desc_map.pa() as u32, &tk);
-        // Clear any latched STATUS bits before enabling signaling.
+        // Configure HOST_CONTROL_1.DMA_SEL = ADMA2-32 + program the
+        // descriptor table address once (reused across every transfer).
+        // `init_adma2_32` preserves the 4-bit bus width set during
+        // M3 ACMD6 — modify_host_control writes the DMA_SEL field
+        // only.
+        sdhci_lib::init_adma2_32(sdhci, desc_map.pa() as u32);
+        // Turn on IRQ signaling for the data path. STATUS_ENABLE was
+        // set during emmc2_entry's post-bootstrap init (before the
+        // ID phase). enable_irq_signaling clears any stale STATUS
+        // bits left latched from the ID phase (notably DATA_COMPLETE
+        // from CMD7's R1b busy release) BEFORE flipping signal-enable
+        // — without that stale-clear the GIC line asserts immediately
+        // on a never-issued transfer, BoundIrq.wait_until returns
+        // instantly on stale status, and the first read sees garbage
+        // (SDHCI v3 §2.2.24 — STATUS_ENABLE & SIGNAL_ENABLE & STATUS
+        // is combinatorial, no edge detection).
         //
-        // ID-phase polling can leave NORMAL_INT_STATUS bits set —
-        // notably DATA_COMPLETE after CMD7 (RESP_SHORT_BUSY / R1b):
-        // the card holds DAT0 busy while it transitions to the
-        // selected state, and the release latches DATA_COMPLETE.
-        // issue_command's W1C only clears CMD_COMPLETE; the
-        // subsequent PRESENT_STATE.DAT_INHIBIT poll waits for the
-        // busy release but does not touch NORMAL_INT_STATUS.
-        //
-        // Per SDHCI v3 §2.2.24, the GIC line is asserted whenever
-        // (STATUS_ENABLE & SIGNAL_ENABLE & STATUS) is non-zero —
-        // combinatorial, no edge detection. So if SIGNAL_ENABLE is
-        // flipped on with STATUS.DATA_COMPLETE still latched, the
-        // controller asserts the GIC line IMMEDIATELY, the kernel
-        // takes the IRQ + masks the SPI + signals the notification,
-        // and BoundIrq.threshold (= 1 after bind) is satisfied
-        // before CMD17 has even been issued. The first wait_until
-        // returns instantly with stale STATUS, the driver "succeeds"
-        // on a transfer that never happened, and the buffer reads
-        // garbage.
-        //
-        // Clearing STATUS via W1C-0xFFFF here is the structural fix
-        // — it's a superset of B4.2's per-command stale-bit guard,
-        // but at this specific site it's REQUIRED to make the
-        // ID-phase → data-phase IRQ-mode transition safe.
-        // P9.6: typed clear via clear_*_int_status with the full
-        // mask wrapped in the typed newtype.
-        sdhci.clear_normal_int_status(NormalIntStatus(0xFFFF), &tk);
-        sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF), &tk);
-
-        // Enable IRQ signaling for the data path. STATUS_ENABLE was
-        // set during emmc2_entry's post-bootstrap init (right after
-        // soft_reset_all, before the ID phase); SIGNAL_ENABLE gates
-        // whether a latched STATUS bit asserts the GIC line. Turned
-        // on HERE, AFTER the ID phase (issue_command polls — no
-        // signal enable during ID = no IRQ overlap during
-        // enumeration).
-        //
-        // The set is the three events the IRQ loop in
-        // adma2_single_block_read handles: CMD_COMPLETE,
-        // DATA_COMPLETE, and ERROR. ERROR (bit 15) is the master
-        // gate for error IRQ delivery (SDHCI 3.0 §2.2.21 Table 2-32):
-        // it AND-gates the per-error ERROR_INT_SIGNAL_ENABLE bits, so
-        // without it set the IRQ loop never wakes on a data-path
-        // CRC/timeout — those would surface only as the 1-second
-        // TransferCompleteTimeout fallback. The three bits here must
-        // match the three the loop's status decode checks; see
-        // docs/tracking/tech-debt.md "emmc2 error-IRQ enable is Pi-fault-path-
-        // only" for why make test cannot guard this set.
+        // The normal-signal set is the three events the IRQ loop in
+        // SdhciDataCompletion handles: CMD_COMPLETE, DATA_COMPLETE,
+        // ERROR. ERROR (bit 15) is the master gate for error IRQ
+        // delivery (SDHCI 3.0 §2.2.21 Table 2-32) — it AND-gates the
+        // per-error ERROR_INT_SIGNAL_ENABLE bits, so without it set
+        // the IRQ loop never wakes on a data-path CRC/timeout. See
+        // docs/tracking/tech-debt.md "emmc2 error-IRQ enable is
+        // Pi-fault-path-only" for why make test cannot guard this set.
         let normal_sig = NormalIntSignalEnable::CMD_COMPLETE
             | NormalIntSignalEnable::DATA_COMPLETE
             | NormalIntSignalEnable::ERROR;
-        sdhci.set_normal_int_signal_enable(normal_sig, &tk);
-        sdhci.set_error_int_signal_enable(ErrorIntSignalEnable(0xFFFF), &tk);
+        sdhci_lib::enable_irq_signaling(sdhci, normal_sig, ErrorIntSignalEnable(0xFFFF));
         // Drop the `sdhci` borrow so we can move `regs` into the
         // struct (NLL should already handle this, but the explicit
         // shadow keeps the intent obvious in review).
@@ -1597,14 +1185,15 @@ impl BlockEngine for Emmc2BlockEngine {
             || -> Result<(), BlockError> {
                 // Reads always use CMD17 (single-block). Multi-sector reads
                 // loop one block at a time, advancing buf_pa by 512 bytes per
-                // sector. The CMD18+Auto-CMD23 path in adma2_transfer is dead
-                // for reads until the cold-boot CMD18 question is settled;
-                // we want every fat32 / partition-manager read to exercise
-                // the proven M6 sub-commit 2b sequence. Performance cost on
-                // Pi: one CMD17 round-trip per sector. Each block runs its
-                // own inner descriptor envelope (IRQ wait + B4.1 drain), so
-                // this kick blocks until every block finishes and the outer
-                // buffer completion is `Immediate`.
+                // sector. CMD18+Auto-CMD23 multi-block was the old
+                // adma2_transfer path; O5 deleted it as YAGNI and the future
+                // multi-block re-introduction will extend
+                // SdhciDataTransfer.block_count, not reintroduce a separate
+                // kick. Performance cost on Pi: one CMD17 round-trip per
+                // sector. Each block runs its own inner descriptor envelope
+                // (IRQ wait + B4.1 drain) inside issue_data_transfer, so this
+                // kick blocks until every block finishes and the outer buffer
+                // completion is `Immediate`.
                 for i in 0..count {
                     let buf_sector_pa = buf_pa + i * 512;
                     let res = adma2_single_block_read(

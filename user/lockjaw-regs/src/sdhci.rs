@@ -815,16 +815,6 @@ pub fn __sdhci_internal_mint(_dev: &Sdhci) -> SdhciOpToken<'_> {
     SdhciOpToken { _life: core::marker::PhantomData, _no_ctor: () }
 }
 
-/// Temporary unguarded mint — exists ONLY for the O2-O5 migration
-/// window. emmc2-driver calls this while its gated-setter sites are
-/// being rewritten to flow through `lockjaw-userlib::sdhci::SdhciCommandInit`
-/// and the init-time helpers. Deleted in O5 once data-phase migrates.
-#[deprecated(note = "O2-O5 migration escape; removed in O5")]
-#[inline(always)]
-pub fn __temp_unguarded_mint(_dev: &Sdhci) -> SdhciOpToken<'_> {
-    SdhciOpToken { _life: core::marker::PhantomData, _no_ctor: () }
-}
-
 // ---------- Sdhci accessors ----------
 
 impl Sdhci {

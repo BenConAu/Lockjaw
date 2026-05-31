@@ -33,6 +33,7 @@
 //!     mintable via `MmcCard::<Tran>::into_parts()`) as compile-time
 //!     proof the card reached `Tran`.
 
+use core::convert::Infallible;
 use core::marker::PhantomData;
 
 // Internal use only — `__sdhci_internal_mint` is the operation
@@ -54,10 +55,16 @@ pub use lockjaw_regs::sdhci::{
 
 use lockjaw_types::sdhci::{
     compute_clock_divisor, response::ResponseShape, sd_command_word, SdCommand,
+    SDHCI_CMD_CRC, SDHCI_CMD_DATA, SDHCI_CMD_INDEX, SDHCI_CMD_RESP_SHORT,
+    SDHCI_TRNS_DMA, SDHCI_TRNS_READ,
 };
 use lockjaw_types::sdhci::operation::{OpIdle, OpState};
 
+use crate::dma_transfer::{run_dma_transfer, DmaCompletion, DmaRegion, DmaTransferError};
+use crate::irq::BoundIrq;
 use crate::time::{monotonic_now, sleep_for, Nanos};
+
+use lockjaw_types::syscall::SyscallError;
 
 // ---------------------------------------------------------------------------
 // SdhciCommandError — generic SDHCI command-issue failure shapes.
@@ -393,3 +400,379 @@ pub fn set_bus_width_4bit(sdhci: &Sdhci) {
     let tk = __sdhci_internal_mint(sdhci);
     sdhci.modify_host_control(|hc| hc.with_dat_4bit(true), &tk);
 }
+
+/// Configure the SDHCI controller for ADMA2-32 data transfers. Sets
+/// `HOST_CONTROL_1.DMA_SEL = ADMA2_32` and writes `descriptor_pa` to
+/// `ADMA_SYS_ADDR`. Called once at engine init; the descriptor table
+/// memory is reused across every transfer. The per-transfer kick path
+/// inside `issue_data_transfer` re-asserts both `DMA_SEL` AND
+/// `ADMA_ADDRESS` defensively — idempotent against the engine init's
+/// writes, but guards against any future code path that might change
+/// either before a data transfer fires.
+///
+/// 32-bit ADMA2 is hardcoded — emmc2 is the only consumer and SDHCI
+/// v3 on BCM2711 supports 32-bit only. A 64-bit ADMA2 helper lands
+/// when a >4GiB-PA SDHCI consumer surfaces.
+pub fn init_adma2_32(sdhci: &Sdhci, descriptor_pa: u32) {
+    let tk = __sdhci_internal_mint(sdhci);
+    sdhci.modify_host_control(
+        |hc| hc.with_dma_sel(HostControlDmaSel::Adma2_32),
+        &tk,
+    );
+    sdhci.write_adma_address(descriptor_pa, &tk);
+}
+
+/// Turn on IRQ-driven completion delivery for data-phase transfers.
+/// Clears any stale `NORMAL_INT_STATUS` / `ERROR_INT_STATUS` bits
+/// LEFT LATCHED FROM THE ID PHASE — then writes `SIGNAL_ENABLE` masks.
+///
+/// The stale-clear is load-bearing: per SDHCI v3 §2.2.24, the GIC
+/// line is asserted whenever `(STATUS_ENABLE & SIGNAL_ENABLE & STATUS)`
+/// is non-zero (combinatorial, no edge detection). If `SIGNAL_ENABLE`
+/// flips on while `STATUS.DATA_COMPLETE` is still latched from a
+/// prior R1b command (e.g. CMD7's busy release), the controller
+/// asserts the GIC line IMMEDIATELY — the first `wait_until` in
+/// `SdhciDataCompletion::await_complete` returns instantly on stale
+/// status, the driver "succeeds" on a transfer that never happened,
+/// and the buffer reads garbage. Clearing STATUS via W1C-0xFFFF before
+/// the signal-enable flip is the structural fix.
+pub fn enable_irq_signaling(
+    sdhci: &Sdhci,
+    normal: NormalIntSignalEnable,
+    error: ErrorIntSignalEnable,
+) {
+    let tk = __sdhci_internal_mint(sdhci);
+    sdhci.clear_normal_int_status(NormalIntStatus(0xFFFF), &tk);
+    sdhci.clear_error_int_status(ErrorIntStatus(0xFFFF), &tk);
+    sdhci.set_normal_int_signal_enable(normal, &tk);
+    sdhci.set_error_int_signal_enable(error, &tk);
+}
+
+// ---------------------------------------------------------------------------
+// SdhciDataCompletion — the device-done signal for data-phase transfers.
+// ---------------------------------------------------------------------------
+
+/// Failure shapes from the data-phase IRQ-driven completion wait.
+/// Generic across SDHCI consumers; emmc2's `Emmc2Error` maps these
+/// into its own variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SdhciDataCompletionError {
+    /// The `BoundIrq::wait_until` deadline expired before
+    /// `NORMAL_INT_STATUS.CMD_COMPLETE` ever fired. The command
+    /// never got past the controller's response phase.
+    CmdCompleteTimeout,
+    /// `CMD_COMPLETE` fired but `DATA_COMPLETE` did not within the
+    /// remaining deadline. The data phase wedged.
+    TransferCompleteTimeout,
+    /// `NORMAL_INT_STATUS.ERROR` fired before `CMD_COMPLETE`;
+    /// `err_int_status` holds the `ERROR_INT_STATUS` snapshot
+    /// captured pre-W1C.
+    CmdError { err_int_status: u16 },
+    /// `NORMAL_INT_STATUS.ERROR` fired after `CMD_COMPLETE` but
+    /// before `DATA_COMPLETE`. CRC/timeout in the data phase.
+    DataError { err_int_status: u16 },
+    /// `DATA_COMPLETE` fired but `PRESENT_STATE.DAT_INHIBIT` did
+    /// not clear within the 10ms drain budget — the controller's
+    /// post-DATA_COMPLETE AXI write tail wedged. B4.1 plan.
+    DatInhibitStuck { present_state: u32 },
+}
+
+/// SDHCI data-transfer completion — the device-done signal the
+/// coherence envelope awaits between the `kick` and the post-transfer
+/// invalidate.
+///
+/// Wraps the IRQ-driven `CMD_COMPLETE`/`DATA_COMPLETE` wait plus the
+/// B4.1 post-`DATA_COMPLETE` `DAT_INHIBIT` drain. SDHCI-family-generic;
+/// any SDHCI consumer that runs IRQ-driven ADMA transfers uses this
+/// shape. Per-driver error mapping happens at the consumer's
+/// `DmaCompletion::Error` boundary.
+pub struct SdhciDataCompletion<'a> {
+    sdhci: &'a Sdhci,
+    bound_irq: &'a mut BoundIrq,
+}
+
+impl<'a> SdhciDataCompletion<'a> {
+    /// Construct a completion bound to `sdhci` + `bound_irq`. The
+    /// envelope's `await_complete` consumes self.
+    #[inline]
+    pub fn new(sdhci: &'a Sdhci, bound_irq: &'a mut BoundIrq) -> Self {
+        Self { sdhci, bound_irq }
+    }
+}
+
+impl DmaCompletion for SdhciDataCompletion<'_> {
+    type Error = SdhciDataCompletionError;
+
+    fn await_complete(self) -> Result<(), Self::Error> {
+        let tk = __sdhci_internal_mint(self.sdhci);
+        // IRQ-driven completion. SDHCI is configured LEVEL_HIGH;
+        // each IRQ delivery: kernel ACK+EOIR+mask in GIC, signals our
+        // notification (counter += 1). `bound_irq.wait_until` wakes the
+        // driver and advances the threshold by 1. We read
+        // NORMAL_INT_STATUS, decode (CMD_COMPLETE, DATA_COMPLETE,
+        // ERROR — could be any combination), W1C the latched bits, and
+        // `bound_irq.unmask` so the GIC re-enables delivery.
+        //
+        // The loop handles both two-IRQ (CMD then DATA arrive far
+        // apart) and one-IRQ-both-bits (fast transfer) cases.
+        // `cmd_complete_seen` tracks whether CMD_COMPLETE was already
+        // observed so an ERROR mid-data is reported as DataError, not
+        // CmdError.
+        //
+        // Deadline-bounded: 1s covers both CMD_COMPLETE (typical <1ms)
+        // and DATA_COMPLETE (typical <100ms for one block).
+        let freq = crate::time::cntfreq_hz();
+        let mut cmd_complete_seen = false;
+        let deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
+        loop {
+            if self.bound_irq.wait_until(deadline).is_err() {
+                return Err(if cmd_complete_seen {
+                    SdhciDataCompletionError::TransferCompleteTimeout
+                } else {
+                    SdhciDataCompletionError::CmdCompleteTimeout
+                });
+            }
+
+            let status = self.sdhci.normal_int_status(&tk);
+
+            if status.contains(NormalIntStatus::ERROR) {
+                let err_int_status = self.sdhci.error_int_status(&tk).bits();
+                self.sdhci
+                    .clear_error_int_status(ErrorIntStatus(0xFFFF), &tk);
+                self.sdhci
+                    .clear_normal_int_status(NormalIntStatus(0xFFFF), &tk);
+                let _ = self.bound_irq.unmask();
+                return Err(if cmd_complete_seen {
+                    SdhciDataCompletionError::DataError { err_int_status }
+                } else {
+                    SdhciDataCompletionError::CmdError { err_int_status }
+                });
+            }
+
+            if status.contains(NormalIntStatus::CMD_COMPLETE) {
+                self.sdhci
+                    .clear_normal_int_status(NormalIntStatus::CMD_COMPLETE, &tk);
+                cmd_complete_seen = true;
+            }
+
+            if status.contains(NormalIntStatus::DATA_COMPLETE) {
+                self.sdhci
+                    .clear_normal_int_status(NormalIntStatus::DATA_COMPLETE, &tk);
+                let _ = self.bound_irq.unmask();
+                break;
+            }
+
+            // Spurious wake or CMD_COMPLETE alone with DATA in flight.
+            // Unmask + loop; the deadline still bounds total time.
+            let _ = self.bound_irq.unmask();
+        }
+
+        // B4.1 — post-DATA_COMPLETE DAT_INHIBIT drain. DATA_COMPLETE
+        // signals card-side end, but the BCM2711 Arasan controller can
+        // keep outbound AXI writes in flight to DRAM for a tail period.
+        // The envelope's post-completion sync_for_cpu invalidate orders
+        // CPU caches but does NOT arbitrate against the controller's
+        // outstanding bus writes. PRESENT_STATE.DAT_INHIBIT is the
+        // controller's own "data path genuinely idle" bit — polling it
+        // here forces the read call to wait for the controller drain.
+        //
+        // 10ms deadline matches the B4.1 plan budget; the actual drain
+        // is microseconds in normal operation.
+        let drain_deadline =
+            monotonic_now().deadline_in(Nanos::from_millis(10), freq);
+        loop {
+            let ps = self.sdhci.present_state();
+            if !ps.contains(PresentState::DAT_INHIBIT) {
+                return Ok(());
+            }
+            if monotonic_now() >= drain_deadline {
+                return Err(SdhciDataCompletionError::DatInhibitStuck {
+                    present_state: ps.bits(),
+                });
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// issue_data_transfer — the data-phase operation envelope.
+// ---------------------------------------------------------------------------
+
+/// Direction selector for a data-phase ADMA2 transfer. Maps to the
+/// `TRNS_READ` bit in `TRANSFER_MODE` — set for card→host, clear for
+/// host→card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataDirection {
+    /// Card → host (CMD17 single-block, CMD18 multi-block). Sets
+    /// `TRNS_READ` in `TRANSFER_MODE`.
+    Read,
+    /// Host → card (CMD24 single-block, CMD25 multi-block). Clears
+    /// `TRNS_READ` in `TRANSFER_MODE`.
+    Write,
+}
+
+/// Parameters for a **single-block** ADMA2-32 data transfer (CMD17
+/// read or CMD24 write). Bundles only the per-transfer values that
+/// vary between calls — `BLOCK_SIZE = 512` and `BLOCK_COUNT = 1` are
+/// hardcoded in the kick because the implementation neither programs
+/// `TRANSFER_MODE.{MULTI, BLK_CNT_EN, AUTO_CMD23}` nor writes
+/// `ARGUMENT2`. Multi-block (CMD18/CMD25) re-introduction will land
+/// the additional fields as part of the same commit that adds the
+/// MULTI/BLK_CNT_EN/AUTO_CMD23 + ARGUMENT2 kick logic, so the API
+/// surface always matches what the kick actually programs (Tier 3 #13
+/// — illegal states unrepresentable).
+pub struct SdhciDataTransfer {
+    /// The SD command — CMD17 (ReadSingleBlock) for reads, CMD24
+    /// (WriteBlock) for writes.
+    pub cmd: SdCommand,
+    /// Command argument — typically the LBA (SDHC/SDXC blocks-as-units).
+    pub arg: u32,
+    /// Read vs. write — selects `TRNS_READ` in `TRANSFER_MODE`.
+    pub direction: DataDirection,
+    /// Physical address of the ADMA2 descriptor table the controller
+    /// will fetch. Must be 4-byte aligned and fit in u32 (ADMA2-32
+    /// mode). The driver is responsible for writing the descriptor
+    /// contents into the backing pageset BEFORE calling
+    /// `issue_data_transfer` — the envelope cleans the descriptor's
+    /// `DmaRegion` (in `regions`) before kicking the controller.
+    pub adma_descriptor_pa: u32,
+}
+
+/// Failure shapes from [`SdhciCommandInit::issue_data_transfer`].
+/// Mirrors the variants of [`DmaTransferError`] with the family-
+/// generic [`SdhciDataCompletionError`] inlined plus the pre-kick
+/// inhibit-poll failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SdhciDataTransferError {
+    /// `PRESENT_STATE.CMD_INHIBIT` or `DAT_INHIBIT` did not clear
+    /// before the pre-kick poll deadline. No registers were touched.
+    InhibitStuck { present_state: u32 },
+    /// A pre-`kick` `sync_for_device` (clean) syscall failed.
+    CleanFailed(SyscallError),
+    /// The data-phase completion wait failed — IRQ timeout, CRC/error
+    /// status, or DAT_INHIBIT drain timeout.
+    Completion(SdhciDataCompletionError),
+    /// A post-completion `sync_for_cpu` (invalidate) syscall failed.
+    InvalidateFailed(SyscallError),
+}
+
+impl<'a> SdhciCommandInit<'a, OpIdle> {
+    /// Issue an ADMA2-32 data-phase command (today: single-block read
+    /// CMD17, parameterized for the obvious extensions) wrapped in
+    /// the DMA coherence envelope.
+    ///
+    /// The driver writes the ADMA2 descriptor into a coherent pageset
+    /// before calling this; the envelope's pre-kick clean ensures the
+    /// descriptor is visible to the controller's DMA, and the post-
+    /// completion invalidate ensures CPU reads of the data buffer see
+    /// fresh DRAM rather than stale cache lines. `regions` should
+    /// include both the descriptor (as `ToDevice`) and the data
+    /// buffer (as `FromDevice` for reads, `ToDevice` for writes).
+    ///
+    /// Sequence:
+    ///   1. Pre-kick `PRESENT_STATE` poll — `CMD_INHIBIT` and
+    ///      `DAT_INHIBIT` both clear (100ms deadline). Writing
+    ///      `ADMA_ADDRESS` or `HOST_CONTROL.DMA_SEL` while a transfer
+    ///      is active wedges the BCM2711 emmc2 controller; this poll
+    ///      is what `Linux's sdhci_send_command` does.
+    ///   2. `run_dma_transfer` envelope:
+    ///        - clean every `DmaRegion` (both directions per B2.2)
+    ///        - kick: program HOST_CONTROL.DMA_SEL=ADMA2-32,
+    ///          ADMA_ADDRESS, BLOCK_SIZE, BLOCK_COUNT, ARGUMENT, then
+    ///          single-store TRANSFER_MODE+COMMAND combined trigger
+    ///        - await `SdhciDataCompletion` (IRQ wait + B4.1 drain)
+    ///        - invalidate every `FromDevice` region
+    ///   3. Return the envelope in `OpIdle` so the next transfer can
+    ///      issue without reopening.
+    pub fn issue_data_transfer(
+        self,
+        params: SdhciDataTransfer,
+        regions: &[DmaRegion],
+        completion: SdhciDataCompletion<'_>,
+    ) -> Result<Self, SdhciDataTransferError> {
+        // 1. Pre-kick inhibit poll. Same shape as adma2_single_block_read's
+        //    pre-kick poll — 100ms deadline.
+        let inhibit_deadline =
+            monotonic_now().deadline_in(Nanos::from_millis(100), crate::time::cntfreq_hz());
+        loop {
+            let ps = self.sdhci.present_state();
+            if !ps.contains(PresentState::CMD_INHIBIT)
+                && !ps.contains(PresentState::DAT_INHIBIT)
+            {
+                break;
+            }
+            if monotonic_now() >= inhibit_deadline {
+                return Err(SdhciDataTransferError::InhibitStuck {
+                    present_state: ps.bits(),
+                });
+            }
+            core::hint::spin_loop();
+        }
+
+        // 2. run_dma_transfer wraps the clean → kick → await →
+        //    invalidate envelope. The kick programs the controller in
+        //    the order BCM2711 expects: BLOCK_SIZE/COUNT/ARGUMENT before
+        //    the combined TRANSFER_MODE+COMMAND store. DMA_SEL+
+        //    ADMA_ADDRESS first so the controller has the descriptor
+        //    table address before fetch starts.
+        let kick_result = run_dma_transfer::<(), Infallible, _, _>(
+            regions,
+            completion,
+            || -> Result<(), Infallible> {
+                self.sdhci.modify_host_control(
+                    |hc| hc.with_dma_sel(HostControlDmaSel::Adma2_32),
+                    &self.tk,
+                );
+                self.sdhci
+                    .write_adma_address(params.adma_descriptor_pa, &self.tk);
+                // Single-block-only: BLOCK_SIZE = 512 (SDHC/SDXC) and
+                // BLOCK_COUNT = 1 are hardcoded. Multi-block variants
+                // would also program TRNS_MULTI / TRNS_BLK_CNT_EN /
+                // TRNS_AUTO_CMD23 + ARGUMENT2 — see SdhciDataTransfer
+                // doc for the API extension plan.
+                self.sdhci.write_block_size(512, &self.tk);
+                self.sdhci.write_block_count(1, &self.tk);
+                self.sdhci.write_argument(params.arg, &self.tk);
+
+                let trns_dir = match params.direction {
+                    DataDirection::Read => SDHCI_TRNS_READ,
+                    DataDirection::Write => 0,
+                };
+                let trns = trns_dir | SDHCI_TRNS_DMA;
+
+                // Data-phase R1 command word: R1 (CRC+INDEX) + data bit.
+                let cmd_word = sd_command_word(
+                    params.cmd.index(),
+                    SDHCI_CMD_RESP_SHORT
+                        | SDHCI_CMD_CRC
+                        | SDHCI_CMD_INDEX
+                        | SDHCI_CMD_DATA,
+                );
+                // Single-store combined trigger — BCM2711 Arasan silently
+                // drops the command if split into two halves.
+                self.sdhci.set_transfer_mode_command(
+                    TransferMode(trns),
+                    Command(cmd_word),
+                    &self.tk,
+                );
+                Ok(())
+            },
+        );
+
+        match kick_result {
+            Ok(()) => Ok(self),
+            Err(DmaTransferError::CleanFailed(s)) => {
+                Err(SdhciDataTransferError::CleanFailed(s))
+            }
+            Err(DmaTransferError::Kick(infallible)) => match infallible {},
+            Err(DmaTransferError::Completion(c)) => {
+                Err(SdhciDataTransferError::Completion(c))
+            }
+            Err(DmaTransferError::InvalidateFailed(s)) => {
+                Err(SdhciDataTransferError::InvalidateFailed(s))
+            }
+        }
+    }
+}
+

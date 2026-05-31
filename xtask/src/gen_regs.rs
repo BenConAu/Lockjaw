@@ -229,15 +229,15 @@ struct Register {
     /// O2: operation-layer capability gate. When set (e.g.
     /// `requires_token = "sdhci_op"`), this register's accessors take
     /// an extra `&<TokenTy><'_>` parameter; the only mint path for
-    /// `<TokenTy>` is `__<token>_internal_mint`, which the xtask
+    /// `<TokenTy>` is `__<device>_internal_mint`, which the xtask
     /// `check-driver-unsafe` regime forbids in `user/*-driver`
-    /// source. The capability prevents driver code from kicking
+    /// source (O7). The capability prevents driver code from kicking
     /// the controller outside the operation envelope in lockjaw-
     /// userlib — same enforcement model as the existing syscall
     /// allowlist. The string is the snake_case stem; the codegen
-    /// derives the type name (`SdhciOpToken`) and the mint
-    /// function names (`__sdhci_internal_mint`, `__temp_unguarded_mint`)
-    /// from it. Currently only `sdhci_op` is used.
+    /// derives the type name (`SdhciOpToken`) and the mint function
+    /// name (`__sdhci_internal_mint`) from it. Currently only
+    /// `sdhci_op` is used.
     #[serde(default)]
     requires_token: Option<String>,
 }
@@ -952,14 +952,14 @@ fn emit_device(spec: &Spec) -> String {
 //
 // When a register declares `requires_token = "<kind>"`, the emitter
 // threads a `&<KindPascal>Token<'_>` parameter through every accessor
-// for that register. The token's only mint paths are:
-//   - `__<device_snake>_internal_mint(&Device) -> <Token>` — for the
-//     lockjaw-userlib operation envelope (e.g. SdhciCommandInit).
-//   - `__temp_unguarded_mint(&Device) -> <Token>` — #[deprecated]
-//     escape valve for O2 driver-side migration, removed in O5.
-// Both are `pub` so lockjaw-userlib can reach them; the xtask
-// `check-driver-unsafe` regime backstops by forbidding
-// `lockjaw_regs` import in `user/*-driver` source.
+// for that register. The token's only mint path is
+// `__<device_snake>_internal_mint(&Device) -> <Token>` — `pub` so the
+// `lockjaw-userlib` operation envelope (e.g. SdhciCommandInit) can
+// reach it across crates. The O7 xtask `check-driver-unsafe` regime
+// backstops by forbidding `lockjaw_regs` import in `user/*-driver`
+// source. (Historical note: O2-O5 also emitted a `#[deprecated]
+// __temp_unguarded_mint` escape valve so the driver-side gated-setter
+// migration could land incrementally; O5 deleted that valve.)
 //
 // The accessor is gated by capability, not visibility — the method
 // itself stays `pub`, but the token parameter has no constructor
@@ -1061,21 +1061,13 @@ fn emit_token_capabilities(out: &mut String, spec: &Spec) {
     writeln!(out, "    {} {{ _life: core::marker::PhantomData, _no_ctor: () }}", ty).unwrap();
     writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
-    // The temp escape valve — exists only between O2 and O5 of the
-    // SdhciCommandInit plan. Driver code mints via this during the
-    // mechanical signature-threading commit; O4/O5 migrate to
-    // SdhciCommandInit::open + lockjaw-userlib helpers, and O5 deletes
-    // this fn (and the xtask exemption that allows emmc2 to call it).
-    writeln!(out, "/// Temporary unguarded mint — exists ONLY for the O2-O5 migration").unwrap();
-    writeln!(out, "/// window. emmc2-driver calls this while its gated-setter sites are").unwrap();
-    writeln!(out, "/// being rewritten to flow through `lockjaw-userlib::sdhci::SdhciCommandInit`").unwrap();
-    writeln!(out, "/// and the init-time helpers. Deleted in O5 once data-phase migrates.").unwrap();
-    writeln!(out, "#[deprecated(note = \"O2-O5 migration escape; removed in O5\")]").unwrap();
-    writeln!(out, "#[inline(always)]").unwrap();
-    writeln!(out, "pub fn __temp_unguarded_mint(_dev: &{}) -> {}<'_> {{", dev, ty).unwrap();
-    writeln!(out, "    {} {{ _life: core::marker::PhantomData, _no_ctor: () }}", ty).unwrap();
-    writeln!(out, "}}").unwrap();
-    writeln!(out).unwrap();
+    // O5: `__temp_unguarded_mint` was emitted here during the
+    // O2-O5 migration window so emmc2-driver could thread tokens
+    // through its gated-setter call sites while the framework
+    // (SdhciCommandInit envelope + init helpers in lockjaw-userlib)
+    // was being built up. With O4 + O5 complete, every driver-side
+    // gated-setter call flows through the framework; the temp mint
+    // has no consumers and is no longer emitted.
 }
 
 fn emit_header(out: &mut String, spec: &Spec) {
