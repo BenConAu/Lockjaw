@@ -184,20 +184,23 @@ Properties like "zero unsafe blocks" follow from (1) — they are
 observable consequences, not separate definitions. Don't list them
 as parallel gates; the lint enforces them.
 
-Substrate organization to keep straight:
+Substrate organization to keep straight (crate names + repo paths):
 
-- `lockjaw-mmio` — typed MMIO cells (Ro/Rw/Wo/W1c), MappedRegs,
-  DmaCell, barriers. All `unsafe` ultimately concentrates here.
-- `lockjaw-regs` — generated from `user/regspecs/*.toml` via
-  `cargo xtask gen-regs`. Per-device register layouts. Do not
-  hand-edit.
+- `lockjaw-mmio` (`user/lockjaw-mmio/`) — typed MMIO cells
+  (Ro/Rw/Wo/W1c), MappedRegs, DmaCell, barriers. All `unsafe`
+  ultimately concentrates here.
+- `lockjaw-regs` (`user/lockjaw-regs/`) — generated from
+  `user/regspecs/*.toml` via `cargo xtask gen-regs`. Per-device
+  register layouts. Do not hand-edit.
 - `lockjaw-types::wire` — generated from `user/wirespecs/*.toml`
   via `cargo xtask gen-wires`. Per-family DMA shared-memory DTOs.
   Do not hand-edit.
-- `lockjaw-types` — hand-written constants, decoders, protocol
-  types. Re-exports the generated wire DTOs.
-- `lockjaw-userlib` — driver runtime (boot_stub!, driver_main!,
-  standard_driver_init, standard_init_no_irq), device-family
+- `lockjaw-types` (`lockjaw-types/` at repo root) — hand-written
+  constants, decoders, protocol types. Re-exports the generated
+  wire DTOs.
+- `lockjaw-userlib` (`user/lockjaw-userlib/`) — driver runtime
+  (boot_stub!, driver_main!, standard_driver_init,
+  standard_init_no_irq, standard_driver_init_level), device-family
   policy modules (virtio, virtio_blk, fwcfg, clock).
 
 When a problem surfaces during driver-conversion work, the fix

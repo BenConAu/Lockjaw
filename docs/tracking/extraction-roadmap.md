@@ -32,8 +32,10 @@ exemplars in the codebase:
   wrapper.
 - **PageTableWalk + MapWalk + unmap_validated** — Page table walks
   fully extracted; kernel does only memory reads.
-- **ProcessTransferPlan** — `sys_create_process` ownership transfer
-  decisions. Validation gates the irreversible commit.
+- **ProcessCreationPlanBuilder + ValidatedProcessCreationPlan + dedup_add_header**
+  — `sys_create_process` ownership transfer decisions. Pure structural
+  validate produces an owned apply-phase token; kernel-state
+  consume_pageset_validate is the second gate before any apply.
 - **SavedContext + Tcb layout** — `lockjaw-types/src/thread.rs` with
   pinned crash-sensitive offsets.
 - **ExceptionContext + ESR decode** — `lockjaw-types/src/exception.rs`

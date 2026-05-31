@@ -65,15 +65,22 @@ identical — `boot_stub!` underneath, a `DriverCtx<T>` out the top —
 but the probe step is virtio-aware. `user/virtio-blk-driver/src/main.rs`
 uses it directly.
 
+A third sibling, `standard_driver_init_level` /
+`LevelDriverCtx`, is the level-triggered IRQ variant — same shape as
+`standard_driver_init`, but binds the IRQ as level-sensitive (the
+SDHCI / GIC SPI default on Pi 4B). emmc2 uses it through Tier-A
+composition rather than a wrapper macro; the framework piece is at
+`user/lockjaw-userlib/src/driver_runtime.rs:401`.
+
 Tier-A `boot_stub!` is the escape valve. Some drivers have a shape
 the standard helpers can't reach — ramfb has no IRQ at all
 (`user/ramfb-driver/src/main.rs` composes `standard_init_no_irq`
-instead), emmc2 needs a level-triggered IRQ binding and a
-crate-specific failure log line that the `driver_main!` macro
-hardcodes (`user/emmc2-driver/src/main.rs:445`, with the rationale
-inlined above the macro call). The escape valve still emits the
-single audited `#[allow(unsafe_code)]` in macro-generated code; the
-driver body remains `#![deny(unsafe_code)]`. The macro is the only
+instead), emmc2 needs the level-IRQ variant plus a crate-specific
+failure log line that the `driver_main!` macro hardcodes
+(`user/emmc2-driver/src/main.rs:445`, with the rationale inlined
+above the macro call). The escape valve still emits the single
+audited `#[allow(unsafe_code)]` in macro-generated code; the driver
+body remains `#![deny(unsafe_code)]`. The macro is the only
 sanctioned site for that attribute in any driver binary.
 
 All three doors converge on the same property: the audited unsafe
@@ -151,7 +158,10 @@ trait so a driver cannot mint a third origin. A separate
 `SyncCapable` trait is implemented only for `DmaPoolOrigin`. The
 `OwnedDmaMapping<O>` and `DmaBacking<O>` types carry `O` as a
 `PhantomData` parameter, so the origin is in the *type* of the
-mapping.
+mapping. `BorrowedDmaMapping` (`user/lockjaw-userlib/src/dma.rs:431`)
+is the third mapping shape, for adopting an existing pageset whose
+allocation a different actor owns — same origin discipline, but
+`Drop` does NOT close the underlying pageset.
 
 Second, **region construction is gated by `SyncCapable`**. The only
 way to obtain a `DmaRegion` — the value the envelope consumes — is
@@ -202,7 +212,7 @@ information needed, and the substrate makes it the *only*
 information needed.
 
 emmc2's read path is the existence proof
-(`user/emmc2-driver/src/main.rs:1802`). A buffer-level outer
+(`user/emmc2-driver/src/main.rs:1838`). A buffer-level outer
 envelope declares the destination buffer as a `FromDevice` region
 and supplies `Immediate` completion. Its `kick` runs an inner loop;
 each iteration calls `adma2_single_block_read`, which sets up its

@@ -53,9 +53,9 @@ the sequencing. Page table walks, scheduler selection, unmap
 validation. *Zero review issues in pull-shaped code.*
 
 **Plan / apply**: types returns a plan or decision; the kernel
-executes it. ProcessTransferPlan, the handle-cleanup vocabulary,
-ProcessTeardownPlan. *Bugs happen when the kernel adds steps outside
-the plan.*
+executes it. ProcessCreationPlanBuilder / ValidatedProcessCreationPlan,
+the handle-cleanup vocabulary, ProcessTeardownPlan. *Bugs happen when
+the kernel adds steps outside the plan.*
 
 **Push**: the kernel calls type helpers in whatever order it likes.
 Refcount inc/dec, map_count manipulation, endpoint state constants.

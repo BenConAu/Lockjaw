@@ -27,99 +27,156 @@ decisions](pure-decisions.md). If it iterates one input at a time
 without accumulating, use a [pure state
 machine](pure-state-machines.md).
 
-## Canonical example: `ProcessTransferPlan`
+## Canonical example: `ProcessCreationPlanBuilder`
 
 `sys_create_process` consumes PageSets from the parent and transfers
 them to the child. Each user mapping might reference the same PageSet
-multiple times; some PageSets must be torn down from the parent's
-address space before the child can claim them; if any teardown fails,
-the entire operation must abort with the parent intact.
+multiple times; the child's single-page handle table has limited
+slots; the scheduler's run queue might be full; any of these is a
+reason to fail *before* the irreversible PageSet consume.
 
 This is exactly the plan/apply shape: build, validate, then commit.
+The pattern splits into two pure pieces: `dedup_add_header` (the
+per-mapping deduplication primitive) and `ProcessCreationPlanBuilder`
+(the outer-orchestration builder whose `validate` produces an owned
+apply-phase token).
 
-**lockjaw-types side** (`lockjaw-types/src/process.rs:130-207`):
+**lockjaw-types side** — the dedup primitive
+(`lockjaw-types/src/process.rs:130`):
 
 ```rust
-pub struct ProcessTransferPlan {
-    headers: [u64; MAX_CONSUMED_HEADERS],
-    header_count: usize,
-    /// Per-header: (total_mapped_handles, successfully_unmapped).
-    unmap_results: [(usize, usize); MAX_CONSUMED_HEADERS],
-}
-
-impl ProcessTransferPlan {
-    /// Record a PageSet header for consumption. Deduplicates —
-    /// multiple mappings from the same PageSet produce one entry.
-    pub fn add_header(&mut self, header_paddr: u64) -> Result<HeaderIndex, TransferError>;
-
-    /// Record the result of unmapping parent handles for a header.
-    pub fn record_unmap(&mut self, header_idx: HeaderIndex, total: usize, unmapped: usize);
-
-    /// Can we commit? All unmaps must have fully succeeded.
-    pub fn validate(&self) -> Result<(), TransferError>;
-
-    /// The deduplicated list of PageSet headers to consume.
-    pub fn headers(&self) -> &[u64];
-}
+/// Returns Ok(true) if the header was new, Ok(false) if already present.
+pub fn dedup_add_header(
+    header_paddr: u64,
+    headers: &mut [u64],
+    count: &mut usize,
+) -> Result<bool, TransferError>;
 ```
 
-The plan owns three pieces of state: deduplicated headers, the unmap
-results recorded against each header index, and the constants that
-determine validity. Nothing in here touches the kernel.
+The kernel owns the storage (a `&mut [u64]` in the proc page so the
+sync-exception stack stays small). The helper is the single API
+boundary for "is this PageSet already on the list?".
 
-**Kernel side** (`src/process.rs`): build, then validate, then commit.
-Edited for length:
+The outer builder (`lockjaw-types/src/process.rs:224`):
 
 ```rust
-let mut plan = ProcessTransferPlan::new();
+pub struct ProcessCreationPlanBuilder { /* mapping_count, stack_pages, … */ }
 
-// Build phase: walk user mappings, dedup headers into the plan.
+impl ProcessCreationPlanBuilder {
+    pub fn record_mapping(&mut self);
+    pub fn record_stack(&mut self, stack_pages: usize) -> Result<(), CreateProcessPlanError>;
+    pub fn record_parent_copy(&mut self, entry: HandleEntry) -> Result<(), CreateProcessPlanError>;
+
+    /// Consumes the builder. Produces a `ValidatedProcessCreationPlan`
+    /// (owned token) only if every structural precondition holds.
+    pub fn validate(
+        self,
+        scratch_capacity: usize,
+        scheduler_has_room: bool,
+        unique_header_count: usize,
+    ) -> Result<ValidatedProcessCreationPlan, CreateProcessPlanError>;
+}
+
+pub struct ValidatedProcessCreationPlan { /* the apply-phase token */ }
+```
+
+The builder tracks only the structural facts (mapping count, stack
+pages, optional parent copy). It does NOT carry the header list — the
+kernel-side storage in the proc page is the single source of truth,
+and `unique_header_count` is passed to `validate` directly so the two
+counts cannot drift.
+
+**Kernel side** (`src/process.rs:152`): build, validate (twice),
+then apply. Edited for length, but the shape matches the live code:
+
+```rust
+let mut plan_builder = ProcessCreationPlanBuilder::new();
+let proc_kva = /* allocate the child's proc page */;
+
+// Build phase: walk user mappings, record each through the single API
+// boundary (record_mapping_into_plan wraps both halves — the proc-page
+// dedup write AND the builder count — so callers can't drift them).
 for i in 0..mapping_count {
     let user_mapping: ProcessMapping = addr_space.read(...)?;
     let ps_entry = ht.lookup(user_mapping.pageset_id as u32, ...)?;
-    // ... resolve to physical page, record in transfer plan ...
-    plan.add_header(ps_entry.object_paddr).map_err(|_| "too many PageSets")?;
+    record_mapping_into_plan(
+        &mut plan_builder,
+        proc_kva,
+        ps_entry.object_paddr,
+    )?;
 }
-plan.add_header(stack_entry.object_paddr).map_err(|_| "too many PageSets")?;
+record_stack_into_plan(&mut plan_builder, proc_kva, stack_hdr, stack_pages)?;
 
-// (... lots of other fallible setup: address space, handle table, TCB ...)
-
-// Phase 1: tear down parent's VA mappings — fallible per-header.
-for i in 0..plan.headers().len() {
-    let (idx, hdr) = plan.header_at(i).unwrap();
-    // ...
-    let (total_mapped, unmapped) = ht.unmap_for_object(hdr, |va| { ... });
-    plan.record_unmap(idx, total_mapped, unmapped);
-    // (decrement map_count for successful unmaps)
+// Parent-copy is optional (sentinel u64::MAX = none). Resolved by
+// handle table here, recorded on the builder directly — no
+// *_into_plan wrapper because parent_copy touches only the builder
+// (no proc-page dedup half to pair).
+if parent_handle_to_copy != u64::MAX {
+    let entry = ht.lookup_any(parent_handle_to_copy as u32, Rights::none())?;
+    plan_builder.record_parent_copy(entry)?;
 }
 
-// Validation gate: any unmap failure aborts before we do anything irreversible.
-plan.validate().map_err(|_| "parent unmap failed during ownership transfer")?;
+// Pure structural validate — consumes builder, yields owned token.
+// unique_header_count comes from the proc-page (single source of
+// truth) so the builder cannot drift from the actual dedup state.
+let unique_header_count =
+    process_consumed_header_count(proc_kva) as usize;
+let plan = plan_builder.validate(
+    scratch_capacity,
+    scheduler::has_room(),
+    unique_header_count,
+)?;
+
+// Kernel-state validate: revoke walk + refcount checks against live
+// state. Read headers by typed index — proc-page storage is private.
+for idx in 0..plan.unique_header_count() {
+    let hdr = process_consumed_header(proc_kva, idx).unwrap();
+    consume_pageset_validate(hdr)?;
+}
 
 // === Point of no return ===
 
-// Phase 2: consume PageSets — infallible because we validated.
-for &hdr in plan.headers() {
-    crate::cap::pageset_table::consume_pageset(hdr, &ht);
+// Apply phase: per-header consume + parent-copy insert +
+// scheduler add. Inlined directly (no single `apply()` wrapper) —
+// each step touches distinct kernel state (handle table, scheduler)
+// and the inlining keeps the invariant ("token's existence ⇒ both
+// validates passed") visible at every step.
+for idx in 0..plan.unique_header_count() {
+    let hdr = process_consumed_header(proc_kva, idx).unwrap();
+    consume_pageset_apply(hdr);
+}
+if let Some(parent) = plan.parent_copy() {
+    child_ht.insert(parent.rights, parent.kind)
+        .expect("fresh empty table; capacity checked in pure validate");
+}
+// (defuse drop guards — child now owns its resources)
+if !scheduler::add_thread(tcb_kva) {
+    panic!("has_room() returned true but add_thread failed (GKL invariant)");
 }
 ```
 
 Three things are worth noticing:
 
-1. The plan doesn't execute. It accumulates and validates. Side effects
-   (the actual unmaps in Phase 1, the consumption in Phase 2) live in
-   the kernel.
-2. Validation comes between the fallible phase and the irreversible
-   phase. If anything in Phase 1 returned a partial unmap, `validate()`
-   detects it and the function returns `Err` — the kernel never reaches
-   Phase 2.
-3. Dedup happens in `add_header`. The kernel doesn't have to know that
-   two `ProcessMapping`s share a PageSet header; it adds, the plan
-   merges.
+1. The builder doesn't execute. It accumulates structural facts and
+   validates. Side effects (the consume loop, the parent-copy insert,
+   the scheduler add) live in the kernel.
+2. There are TWO validate gates before any apply runs. The pure
+   structural `plan_builder.validate(...)` produces the apply-phase
+   token; the kernel-state `consume_pageset_validate(...)` runs after
+   it but before any consume. Both must pass.
+3. Dedup happens in `dedup_add_header` (the lockjaw-types primitive,
+   tested in isolation) but the kernel reaches it through
+   `process_record_consumed_header` (the typed boundary at
+   `src/cap/process_obj.rs:180`) which `record_mapping_into_plan`
+   wraps. Three layers, each its own job: primitive, typed boundary,
+   single-call helper.
 
-The plan is exhaustively host-tested
-(`lockjaw-types/src/process.rs:357-484`): dedup, capacity overflow,
-partial unmap detection, empty plan, ordering of unmap records.
+The plan layer is exhaustively host-tested
+(`lockjaw-types/src/process.rs:469+`): `dedup_add_header` covers
+new-vs-duplicate, storage exhaustion, ordering; the builder covers
+each `CreateProcessPlanError` variant, the
+double-stack and double-parent-copy guards, and the
+`ValidatedProcessCreationPlan` capacity preconditions.
 
 ## Variants
 
@@ -132,7 +189,8 @@ the dying process's state (`owned_page_count`, `has_address_space`,
 to a pure builder. The builder returns a sequence of `TeardownStep`s
 the kernel iterates and applies.
 
-`lockjaw-types/src/process.rs:217-303`:
+`lockjaw-types/src/process.rs:376` (TeardownStep), `:401`
+(ProcessTeardownPlan), `:436` (build_teardown_plan):
 
 ```rust
 pub enum TeardownStep {
@@ -192,12 +250,13 @@ construction order.
   this — validation is the last fallible step before the point of no
   return — but it's a discipline to maintain.
 
-- **Plans built over user input without bounded capacity.** Both
-  `ProcessTransferPlan` and `ProcessTeardownPlan` use fixed-size
-  arrays (`MAX_CONSUMED_HEADERS = 32`, `[Option<TeardownStep>; 5]`).
-  The kernel can't allocate from the heap; the plan must declare its
-  bounds at compile time and return errors when an input would exceed
-  them. Don't design a plan that needs `Vec`.
+- **Plans built over user input without bounded capacity.** The
+  `dedup_add_header` primitive and `ProcessTeardownPlan` use
+  fixed-size storage (caller-supplied `[u64; MAX_CONSUMED_HEADERS]`
+  with `MAX_CONSUMED_HEADERS = 32`, `[Option<TeardownStep>; 5]`
+  respectively). The kernel can't allocate from the heap; the plan
+  must declare its bounds at compile time and return errors when an
+  input would exceed them. Don't design a plan that needs `Vec`.
 
 ## Recognizing push-shaped code that wants this pattern
 

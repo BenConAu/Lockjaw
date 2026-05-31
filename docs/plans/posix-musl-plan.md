@@ -338,7 +338,7 @@ Deferred to follow-on phases: `lseek`, `fstat`, `newfstatat`,
   forged "FAT32   " on a FAT16-sized volume should be rejected.
   `parse_bpb` enforces `cluster_count >= FAT32_MIN_CLUSTERS = 65525`.
 - **Per-page PageSet allocation breaks at 32 pages.**
-  `ProcessTransferPlan::MAX_CONSUMED_HEADERS = 32`. Init's
+  `MAX_CONSUMED_HEADERS = 32` (caller-supplied storage to `dedup_add_header`). Init's
   `spawn_elf` originally allocated one PageSet per page of the
   child binary, which broke `sys_create_process` for posix-server
   (now ~42 pages because of the embedded musl hello binary).

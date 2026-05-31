@@ -68,17 +68,26 @@ the same output file via `; echo "codex exit $?"`.
   Codex remembers prior rounds — when you tell it "Round 3 — addressed
   your round-2 High by X", it knows what its round-2 High was. This is
   the resumable-context win.
-- **Start a new thread** for a logically separate effort. New thread:
-  `codex exec --json "..."` — the JSON output includes a `thread_id`
-  field. Grab it and reuse it for subsequent rounds. (`--json` is needed
-  only on the *first* call; `resume` outputs plain text.)
+- **Start a new thread** for a logically separate effort. The typical
+  shape is `codex exec "..."` (no flag needed); the new session is
+  recorded under `~/.codex/sessions/`. To continue it in the next
+  round, use `codex exec resume --last "..."` — `--last` picks the
+  most recent session for the current cwd, which is the right session
+  as long as you stay in the repo root between rounds.
+- **Pinning to a specific session ID** (cross-cwd, or after starting
+  multiple efforts in parallel) requires capturing the ID from the
+  first call. `--json` prints all events as JSONL, including a
+  session-start event with the session UUID — grep for it
+  (`jq -r 'select(.type=="session_started") | .session_id'`). For
+  most workflows `resume --last` is simpler and is what the round-
+  to-round pattern below assumes.
 - **Don't try `codex review --uncommitted [PROMPT]`**: the CLI rejects
   it as mutually exclusive. Use `codex exec` (with or without resume),
   not `codex review`.
 
 ### What to put in the prompt
 
-The Codex-reminder rule in `docs/process/ben_principles.md` Tier 4 #17 is
+The Codex-reminder rule in `docs/process/ben_principles.md` Tier 4 #18 is
 load-bearing: *every* prompt points at `docs/process/ben_principles.md` and
 calls out the relevant tier (most commonly Tier 1 #1 correctness-by-
 construction, Tier 3 #13 explicit-init / no-coincidental-defaults,
@@ -261,9 +270,8 @@ real-driver smoke test: inject all the violations into one driver
 to fail with the exact findings you predicted, then revert:
 
 ```bash
-# 1. Edit to inject violations.
-# 2.
-cd <repo>
+# 1. Edit to inject violations into user/uart-driver/src/main.rs.
+# 2. Run from repo root (do NOT cd — see "don't cd mid-session" gotcha):
 cargo xtask check-driver-unsafe 2>&1; echo "exit=$?"
 git checkout user/uart-driver/src/main.rs
 git status --short user/uart-driver/   # must be empty
@@ -324,4 +332,4 @@ Three places to spend or save cycles:
 - `docs/process/paired-review-workflow.md` — *this file*. The orchestrator's
   side. **You read.**
 - `docs/process/ben_principles.md` — both reviewers read. **You point at it from
-  every prompt** (Tier 4 #17).
+  every prompt** (Tier 4 #18).

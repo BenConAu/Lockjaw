@@ -166,12 +166,14 @@ Same pattern as a state machine, but flatter: one function call
 instead of a step loop. Use this when the data structure is too
 distributed to expose as a `&[T]` but the operations are still pure.
 
-### Plan-builder methods: `ProcessTransferPlan`
+### Plan-builder methods: `ProcessCreationPlanBuilder`
 
-`ProcessTransferPlan` (`lockjaw-types/src/process.rs:130-207`) is a
-data structure with operations (`add_header`, `record_unmap`,
-`validate`, `headers`). The kernel calls each method; types
-maintains the invariants (dedup, capacity, validation).
+`ProcessCreationPlanBuilder` (`lockjaw-types/src/process.rs:224`)
+plus the standalone `dedup_add_header` primitive (`:130`) form a
+small data structure with operations (`record_mapping`,
+`record_stack`, `record_parent_copy`, `validate`). The kernel calls
+each method; types maintains the structural invariants (capacity,
+post-consume occupancy, no-double-stack, no-double-parent-copy).
 
 This overlaps with [plan/apply](plan-apply.md) — a plan *is* a pure
 data structure. The shape distinction: plan/apply wraps a build →

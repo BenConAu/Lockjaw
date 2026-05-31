@@ -20,7 +20,7 @@ tension between them.
    model across multiple subsystems should be paid down ahead of
    feature work, even when local workarounds exist.** This is the
    prioritization meta-rule. Most debt waits its turn (see Tier 4
-   #15 — "debt is stuff we need but can't build yet"). Substrate
+   #17 — "debt is stuff we need but can't build yet"). Substrate
    debt is the exception: it keeps the surface working but biases
    downstream design into the wrong shape, so polishing on top of
    it compounds the problem rather than progressing past it.
@@ -131,24 +131,24 @@ Specific Rust patterns that implement tiers 1 and 2.
 
 Working rules that aren't directly about correctness.
 
-13. **Drivers should be split between bit bangers and protocol
+14. **Drivers should be split between bit bangers and protocol
     drivers.** UART buffering should not be repeated everywhere,
     block management should not be repeated everywhere; think of
     KMD vs UMD in Windows.
 
-14. **Prefer clean code and abstractions over feature richness.**
+15. **Prefer clean code and abstractions over feature richness.**
 
-15. **Back compatibility is not a concern until much later** —
+16. **Back compatibility is not a concern until much later** —
     we should feel free to refactor anything and change any
     protocol.
 
-16. **YAGNI is for things you can build now but don't need; debt
+17. **YAGNI is for things you can build now but don't need; debt
     is stuff we need but can't build yet.** The Tier 1 #3
     counterpoint: substrate debt is need-but-can't-build-yet
     debt that *also* keeps the surface working — the surface
     working is not a reason to defer it.
 
-17. **Codex reviews must be reminded of these principles.** A
+18. **Codex reviews must be reminded of these principles.** A
     fresh `codex review` session starts without project context,
     so its baseline taste is "idiomatic Rust", not "Lockjaw
     architectural rules". Every review prompt (review of a plan,

@@ -169,8 +169,8 @@ pub struct ParentHandleCopy {
 }
 
 /// Errors from the pure structural validate. Each variant identifies
-/// a specific structural precondition for `apply_validated_plan` to
-/// be infallible.
+/// a specific structural precondition for `create_process`'s apply
+/// phase to be infallible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateProcessPlanError {
     /// `record_parent_copy` was given a PageSet handle. PageSet
@@ -181,8 +181,8 @@ pub enum CreateProcessPlanError {
     /// `mapping_count + stack_pages > scratch_capacity`. The user's
     /// scratch buffer cannot hold the combined mapping+stack list.
     BufferCapacityExceeded,
-    /// `ProcessTransferPlan` ran out of dedup slots (more than
-    /// `MAX_CONSUMED_HEADERS` distinct headers).
+    /// `dedup_add_header` ran out of slots in the caller-supplied
+    /// storage (more than `MAX_CONSUMED_HEADERS` distinct headers).
     TooManyHeaders,
     /// `unique_headers + parent_copy_count > HANDLE_SLOTS_PER_PAGE`.
     /// The child's single-page handle table cannot fit one PageSet
