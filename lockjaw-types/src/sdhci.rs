@@ -21,6 +21,24 @@
 pub use crate::wire::sdhci::*;
 
 // ---------------------------------------------------------------------------
+// Operation-level construction safety sub-modules (P10 / SdhciCommandInit<S>)
+// ---------------------------------------------------------------------------
+//
+// `response`   — typed R0/R1/R1b/R2/R3/R6/R7 response shapes with the
+//                `ResponseShape` trait. Picks correct COMMAND flags +
+//                decode in one type-level decision.
+// `card_state` — ZST markers Uninit/Idle/Ready/Ident/Stby/Tran for the
+//                MMC card lifecycle, paired with a value-level
+//                `CardState` reference model the userlib's `MmcCard<S>`
+//                I/O-side typestate must agree with.
+// `operation`  — ZST markers OpIdle/OpArmed/OpKicked/OpCompleted for the
+//                inner per-operation lifecycle of `SdhciCommandInit<S>`.
+
+pub mod card_state;
+pub mod operation;
+pub mod response;
+
+// ---------------------------------------------------------------------------
 // SDHCI register offsets (Standard Spec § 2.1.1)
 // ---------------------------------------------------------------------------
 //
