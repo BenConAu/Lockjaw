@@ -54,11 +54,15 @@ pub use lockjaw_regs::sdhci::{
 };
 
 use lockjaw_types::sdhci::{
-    compute_clock_divisor, response::ResponseShape, sd_command_word, SdCommand,
-    SDHCI_CMD_CRC, SDHCI_CMD_DATA, SDHCI_CMD_INDEX, SDHCI_CMD_RESP_SHORT,
-    SDHCI_TRNS_DMA, SDHCI_TRNS_READ,
+    compute_clock_divisor, response::ResponseShape, sd_command_word,
+    CMD8_IF_COND_ARG, CsdV2, NotCsdV2, OcrRegister, SdCommand, SDHCI_CMD_CRC,
+    SDHCI_CMD_DATA, SDHCI_CMD_INDEX, SDHCI_CMD_RESP_SHORT, SDHCI_TRNS_DMA, SDHCI_TRNS_READ,
+};
+use lockjaw_types::sdhci::card_state::{
+    BusWidth, CardLifecycleState, Ident, Idle, Ready, Stby, Tran, Uninit,
 };
 use lockjaw_types::sdhci::operation::{OpIdle, OpState};
+use lockjaw_types::sdhci::response::{R0, R1, R1b, R2, R3, R6, R6Response, R7};
 
 use crate::dma_transfer::{run_dma_transfer, DmaCompletion, DmaRegion, DmaTransferError};
 use crate::irq::BoundIrq;
@@ -772,6 +776,354 @@ impl<'a> SdhciCommandInit<'a, OpIdle> {
             Err(DmaTransferError::InvalidateFailed(s)) => {
                 Err(SdhciDataTransferError::InvalidateFailed(s))
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MmcCard<'a, S> — outer card-state typestate (O6).
+// ---------------------------------------------------------------------------
+//
+// Linear lifecycle from card power-up to data-transfer-ready: Uninit
+// → Idle (CMD0) → Ready (ACMD41 loop) → Ident (CMD2) → Stby (CMD3, with
+// CMD9 staying in Stby) → Tran (CMD7 + DAT_INHIBIT drain, with ACMD6 +
+// host_control flip staying in Tran). Each transition consumes self,
+// runs the required ID-phase command(s) via `SdhciCommandInit`, and
+// returns the next state. Card state is encoded in the type system —
+// `engine.read()` against a `MmcCard<Stby>` is a compile error because
+// `Emmc2BlockEngine::new` requires a `CardInfo`, whose only mint path
+// is `MmcCard::<Tran>::into_parts()`.
+//
+// `MmcCard<'a, S>` borrows `&'a Sdhci` for its lifetime — the typestate
+// chain is a sequence of consumed values, all sharing the same borrow.
+// `into_parts()` drops the borrow and returns the captured `CardInfo`
+// (rca/ocr/cid/csd/bus_width) so the engine can take ownership of
+// `MappedRegs<Sdhci>` separately.
+
+/// Failures from `MmcCard<S>` state transitions. Family-generic across
+/// SDHCI consumers; drivers map to their own error type (e.g. emmc2's
+/// `Emmc2Error`) at the call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmcCardError {
+    /// The underlying SDHCI command failed (poll inhibit timeout, no
+    /// response, controller error). Wraps the per-command failure for
+    /// caller decode.
+    Sdhci(SdhciCommandError),
+    /// CMD8 R7 echo did not match the issued check pattern. The card is
+    /// either pre-SDv2 (won't speak CMD8 at all — typically surfaces as
+    /// `Sdhci(NoResponse)`), or the bus is mis-clocked / mis-voltaged
+    /// and the response framing is corrupt.
+    Cmd8EchoMismatch { echo: u32 },
+    /// The ACMD41 loop ran for its full 1-second deadline without the
+    /// card asserting `OCR.power_up_done`. Card is dead, missing, or
+    /// has a power-supply problem.
+    Acmd41Timeout,
+    /// CMD9's R2 response decoded as something other than CSD v2
+    /// (SDHC/SDXC). Lockjaw doesn't support legacy SDSC (CSD v1).
+    /// Carries the actual `CSD_STRUCTURE` value seen.
+    Cmd9NotV2 { csd_structure: u8 },
+    /// CMD7's R1b busy phase did not release `PRESENT_STATE.DAT_INHIBIT`
+    /// within the 500ms deadline — card never transitioned to Tran.
+    Cmd7BusyStuck { present_state: u32 },
+}
+
+impl From<SdhciCommandError> for MmcCardError {
+    #[inline]
+    fn from(e: SdhciCommandError) -> Self {
+        MmcCardError::Sdhci(e)
+    }
+}
+
+/// Captured card metadata from the ID phase. The only mint path is
+/// [`MmcCard::<Tran>::into_parts`], so requiring `CardInfo` as an
+/// `Emmc2BlockEngine::new` parameter is compile-time proof that the
+/// card reached `Tran`. Fields are `pub` for caller read; the
+/// constructor is `pub(crate)` so nothing outside `lockjaw-userlib`
+/// can fabricate one.
+#[derive(Clone, Copy, Debug)]
+pub struct CardInfo {
+    rca: u16,
+    ocr: OcrRegister,
+    cid: [u32; 4],
+    csd: CsdV2,
+    bus_width: BusWidth,
+}
+
+impl CardInfo {
+    /// Crate-private constructor — only `MmcCard::<Tran>::into_parts()`
+    /// mints a `CardInfo`. Drivers cannot construct one directly.
+    pub(crate) fn new(
+        rca: u16,
+        ocr: OcrRegister,
+        cid: [u32; 4],
+        csd: CsdV2,
+        bus_width: BusWidth,
+    ) -> Self {
+        Self { rca, ocr, cid, csd, bus_width }
+    }
+
+    /// Relative Card Address published by CMD3.
+    pub fn rca(&self) -> u16 { self.rca }
+    /// OCR snapshot from the final ACMD41.
+    pub fn ocr(&self) -> OcrRegister { self.ocr }
+    /// CID raw words (R2 response from CMD2).
+    pub fn cid(&self) -> [u32; 4] { self.cid }
+    /// CSD v2 decoded capacity from CMD9.
+    pub fn csd(&self) -> CsdV2 { self.csd }
+    /// Current bus width on the controller side.
+    pub fn bus_width(&self) -> BusWidth { self.bus_width }
+}
+
+/// Outer card-state typestate envelope. `S: CardLifecycleState`
+/// constrains the phantom to one of the six legal markers (Uninit /
+/// Idle / Ready / Ident / Stby / Tran).
+pub struct MmcCard<'a, S: CardLifecycleState> {
+    sdhci: &'a Sdhci,
+    // Captured incrementally as each transition succeeds. Each Option
+    // is filled at exactly one state transition and read by
+    // `into_parts()` at `<Tran>`; the typestate chain guarantees every
+    // field is `Some` by the time the card reaches Tran.
+    ocr: Option<OcrRegister>,
+    cid: Option<[u32; 4]>,
+    rca: Option<u16>,
+    csd: Option<CsdV2>,
+    bus_width: BusWidth,
+    _state: PhantomData<S>,
+}
+
+impl<'a> MmcCard<'a, Uninit> {
+    /// Open a new card lifecycle envelope against `sdhci`. The card has
+    /// not been touched yet; the first transition is `go_idle()` (CMD0).
+    pub fn uninit(sdhci: &'a Sdhci) -> Self {
+        Self {
+            sdhci,
+            ocr: None,
+            cid: None,
+            rca: None,
+            csd: None,
+            bus_width: BusWidth::Bit1,
+            _state: PhantomData,
+        }
+    }
+
+    /// CMD0 — GO_IDLE_STATE. Resets the card to the Idle state. No
+    /// response. Tolerant: if CMD0 has any error path the caller can
+    /// inspect via `Sdhci(_)`, but the card may simply have been Idle
+    /// already (CMD0-on-Idle is a no-op).
+    pub fn go_idle(self) -> Result<MmcCard<'a, Idle>, MmcCardError> {
+        SdhciCommandInit::open(self.sdhci)
+            .issue_no_data::<R0>(SdCommand::GoIdleState, 0)
+            .map_err(MmcCardError::from)?;
+        Ok(self.transition())
+    }
+}
+
+impl<'a> MmcCard<'a, Idle> {
+    /// CMD8 — SEND_IF_COND. Verifies SDv2+ compatibility by echoing
+    /// the check pattern. Returns the original `MmcCard<Idle>` on
+    /// success. Stays in Idle — CMD8 is a one-shot identification
+    /// probe, not a state-changing command. Driver typically calls
+    /// this before `power_up_to_ready` to verify the card is SDHC/SDXC
+    /// capable.
+    pub fn verify_sdv2_if_cond(self) -> Result<Self, MmcCardError> {
+        let echo: u32 = SdhciCommandInit::open(self.sdhci)
+            .issue_no_data::<R7>(SdCommand::SendIfCond, CMD8_IF_COND_ARG)
+            .map_err(MmcCardError::from)?
+            .0;
+        // R7: bits[11:8] = VHS echo, bits[7:0] = check pattern echo.
+        // Combined bits[11:0] must equal 0x1AA (matching CMD8_IF_COND_ARG).
+        if echo & 0xFFF != 0x1AA {
+            return Err(MmcCardError::Cmd8EchoMismatch { echo });
+        }
+        Ok(self)
+    }
+
+    /// ACMD41 loop — SD spec §4.2.3.1. Each iteration: CMD55 (sets
+    /// APP_CMD mode for the next command), then ACMD41 with the
+    /// caller-supplied argument (typically `ACMD41_ARG_HCS` =
+    /// 0x40FF8000 to request SDHC/SDXC). Loops on a 1-second deadline
+    /// until `OCR.power_up_done` is set, with a 10ms inter-retry sleep
+    /// (SD spec doesn't require it but gives the card breathing room).
+    /// Captures the final OCR for `CardInfo`.
+    pub fn power_up_to_ready(
+        self,
+        acmd41_arg: u32,
+    ) -> Result<MmcCard<'a, Ready>, MmcCardError> {
+        let freq = crate::time::cntfreq_hz();
+        let deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
+        loop {
+            // CMD55 — broadcast (arg=0); response is R1 from the card.
+            SdhciCommandInit::open(self.sdhci)
+                .issue_no_data::<R1>(SdCommand::AppCmd, 0)
+                .map_err(MmcCardError::from)?;
+            // ACMD41 — R3 (no CRC/index check); OCR returns busy bit
+            // clear when card finished init.
+            let ocr = SdhciCommandInit::open(self.sdhci)
+                .issue_no_data::<R3>(SdCommand::SdSendOpCond, acmd41_arg)
+                .map_err(MmcCardError::from)?
+                .0;
+            if ocr.power_up_done {
+                let mut next: MmcCard<'a, Ready> = self.transition();
+                next.ocr = Some(ocr);
+                return Ok(next);
+            }
+            if monotonic_now() >= deadline {
+                return Err(MmcCardError::Acmd41Timeout);
+            }
+            let _ = sleep_for(Nanos::from_millis(10));
+        }
+    }
+}
+
+impl<'a> MmcCard<'a, Ready> {
+    /// CMD2 — ALL_SEND_CID. Card returns 136-bit CID in R2 response.
+    /// Captures the four-word view for `CardInfo`.
+    pub fn identify(self) -> Result<MmcCard<'a, Ident>, MmcCardError> {
+        let cid = SdhciCommandInit::open(self.sdhci)
+            .issue_no_data::<R2>(SdCommand::AllSendCid, 0)
+            .map_err(MmcCardError::from)?
+            .0;
+        let mut next: MmcCard<'a, Ident> = self.transition();
+        next.cid = Some(cid);
+        Ok(next)
+    }
+}
+
+impl<'a> MmcCard<'a, Ident> {
+    /// CMD3 — SEND_RELATIVE_ADDR. Card publishes its RCA. R6 response
+    /// carries `(rca, status)`; captures the RCA for `CardInfo` and
+    /// subsequent RCA-targeted commands (CMD7, CMD9, CMD13).
+    pub fn publish_rca(self) -> Result<MmcCard<'a, Stby>, MmcCardError> {
+        let r6: R6Response = SdhciCommandInit::open(self.sdhci)
+            .issue_no_data::<R6>(SdCommand::SendRelativeAddr, 0)
+            .map_err(MmcCardError::from)?
+            .0;
+        let mut next: MmcCard<'a, Stby> = self.transition();
+        next.rca = Some(r6.rca);
+        Ok(next)
+    }
+}
+
+impl<'a> MmcCard<'a, Stby> {
+    /// Transition Stby → Tran by running CMD9 (SEND_CSD) to capture
+    /// the card-capacity metadata, then CMD7 (SELECT_CARD) to move
+    /// the card into the Transfer state, then polling
+    /// `PRESENT_STATE.{CMD,DAT}_INHIBIT` until both clear (500ms
+    /// deadline for the R1b busy release).
+    ///
+    /// CMD9 + CMD7 are folded into one transition because every
+    /// production path needs CSD before any data transfer, AND
+    /// because folding them makes "`CardInfo` contains a valid CSD"
+    /// structural: every `MmcCard<Tran>` was constructed via this
+    /// method, which always captures CSD before transitioning. If
+    /// they were separate methods, `publish_rca()?.select()?` would
+    /// compile but `into_parts()` would panic at runtime when the
+    /// consumer reads `csd` — codex + opus called that out as a
+    /// proof-property gap in O6 round 1.
+    ///
+    /// Failure paths:
+    ///   - CMD9 fails (`Sdhci`) or returns a CSD that isn't v2
+    ///     (`Cmd9NotV2`) → card stays in Stby on the bus, no
+    ///     state advance.
+    ///   - CMD7 fails (`Sdhci`) → card stays in Stby, no advance.
+    ///   - DAT_INHIBIT poll times out (`Cmd7BusyStuck`) → CMD7
+    ///     fired but the card never released busy.
+    pub fn select(self) -> Result<MmcCard<'a, Tran>, MmcCardError> {
+        let rca = self.rca.expect("rca captured at MmcCard<Stby> construction");
+        let rca_arg = (rca as u32) << 16;
+
+        // CMD9 first — capture CSD before transitioning. If CMD9
+        // errors or the CSD isn't v2, the card stays in Stby on the
+        // bus and the typestate doesn't advance.
+        let words = SdhciCommandInit::open(self.sdhci)
+            .issue_no_data::<R2>(SdCommand::SendCsd, rca_arg)
+            .map_err(MmcCardError::from)?
+            .0;
+        let csd = CsdV2::decode(words).map_err(|NotCsdV2 { csd_structure }| {
+            MmcCardError::Cmd9NotV2 { csd_structure }
+        })?;
+
+        // CMD7 — actually select the card.
+        SdhciCommandInit::open(self.sdhci)
+            .issue_no_data::<R1b>(SdCommand::SelectCard, rca_arg)
+            .map_err(MmcCardError::from)?;
+        // Wait for DAT0 to deassert — the card signals "ready" by
+        // releasing it. 500ms covers the worst-case card-internal
+        // state-transition latency observed in the field.
+        let freq = crate::time::cntfreq_hz();
+        let deadline = monotonic_now().deadline_in(Nanos::from_millis(500), freq);
+        loop {
+            let ps = self.sdhci.present_state();
+            if !ps.contains(PresentState::CMD_INHIBIT)
+                && !ps.contains(PresentState::DAT_INHIBIT)
+            {
+                // Transition to Tran with CSD captured — the
+                // structural proof for into_parts()'s csd.expect.
+                let mut next: MmcCard<'a, Tran> = self.transition();
+                next.csd = Some(csd);
+                return Ok(next);
+            }
+            if monotonic_now() >= deadline {
+                return Err(MmcCardError::Cmd7BusyStuck {
+                    present_state: ps.bits(),
+                });
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+impl<'a> MmcCard<'a, Tran> {
+    /// CMD55+ACMD6 — SET_BUS_WIDTH to 4-bit. Must be preceded by CMD55
+    /// addressed to the selected card (RCA). After the card
+    /// acknowledges ACMD6, mirrors the 4-bit width in
+    /// `HOST_CONTROL_1.DAT_4BIT` via [`set_bus_width_4bit`]. Stays in
+    /// Tran — bus width is a runtime field on `CardInfo`, not a
+    /// typestate slot.
+    pub fn set_bus_width_4bit(mut self) -> Result<Self, MmcCardError> {
+        let rca = self.rca.expect("rca captured at MmcCard<Tran> construction");
+        let rca_arg = (rca as u32) << 16;
+        SdhciCommandInit::open(self.sdhci)
+            .issue_no_data::<R1>(SdCommand::AppCmd, rca_arg)
+            .map_err(MmcCardError::from)?;
+        SdhciCommandInit::open(self.sdhci)
+            .issue_no_data::<R1>(SdCommand::SetBusWidth, 0x2)
+            .map_err(MmcCardError::from)?;
+        set_bus_width_4bit(self.sdhci);
+        self.bus_width = BusWidth::Bit4;
+        Ok(self)
+    }
+
+    /// Drop the `&Sdhci` borrow and return the captured `CardInfo` —
+    /// the structural proof token that crosses into engine
+    /// construction. Each field was filled at exactly one state
+    /// transition along the typestate chain; the chain guarantees
+    /// every `.expect()` here succeeds.
+    pub fn into_parts(self) -> CardInfo {
+        CardInfo::new(
+            self.rca.expect("rca captured at MmcCard<Stby>"),
+            self.ocr.expect("ocr captured at MmcCard<Ready>"),
+            self.cid.expect("cid captured at MmcCard<Ident>"),
+            self.csd.expect("csd captured at MmcCard<Stby> read_csd"),
+            self.bus_width,
+        )
+    }
+}
+
+impl<'a, S: CardLifecycleState> MmcCard<'a, S> {
+    /// Transition helper — preserves captured metadata across the
+    /// typestate change. Private; only the impl blocks above can call
+    /// it (each lives in this module).
+    #[inline]
+    fn transition<N: CardLifecycleState>(self) -> MmcCard<'a, N> {
+        MmcCard {
+            sdhci: self.sdhci,
+            ocr: self.ocr,
+            cid: self.cid,
+            rca: self.rca,
+            csd: self.csd,
+            bus_width: self.bus_width,
+            _state: PhantomData,
         }
     }
 }

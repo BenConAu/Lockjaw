@@ -31,7 +31,7 @@ use lockjaw_mmio::region::MappedRegs;
 use lockjaw_regs::sdhci::{
     ErrorIntSignalEnable, ErrorIntStatusEnable,
     NormalIntSignalEnable, NormalIntStatusEnable,
-    PowerControlBusVoltage, PresentState, Sdhci,
+    PowerControlBusVoltage, Sdhci,
 };
 // O5: `__temp_unguarded_mint` removed — every gated-setter call site
 // in this driver now flows through `lockjaw_userlib::sdhci` (the
@@ -41,7 +41,7 @@ use lockjaw_regs::sdhci::{
 // `__sdhci_internal_mint` (lockjaw-userlib's internal use) and zero
 // driver-reachable mints.
 use lockjaw_types::addr::PAGE_SIZE;
-use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, sleep_for, Nanos};
+use lockjaw_userlib::time::{sleep_for, Nanos};
 // `monotonic_now` returns `MonoTicks`, which is `Ord`; the comparisons in the
 // poll helpers don't need the type imported by name. `sleep_for` is used only
 // for pure-time waits (regulator settle, post-clock idle) — never inside
@@ -49,81 +49,30 @@ use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, sleep_for, Nanos};
 // reads to avoid quantizing 200µs hardware events to a 10ms scheduler tick.
 use lockjaw_types::device::BCM2711_EMMC2_HASH;
 use lockjaw_types::sdhci::{
-    Capabilities, CsdV2,
-    CMD8_IF_COND_ARG, ACMD41_ARG_HCS,
+    Capabilities, ACMD41_ARG_HCS, SdCommand,
     SDHCI_SPEC_300,
     SDHCI_INT_CMD_TIMEOUT, SDHCI_INT_CMD_CRC,
     SDHCI_INT_CMD_END_BIT, SDHCI_INT_CMD_INDEX,
     SDHCI_INT_DATA_TIMEOUT, SDHCI_INT_DATA_CRC, SDHCI_INT_DATA_END_BIT,
-    SdCommand, compute_clock_divisor,
+    compute_clock_divisor,
 };
-use lockjaw_types::sdhci::response::{R0, R1, R1b, R2, R3, R6, R7};
 use lockjaw_types::wire::sdhci::Adma2Descriptor;
-// O4: framework-side SDHCI envelope + init helpers. ID-phase + init
-// callsites flow through this surface; data-phase still uses the
-// O2 temp-mint imports (removed in O5).
+// O6: framework-side SDHCI surface. Driver consumes the MmcCard
+// outer typestate (ID phase + bus-width init), the per-operation
+// envelopes (SdhciCommandInit + issue_data_transfer for data phase),
+// and the init-time helpers (soft_reset_all / configure_clock /
+// set_power_on_and_settle / set_int_enable_masks /
+// set_timeout_dat_counter / init_adma2_32 / enable_irq_signaling).
 use lockjaw_userlib::sdhci::{
-    self as sdhci_lib, SdhciCommandError, SdhciCommandInit, SdhciInitError,
+    self as sdhci_lib, SdhciCommandInit, SdhciInitError,
 };
 
-// ---------------------------------------------------------------------------
-// Status-bit polls (deadline-bounded, busy)
-// ---------------------------------------------------------------------------
-//
-// Pattern: check the register, return immediately if the condition
-// is satisfied; otherwise `core::hint::spin_loop()` between MMIO
-// reads. The loop is bounded by an absolute monotonic deadline
-// computed from `timeout` so termination doesn't depend on CPU
-// clock or codegen — that's the bug-class the new sleep primitive
-// fixed (iteration-count-as-time), and a real-time deadline
-// preserves the fix without yielding.
-//
-// We deliberately do *not* `sleep_for` between checks here, even
-// though the sleep primitive exists. The hardware events these
-// polls watch fire on the order of microseconds (CMD_INHIBIT,
-// CMD_COMPLETE) to a few milliseconds (SW_RST_ALL,
-// INT_CLK_STABLE). Yielding for a tick (~10 ms) between every MMIO
-// read would push a typical 200 µs CMD_COMPLETE into the 10 ms
-// regime and turn a "100 ms timeout" into a "~110 ms in the worst
-// case, with the driver descheduled the whole time" path. The two
-// rules from the sleep-plan principle are different shapes:
-//   - pure-time wait (regulator settle, 74 SD-clock idle):
-//     `sleep_for` — yield to the scheduler.
-//   - hardware-event poll: deadline + `spin_loop`.
-// The polls return Err(()) on timeout; the caller logs the failure.
-
-/// Deadline-bounded busy-wait until `pred()` returns true. Returns
-/// `Err(())` if the deadline expires first.
-///
-/// Single closure-based helper that survives the per-width typed-
-/// accessor transition (P9.5 / P9.6 / P9.8). Pre-typed-accessor the
-/// driver had three per-width variants (poll_until_clear_8 / set_16 /
-/// clear_32) that each baked in a raw `(offset, mask, read_width)`
-/// triple; once the predicates moved to typed snapshots
-/// (sdhci.software_reset().contains(...),
-/// sdhci.clock_control().int_clk_stable(), etc.) the per-width
-/// versions became four-line copies of this same loop with one
-/// differing line. The closure version collapses them.
-///
-/// Busy-poll with `core::hint::spin_loop()` between checks rather
-/// than yielding via `sleep_for`: hardware events of interest happen
-/// in microseconds to milliseconds (SDHCI command response,
-/// SOFTWARE_RESET clear, INT_CLK_STABLE), and the scheduler's
-/// per-tick granularity (~10 ms) would quantize those waits to far
-/// longer than the actual event budget.
-fn poll_until<F: FnMut() -> bool>(mut pred: F, timeout: Nanos) -> Result<(), ()> {
-    let freq = cntfreq_hz();
-    let deadline = monotonic_now().deadline_in(timeout, freq);
-    loop {
-        if pred() {
-            return Ok(());
-        }
-        if monotonic_now() >= deadline {
-            return Err(());
-        }
-        core::hint::spin_loop();
-    }
-}
+// O6: `poll_until` deleted — every status-bit poll the driver used to
+// drive directly now lives inside the framework (CMD_INHIBIT poll in
+// SdhciCommandInit::issue_no_data, INT_CLK_STABLE poll in
+// configure_clock, SW_RST_ALL poll in soft_reset_all, DAT_INHIBIT
+// drain in SdhciDataCompletion + MmcCard::select). The driver no
+// longer hand-runs any deadline-bounded busy poll.
 
 // ---------------------------------------------------------------------------
 // Soft reset
@@ -169,51 +118,15 @@ fn poll_until<F: FnMut() -> bool>(mut pred: F, timeout: Nanos) -> Result<(), ()>
 // Command issue
 // ---------------------------------------------------------------------------
 
-// O4: `issue_command` + `CmdResult` deleted. The ID-phase command
-// pattern is now `SdhciCommandInit::open(sdhci).issue_no_data::<R>(cmd,
-// arg)` from `lockjaw_userlib::sdhci`. The envelope wraps the exact
-// poll sequence the old issue_command implemented (CMD_INHIBIT poll
-// → ARGUMENT → TRANSFER_MODE+COMMAND single-store → NORMAL_INT_STATUS
-// poll → W1C → typed response decode) with byte-identical wire effects,
-// parameterized over the `ResponseShape` (R0/R1/R1b/R2/R3/R6/R7). The
-// local `issue_or_die` helper below shapes the SdhciCommandError into
-// the existing log-and-sys_exit error pattern for the strict ID-phase
-// commands.
-
-/// Issue an ID-phase command via the operation envelope and either
-/// return its decoded response or log + sys_exit on failure. The
-/// strict pattern used by every M2/M3 command except CMD0 (which is
-/// lenient — see emmc2_entry).
-fn issue_or_die<R: lockjaw_types::sdhci::response::ResponseShape>(
-    sdhci: &Sdhci,
-    label: &str,
-    cmd: SdCommand,
-    arg: u32,
-) -> R::Decoded {
-    match SdhciCommandInit::open(sdhci).issue_no_data::<R>(cmd, arg) {
-        Ok((decoded, _)) => decoded,
-        Err(SdhciCommandError::InhibitStuck { .. }) => {
-            puts("[EMMC2:IDPHASE] ");
-            puts(label);
-            puts(" FAILED: CMD_INHIBIT did not clear before deadline\n");
-            sys_exit()
-        }
-        Err(SdhciCommandError::ControllerError { err_int_status }) => {
-            puts("[EMMC2:IDPHASE] ");
-            puts(label);
-            puts(" FAILED: ");
-            put_error_int_status(err_int_status);
-            puts("\n");
-            sys_exit()
-        }
-        Err(SdhciCommandError::NoResponse) => {
-            puts("[EMMC2:IDPHASE] ");
-            puts(label);
-            puts(" FAILED: no CMD_COMPLETE/ERROR within 1s\n");
-            sys_exit()
-        }
-    }
-}
+// O6: `issue_or_die` deleted. The ID-phase command pattern is now the
+// MmcCard<'a, S> typestate chain from `lockjaw_userlib::sdhci` — each
+// transition consumes the previous state and produces the next
+// (Uninit → Idle → Ready → Ident → Stby → Tran), with typed
+// MmcCardError variants carrying the failure detail. emmc2_entry
+// dispatches log-and-sys_exit per transition via match (CMD0 lenient,
+// others strict). The framework owns the SdhciCommandInit::open +
+// issue_no_data::<R> mechanics; the driver expresses card-state
+// intent only.
 
 
 /// Pretty-print ERROR_INT_STATUS bits to the kernel UART. Names match
@@ -598,139 +511,90 @@ fn emmc2_entry() -> ! {
     // satisfies the "≥ 185 µs" minimum.
     let _ = sleep_for(Nanos::from_micros(200));
 
-    // CMD0 — GO_IDLE_STATE. No response (RESP_NONE). Resets all cards
-    // on the bus to idle state. We log the outcome but don't bail on
-    // failure: it's safe for the card to miss CMD0 if it was already
-    // idle. A controller-level error here (e.g. CMD line wedged) is
-    // still useful diagnostic context for what follows. CMD0's lenient
-    // handling is the one ID-phase divergence from `issue_or_die`.
-    match SdhciCommandInit::open(sdhci).issue_no_data::<R0>(SdCommand::GoIdleState, 0) {
-        Ok(_) => puts("[EMMC2:IDPHASE] CMD0 acknowledged\n"),
-        Err(SdhciCommandError::InhibitStuck { .. }) => {
-            puts("[EMMC2:IDPHASE] CMD0: CMD_INHIBIT stuck (controller not responding)\n")
-        }
-        Err(SdhciCommandError::ControllerError { err_int_status }) => {
-            puts("[EMMC2:IDPHASE] CMD0 controller error: ");
-            put_error_int_status(err_int_status);
+    // ID-phase: drive the card through CMD0 → CMD8 → ACMD41 → CMD2 →
+    // CMD3 → CMD7 (folds CMD9 inside per O6 review) → ACMD6 via the
+    // MmcCard typestate chain. Each transition consumes the previous
+    // state and produces the next; a typo that calls these out of
+    // order (e.g. `select()` before `publish_rca()`) is a compile
+    // error. Per-step failure logs and sys_exits inline — the framework
+    // returns MmcCardError, the driver decides logging/exit policy.
+    // Errors carry typed diagnostic info (Cmd8EchoMismatch,
+    // Acmd41Timeout, Cmd9NotV2, Cmd7BusyStuck, or the underlying
+    // SdhciCommandError).
+    let card = sdhci_lib::MmcCard::uninit(sdhci);
+    // CMD0 — strict-exit. Every failure mode (InhibitStuck /
+    // ControllerError / NoResponse) signals a controller in bad state,
+    // and the typestate chain requires a real `MmcCard<Idle>` for the
+    // next step. Pre-O6 history: the hand-rolled CMD0 was tolerant
+    // (logged and continued), but the typestate now leaves no path to
+    // proceed without an `Ok(_)` from go_idle.
+    let card = match card.go_idle() {
+        Ok(c) => { puts("[EMMC2:IDPHASE] CMD0 acknowledged\n"); c }
+        Err(e) => {
+            puts("[EMMC2:IDPHASE] CMD0 FAILED, halting: ");
+            put_mmc_card_error(&e);
             puts("\n");
+            sys_exit();
         }
-        Err(SdhciCommandError::NoResponse) => {
-            puts("[EMMC2:IDPHASE] CMD0: no CMD_COMPLETE within 1s (suspicious)\n")
+    };
+
+    // CMD8 — SEND_IF_COND with the standard 0x1AA check pattern.
+    // R7 echo verifies SDv2+. Pre-SDv2 cards / clock-mis-configured
+    // bus surface as Acmd8EchoMismatch or Sdhci(NoResponse).
+    let card = match card.verify_sdv2_if_cond() {
+        Ok(c) => {
+            puts("[EMMC2:IDPHASE] CMD8 echo=0x1AA — card is SDv2+ (clk via cprman)\n");
+            c
         }
-    }
-
-    // CMD8 — SEND_IF_COND. Arg: VHS=1 (2.7–3.6 V) + check pattern 0xAA.
-    // R7 response echoes VHS and the check pattern back. A correct echo
-    // proves the card is SD Physical Layer Spec v2.0+ (SDv2+). Pre-SDv2
-    // cards don't respond to CMD8; UHS and SDXC cards need it for ACMD41.
-    let cmd8_echo: u32 = issue_or_die::<R7>(sdhci, "CMD8", SdCommand::SendIfCond, CMD8_IF_COND_ARG);
-
-    // CMD8 R7: bits[11:8] = voltage accepted (echoes VHS=1), bits[7:0]
-    // = check pattern (echoes 0xAA). Together bits[11:0] = 0x1AA.
-    if cmd8_echo & 0xFFF != 0x1AA {
-        puts("emmc2: CMD8 bad echo=");
-        put_hex((cmd8_echo & 0xFFF) as u64);
-        puts("\n");
-        sys_exit();
-    }
-
-    puts("[EMMC2:IDPHASE] CMD8 echo=0x1AA — card is SDv2+ (clk via cprman)\n");
+        Err(e) => { puts("[EMMC2:IDPHASE] CMD8 FAILED: "); put_mmc_card_error(&e); puts("\n"); sys_exit(); }
+    };
 
     // -----------------------------------------------------------------------
     // M3 — Full SD identification: ACMD41 → CMD2 → CMD3 → CMD9 →
     //       CMD7 → ACMD6 → HOST_CONTROL → 25 MHz
     // -----------------------------------------------------------------------
 
-    // ACMD41 loop — SD spec § 4.2.3.1. Each iteration: CMD55 (sets
-    // APP_CMD mode for the next command), then ACMD41 with HCS=1.
-    // Loops until OCR.power_up_done = true (card finished init) or the
-    // 1-second timeout expires.
-    //
-    // CMD55 in broadcast mode (arg=0, no RCA assigned yet). ACMD41
-    // uses R3 (no CRC/index — spec §4.9.3); the typed envelope's
-    // `R3::FLAGS = SDHCI_CMD_RESP_SHORT` encodes that.
-    let freq = cntfreq_hz();
-    let acmd41_deadline = monotonic_now().deadline_in(Nanos::from_secs(1), freq);
-    let ocr = loop {
-        let _: u32 = issue_or_die::<R1>(sdhci, "CMD55", SdCommand::AppCmd, 0);
-        let ocr = issue_or_die::<R3>(sdhci, "ACMD41", SdCommand::SdSendOpCond, ACMD41_ARG_HCS);
-        if ocr.power_up_done {
-            break ocr;
-        }
-        if monotonic_now() >= acmd41_deadline {
-            puts("[EMMC2:IDPHASE] ACMD41 timeout: card never became ready\n");
-            sys_exit();
-        }
-        // Short delay between retries — SD spec doesn't require one
-        // but gives the card breathing room between polls.
-        let _ = sleep_for(Nanos::from_millis(10));
+    // ACMD41 loop — internally retries CMD55+ACMD41 with a 1-second
+    // deadline + 10ms inter-retry sleep. Captures the OCR for CardInfo.
+    let card = match card.power_up_to_ready(ACMD41_ARG_HCS) {
+        Ok(c) => c,
+        Err(e) => { puts("[EMMC2:IDPHASE] ACMD41 FAILED: "); put_mmc_card_error(&e); puts("\n"); sys_exit(); }
     };
-    puts("[EMMC2:IDPHASE] ACMD41 ready ccs=");
-    put_decimal(ocr.ccs as u64);
-    puts("\n");
+    puts("[EMMC2:IDPHASE] ACMD41 ready\n");
 
-    // CMD2 — ALL_SEND_CID. R2 (136-bit) carries the card's unique CID.
-    // We log the success but don't decode CID in M3 — capacity and
-    // addressing come from CSD (CMD9). R2 returns the raw four-word
-    // view; we discard it because the CID decoder isn't on the M3 path.
-    let _cid: [u32; 4] = issue_or_die::<R2>(sdhci, "CMD2", SdCommand::AllSendCid, 0);
+    // CMD2 — ALL_SEND_CID. Captures CID for CardInfo.
+    let card = match card.identify() {
+        Ok(c) => c,
+        Err(e) => { puts("[EMMC2:IDPHASE] CMD2 FAILED: "); put_mmc_card_error(&e); puts("\n"); sys_exit(); }
+    };
     puts("[EMMC2:IDPHASE] CMD2 CID received\n");
 
-    // CMD3 — SEND_RELATIVE_ADDR. Card publishes its RCA; the host
-    // stores it and uses it to address the card from here on. R6
-    // response: rca (u16) + 16 bits of card status; the typed envelope
-    // splits both into the `R6Response` struct.
-    let r6 = issue_or_die::<R6>(sdhci, "CMD3", SdCommand::SendRelativeAddr, 0);
-    let rca: u16 = r6.rca;
-    puts("[EMMC2:IDPHASE] CMD3 rca=");
-    put_hex(rca as u64);
-    puts("\n");
-
-    // CMD9 — SEND_CSD. R2 (136-bit) response carries the CSD register.
-    // CSD v2 (SDHC/SDXC) encodes capacity in the C_SIZE field; the pure
-    // decoder in lockjaw-types computes capacity_bytes from the four
-    // RESPONSE words. The R2 envelope returns the four-word view
-    // directly — no separate manual RESPONSE_1..3 reads needed.
-    let rca_arg = (rca as u32) << 16;
-    let csd_resp: [u32; 4] = issue_or_die::<R2>(sdhci, "CMD9", SdCommand::SendCsd, rca_arg);
-    let capacity_bytes: u64 = match CsdV2::decode(csd_resp) {
-        Ok(csd) => csd.capacity_bytes,
-        Err(e) => {
-            puts("[EMMC2:IDPHASE] CMD9 CSD_STRUCTURE=");
-            put_decimal(e.csd_structure as u64);
-            puts(" (expected 1 for SDHC/SDXC)\n");
-            sys_exit();
-        }
+    // CMD3 — SEND_RELATIVE_ADDR. Captures RCA for CardInfo + the
+    // subsequent RCA-addressed commands (CMD7, CMD9).
+    let card = match card.publish_rca() {
+        Ok(c) => c,
+        Err(e) => { puts("[EMMC2:IDPHASE] CMD3 FAILED: "); put_mmc_card_error(&e); puts("\n"); sys_exit(); }
     };
 
-    // CMD7 — SELECT_CARD. Moves the card from Stand-by to Transfer
-    // state. R1b: CMD_COMPLETE fires immediately; controller holds
-    // CMD_COMPLETE until DAT0 deasserts. Wait for both CMD_INHIBIT and
-    // DAT_INHIBIT before issuing the next command.
-    let _: u32 = issue_or_die::<R1b>(sdhci, "CMD7", SdCommand::SelectCard, rca_arg);
-    // Wait for DAT0 to deassert — the card signals "ready" by releasing it.
-    if poll_until(
-        || {
-            let ps = sdhci.present_state();
-            !ps.contains(PresentState::CMD_INHIBIT) && !ps.contains(PresentState::DAT_INHIBIT)
-        },
-        Nanos::from_millis(500),
-    ).is_err() {
-        puts("[EMMC2:IDPHASE] CMD7 DAT_INHIBIT did not clear (card busy timeout)\n");
-        sys_exit();
-    }
-    puts("[EMMC2:IDPHASE] CMD7 card selected\n");
+    // CMD9 + CMD7 — Stby → Tran. `select()` folds the two together
+    // (per O6 review): runs CMD9 to capture the CSD-v2 capacity first,
+    // then CMD7 to select the card and polls DAT_INHIBIT (500ms). The
+    // fold makes "`CardInfo.csd` is captured" a structural property of
+    // reaching `MmcCard<Tran>` rather than a runtime expect. Cmd9NotV2
+    // surfaces for legacy SDSC; Cmd7BusyStuck for a card that never
+    // releases DAT0 busy.
+    let card = match card.select() {
+        Ok(c) => c,
+        Err(e) => { puts("[EMMC2:IDPHASE] CMD9/CMD7 FAILED: "); put_mmc_card_error(&e); puts("\n"); sys_exit(); }
+    };
+    puts("[EMMC2:IDPHASE] CMD9+CMD7 card selected with CSD captured\n");
 
-    // ACMD6 — SET_BUS_WIDTH. Switch the card to 4-bit DAT bus. Must
-    // be preceded by CMD55 addressed to the selected card (RCA).
-    let _: u32 = issue_or_die::<R1>(sdhci, "CMD55 (pre-ACMD6)", SdCommand::AppCmd, rca_arg);
-    // ACMD6 argument: 0x2 = 4-bit bus (bits[1:0] = 10).
-    let _: u32 = issue_or_die::<R1>(sdhci, "ACMD6", SdCommand::SetBusWidth, 0x2);
-    // Mirror the 4-bit bus width in HOST_CONTROL_1 immediately after
-    // the card acknowledges ACMD6 — the host side must match the card.
-    // The framework helper `set_bus_width_4bit` does the typed
-    // modify_host_control with the internal token.
-    sdhci_lib::set_bus_width_4bit(sdhci);
+    // ACMD6 — SET_BUS_WIDTH 4-bit. Internally CMD55+ACMD6 +
+    // host_control flip via set_bus_width_4bit.
+    let card = match card.set_bus_width_4bit() {
+        Ok(c) => c,
+        Err(e) => { puts("[EMMC2:IDPHASE] ACMD6 FAILED: "); put_mmc_card_error(&e); puts("\n"); sys_exit(); }
+    };
 
     // Raise the SD bus clock from 400 kHz (ID mode) to 25 MHz (data
     // transfer mode). SDHCI spec § 3.2.4: disable SD_CLK_EN first,
@@ -739,6 +603,13 @@ fn emmc2_entry() -> ! {
         puts("[EMMC2:READY] clock-to-25MHz FAILED: INT_CLK_STABLE timeout\n");
         sys_exit();
     }
+
+    // Surrender the &Sdhci borrow + drop the typestate. CardInfo is
+    // the proof token Emmc2BlockEngine::new requires — no other path
+    // to construct one (Tier 3 #13).
+    let card_info = card.into_parts();
+    let rca = card_info.rca();
+    let capacity_bytes = card_info.csd().capacity_bytes;
 
     // Derive and log the actual clock we set so the Pi log is self-
     // contained for debugging.
@@ -766,13 +637,12 @@ fn emmc2_entry() -> ! {
     // BlockClient performs exercise the same SDHCI paths under
     // caller-controlled LBAs.
     // -----------------------------------------------------------------------
-    let capacity_sectors = capacity_bytes / 512;
-    // Drop the `sdhci` borrow on ctx.regs before moving it into the
-    // engine. After this point any further direct SDHCI access in
-    // emmc2_entry must go through `engine.regs.regs()` (used by the
-    // selftest below).
-    let _ = sdhci;
-    let engine = match Emmc2BlockEngine::new(ctx.regs, capacity_sectors, ctx.irq) {
+    // MmcCard<Tran>::into_parts() above already dropped the &Sdhci
+    // borrow chain — `sdhci` (= ctx.regs.regs()) is no longer
+    // live-borrowed by anything, so `ctx.regs` is movable into the
+    // engine. The CardInfo is the structural proof token; the engine
+    // ctor extracts capacity_sectors from card_info.csd() internally.
+    let engine = match Emmc2BlockEngine::new(ctx.regs, card_info, ctx.irq) {
         Ok(e) => e,
         Err(err) => {
             puts("[EMMC2:BLK] engine init FAILED: ");
@@ -834,7 +704,7 @@ fn emmc2_entry() -> ! {
     engine.free_buffer(selftest_buf);
 
     puts("[BLOCKDEV] /dev/sd0 ready: 512B x ");
-    put_decimal(capacity_sectors);
+    put_decimal(capacity_bytes / 512);
     puts(" blocks; selftest read OK\n");
 
     run_block_server(&mut engine, blk_srv_ep);
@@ -928,6 +798,40 @@ fn adma2_single_block_read(
 // Diagnostics helpers
 // ---------------------------------------------------------------------------
 
+/// Print a MmcCardError diagnostic: family-generic SdhciCommandError
+/// for command failures, plus the card-state-specific variants
+/// (Cmd8EchoMismatch / Acmd41Timeout / Cmd9NotV2 / Cmd7BusyStuck).
+/// Caller adds the leading "[EMMC2:IDPHASE] CMD-X FAILED: " prefix
+/// and the trailing newline.
+fn put_mmc_card_error(err: &sdhci_lib::MmcCardError) {
+    match err {
+        sdhci_lib::MmcCardError::Sdhci(sc) => match sc {
+            sdhci_lib::SdhciCommandError::InhibitStuck { present_state } => {
+                puts("CMD_INHIBIT stuck present_state=");
+                put_hex(*present_state as u64);
+            }
+            sdhci_lib::SdhciCommandError::ControllerError { err_int_status } => {
+                put_error_int_status(*err_int_status);
+            }
+            sdhci_lib::SdhciCommandError::NoResponse => puts("no CMD_COMPLETE within 1s"),
+        },
+        sdhci_lib::MmcCardError::Cmd8EchoMismatch { echo } => {
+            puts("CMD8 bad echo=0x"); put_hex((*echo & 0xFFF) as u64);
+        }
+        sdhci_lib::MmcCardError::Acmd41Timeout => {
+            puts("ACMD41 timeout: card never became ready");
+        }
+        sdhci_lib::MmcCardError::Cmd9NotV2 { csd_structure } => {
+            puts("CSD_STRUCTURE="); put_decimal(*csd_structure as u64);
+            puts(" (expected 1 for SDHC/SDXC)");
+        }
+        sdhci_lib::MmcCardError::Cmd7BusyStuck { present_state } => {
+            puts("DAT_INHIBIT did not clear present_state=");
+            put_hex(*present_state as u64);
+        }
+    }
+}
+
 fn put_clock_error(e: ClockError) {
     match e {
         ClockError::NotSupported(id) => { puts("NotSupported("); put_decimal(id as u64); puts(")"); }
@@ -1015,10 +919,17 @@ impl Emmc2BlockEngine {
     /// interference.
     fn new(
         regs: MappedRegs<Sdhci>,
-        capacity_sectors: u64,
+        card_info: sdhci_lib::CardInfo,
         irq: lockjaw_userlib::irq::BoundIrq,
     ) -> Result<Self, Emmc2Error>
     {
+        // CardInfo is the structural proof token that the card reached
+        // Tran state. Its only mint path is
+        // `MmcCard::<Tran>::into_parts()`, so this signature is
+        // compile-time proof emmc2_entry walked the typestate chain
+        // through every required ID-phase command. Capacity comes from
+        // the CSD v2 decode the chain captured.
+        let capacity_sectors = card_info.csd().capacity_blocks;
         // Reborrow as &Sdhci for the init-helper calls. regs is moved
         // into the engine at the end of this function.
         let sdhci = regs.regs();
