@@ -95,19 +95,22 @@ Without yield, a thread waiting for something would spin-wait (burning CPU) unti
 - **Polling patterns** where a thread checks a condition and yields between attempts
 - **Fairness** between threads with different workloads
 
-## Current syscalls (25)
+## Current syscalls (32)
+
+Source of truth: `lockjaw-types/src/syscall.rs` (constants) +
+`src/syscall/handler.rs` (dispatch + handlers).
 
 | # | Name | Arguments | Returns | Description |
 |---|------|-----------|---------|-------------|
-| 0 | debug_putc | x0=char | — | Print one character via UART (debug only) |
+| 0 | debug_puts | x0=buf VA, x1=len | — | Print a buffer via UART (debug only). Buffer must fit in one page; rejected if it crosses user VA end. |
 | 1 | yield | — | — | Voluntary reschedule |
 | 2 | send | x0=ep handle, x1-x4=msg | — | Send message on endpoint (non-blocking) |
 | 3 | receive | x0=ep handle | x1-x4=msg | Receive message (blocks if queue empty) |
 | 4 | call | x0=ep handle, x1=reply handle, x2-x5=msg | x1-x4=reply | Send + block for reply (call/reply IPC) |
 | 5 | reply | x0-x3=msg | — | Reply to current bound caller |
-| 6 | alloc_pages | x0=count, x1=flags | x1=handle | Allocate physical pages, return PageSet handle (flag 1 = contiguous) |
+| 6 | alloc_pages | x0=count, x1=flags | x1=handle | Allocate physical pages, return PageSet handle (`ALLOC_FLAG_CONTIGUOUS = 1`) |
 | 7 | map_pages | x0=handle, x1=VA, x2=flags | — | Map PageSet pages into caller's address space |
-| 8 | create_process | x0=mappings ptr, x1=count, x2=entry, x3=stack handle, x4=scratch handle, x5=handle, x6=name ptr | — | Create new process from mapping list |
+| 8 | create_process | x0=mappings VA, x1=mapping_count, x2=entry_point, x3=stack_pageset_id, x4=scratch_pageset_id, x5=parent_handle_to_copy (u64::MAX for none), x6=name VA | — | Create new process from mapping list. Per-arg breakdown in `src/syscall/handler.rs:549`. |
 | 9 | create_notification | x0=PageSet handle | x1=handle | Create notification (timeline semaphore) |
 | 10 | signal_notification | x0=handle, x1=value | — | Signal notification (must be monotonic) |
 | 11 | wait_notification | x0=handle, x1=threshold | x1=value | Wait until counter >= threshold |
@@ -124,6 +127,13 @@ Without yield, a thread waiting for something would spin-wait (burning CPU) unti
 | 22 | create_thread | x0=entry, x1=stack_top, x2=stack_base, x3=arg | — | Create thread in calling process (shares address space). VA range validated; mapping not checked (faults at EL0 if unmapped). stack_top must be 16-byte aligned. |
 | 23 | query_mapping | x0=VA (page-aligned) | x1=mapped (0/1), x2=run_pages | Query mapping state at a user VA. Returns whether the page is mapped and how many consecutive pages share the same state. |
 | 24 | close_handle | x0=handle | — | Remove a handle from caller's table, freeing the slot. Does NOT free backing object or pages (no refcounting). |
+| 25 | unmap_pages | x0=handle, x1=VA | — | Unmap a previously-mapped PageSet from caller's address space. |
+| 26 | query_caller_token | — | x1=token (u64) | Return the per-call identity token for the currently-bound caller. Server-side primitive — read inside a `receive`/`recv_nb` handler. See [`../architecture/02-handle-identity-tokens.md`](../architecture/02-handle-identity-tokens.md). |
+| 27 | alloc_dma_pages | x0=count | x1=handle | Allocate `count` pages from the DMA pool (`DmaPoolOrigin`). Pages are physically contiguous and cacheable; the returned PageSet is the only origin `sys_dma_sync_*` will accept. |
+| 28 | sched_telemetry | — | x1=ticks, x2=ctx_switches, x3=ttbr0_writes, x4=tick_max | 4-word message return: scheduler counters since boot + worst-case observed tick handler latency. Intended for kernel-health diagnostics. |
+| 29 | dma_sync_for_cpu | x0=handle, x1=offset, x2=len | — | Invalidate cache lines covering `[offset, offset+len)` in a `DmaPoolOrigin` PageSet so a subsequent CPU load sees device-DMA'd bytes. Only callable on DMA-pool origins (rejects Buddy origins with `INVALID_PARAMETER`). Driver-internal — `lockjaw-userlib` wraps via `run_dma_transfer`. |
+| 30 | dma_sync_for_device | x0=handle, x1=offset, x2=len | — | Clean (write back) cache lines so a subsequent device DMA read sees CPU-written bytes. Mirror of `dma_sync_for_cpu`; same origin restriction. |
+| 31 | unmask_irq | x0=INTID | — | Re-enable a previously-bound level-triggered SPI in the GIC after the userspace driver has cleared the source. Rejects INTID < 32 (PPIs/SGIs aren't userspace-bindable). No-op for edge IRQs (which aren't masked in the first place). |
 
 ## wait_any (extended)
 
