@@ -1,49 +1,141 @@
 # Memory Model
 
-Lockjaw's kernel does not dynamically allocate memory. There is no `alloc` crate, no heap, no `malloc`. All kernel data structures are either statically sized (in BSS) or initialized in pages donated by userspace via PageSets.
+Lockjaw's kernel does not dynamically allocate memory through any
+heap or `alloc` crate. Every byte of kernel-resident state is either
+in BSS (statically sized, decided at link time) or in pages handed
+out by one of two dedicated kernel allocators: the **buddy** for
+physical pages userspace will own, and the **KVM pool** for kernel
+objects whose storage the kernel itself manages.
 
-## Who owns physical memory?
+## Where physical RAM comes from
 
-At boot, the kernel knows about all physical RAM (hardcoded for QEMU virt: 128 MB at `0x4000_0000`). Some of it is reserved:
+The kernel does not hardcode RAM size. At boot, the DTB is parsed
+for the `memory` node, and the answer lives in
+`src/mm/addr.rs::ram_start()` / `ram_size()` / `total_pages()`. On
+QEMU virt the values are 1-2 GiB at `0x4000_0000`; on Pi 4B they
+are typically 4 GiB at `0x0000_0000`. The buddy allocator is
+parameterized by `total_pages()` at init time — no `[u8; 4096]`
+bitmap, no compile-time constants for page count.
 
-- **Firmware/DTB** — the first 512 KB (`0x4000_0000` to `0x4008_0000`)
-- **Kernel image** — `.text`, `.rodata`, `.data`, `.bss` sections
-- **Kernel stack** — one 4 KB page, plus a guard page gap
-- **Boot page tables** — static arrays in BSS used to set up the MMU
+## How RAM is partitioned
 
-Everything else is **free physical memory** that the kernel will hand to userspace as PageSets.
+`src/mm/page_alloc.rs::init_with_gap` runs once at boot and
+classifies every page of RAM into one of five categories:
 
-## The page allocator
+| Region | Lifetime | Backing |
+|---|---|---|
+| `[ram_start, kernel_start)` | Reserved forever | Firmware, DTB, anything pre-kernel-image. Not registered with any allocator. |
+| Kernel image | Reserved forever | `.text` / `.rodata` / `.data` / `.bss` sections. |
+| Per-CPU stack region | Reserved forever | 4 KiB guard page + 8 KiB stack per CPU, `MAX_CPUS=4`. Stride = 12 KiB. See [`stack-budget.md`](stack-budget.md). |
+| DMA pool | Carved off the tail | Highest 2 MiB block (`DMA_POOL_PAGES = 512` from `lockjaw-types/src/dma_pool.rs:56`). Owned by `src/cap/dma_pool.rs`, not buddy. |
+| Everything else | Free | Registered with `BuddyAllocator` at boot, handed out via `sys_alloc_pages` / `sys_alloc_dma_pages`. |
 
-The kernel maintains a static bitmap (`[u8; 4096]` in BSS) that tracks which of the 32,768 physical pages (4 KB each) are reserved vs. free. This is **not** a general-purpose allocator — it exists for two purposes:
+The two ranges that go to buddy are:
+1. `[kernel_end, stacks_start)` — the alignment gap between the
+   kernel image and the 2 MiB-aligned per-CPU stack region.
+2. `[stacks_end, dma_pool_base)` — most of the free RAM.
 
-1. **Boot-time bookkeeping**: track what is reserved so the kernel does not hand out pages that contain its own code or page tables.
-2. **PageSet allocation**: when userspace requests physical pages via `sys_alloc_pages`, the kernel allocates from this bitmap and returns a PageSet handle.
+The post-pool tail `[dma_pool_end, ram_end)` also goes to buddy if
+there's anything there.
 
-Once userspace has PageSets, object creation works like this:
+## The buddy allocator
 
-```
-Userspace: "I want a new TCB"
-         → sys_alloc_pages(query_tcb_size(&info).pages)  // get pages
-         → sys_create_tcb(&info, pageset_handle)          // donate pages, create object
-         → receives a handle to the new TCB
-```
+`lockjaw-types/src/buddy.rs::BuddyAllocator` is a textbook
+order-based buddy. `MAX_PAGES = 262144` (1 GiB at 4 KiB), `MAX_ORDER = 18`
+(2^18 = 256K pages = 1 GiB). The kernel wraps it in `src/mm/page_alloc.rs`;
+under SMP (landed in Phase 11), concurrent access is serialized by
+the Giant Kernel Lock (`src/sched/gkl.rs`) — every syscall and IRQ
+entry takes the GKL, so the page allocator's `unsafe impl Sync`
+relies on "GKL held, IRQs masked" rather than the older single-core
+invariant. The end-state is to break the GKL into per-subsystem
+locks (a `SpinMutex` around buddy state would be one of them);
+that's tracked in [`../tracking/tech-debt.md`](../tracking/tech-debt.md)
+under "UnsafeCell globals serialized only by GKL".
 
-The kernel writes the object into the donated pages. Userspace cannot see the raw memory — it interacts only through handles and syscalls.
+Public API:
+- `alloc_page() -> Option<PhysPage>` — single-page allocation
+  (`page_alloc.rs:149`).
+- `alloc_pages_contiguous(count: usize) -> Option<PhysPage>` —
+  multi-page, physically contiguous (`:160`).
+- `dealloc_page(page)` / `dealloc_pages_contiguous(first, count)` —
+  returns to buddy (`:173`, `:184`).
+- `zero_page(paddr)` — zero-fills via the linear KVA map (`:196`).
+- `free_count()` — diagnostic (`:140`).
 
-## Why not skip the bitmap entirely?
+Userspace reaches buddy through `sys_alloc_pages(count, flags)`:
+`ALLOC_FLAG_CONTIGUOUS=1` routes to `alloc_pages_contiguous`,
+otherwise the request walks the buddy.
 
-The boot page tables in Milestones 2.4–2.6 are statically allocated (fixed-size arrays in BSS), so they don't need the page allocator. But the page allocator is the backing for all PageSet allocations — it is the mechanism by which userspace obtains physical memory. Building it early also lets us verify that reserved page tracking is correct before the system gets more complex.
+## The DMA pool
 
-## Static kernel memory budget
+The 2 MiB tail carve-out (`src/cap/dma_pool.rs`) exists because DMA
+allocations have different cache attributes from regular pages.
+Post-C1 of the cacheable-DMA migration (see
+[`../history/cacheable-dma-migration-plan.md`](../history/cacheable-dma-migration-plan.md)),
+the pool participates in the kernel TTBR1 direct map as Normal
+Cacheable — same MAIR slot as the rest of RAM — but it is allocated
+through its own `dma_pool::alloc_pages` / `free_pages` rather than
+through buddy. Two reasons:
 
-All kernel-resident memory fits in BSS:
+- **Origin discipline.** A pageset returned by `sys_alloc_dma_pages`
+  carries `PageSetOrigin::DmaPool`; one from `sys_alloc_pages`
+  carries `PageSetOrigin::Buddy`. The DMA-sync syscalls reject
+  Buddy-origin pages with `INVALID_PARAMETER` — only DmaPool pages
+  are valid for `sys_dma_sync_for_{cpu,device}`. This origin tag
+  is the runtime check; the type-level `SyncCapable` gate in
+  `lockjaw-userlib::dma` is the compile-time enforcement (see
+  [`../architecture/04-driver-substrate.md`](../architecture/04-driver-substrate.md)).
+- **Allocator isolation.** Feeding pool pages into buddy would
+  double-issue them. The pool is its own bitmap allocator
+  (`lockjaw-types/src/dma_pool.rs::DmaPool`) over a fixed PA range.
+
+The pool's physical base is computed at boot in `init_with_gap`:
+round `ram_end` down to a 2 MiB boundary, subtract `DMA_POOL_PAGES`
+× `PAGE_SIZE` to get `pool_base_phys`. If RAM is too tight to fit
+the carve-out aligned, init logs a warning and the pool is empty —
+`sys_alloc_dma_pages` then returns `OUT_OF_MEMORY` (cannot happen
+on Pi 4B or QEMU virt today; both have ≥ 1 GiB).
+
+## The KVM allocator
+
+Kernel objects (TCBs, endpoints, handle tables, PageSet headers,
+process pages) live in a higher-half virtually-contiguous range
+managed by `src/mm/kvm.rs` + `lockjaw-types/src/kvm.rs`. The KVM
+pool occupies `L0[256]` at `0xFFFF_8000_0000_0000` and stitches
+together N physically-discontiguous pages into N pages of virtually
+contiguous KVA. The roadmap that motivated the KVM allocator lives
+at [`../tracking/kernel-vmem-roadmap.md`](../tracking/kernel-vmem-roadmap.md).
+
+The userspace-facing entry remains the PageSet handle: userspace
+doesn't allocate kernel objects directly. The kernel allocates KVM
+pages for the object, then returns a handle. The PageSet underlying
+the object is bookkeeping in the kernel; userspace never sees the
+KVA.
+
+## Who owns what
+
+| Memory class | Allocator | API to userspace |
+|---|---|---|
+| User PageSets (Buddy origin) | `page_alloc` (buddy) | `sys_alloc_pages` |
+| User PageSets (DmaPool origin) | `cap::dma_pool` | `sys_alloc_dma_pages` |
+| Kernel objects (TCB, Endpoint, etc.) | `mm::kvm` | (kernel-internal; userspace gets handles) |
+| Kernel image + stacks + DTB | Linker / boot | (none — reserved at init) |
+
+## The static budget
+
+Kernel-resident BSS state, on top of the per-CPU stack region:
 
 | Item | Size | Notes |
-|------|------|-------|
-| Page bitmap | 4,096 bytes | 1 bit per 4 KB page, 128 MB RAM |
+|---|---|---|
 | Boot page tables | ~24 KB | L0 + L1 + L2 + L3 tables (static arrays) |
-| Kernel stack | 4,096 bytes | One page, guard page below |
-| BSS zero-init data | varies | Global state, counters, etc. |
+| Per-CPU stacks | 32 KiB usable + 16 KiB guards | 4 CPUs × (8 KiB stack + 4 KiB guard), stride 12 KiB |
+| BuddyAllocator state | ~96 KiB | ~64 KiB per-order freelist bitmap (sum across MAX_ORDER=18 orders for MAX_PAGES=262144) + ~32 KiB allocated bitmap. Source comment: `lockjaw-types/src/buddy.rs:41`. |
+| DmaPool bitmap | 64 bytes | 512 bits for `DMA_POOL_PAGES = 512` |
+| KVM allocator state | small (varies) | Free-list + level-page bookkeeping |
+| BSS misc | varies | Counters, global state |
 
-No kernel memory grows at runtime. The stack is proven to fit within budget by `cargo xtask check-stack`.
+No kernel memory grows at runtime in a way that can fail.
+The stack-budget invariant is proven by `cargo xtask check-stack`;
+see [`stack-budget.md`](stack-budget.md). The buddy and KVM
+allocators return `Option::None` / `Result::Err` on exhaustion —
+the kernel never panics on allocation failure.
