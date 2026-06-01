@@ -16,6 +16,7 @@ pub mod fs;
 pub mod fwcfg;
 pub mod handle;
 pub mod irq;
+pub mod pl011;
 pub mod sdhci;
 pub mod time;
 pub mod virtio;

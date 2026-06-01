@@ -65,8 +65,15 @@ edition = "2021"
 
 [dependencies]
 lockjaw-userlib = { path = "../lockjaw-userlib" }
-lockjaw-regs    = { path = "../lockjaw-regs" }
 lockjaw-mmio    = { path = "../lockjaw-mmio" }   # if you hold MappedRegs<T>
+
+# Note: lockjaw-regs is NOT a default driver dependency. Drivers
+# consume generated register families through lockjaw_userlib::<family>
+# re-exports (enforced by xtask check-driver-unsafe — see Step 6).
+# Only add lockjaw-regs if your driver's family is not yet migrated
+# to lockjaw-userlib (at time of writing: cprman, fw_cfg, virtio_mmio).
+# A new driver should not need it — migrate the family to
+# lockjaw-userlib first if it's missing.
 
 [profile.release]
 panic = "abort"
@@ -91,10 +98,13 @@ look at `user/regspecs/pl011.toml` for a worked example. Drift
 between the regspec source and the generated Rust is detected by
 `cargo xtask gen-regs --check` (run inside `make build`).
 
-If the layout exists already, just import the generated module:
+If the layout exists already, import through the family's `lockjaw-userlib`
+surface — drivers consume the safe types via `lockjaw_userlib::<family>`
+and never name `lockjaw_regs` directly (the xtask `check-driver-unsafe`
+regime enforces this; see Step 6):
 
 ```rust
-use lockjaw_regs::pl011::{Flag, Imsc, Pl011};
+use lockjaw_userlib::pl011::{Flag, Imsc, Pl011};
 ```
 
 ## Step 3 — wire DTOs (if new)
@@ -182,7 +192,7 @@ impl EventEngine for UartEngine {
 ```
 
 Your `uart_main(ctx: DriverCtx<Pl011>)` constructs the engine
-(`UartEngine { regs: ctx.mmio_regs }`), then calls
+(`UartEngine { regs: ctx.regs }`), then calls
 `run_event_server(&mut engine, ctx.server_ep, ctx.irq_notif, ctx.irq_initial_threshold)`
 (see `user/lockjaw-userlib/src/driver_runtime.rs:733` — the first
 arg is `&mut E`, not by-value). The function never returns.
@@ -210,12 +220,19 @@ const DRIVER_CRATES: &[&str] = &[
 
 Once added, `cargo xtask check-driver-unsafe` (run inside
 `make build`) will gate every commit that touches your driver
-against the three regime rules:
+against the four regime rules:
 
 1. `#![deny(unsafe_code)]` at the crate root.
 2. Zero `#[allow(unsafe_code)]` attributes.
 3. No raw `syscall::*` path beyond the allowlist (`sys_exit`,
    `sys_debug_puts`).
+4. No reference to a `(crate, module)` pair in
+   `BANNED_DRIVER_MODULE_PATHS` (currently `lockjaw_regs::sdhci`
+   and `lockjaw_regs::pl011`) via any path/use/macro/alias/raw-ident
+   shape — drivers consume those module families through the
+   `lockjaw-userlib` re-exports instead. See
+   [`../architecture/patterns/operation-envelope.md`](../architecture/patterns/operation-envelope.md)
+   for the structural rationale.
 
 The check uses `syn` AST + `visit_macro` + raw-ident
 normalization — see chapter 04 for why each layer is load-bearing.

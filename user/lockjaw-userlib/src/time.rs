@@ -86,3 +86,30 @@ pub fn sleep_for(nanos: Nanos) -> Result<(), SyscallError> {
     let deadline = monotonic_now().deadline_in(nanos, cntfreq_hz());
     sleep_until(deadline)
 }
+
+/// Returned by [`spin_until_or_deadline`] when the deadline elapsed
+/// before the predicate ever returned true. Unit struct because the
+/// only fact the primitive knows is "we ran out of time" — the
+/// operation context is the caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineExpired;
+
+/// Spin until `check()` returns true, or until `deadline` expires.
+///
+/// Uses `MonoTicks::has_expired(monotonic_now())` so the
+/// `NO_DEADLINE` sentinel is honored (a `NO_DEADLINE` deadline never
+/// expires — equivalent to "spin forever until check passes").
+pub fn spin_until_or_deadline<F: FnMut() -> bool>(
+    mut check: F,
+    deadline: MonoTicks,
+) -> Result<(), DeadlineExpired> {
+    loop {
+        if check() {
+            return Ok(());
+        }
+        if deadline.has_expired(monotonic_now()) {
+            return Err(DeadlineExpired);
+        }
+        core::hint::spin_loop();
+    }
+}

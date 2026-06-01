@@ -7,14 +7,16 @@ edition = "2021"
 
 [dependencies]
 lockjaw-userlib = { path = "../lockjaw-userlib" }
-# Generated typed register layer for the PL011. Replaces the
-# hand-written offset constants and bit masks the Phase-3 driver
-# carried.
-lockjaw-regs = { path = "../lockjaw-regs" }
 # Direct lockjaw-mmio dep for `MappedRegs<Pl011>` in the UartEngine
 # field. lockjaw-userlib re-exports plenty but not MappedRegs (which
 # is substrate, not userlib); explicit is cleaner.
 lockjaw-mmio = { path = "../lockjaw-mmio" }
+# Note: lockjaw-regs is NOT a dependency — drivers reach the
+# generated PL011 register surface only through
+# lockjaw_userlib::pl011's curated re-export. The xtask
+# check-driver-unsafe regime forbids naming `lockjaw_regs`
+# anywhere in `user/*-driver` source (the (lockjaw_regs, pl011)
+# entry in BANNED_DRIVER_MODULE_PATHS).
 
 [profile.release]
 panic = "abort"

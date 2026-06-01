@@ -81,20 +81,30 @@ const SYSCALL_ALLOWLIST: &[&str] = &["sys_exit", "sys_debug_puts"];
 /// source must consume these via a `lockjaw_userlib::<module>`
 /// re-export rather than naming the underlying crate directly.
 ///
-/// Today: `lockjaw_regs::sdhci` — `lockjaw-userlib::sdhci` re-exports
-/// every safe SDHCI surface (Sdhci, register-field newtypes, the
-/// operation envelope, init helpers) WITHOUT re-exporting the gated
-/// `__sdhci_internal_mint`. The ban makes the mint unreachable from
-/// driver source, structurally enforcing the R3 ("sanctioned transfer
-/// path is the only path") property from the P9.11/SdhciCommandInit
-/// effort (O7 of the operation-level construction safety plan).
+/// Today: `lockjaw_regs::sdhci` and `lockjaw_regs::pl011`.
+///
+/// `lockjaw_userlib::sdhci` re-exports the safe SDHCI surface
+/// (Sdhci, register-field newtypes, operation envelope, init helpers)
+/// WITHOUT exposing the gated `__sdhci_internal_mint`, structurally
+/// enforcing the R3 ("sanctioned transfer path is the only path")
+/// property from P9.11/SdhciCommandInit (O7 of the operation-level
+/// construction safety plan).
+///
+/// `lockjaw_userlib::pl011` re-exports the safe PL011 surface (P1 of
+/// the pl011 framework-mediation plan); P2 and P3 add deadline-bounded
+/// TX (`write_byte_deadline`) and write-replace IMSC (`set_interrupt_masks`)
+/// helpers to close the unbounded-spin tech-debt and the non-atomic
+/// IMSC RMW correctness gap respectively.
 ///
 /// Not banned yet (other drivers still import `lockjaw_regs::<module>`
-/// directly): `cprman`, `fw_cfg`, `pl011`, `virtio_mmio`. Tracked as
+/// directly): `cprman`, `fw_cfg`, `virtio_mmio`. Tracked as
 /// tech-debt — when each non-SDHCI driver's family helper lands in
 /// lockjaw-userlib, its module gets added here and the corresponding
 /// `lockjaw_regs::<module>` import in the driver gets removed.
-const BANNED_DRIVER_MODULE_PATHS: &[(&str, &str)] = &[("lockjaw_regs", "sdhci")];
+const BANNED_DRIVER_MODULE_PATHS: &[(&str, &str)] = &[
+    ("lockjaw_regs", "sdhci"),
+    ("lockjaw_regs", "pl011"),
+];
 
 pub fn run() {
     println!("=== Driver-unsafe regime check ===");
@@ -1015,6 +1025,19 @@ mod tests {
         let f = syscall_findings("use lockjaw_regs;\nfn _f() {}");
         assert!(
             f.iter().any(|s| s.contains("names banned-pair crate") && s.contains("lockjaw_regs")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn flags_bare_use_of_pl011_ban_pair() {
+        // pl011 added to BANNED_DRIVER_MODULE_PATHS in P1 of the
+        // pl011 framework-mediation plan. The list enumeration in
+        // every visitor automatically covers it; this test is the
+        // representative confirmation that the new pair is wired.
+        let f = syscall_findings("use lockjaw_regs::pl011::Pl011;\nfn _f() {}");
+        assert!(
+            f.iter().any(|s| s.contains("banned module path") && s.contains("lockjaw_regs::pl011")),
             "{f:?}"
         );
     }

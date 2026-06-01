@@ -16,11 +16,13 @@
 use lockjaw_userlib::driver_runtime::{run_event_server, DriverCtx, EventEngine};
 use lockjaw_userlib::{driver_main, puts, sys_exit, PL011_HASH};
 use lockjaw_mmio::region::MappedRegs;
-use lockjaw_regs::pl011::{Flag, Imsc, Pl011};
+use lockjaw_userlib::pl011::{Flag, Imsc, Pl011};
 
 // ---------------------------------------------------------------------------
 // PL011 helpers (the only "device behaviour" the driver expresses —
-// the rest of the register surface is the generated lockjaw_regs::pl011).
+// the rest of the register surface is the generated lockjaw_regs::pl011,
+// reached through lockjaw_userlib::pl011's curated re-export; drivers
+// cannot name lockjaw_regs directly per check-driver-unsafe).
 // ---------------------------------------------------------------------------
 
 /// Write a byte to the UART, spinning while the TX FIFO is full.
