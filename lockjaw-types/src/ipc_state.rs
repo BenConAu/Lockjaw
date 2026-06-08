@@ -10,7 +10,7 @@
 //! The previous design assumed at most one caller per endpoint (a single
 //! `caller_tcb_paddr` slot on the EndpointObject). Two clients calling the
 //! same endpoint before the server replied silently overwrote each other —
-//! a real corruption bug hit during ramfb/uart-driver bring-up. This model
+//! a real corruption bug hit during ramfb/pl011-driver bring-up. This model
 //! eliminates that failure mode by:
 //!
 //! 1. Making the endpoint a queue of waiters rather than a single-slot

@@ -266,15 +266,15 @@ by the shell and the commit body fills with stderr.
 When the change you're reviewing is itself an enforcement check (an
 xtask lint, a new attribute, a build gate), pair the unit tests with a
 real-driver smoke test: inject all the violations into one driver
-(uart is small and survives the round trip), run the check, expect it
+(pl011 is small and survives the round trip), run the check, expect it
 to fail with the exact findings you predicted, then revert:
 
 ```bash
-# 1. Edit to inject violations into user/uart-driver/src/main.rs.
+# 1. Edit to inject violations into user/pl011-driver/src/main.rs.
 # 2. Run from repo root (do NOT cd — see "don't cd mid-session" gotcha):
 cargo xtask check-driver-unsafe 2>&1; echo "exit=$?"
-git checkout user/uart-driver/src/main.rs
-git status --short user/uart-driver/   # must be empty
+git checkout user/pl011-driver/src/main.rs
+git status --short user/pl011-driver/   # must be empty
 ```
 
 This catches the end-to-end exit-1 path that unit tests don't (they

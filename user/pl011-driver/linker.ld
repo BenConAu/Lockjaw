@@ -1,5 +1,5 @@
 /*
- * Lockjaw UART driver process linker script.
+ * Lockjaw PL011 driver process linker script.
  * Each process gets its own address space so the same base VA is fine.
  */
 

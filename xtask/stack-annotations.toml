@@ -124,7 +124,7 @@
 [allowed_cycles]
 # print_thread_context has a runtime AtomicBool re-entry guard.
 "lockjaw::crash::print_thread_context" = true
-# The panic handler calls uart.puts() + KPrint, which the compiler
+# The panic handler calls pl011.puts() + KPrint, which the compiler
 # sees as potentially panicking again. Not real recursion.
 "__rustc::rust_begin_unwind" = true
 
@@ -134,7 +134,7 @@
 # entries), not function pointers to gic::init itself.
 "gic::init+" = "compiler jump table"
 "process_obj::process_handle_table+" = "compiler jump table"
-"uart::Uart>::puts" = "kprintln infrastructure function pointer"
+"pl011::Pl011>::puts" = "kprintln infrastructure function pointer"
 
 # Specific Debug::fmt impls pulled in by assert_eq! in the kernel.
 # Each new type requires its own entry — keeps the gate narrow.

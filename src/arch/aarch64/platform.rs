@@ -34,7 +34,7 @@ pub use lockjaw_types::scheduler::MAX_CPUS;
 /// Discovered platform information. All fields are zero until discover()
 /// populates them from the DTB. Zero means "not discovered".
 pub struct PlatformInfo {
-    pub uart0_base: u64,
+    pub pl011_base: u64,
     pub gicd_base: u64,
     /// GICv3: redistributor base. GICv2: CPU interface base.
     pub gic_secondary_base: u64,
@@ -58,7 +58,7 @@ pub enum PlatformError {
     /// DTB structure unparseable.
     ParseFailed,
     /// No PL011 UART found in DTB.
-    MissingUart,
+    MissingPl011,
     /// No GIC distributor found in DTB.
     MissingGic,
     /// No memory node found in DTB.
@@ -67,7 +67,7 @@ pub enum PlatformError {
 
 /// Global platform info. All zeros until discover() populates from DTB.
 static mut PLATFORM: PlatformInfo = PlatformInfo {
-    uart0_base: 0,
+    pl011_base: 0,
     gicd_base: 0,
     gic_secondary_base: 0,
     ram_base: 0,
@@ -122,8 +122,8 @@ pub fn discover(dtb_paddr: u64) -> Result<(), PlatformError> {
         .map_err(|_| PlatformError::ParseFailed)?;
 
     // Validate required fields — all essential hardware must be present.
-    if hw.uart_base == 0 {
-        return Err(PlatformError::MissingUart);
+    if hw.pl011_base == 0 {
+        return Err(PlatformError::MissingPl011);
     }
     if hw.gicd_base == 0 {
         return Err(PlatformError::MissingGic);
@@ -135,17 +135,17 @@ pub fn discover(dtb_paddr: u64) -> Result<(), PlatformError> {
     // SAFETY: single-core boot, no concurrent access yet.
     let p = unsafe { &mut *core::ptr::addr_of_mut!(PLATFORM) };
 
-    p.uart0_base = hw.uart_base;
+    p.pl011_base = hw.pl011_base;
     p.gicd_base = hw.gicd_base;
     p.gic_secondary_base = hw.gic_secondary_base;
     p.gic_v2 = hw.gic_v2;
     p.ram_base = hw.ram_base;
     p.ram_size = hw.ram_size;
 
-    // Heuristic: infer device MMIO region from UART address range.
+    // Heuristic: infer device MMIO region from PL011 address range.
     // Works for QEMU virt (0x08000000) and Pi 4B (0xFE000000).
     // Future platforms may need explicit MMIO range discovery from DTB.
-    if hw.uart_base >= 0xFE00_0000 {
+    if hw.pl011_base >= 0xFE00_0000 {
         p.device_mmio_base = 0xFE00_0000;
     } else {
         p.device_mmio_base = 0x0800_0000;

@@ -10,6 +10,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lockjaw-pl011-driver"
+version = "0.1.0"
+dependencies = [
+ "lockjaw-mmio",
+ "lockjaw-userlib",
+]
+
+[[package]]
 name = "lockjaw-regs"
 version = "0.1.0"
 dependencies = [
@@ -20,15 +28,6 @@ dependencies = [
 [[package]]
 name = "lockjaw-types"
 version = "0.1.0"
-
-[[package]]
-name = "lockjaw-uart-driver"
-version = "0.1.0"
-dependencies = [
- "lockjaw-mmio",
- "lockjaw-regs",
- "lockjaw-userlib",
-]
 
 [[package]]
 name = "lockjaw-userlib"

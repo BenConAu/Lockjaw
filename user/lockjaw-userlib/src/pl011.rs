@@ -49,7 +49,7 @@ pub fn write_byte_deadline(
 /// write, with no synchronization against a concurrent writer)
 /// closes by construction because there is no read step.
 ///
-/// Today's only caller is `uart_main`, which passes `Imsc::RXIM` to
+/// Today's only caller is `pl011_main`, which passes `Imsc::RXIM` to
 /// enable RX interrupts. TXIM gets cleared, which is deliberate
 /// current policy — the driver does TX via polling
 /// [`write_byte_deadline`], not via TX interrupts. A future TX-IRQ

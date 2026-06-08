@@ -1059,7 +1059,7 @@ fn check_vtables() {
 /// kprintln! infrastructure: the compiler stores pointers into the calling
 /// function's body (for format args / panic locations), and these shift when
 /// unrelated code changes. By checking nearby callees we make the allowlist
-/// entry for e.g. `uart::Uart>::puts` transitively cover all callers.
+/// entry for e.g. `pl011::Pl011>::puts` transitively cover all callers.
 fn has_nearby_allowed_callee(
     elf: &[u8],
     text: &ElfSection,

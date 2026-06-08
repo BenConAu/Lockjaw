@@ -243,7 +243,7 @@ pub struct DriverCtx<T: 'static> {
     /// Resolved `clocks = <&phandle id>` reference from the device's
     /// DTB node, or `None` if the node had no `clocks` property
     /// (P9.4a). Drivers that need a clock (e.g. emmc2) pass straight
-    /// into `ClockClient::acquire`; drivers that don't (uart,
+    /// into `ClockClient::acquire`; drivers that don't (pl011,
     /// virtio-blk on QEMU virt) ignore the field.
     pub clock_ref: Option<ClockRef>,
     /// Server endpoint the driver receives requests on.
@@ -692,7 +692,7 @@ macro_rules! driver_main {
 //
 // First canonical shape: block-style request/response (`run_block_server`,
 // virtio-blk, future ramfb / emmc2 / fat32 etc.).
-// Second canonical shape: input device + IPC TX (uart-driver, future
+// Second canonical shape: input device + IPC TX (pl011-driver, future
 // console / keyboard / serial / polled-but-async devices).
 //
 // The two named bit constants and the IRQ-threshold increment used to

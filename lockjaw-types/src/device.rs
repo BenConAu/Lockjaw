@@ -19,7 +19,7 @@ pub const fn compatible_hash(s: &[u8]) -> u64 {
     hash
 }
 
-/// Pre-computed hash for "arm,pl011" — used by the UART driver.
+/// Pre-computed hash for "arm,pl011" — used by the PL011 driver.
 pub const PL011_HASH: u64 = compatible_hash(b"arm,pl011");
 
 /// Pre-computed hash for "qemu,fw-cfg-mmio" — used by the ramfb display driver.

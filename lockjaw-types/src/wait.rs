@@ -299,10 +299,10 @@ mod tests {
         assert!(!is_notification_ready(0, 1));
     }
 
-    // --- compute_ready_mask: UART driver scenarios ---
+    // --- compute_ready_mask: PL011 driver scenarios ---
 
     #[test]
-    fn uart_driver_nothing_ready_blocks() {
+    fn pl011_driver_nothing_ready_blocks() {
         // Endpoint idle, notification below threshold → would block
         let objects = [
             ObjectReadiness::Endpoint(EpState::Idle),
@@ -312,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn uart_driver_ipc_message_arrives() {
+    fn pl011_driver_ipc_message_arrives() {
         // Sender waiting on endpoint, notification below threshold → endpoint ready
         let objects = [
             ObjectReadiness::Endpoint(EpState::HasWaiters),
@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn uart_driver_irq_fires() {
+    fn pl011_driver_irq_fires() {
         // Endpoint idle, notification meets threshold → notification ready
         let objects = [
             ObjectReadiness::Endpoint(EpState::Idle),
@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn uart_driver_both_ready() {
+    fn pl011_driver_both_ready() {
         // Caller waiting + notification met → both ready
         let objects = [
             ObjectReadiness::Endpoint(EpState::HasWaiters),
@@ -342,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn uart_driver_notification_not_yet() {
+    fn pl011_driver_notification_not_yet() {
         // Endpoint has a caller, notification one below threshold
         let objects = [
             ObjectReadiness::Endpoint(EpState::HasWaiters),

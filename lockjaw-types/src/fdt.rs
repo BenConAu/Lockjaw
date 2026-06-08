@@ -927,7 +927,7 @@ fn resolve_clocks_for(
 #[derive(Clone, Copy, Debug)]
 pub struct PlatformHw {
     /// PL011 UART physical base address. 0 = not found.
-    pub uart_base: u64,
+    pub pl011_base: u64,
     /// GIC distributor physical base address. 0 = not found.
     pub gicd_base: u64,
     /// GIC secondary base: redistributor (v3) or CPU interface (v2).
@@ -968,7 +968,7 @@ pub fn scan_platform(data: &[u8]) -> Result<PlatformHw, FdtError> {
     let gic400_hash = compatible_hash(b"arm,gic-400");
 
     let mut hw = PlatformHw {
-        uart_base: 0, gicd_base: 0, gic_secondary_base: 0,
+        pl011_base: 0, gicd_base: 0, gic_secondary_base: 0,
         gic_v2: false, ram_base: 0, ram_size: 0,
         smp_method: SmpMethod::None, cpus: [CpuInfo::EMPTY; 4], cpu_count: 0,
     };
@@ -983,10 +983,10 @@ pub fn scan_platform(data: &[u8]) -> Result<PlatformHw, FdtError> {
         if is_memory && node.reg_size != 0 && hw.ram_size == 0 {
             hw.ram_base = node.reg_addr;
             hw.ram_size = node.reg_size;
-        } else if node.has_compat_hash(pl011_hash) && hw.uart_base == 0 {
+        } else if node.has_compat_hash(pl011_hash) && hw.pl011_base == 0 {
             // Match any compatible string (e.g., "arm,pl011-axi" first,
             // "arm,pl011" second on Pi 4B; "arm,pl011" first on QEMU).
-            hw.uart_base = node.reg_addr;
+            hw.pl011_base = node.reg_addr;
         } else if node.has_compat_hash(gicv3_hash) && hw.gicd_base == 0 {
             hw.gicd_base = node.reg_addr;
             hw.gic_secondary_base = node.reg_addr2;
@@ -1418,9 +1418,9 @@ mod tests {
     // --- scan_platform tests ---
 
     #[test]
-    fn scan_finds_uart() {
+    fn scan_finds_pl011() {
         let hw = scan_platform(QEMU_DTB).unwrap();
-        assert_eq!(hw.uart_base, 0x0900_0000, "PL011 UART0 base");
+        assert_eq!(hw.pl011_base, 0x0900_0000, "PL011 UART0 base");
     }
 
     #[test]
@@ -1540,13 +1540,13 @@ mod tests {
     // --- consistency: both parsers agree ---
 
     #[test]
-    fn scan_and_parse_agree_on_uart() {
+    fn scan_and_parse_agree_on_pl011() {
         let hw = scan_platform(QEMU_DTB).unwrap();
         let devs = parse_fdt(QEMU_DTB).unwrap();
         let uart0 = devs.devices[..devs.count]
             .iter()
             .find(|d| d.has_compat(PL011_HASH));
-        assert_eq!(hw.uart_base, uart0.unwrap().mmio_addr);
+        assert_eq!(hw.pl011_base, uart0.unwrap().mmio_addr);
     }
 
     #[test]
@@ -1570,11 +1570,11 @@ mod tests {
     }
 
     #[test]
-    fn pi4b_scan_finds_uart_translated() {
+    fn pi4b_scan_finds_pl011_translated() {
         // Pi 4B UART: compatible = "arm,pl011-axi", "arm,pl011", ...
         // DTB reg = 0x7e201000 (bus address), ranges translate to 0xfe201000
         let hw = scan_platform(PI4B_DTB).unwrap();
-        assert_eq!(hw.uart_base, 0xfe20_1000,
+        assert_eq!(hw.pl011_base, 0xfe20_1000,
             "UART should be translated from bus 0x7e201000 to physical 0xfe201000");
     }
 

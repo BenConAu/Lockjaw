@@ -38,9 +38,9 @@ const INIT_PLAN_BUFFER_PAGES: u64 = {
 /// Built by: cd user/hello && cargo build --release
 static HELLO_ELF: &[u8] = include_bytes!("../../hello/target/aarch64-unknown-none/release/lockjaw-hello");
 
-/// The UART driver ELF binary, embedded at compile time.
-/// Built by: cd user/uart-driver && cargo build --release
-static UART_ELF: &[u8] = include_bytes!("../../uart-driver/target/aarch64-unknown-none/release/lockjaw-uart-driver");
+/// The PL011 driver ELF binary, embedded at compile time.
+/// Built by: cd user/pl011-driver && cargo build --release
+static PL011_ELF: &[u8] = include_bytes!("../../pl011-driver/target/aarch64-unknown-none/release/lockjaw-pl011-driver");
 
 /// The device manager ELF binary, embedded at compile time.
 /// Built by: cd user/device-manager && cargo build --release
@@ -441,10 +441,10 @@ pub extern "C" fn _start() -> ! {
     };
 
     // Create endpoints for IPC infrastructure.
-    // ep_handle: UART server endpoint (init sends characters, UART driver serves)
+    // ep_handle: PL011 server endpoint (init sends characters, PL011 driver serves)
     // devmgr_ep: device-manager server endpoint (drivers send claims, devmgr serves)
-    // hello_boot_ep, devmgr_boot_ep, uart_boot_ep: bootstrap endpoints (used once each)
-    let ep_handle = alloc_endpoint("uart srv");
+    // hello_boot_ep, devmgr_boot_ep, pl011_boot_ep: bootstrap endpoints (used once each)
+    let ep_handle = alloc_endpoint("pl011 srv");
     let devmgr_ep = alloc_endpoint("devmgr srv");
     let display_ep = alloc_endpoint("display srv");
     // CPRMAN clock-provider endpoint. The only legitimate caller is
@@ -454,7 +454,7 @@ pub extern "C" fn _start() -> ! {
     let cprman_srv_ep = alloc_endpoint("cprman srv");
     let hello_boot_ep = alloc_endpoint("hello boot");
     let devmgr_boot_ep = alloc_endpoint("devmgr boot");
-    let uart_boot_ep = alloc_endpoint("uart boot");
+    let pl011_boot_ep = alloc_endpoint("pl011 boot");
     let ramfb_boot_ep = alloc_endpoint("ramfb boot");
     let display_test_boot_ep = alloc_endpoint("dtest boot");
     let blk_srv_ep = alloc_endpoint("blk srv");
@@ -514,7 +514,7 @@ pub extern "C" fn _start() -> ! {
     // will). On QEMU the CPRMAN device claim fails gracefully and
     // cprman serves NotSupported for every clock op.
     spawn_elf(CPRMAN_ELF, "cprman-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, cprman_boot_ep, 4);
-    spawn_elf(UART_ELF, "uart-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, uart_boot_ep, 4);
+    spawn_elf(PL011_ELF, "pl011-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, pl011_boot_ep, 4);
     spawn_elf(RAMFB_ELF, "ramfb-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, ramfb_boot_ep, 4);
     spawn_elf(BLK_ELF, "blk-driver", map_array_va, temp_base_va, plan_buf_va, scratch_ps, blk_boot_ep, 4);
     spawn_elf(FAT32_ELF, "fat32-server", map_array_va, temp_base_va, plan_buf_va, scratch_ps, fat32_boot_ep, 4);
@@ -596,7 +596,7 @@ pub extern "C" fn _start() -> ! {
 
     // Bootstrap cprman-driver: export cprman_srv_ep (the endpoint
     // it serves clock ops on) plus devmgr_ep (so it can claim its
-    // CPRMAN MMIO device). Same shape as uart-driver bootstrap.
+    // CPRMAN MMIO device). Same shape as pl011-driver bootstrap.
     puts("init: waiting for cprman bootstrap...\n");
     let _ = sys_receive(cprman_boot_ep);
     let cprman_srv_idx = match sys_export_handle(cprman_srv_ep) {
@@ -610,19 +610,19 @@ pub extern "C" fn _start() -> ! {
     sys_reply(cprman_srv_idx, cprman_devmgr_idx, 0, 0);
     puts("[BOOTSTRAP] cprman\n");
 
-    // Bootstrap UART driver: export ep_handle (its IPC server) and devmgr_ep (its client).
-    puts("init: waiting for uart bootstrap...\n");
-    let _ = sys_receive(uart_boot_ep);
-    let uart_ep_idx = match sys_export_handle(ep_handle) {
+    // Bootstrap PL011 driver: export ep_handle (its IPC server) and devmgr_ep (its client).
+    puts("init: waiting for pl011 bootstrap...\n");
+    let _ = sys_receive(pl011_boot_ep);
+    let pl011_ep_idx = match sys_export_handle(ep_handle) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export uart ep FAILED\n"); park_forever(); }
+        Err(_) => { puts("init: export pl011 ep FAILED\n"); park_forever(); }
     };
-    let uart_devmgr_idx = match sys_export_handle(devmgr_ep) {
+    let pl011_devmgr_idx = match sys_export_handle(devmgr_ep) {
         Ok(idx) => idx,
-        Err(_) => { puts("init: export devmgr to uart FAILED\n"); park_forever(); }
+        Err(_) => { puts("init: export devmgr to pl011 FAILED\n"); park_forever(); }
     };
-    sys_reply(uart_ep_idx, uart_devmgr_idx, 0, 0);
-    puts("[BOOTSTRAP] uart\n");
+    sys_reply(pl011_ep_idx, pl011_devmgr_idx, 0, 0);
+    puts("[BOOTSTRAP] pl011\n");
 
     // Bootstrap ramfb driver: export devmgr_ep (to claim fw_cfg) and
     // display_ep (to serve DDI clients) into its handle table.
@@ -639,7 +639,7 @@ pub extern "C" fn _start() -> ! {
     // Order matches driver_bootstrap's expectation: reply[0] = server
     // endpoint, reply[1] = devmgr endpoint. (Earlier ramfb pre-Phase-6
     // expected the reversed order; Phase 6 conversion to driver_bootstrap
-    // unified ramfb with the uart/virtio-blk convention.)
+    // unified ramfb with the pl011/virtio-blk convention.)
     sys_reply(ramfb_display_idx, ramfb_devmgr_idx, 0, 0);
     puts("[BOOTSTRAP] ramfb\n");
 
@@ -685,7 +685,7 @@ pub extern "C" fn _start() -> ! {
     };
     // P9.4c: bootstrap reply order changed to match the framework's
     // `driver_bootstrap` convention (reply[0] = server_ep,
-    // reply[1] = devmgr_ep) — the same shape blk-driver / uart use.
+    // reply[1] = devmgr_ep) — the same shape blk-driver / pl011 use.
     // Pre-P9.4c emmc2 read these as `[devmgr, blk_srv, _, _]` with a
     // raw bootstrap; the new emmc2_entry consumes the framework ctx
     // via standard_driver_init_level and would deadlock if init

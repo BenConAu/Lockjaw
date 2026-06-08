@@ -29,7 +29,7 @@ pub fn print_thread_context(prefix: &str) {
     if IN_CRASH.swap(true, Ordering::Relaxed) {
         return; // already in crash handler — don't recurse
     }
-    let uart = crate::arch::aarch64::uart::Uart::new();
+    let uart = crate::arch::aarch64::pl011::Pl011::new();
 
     unsafe {
         let thread_idx = crate::sched::scheduler::current_thread_index();

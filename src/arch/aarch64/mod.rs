@@ -7,8 +7,8 @@ pub mod mmu;
 pub mod platform;
 pub mod psci;
 pub mod spin_table;
+pub mod pl011;
 pub mod timer;
-pub mod uart;
 pub mod vmem;
 
 /// IRQ dispatch — called from the exception vector IRQ stub.

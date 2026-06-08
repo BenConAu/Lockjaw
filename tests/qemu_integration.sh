@@ -7,9 +7,9 @@ TIMEOUT=60
 QEMU="qemu-system-aarch64"
 GIC_VERSION="${GIC_VERSION:-3}"
 # Two UARTs muxed onto stdio: UART0 for kernel debug, UART1 for the
-# userspace UART driver to claim. Single `-nographic` only exposes one,
+# userspace PL011 driver to claim. Single `-nographic` only exposes one,
 # leaving the driver with nothing to claim and breaking the
-# uart-driver-related assertions further down.
+# pl011-driver-related assertions further down.
 QEMU_FLAGS="-machine virt,gic-version=${GIC_VERSION} -cpu cortex-a53 -display none \
     -chardev stdio,mux=on,id=char0 -mon chardev=char0,mode=readline \
     -serial chardev:char0 -serial chardev:char0 \
@@ -111,7 +111,7 @@ assert_not_contains "bootstrap receive FAILED" "Hello bootstrap receive succeede
 assert_contains "caller token OK" "Caller token delivered via IPC"
 assert_contains "\[BOOTSTRAP\] hello" "Init-hello bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] devmgr" "Init-devmgr bootstrap IPC completed"
-assert_contains "\[BOOTSTRAP\] uart" "Init-uart bootstrap IPC completed"
+assert_contains "\[BOOTSTRAP\] pl011" "Init-pl011 bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] ramfb" "Init-ramfb bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] blk" "Init-blk bootstrap IPC completed"
 assert_contains "\[BOOTSTRAP\] display-test" "Init-display-test bootstrap IPC completed"
@@ -147,7 +147,7 @@ assert_contains "\[EMMC2:INIT\] no bcm2711-emmc2 device on this platform (QEMU)"
 # (mrs CNTVCT_EL0 from EL0 — gated by S1's CNTKCTL_EL1 setup).
 # Tolerance window [50ms, 200ms]: lower bound = the deadline floor;
 # upper bound is loose because the QEMU host is single-CPU and the
-# sleep coincides with concurrent driver startup (uart, devmgr,
+# sleep coincides with concurrent driver startup (pl011, devmgr,
 # posix-server, cprman, ramfb, clock-test, emmc2). All those threads
 # fair-share the CPU while sleep-test is Blocked; sleep-test only
 # resumes once the round-robin reaches it after wake_expired_deadlines
@@ -188,19 +188,19 @@ assert_contains "\[THREAD-TEST\] child wrote marker" "sys_create_thread works (s
 
 echo "Phase 10 — Device Manager:"
 assert_contains "devmgr: parsed DTB" "Device manager parsed DTB"
-assert_contains "devmgr: claimed device at 0x9040000" "Device manager claim-by-addr (UART)"
+assert_contains "devmgr: claimed device at 0x9040000" "Device manager claim-by-addr (PL011)"
 assert_contains "devmgr: claimed device at 0x9020000" "Device manager claim-by-addr (fw_cfg)"
 assert_contains "devmgr: serving" "Device manager IPC loop running"
 
-echo "Phase 10 — UART Driver:"
+echo "Phase 10 — PL011 Driver:"
 # Phase 5 conversion replaced the bespoke claim+map sequence with
 # driver_main!'s standard_driver_init. The probe + claim_typed +
 # MMIO map are internal substrate now; assertions cover the visible
 # phase milestones — start, bootstrap+claim done, IRQ bound, loop up.
-assert_contains "uart-driver: starting" "UART driver started"
-assert_contains "uart-driver: bootstrapped" "UART driver bootstrapped + claimed PL011 via driver_main"
-assert_contains "uart-driver: IRQ bound" "UART driver bound IRQ → notification"
-assert_contains "uart-driver: server ready" "UART driver server loop entered"
+assert_contains "pl011-driver: starting" "PL011 driver started"
+assert_contains "pl011-driver: bootstrapped" "PL011 driver bootstrapped + claimed PL011 via driver_main"
+assert_contains "pl011-driver: IRQ bound" "PL011 driver bound IRQ → notification"
+assert_contains "pl011-driver: server ready" "PL011 driver server loop entered"
 
 echo "Phase 10 — ramfb Display Driver:"
 # Phase 6 conversion: ramfb now uses Tier-A boot_stub! +

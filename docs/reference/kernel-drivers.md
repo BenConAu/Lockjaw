@@ -26,4 +26,4 @@ The timer drives preemptive scheduling. When a thread's time slice expires, the 
 
 The UART, block devices, network — these are all userspace drivers in Lockjaw. They receive hardware interrupts via IPC notifications from the kernel (the kernel acknowledges the GIC, then signals a Notification object that wakes the driver). They access device MMIO through mapped device memory frames granted via capabilities. The kernel never touches their hardware directly after boot.
 
-The early-boot UART access in `src/arch/aarch64/uart.rs` is a temporary bootstrap mechanism. In Phase 9, a standalone userspace UART server takes over, and the kernel stops accessing the UART entirely.
+The early-boot UART access in `src/arch/aarch64/pl011.rs` is a temporary bootstrap mechanism. In Phase 9, a standalone userspace UART server takes over, and the kernel stops accessing the UART entirely.

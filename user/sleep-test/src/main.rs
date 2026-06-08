@@ -22,7 +22,7 @@ use lockjaw_userlib::time::{
 ///   - upper bound = ≤15 scheduler-tick periods of slack. The bound
 ///     is loose because the slack budget includes other concurrent
 ///     startup work on the 1-CPU QEMU host. When sleep-test starts
-///     sleeping the boot is still spinning up (uart-driver, devmgr,
+///     sleeping the boot is still spinning up (pl011-driver, devmgr,
 ///     posix-server, cprman, ramfb, clock-test, emmc2 init/exit);
 ///     each gets fair-round-robin slots while sleep-test is Blocked,
 ///     and sleep-test only resumes once its turn comes back around

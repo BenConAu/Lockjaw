@@ -9,7 +9,7 @@
 // `#![deny]` (not `#![forbid]`) so the macro-emitted per-item
 // allows on `#[no_mangle]` and `#[link_section]` are honoured.
 // Acceptance grep:
-// `grep -rn 'allow(unsafe_code)' user/uart-driver/src/`
+// `grep -rn 'allow(unsafe_code)' user/pl011-driver/src/`
 // MUST return nothing.
 #![deny(unsafe_code)]
 
@@ -41,19 +41,19 @@ const TX_TIMEOUT_NANOS: Nanos = Nanos(10_000_000);
 /// the current callsites — banner / IPC TX / IRQ echo all discard
 /// the result). The visible improvement over the pre-P2 unbounded
 /// spin is that the driver cannot infinite-loop on a stuck FIFO.
-fn uart_putc(regs: &Pl011, c: u8) {
+fn pl011_putc(regs: &Pl011, c: u8) {
     let deadline = monotonic_now().deadline_in(TX_TIMEOUT_NANOS, cntfreq_hz());
     let _ = write_byte_deadline(regs, c, deadline);
 }
 
 /// Write a string to the UART, converting `\n` to `\r\n` (PL011 expects
 /// the explicit CR for terminals that don't auto-translate).
-fn uart_puts(regs: &Pl011, s: &str) {
+fn pl011_puts(regs: &Pl011, s: &str) {
     for b in s.bytes() {
         if b == b'\n' {
-            uart_putc(regs, b'\r');
+            pl011_putc(regs, b'\r');
         }
-        uart_putc(regs, b);
+        pl011_putc(regs, b);
     }
 }
 
@@ -66,18 +66,18 @@ fn uart_puts(regs: &Pl011, s: &str) {
 // `sys_exit` in the panic handler.
 // ---------------------------------------------------------------------------
 
-struct UartEngine {
+struct Pl011Engine {
     regs: MappedRegs<Pl011>,
 }
 
-impl UartEngine {
+impl Pl011Engine {
     fn regs(&self) -> &Pl011 { self.regs.regs() }
 }
 
-impl EventEngine for UartEngine {
+impl EventEngine for Pl011Engine {
     fn on_ipc(&mut self, msg: u64) -> u64 {
         // IPC TX request: the message word is the byte to send.
-        uart_putc(self.regs(), msg as u8);
+        pl011_putc(self.regs(), msg as u8);
         0
     }
 
@@ -87,9 +87,9 @@ impl EventEngine for UartEngine {
         // closure decides what to do with each byte.
         let regs = self.regs();
         drain_rx_fifo(regs, |ch| {
-            uart_putc(regs, ch);
+            pl011_putc(regs, ch);
             if ch == b'\r' {
-                uart_putc(regs, b'\n');
+                pl011_putc(regs, b'\n');
             }
         });
     }
@@ -101,8 +101,8 @@ impl EventEngine for UartEngine {
 // then hands off to `run_event_server`.
 // ---------------------------------------------------------------------------
 
-fn uart_main(ctx: DriverCtx<Pl011>) -> ! {
-    let mut engine = UartEngine { regs: ctx.regs };
+fn pl011_main(ctx: DriverCtx<Pl011>) -> ! {
+    let mut engine = Pl011Engine { regs: ctx.regs };
 
     // Enable PL011 RX interrupt via write-replace (not RMW): the
     // framework helper writes the full intended mask, clobbering
@@ -115,11 +115,11 @@ fn uart_main(ctx: DriverCtx<Pl011>) -> ! {
     // Kernel-debug-channel confirmation FIRST so the "reached here"
     // signal lands even if UART1 itself is broken — `puts` routes
     // through `sys_debug_puts`, independent of the user PL011.
-    // The UART1 banner follows via `uart_putc`, which since P2 is
+    // The UART1 banner follows via `pl011_putc`, which since P2 is
     // bounded by `TX_TIMEOUT_NANOS` (10 ms per byte): a stuck FIFO
     // drops bytes instead of hanging the driver.
-    puts("uart-driver: server ready\n");
-    uart_puts(engine.regs(), "uart-driver: UART1 active\n");
+    puts("pl011-driver: server ready\n");
+    pl011_puts(engine.regs(), "pl011-driver: UART1 active\n");
 
     run_event_server(
         &mut engine,
@@ -131,7 +131,7 @@ fn uart_main(ctx: DriverCtx<Pl011>) -> ! {
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    puts("uart-driver: PANIC\n");
+    puts("pl011-driver: PANIC\n");
     sys_exit();
 }
 
@@ -142,9 +142,9 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 // ---------------------------------------------------------------------------
 
 driver_main! {
-    name = "uart-driver",
+    name = "pl011-driver",
     hash = LOCKJAW_SOURCE_HASH,
     probe_hash = PL011_HASH,
     layout = Pl011,
-    main = uart_main,
+    main = pl011_main,
 }

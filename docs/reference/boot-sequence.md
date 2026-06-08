@@ -56,7 +56,7 @@ The asm halts in `wfi` if kmain ever returns; it never does.
    the `PlatformInfo` static (UART base, GIC base, RAM range, CPU
    topology, SMP boot method). Halts with no diagnostic on failure
    — UART address isn't known yet, so we have no way to print.
-3. **UART init.** `Uart::set_base(plat.uart0_base)` + `init_baud`.
+3. **UART init.** `Pl011::set_base(plat.pl011_base)` + `init_baud`.
    First print happens here.
 4. **Print boot banner + memory layout** from linker symbols.
 5. **`page_alloc::init_with_gap(...)`** registers all-RAM-minus-
@@ -70,7 +70,7 @@ The asm halts in `wfi` if kmain ever returns; it never does.
 7. **`mmu::enable_mmu()`** writes TCR_EL1, MAIR_EL1, TTBR0_EL1,
    TTBR1_EL1, and finally SCTLR_EL1.M. UART access is preserved
    because the boot tables identity-map device MMIO.
-8. **`mmu::enable_higher_half()`** + **`Uart::use_high_addresses()`**
+8. **`mmu::enable_higher_half()`** + **`Pl011::use_high_addresses()`**
    — kernel code can now reach addresses via the linear
    higher-half map at `KERNEL_VA_OFFSET = 0xFFFF_0000_0000_0000`.
    UART pointer rewritten to use the high mapping.

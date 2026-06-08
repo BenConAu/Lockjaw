@@ -15,7 +15,7 @@ mod process;
 mod sched;
 mod syscall;
 
-use arch::aarch64::uart::Uart;
+use arch::aarch64::pl011::Pl011;
 use print::{Hex, Addr, Hex32, HexByte};
 
 extern "C" {
@@ -113,13 +113,13 @@ pub extern "C" fn kmain() -> ! {
     let plat = arch::aarch64::platform::info();
 
     // UART is now safe to use — set_base + init_baud, then first print.
-    unsafe { Uart::set_base(plat.uart0_base); }
-    unsafe { Uart::new().init_baud(); }
+    unsafe { Pl011::set_base(plat.pl011_base); }
+    unsafe { Pl011::new().init_baud(); }
 
     // First print happens here — banner + platform info.
     kprintln!("=== Lockjaw Microkernel v", env!("CARGO_PKG_VERSION"), " ===");
     kprintln!("Target: AArch64 (ARMv8-A)");
-    kprintln!("Platform: UART=", Hex(plat.uart0_base), " GICD=", Hex(plat.gicd_base),
+    kprintln!("Platform: UART=", Hex(plat.pl011_base), " GICD=", Hex(plat.gicd_base),
         " GICv", if plat.gic_v2 { "2" } else { "3" }, " RAM=", Hex(plat.ram_base), "+", Hex(plat.ram_size));
     kprintln!();
 
@@ -176,9 +176,9 @@ pub extern "C" fn kmain() -> ! {
     kprintln!("Enabling higher-half kernel mapping...");
     unsafe {
         arch::aarch64::mmu::enable_higher_half();
-        Uart::use_high_addresses();
+        Pl011::use_high_addresses();
     }
-    kprintln!("Higher-half active — UART at ", Hex(plat.uart0_base + mm::addr::KERNEL_VA_OFFSET));
+    kprintln!("Higher-half active — UART at ", Hex(plat.pl011_base + mm::addr::KERNEL_VA_OFFSET));
 
     // Read CTR_EL0.DminLine and verify the silicon's data cache
     // line size matches `lockjaw_types::cache::CACHE_LINE_BYTES`.
@@ -938,7 +938,7 @@ pub extern "C" fn secondary_main(cpu_id: u64) -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    let uart = Uart::new();
+    let uart = Pl011::new();
 
     uart.puts("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
     uart.puts("[PANIC:KERN]  KERNEL PANIC\n");

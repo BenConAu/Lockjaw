@@ -92,7 +92,7 @@ The endpoint/notification/reply syscalls already follow the seL4-style "user don
 
 **What:** sys_create_process copies at most one handle from the parent's handle table into the child's. x5 = handle index to copy, or u64::MAX for none. PageSet kinds are now explicitly rejected here (see the validate-phase check in `process.rs:98-109`) — callers that need to transfer a PageSet must use `sys_export_handle` instead.
 
-**Why bootstrap:** The UART driver needs exactly one handle (the IPC endpoint from init). One handle is enough for current bootstrap shapes; everything else flows through `sys_export_handle` post-spawn.
+**Why bootstrap:** The PL011 driver needs exactly one handle (the IPC endpoint from init). One handle is enough for current bootstrap shapes; everything else flows through `sys_export_handle` post-spawn.
 
 **Fix:** Either extend to an array of handles (x5 = pointer to handle index array, x6 = count), or treat the current single-handle path as deprecated and route everything through IPC-based transfer. The latter is the proper microkernel approach — capabilities flow through IPC, not just at creation time.
 
@@ -201,7 +201,7 @@ The endpoint/notification/reply syscalls already follow the seL4-style "user don
 
 ## DTB-driven baud rate computation
 
-**Where:** `src/arch/aarch64/uart.rs` (init_baud)
+**Where:** `src/arch/aarch64/pl011.rs` (init_baud)
 
 **What:** `init_baud()` hardcodes IBRD=26 / FBRD=3 for a 48 MHz UARTCLK (Pi 4B and QEMU). Future platforms with a different UARTCLK will produce the wrong baud rate. The proper fix is to read `clock-frequency` from the DTB's UART node and compute the divisors dynamically.
 
@@ -246,15 +246,15 @@ Pick (2) when CPRMAN gets `get_rate` for EMMC2; (1) is a working fallback meanwh
 
 ---
 
-## uart-driver bind_irq fails on Pi 4B
+## pl011-driver bind_irq fails on Pi 4B
 
-**Where:** `user/uart-driver/src/main.rs` IRQ-bind step. Surfaces in Pi log as `uart-driver: bind IRQ FAILED` after `uart-driver: notification created`. QEMU virt path works fine.
+**Where:** `user/pl011-driver/src/main.rs` IRQ-bind step. Surfaces in Pi log as `pl011-driver: bind IRQ FAILED` after `pl011-driver: notification created`. QEMU virt path works fine.
 
 **What:** PL011 IRQ binding succeeds on QEMU virt (GICv3, INTID assigned by virt platform code) but fails on Pi 4B (GICv2, INTIDs come from the BCM2711 DTB). The Pi log shows devmgr decoding INTID 153 for `0xfe201000` — but `153` is in the kernel-reserved range as labeled in the same log line (`intid=153 (kernel, reserved)`), so the bind syscall refuses. Either the DTB decode is wrong (PL011 IRQ is somewhere else on BCM2711) or the kernel-reserved range is too aggressive on Pi.
 
 The user-facing symptom is no UART input from the Pi — output works (kernel UART path) but typed characters don't make it to userspace.
 
-**Why bootstrap:** Pi 4B was added late and the GICv2 + BCM2711 IRQ map differs from QEMU virt enough that the M0/M1 milestones got the platform booting on hardware but didn't gate the userspace UART path on Pi.
+**Why bootstrap:** Pi 4B was added late and the GICv2 + BCM2711 IRQ map differs from QEMU virt enough that the M0/M1 milestones got the platform booting on hardware but didn't gate the userspace PL011 path on Pi.
 
 **Fix:** Audit the BCM2711 DTB IRQ encoding for PL011 (probably `interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL_HIGH>` per the BCM2711 binding, not 153). If the decode is right and 153 is just out of the kernel's whitelist on Pi, narrow the reserved range. Out of the emmc2 critical path; lands when someone needs Pi UART input.
 
@@ -262,7 +262,7 @@ The user-facing symptom is no UART input from the Pi — output works (kernel UA
 
 ## Per-process UART output not serialized on Pi
 
-**Where:** Kernel UART writer in `src/io/uart.rs` (or wherever `puts` lands per platform). QEMU virt path holds the GKL across the whole emit so output never interleaves; Pi 4B path doesn't.
+**Where:** Kernel UART writer in `src/arch/aarch64/pl011.rs` (or wherever `puts` lands per platform). QEMU virt path holds the GKL across the whole emit so output never interleaves; Pi 4B path doesn't.
 
 **What:** On Pi log captures, lines from concurrent userspace processes regularly interleave mid-string (e.g. `devmgr: PL011 at 0xfe201000[EXIT] Thread 6 cleaned up...`). On QEMU output is character-by-character clean because GKL ordering happens to serialize the writes. On Pi the same code path is racier — possibly because BCM2711 PL011 init differs, or because the puts loop on Pi releases and reacquires something the QEMU path doesn't.
 
@@ -403,14 +403,14 @@ Until that's diagnosed, all reads use CMD17 single-block (validated on Pi as M6 
 
 ## PL011 TX wait is unbounded — **DONE (P2 of pl011 plan, 2026-05-31)**
 
-Acceptance met: `user/uart-driver/src/main.rs::uart_putc` wraps
+Acceptance met: `user/pl011-driver/src/main.rs::pl011_putc` wraps
 `lockjaw_userlib::pl011::write_byte_deadline`, which builds on the
 shared `lockjaw_userlib::time::spin_until_or_deadline` primitive
 added in P1 (commit `41cb644`). On `TxTimeout` the byte is dropped
 and the driver continues — no more infinite-loop on a stuck FIFO.
 
 Per-board deadline at `TX_TIMEOUT_NANOS = Nanos(10_000_000)` (10 ms)
-in `uart-driver/src/main.rs`, tunable without touching lockjaw-userlib.
+in `pl011-driver/src/main.rs`, tunable without touching lockjaw-userlib.
 
 Trade-off (documented in plan): current callsites (banner / IPC TX
 / IRQ echo) discard `TxTimeout` via `let _`; re-architecting every

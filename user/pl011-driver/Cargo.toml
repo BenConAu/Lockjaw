@@ -1,5 +1,5 @@
 [package]
-name = "lockjaw-uart-driver"
+name = "lockjaw-pl011-driver"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 lockjaw-userlib = { path = "../lockjaw-userlib" }
-# Direct lockjaw-mmio dep for `MappedRegs<Pl011>` in the UartEngine
+# Direct lockjaw-mmio dep for `MappedRegs<Pl011>` in the Pl011Engine
 # field. lockjaw-userlib re-exports plenty but not MappedRegs (which
 # is substrate, not userlib); explicit is cleaner.
 lockjaw-mmio = { path = "../lockjaw-mmio" }

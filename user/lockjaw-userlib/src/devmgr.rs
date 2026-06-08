@@ -33,7 +33,7 @@ pub struct ClaimedDevice<T: 'static> {
     /// `claim[3]` (the packed_clock_ref word) is decoded once here
     /// so drivers don't carry their own `unpack_clock_ref` call
     /// site. Pass straight into `ClockClient::acquire`. Drivers
-    /// that don't need clocks (ramfb, virtio-blk, uart, cprman
+    /// that don't need clocks (ramfb, virtio-blk, pl011, cprman
     /// itself) ignore the field.
     pub clock_ref: Option<ClockRef>,
     /// Pageset handle backing the MMIO mapping. Most drivers ignore

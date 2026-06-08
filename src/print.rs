@@ -13,7 +13,7 @@
 ///   Dec02(usize)    — 2-digit zero-padded decimal: `05`
 ///
 /// Built-in impls: &str, u64, u32, u8, usize, i64, bool
-use crate::arch::aarch64::uart::Uart;
+use crate::arch::aarch64::pl011::Pl011;
 
 // ── trait ──────────────────────────────────────────────────────
 
@@ -55,7 +55,7 @@ fn hex_nibble(val: u64, shift: u32) -> u8 {
 
 /// Unsigned decimal to UART. Max 20 digits for u64::MAX.
 fn put_decimal(mut val: u64) {
-    let uart = Uart::new();
+    let uart = Pl011::new();
     if val == 0 {
         uart.putc(b'0');
         return;
@@ -78,13 +78,13 @@ fn put_decimal(mut val: u64) {
 
 impl KPrint for str {
     fn kprint(&self) {
-        Uart::new().puts(self);
+        Pl011::new().puts(self);
     }
 }
 
 impl KPrint for &str {
     fn kprint(&self) {
-        Uart::new().puts(self);
+        Pl011::new().puts(self);
     }
 }
 
@@ -115,7 +115,7 @@ impl KPrint for usize {
 impl KPrint for i64 {
     fn kprint(&self) {
         if *self < 0 {
-            Uart::new().putc(b'-');
+            Pl011::new().putc(b'-');
             // i64::MIN cannot be negated within i64
             let abs = if *self == i64::MIN {
                 9_223_372_036_854_775_808u64
@@ -131,13 +131,13 @@ impl KPrint for i64 {
 
 impl KPrint for bool {
     fn kprint(&self) {
-        Uart::new().puts(if *self { "true" } else { "false" });
+        Pl011::new().puts(if *self { "true" } else { "false" });
     }
 }
 
 impl KPrint for Hex {
     fn kprint(&self) {
-        let uart = Uart::new();
+        let uart = Pl011::new();
         uart.puts("0x");
         let val = self.0;
         if val == 0 {
@@ -161,7 +161,7 @@ impl KPrint for Hex {
 
 impl KPrint for Addr {
     fn kprint(&self) {
-        let uart = Uart::new();
+        let uart = Pl011::new();
         uart.puts("0x");
         let mut shift = 60u32;
         loop {
@@ -174,7 +174,7 @@ impl KPrint for Addr {
 
 impl KPrint for Hex32 {
     fn kprint(&self) {
-        let uart = Uart::new();
+        let uart = Pl011::new();
         uart.puts("0x");
         let mut shift = 28u32;
         loop {
@@ -187,7 +187,7 @@ impl KPrint for Hex32 {
 
 impl KPrint for PaddedHex8 {
     fn kprint(&self) {
-        let uart = Uart::new();
+        let uart = Pl011::new();
         let mut shift = 28u32;
         loop {
             uart.putc(hex_nibble(self.0, shift));
@@ -199,7 +199,7 @@ impl KPrint for PaddedHex8 {
 
 impl KPrint for HexByte {
     fn kprint(&self) {
-        let uart = Uart::new();
+        let uart = Pl011::new();
         uart.puts("0x");
         uart.putc(hex_nibble(self.0, 4));
         uart.putc(hex_nibble(self.0, 0));
@@ -208,7 +208,7 @@ impl KPrint for HexByte {
 
 impl KPrint for Dec02 {
     fn kprint(&self) {
-        let uart = Uart::new();
+        let uart = Pl011::new();
         let n = self.0 % 100;
         uart.putc(b'0' + (n / 10) as u8);
         uart.putc(b'0' + (n % 10) as u8);
@@ -227,10 +227,10 @@ macro_rules! kprint {
 #[macro_export]
 macro_rules! kprintln {
     () => {
-        $crate::arch::aarch64::uart::Uart::new().puts("\n");
+        $crate::arch::aarch64::pl011::Pl011::new().puts("\n");
     };
     ($($arg:expr),+ $(,)?) => {{
         $( $crate::print::KPrint::kprint(&$arg); )+
-        $crate::arch::aarch64::uart::Uart::new().puts("\n");
+        $crate::arch::aarch64::pl011::Pl011::new().puts("\n");
     }};
 }

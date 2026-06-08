@@ -24,7 +24,7 @@ IPC shim (linked into binary, uses shared buffer page)
 POSIX Personality Server (userspace process)
   |  FD tables, pipes, brk, signals, VFS dispatch
   |  routes to resource servers via IPC
-Lockjaw Kernel + Resource Servers (ramfs, uart-driver, etc.)
+Lockjaw Kernel + Resource Servers (ramfs, pl011-driver, etc.)
 ```
 
 The personality server is a normal Lockjaw userspace process. It

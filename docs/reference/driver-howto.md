@@ -30,19 +30,19 @@ Pick a canonical sibling to copy from:
 
 | Shape | Sibling driver | Why |
 |---|---|---|
-| Single MMIO + edge IRQ + event-loop | `user/uart-driver/` | Smallest end-to-end exemplar. |
+| Single MMIO + edge IRQ + event-loop | `user/pl011-driver/` | Smallest end-to-end exemplar. |
 | VirtIO MMIO transport | `user/virtio-blk-driver/` | Probe/feature-negotiation + virtqueue. |
 | No-IRQ "do its job once" | `user/ramfb-driver/` | `standard_init_no_irq` shape. |
 | Level-triggered IRQ + DMA | `user/emmc2-driver/` | Tier-A `boot_stub!` + `LevelDriverCtx` + DMA envelope. |
 | No-IRQ + cross-driver dependency | `user/cprman-driver/` | Tier-A with hash probe + claim. |
 
 The rest of this doc walks the steps for the canonical edge-IRQ
-shape (uart-driver). Variants are called out inline.
+shape (pl011-driver). Variants are called out inline.
 
 ## Step 1 — create the crate
 
 Drivers live at `user/<name>-driver/`. The smallest layout (copied
-from `user/uart-driver/`):
+from `user/pl011-driver/`):
 
 ```text
 user/<name>-driver/
@@ -138,23 +138,23 @@ difference is in IRQ handling and which init helpers are composed.
 | `virtio_driver_main!` | `user/lockjaw-userlib/src/virtio.rs:425` | VirtIO transport (probe magic, feature negotiation, virtqueue setup). |
 | `boot_stub!` (Tier-A escape valve) | `user/lockjaw-userlib/src/driver_runtime.rs:589` | No IRQ at all (use `standard_init_no_irq`), level-triggered IRQ (use `standard_driver_init_level` / `LevelDriverCtx`), or a per-crate failure log line the macro hardcodes. |
 
-`driver_main!` invocation pattern (from uart-driver tail):
+`driver_main!` invocation pattern (from pl011-driver tail):
 
 ```rust
 driver_main! {
-    name        = "uart-driver",
+    name        = "pl011-driver",
     hash        = LOCKJAW_SOURCE_HASH,  // declared by the macro expansion
                                         // from the build-script's source_hash.rs
     probe_hash  = PL011_HASH,           // from lockjaw_userlib (re-exported
                                         // from lockjaw_types::device:23)
     layout      = Pl011,                // your typed register set
-    main        = uart_main,            // your user-fn taking DriverCtx<Pl011>
+    main        = pl011_main,           // your user-fn taking DriverCtx<Pl011>
 }
 ```
 
 The macro expands into the `_start` entry, the boot-stub
 `#[allow(unsafe_code)]` site, and a call to
-`standard_driver_init::<Pl011>` that hands your `uart_main` a
+`standard_driver_init::<Pl011>` that hands your `pl011_main` a
 `DriverCtx<Pl011>` with mapped regs + bound IRQ notification +
 server endpoint. The single audited per-item allow lives inside
 the macro expansion; your driver source stays unsafe-free.
@@ -165,22 +165,22 @@ The driver body is an `EventEngine` (`BlockEngine` /
 `DisplayEngine` for storage / display) impl. The framework owns
 the receive/dispatch/reply loop, IRQ-threshold bookkeeping, and
 the `sys_wait_any` substrate; you write the device-specific
-behavior on `on_ipc` and `on_irq`. From uart-driver:
+behavior on `on_ipc` and `on_irq`. From pl011-driver:
 
 ```rust
-struct UartEngine {
+struct Pl011Engine {
     regs: MappedRegs<Pl011>,
 }
 
-impl UartEngine {
+impl Pl011Engine {
     // Field-access helper. The MappedRegs<T> wrapper hides the raw
     // pointer; `.regs()` projects to the typed `&Pl011`.
     fn regs(&self) -> &Pl011 { self.regs.regs() }
 }
 
-impl EventEngine for UartEngine {
+impl EventEngine for Pl011Engine {
     fn on_ipc(&mut self, msg: u64) -> u64 {
-        uart_putc(self.regs(), msg as u8);
+        pl011_putc(self.regs(), msg as u8);
         0
     }
 
@@ -188,13 +188,13 @@ impl EventEngine for UartEngine {
         // Framework `drain_rx_fifo` owns the FIFO-empty check; the
         // closure decides what to do with each byte.
         let regs = self.regs();
-        drain_rx_fifo(regs, |ch| uart_putc(regs, ch));
+        drain_rx_fifo(regs, |ch| pl011_putc(regs, ch));
     }
 }
 ```
 
-Your `uart_main(ctx: DriverCtx<Pl011>)` constructs the engine
-(`UartEngine { regs: ctx.regs }`), then calls
+Your `pl011_main(ctx: DriverCtx<Pl011>)` constructs the engine
+(`Pl011Engine { regs: ctx.regs }`), then calls
 `run_event_server(&mut engine, ctx.server_ep, ctx.irq_notif, ctx.irq_initial_threshold)`
 (see `user/lockjaw-userlib/src/driver_runtime.rs:733` — the first
 arg is `&mut E`, not by-value). The function never returns.
@@ -214,7 +214,7 @@ const DRIVER_CRATES: &[&str] = &[
     "user/cprman-driver",
     "user/emmc2-driver",
     "user/ramfb-driver",
-    "user/uart-driver",
+    "user/pl011-driver",
     "user/virtio-blk-driver",
     "user/<name>-driver",   // <-- add here, sorted
 ];
@@ -247,13 +247,13 @@ The real signature takes the ELF as `&[u8]` (NOT a path string) —
 you `include_bytes!` the driver binary at the top of init:
 
 ```rust
-static UART_DRIVER_ELF: &[u8] = include_bytes!(
-    "../../uart-driver/target/aarch64-unknown-none/release/uart-driver"
+static PL011_DRIVER_ELF: &[u8] = include_bytes!(
+    "../../pl011-driver/target/aarch64-unknown-none/release/lockjaw-pl011-driver"
 );
 // ... then in init's main:
 spawn_elf(
-    UART_DRIVER_ELF,
-    "uart-driver",
+    PL011_DRIVER_ELF,
+    "pl011-driver",
     map_array_va,       // pre-mapped scratch for the ProcessMapping array
     temp_base_va,       // temp VA range init uses while copying segments
     plan_buf_va,        // proc-page scratch

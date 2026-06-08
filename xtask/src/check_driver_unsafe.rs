@@ -66,7 +66,7 @@ const DRIVER_CRATES: &[&str] = &[
     "user/cprman-driver",
     "user/emmc2-driver",
     "user/ramfb-driver",
-    "user/uart-driver",
+    "user/pl011-driver",
     "user/virtio-blk-driver",
 ];
 

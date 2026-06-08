@@ -181,7 +181,7 @@ let clk = ClockClient::acquire(
 // `clk` is held in scope; drop closes the Endpoint per RAII.
 ```
 
-Drivers that don't need a clock (ramfb, virtio-blk, uart, cprman
+Drivers that don't need a clock (ramfb, virtio-blk, pl011, cprman
 itself) just ignore `ctx.clock_ref`.
 
 ## Server API — `ClockEngine`

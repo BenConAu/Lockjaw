@@ -1,5 +1,5 @@
 use crate::arch::aarch64::exceptions::ExceptionContext;
-use crate::arch::aarch64::uart::Uart;
+use crate::arch::aarch64::pl011::Pl011;
 use crate::cap::handle_table;
 use crate::cap::object::ObjectType;
 use crate::cap::rights::{Rights, RIGHT_READ, RIGHT_WRITE};
@@ -273,7 +273,7 @@ fn sys_debug_puts(ctx: &mut ExceptionContext) -> SyscallError {
     };
 
     // Both pages validated; emit cannot fault.
-    let uart = Uart::new();
+    let uart = Pl011::new();
     for i in 0..len {
         let user_va = buf_va + i as u64;
         let kva_base = if user_va & !(page_size - 1) == first_page_va { kva_first } else { kva_last };

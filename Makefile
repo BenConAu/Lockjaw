@@ -18,7 +18,7 @@ QEMU_DISPLAY_FLAGS := -machine virt,gic-version=3 -cpu cortex-a53 -m 128M \
 	-device ramfb -display cocoa \
 	-kernel
 
-USER_CRATES := user/hello user/uart-driver user/device-manager user/ramfb-driver user/display-test user/virtio-blk-driver user/fat32-server user/fat32-test user/posix-server user/cprman-driver user/clock-test user/emmc2-driver user/sleep-test user/partition-manager user/init
+USER_CRATES := user/hello user/pl011-driver user/device-manager user/ramfb-driver user/display-test user/virtio-blk-driver user/fat32-server user/fat32-test user/posix-server user/cprman-driver user/clock-test user/emmc2-driver user/sleep-test user/partition-manager user/init
 
 .PHONY: build build-release build-user build-hash clean-all run run-release run-display run-blk objdump nm check-stack check-pointers check-vtables check-init-size check-linker-symbols check-kernel-no-neon check-driver-unsafe test test-unit test-qemu-gicv3 test-qemu-gicv2 clean pi4 test-img
 
@@ -34,7 +34,7 @@ build-hash:
 
 build-user: clean-all build-hash
 	cd user/hello && cargo build --release
-	cd user/uart-driver && cargo build --release
+	cd user/pl011-driver && cargo build --release
 	cd user/device-manager && cargo build --release
 	cd user/ramfb-driver && cargo build --release
 	cd user/display-test && cargo build --release

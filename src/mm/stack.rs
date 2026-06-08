@@ -75,12 +75,12 @@ pub fn check_canary() {
         let value = ptr::read_volatile(canary_ptr);
         if value != STACK_CANARY {
             use crate::print::{KPrint, Addr};
-            crate::arch::aarch64::uart::Uart::new().puts("[PANIC] Stack canary corrupted!\n");
-            crate::arch::aarch64::uart::Uart::new().puts("  Expected: ");
+            crate::arch::aarch64::pl011::Pl011::new().puts("[PANIC] Stack canary corrupted!\n");
+            crate::arch::aarch64::pl011::Pl011::new().puts("  Expected: ");
             KPrint::kprint(&Addr(STACK_CANARY));
-            crate::arch::aarch64::uart::Uart::new().puts("\n  Got:      ");
+            crate::arch::aarch64::pl011::Pl011::new().puts("\n  Got:      ");
             KPrint::kprint(&Addr(value));
-            crate::arch::aarch64::uart::Uart::new().puts("\n");
+            crate::arch::aarch64::pl011::Pl011::new().puts("\n");
             panic!("stack canary corrupted");
         }
     }
@@ -91,7 +91,7 @@ pub fn check_canary() {
 /// we want to print that fact, not trigger a second panic.
 /// Writes directly to UART (not kprintln) to avoid re-entrant panics.
 pub fn check_canary_report(prefix: &str) {
-    let uart = crate::arch::aarch64::uart::Uart::new();
+    let uart = crate::arch::aarch64::pl011::Pl011::new();
     unsafe {
         // SAFETY: linker symbol
         let canary_ptr = &raw const __stack_bottom_0 as *const u64;

@@ -884,7 +884,7 @@ fn check_thread_canary(tcb: &Tcb) {
     let value = unsafe { ptr::read_volatile(canary_ptr) };
     if value != lockjaw_types::constants::STACK_CANARY {
         use crate::print::{KPrint, Addr};
-        let uart = crate::arch::aarch64::uart::Uart::new();
+        let uart = crate::arch::aarch64::pl011::Pl011::new();
         uart.puts("[PANIC] Thread stack canary corrupted!\n");
         uart.puts("  Expected: ");
         KPrint::kprint(&Addr(lockjaw_types::constants::STACK_CANARY));

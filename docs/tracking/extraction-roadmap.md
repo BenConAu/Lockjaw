@@ -358,7 +358,7 @@ eliminate the encode path.
 These items appeared in earlier drafts but are either obsolete or
 the framing was wrong:
 
-- **Platform MMIO constants extraction**: `UART0_BASE_PHYS`, `GICD_BASE_PHYS`,
+- **Platform MMIO constants extraction**: `PL011_BASE_PHYS`, `GICD_BASE_PHYS`,
   etc. do not exist as compile-time constants. All MMIO addresses are
   discovered at runtime via DTB scan (`platform::discover()`) and stored
   in `PlatformInfo`. Extracting non-existent constants is a non-item.
@@ -374,7 +374,7 @@ file extraction PRs against them.
 | Zone | Files | Reason |
 |---|---|---|
 | Inline assembly | `src/arch/aarch64/context.rs`, `src/arch/aarch64/exceptions.rs`, `boot.rs` | Context switches, eret, MSR/MRS, SPSR manipulation. No pure model. |
-| MMIO | `src/arch/aarch64/uart.rs`, `gic/v*.rs`, `timer.rs` | Volatile writes to specific addresses. Geometry can be pure (item 19); register I/O stays. |
+| MMIO | `src/arch/aarch64/pl011.rs`, `gic/v*.rs`, `timer.rs` | Volatile writes to specific addresses. Geometry can be pure (item 19); register I/O stays. |
 | Page allocator | `src/mm/page_alloc.rs` (alloc/dealloc paths) | Buddy state mutation under IRQ mask. Address arithmetic can be pure (item 17); state mutation stays. |
 | TTBR0 swap + TLB | `src/sched/scheduler.rs` (process switch) | `msr ttbr0_el1`, `tlbi vmalle1is` — must stay inline. |
 | Intrusive list operations | `src/ipc/ep_queue.rs` | TCB linked-list pointer surgery. The queue *contract* can be pure; the pointer ops can't. |

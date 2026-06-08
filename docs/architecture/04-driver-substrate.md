@@ -51,8 +51,8 @@ single edge-triggered IRQ, a server endpoint, and an event loop that
 alternates between IPC requests and IRQ deliveries. It expands to a
 `boot_stub!` invocation plus a call to `standard_driver_init`, and
 hands the driver body a `DriverCtx<T>` with typed registers, the IRQ
-notification, and the server endpoint already wired up. The uart
-driver — see `user/uart-driver/src/main.rs` — is the canonical
+notification, and the server endpoint already wired up. The pl011
+driver — see `user/pl011-driver/src/main.rs` — is the canonical
 consumer: thirteen lines of imports, a four-method `EventEngine`
 impl, and one macro invocation at the bottom.
 

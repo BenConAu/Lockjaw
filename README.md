@@ -22,7 +22,7 @@ The design follows a few core principles:
 
 ## What works today
 
-Lockjaw boots on QEMU with up to 4 cores (`-smp 4`), manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads across multiple CPUs with a Giant Kernel Lock, serves 28 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects and kernel-assigned caller tokens for multi-client isolation, runs ten isolated userspace processes loaded from ELF binaries (init, hello, device-manager, uart-driver, ramfb-driver, virtio-blk-driver, fat32-server, fat32-test, posix-server, plus a musl-built `hello, lockjaw` test client spawned by the personality server), has a device manager that discovers hardware from the DTB with probe and claim-by-address protocols, a UART driver, a ramfb display driver, a VirtIO block driver that reads from a virtual disk via virtqueues, a FAT32 filesystem server that mounts the disk and serves open/read/close over IPC, and a POSIX personality server that runs statically-linked patched-musl binaries — including reading `/HELLO.TXT` via `fopen + fread + fclose` and allocating an 8 MiB buffer through `malloc` (musl stdio + mmap + cross-process file I/O all working end-to-end).
+Lockjaw boots on QEMU with up to 4 cores (`-smp 4`), manages virtual memory with a buddy allocator supporting contiguous DMA allocation, handles interrupts, runs preemptively scheduled threads across multiple CPUs with a Giant Kernel Lock, serves 28 syscalls from EL0 userspace, passes messages between threads via synchronous IPC with Reply objects and kernel-assigned caller tokens for multi-client isolation, runs ten isolated userspace processes loaded from ELF binaries (init, hello, device-manager, pl011-driver, ramfb-driver, virtio-blk-driver, fat32-server, fat32-test, posix-server, plus a musl-built `hello, lockjaw` test client spawned by the personality server), has a device manager that discovers hardware from the DTB with probe and claim-by-address protocols, a PL011 driver, a ramfb display driver, a VirtIO block driver that reads from a virtual disk via virtqueues, a FAT32 filesystem server that mounts the disk and serves open/read/close over IPC, and a POSIX personality server that runs statically-linked patched-musl binaries — including reading `/HELLO.TXT` via `fopen + fread + fclose` and allocating an 8 MiB buffer through `malloc` (musl stdio + mmap + cross-process file I/O all working end-to-end).
 
 ```
 === Lockjaw Microkernel v0.1.0 ===
@@ -37,12 +37,12 @@ Dropping to EL0...
 Hello from userspace init!
 init: hello spawned OK
 init: device-manager spawned OK
-init: uart-driver spawned OK
+init: pl011-driver spawned OK
 init: ramfb-driver spawned OK
 init: blk-driver spawned OK
 devmgr: parsed DTB, 49 devices
-uart-driver: claimed PL011
-uart-driver: server ready
+pl011-driver: claimed PL011
+pl011-driver: server ready
 ramfb: claimed fw_cfg
 ramfb: display configured
 blk: found virtio-blk device            # with -drive flag
@@ -192,7 +192,7 @@ src/
   arch/aarch64/
     boot.rs                  # _start and _secondary_start entry points (EL2→EL1, stack, BSS)
     psci.rs                  # PSCI CPU_ON for secondary core boot (HVC #0)
-    uart.rs                  # PL011 UART driver (kernel debug on UART0)
+    pl011.rs                 # PL011 UART driver (kernel debug on UART0)
     mmu.rs                   # Boot page tables, MMU enable, higher-half, guard page
     vmem.rs                  # Dynamic per-process page table management
     exceptions.rs            # Exception vectors, crash diagnostics (imports types for ESR decode)
@@ -260,7 +260,7 @@ lockjaw-types/               # Pure-logic library crate, testable on host
 user/                        # Userspace binaries (separate Cargo projects)
   init/                      # Init process -- spawns and bootstraps all children
   hello/                     # Hello process -- bootstrap protocol test
-  uart-driver/               # UART driver -- claims PL011 from device manager
+  pl011-driver/              # PL011 driver -- claims PL011 from device manager
   device-manager/            # Device manager -- DTB parsing, probe/claim-by-addr IPC
   ramfb-driver/              # Display driver -- fw_cfg DMA, contiguous framebuffer
   virtio-blk-driver/         # VirtIO block driver -- MMIO transport, virtqueue, BlockEngine
