@@ -104,7 +104,9 @@ and never name `lockjaw_regs` directly (the xtask `check-driver-unsafe`
 regime enforces this; see Step 6):
 
 ```rust
-use lockjaw_userlib::pl011::{Flag, Imsc, Pl011};
+use lockjaw_userlib::pl011::{
+    drain_rx_fifo, set_interrupt_masks, write_byte_deadline, Imsc, Pl011,
+};
 ```
 
 ## Step 3 — wire DTOs (if new)
@@ -183,10 +185,10 @@ impl EventEngine for UartEngine {
     }
 
     fn on_irq(&mut self) {
-        while !self.regs().flag().contains(Flag::RXFE) {
-            let ch = (self.regs().read_data() & 0xFF) as u8;
-            uart_putc(self.regs(), ch);
-        }
+        // Framework `drain_rx_fifo` owns the FIFO-empty check; the
+        // closure decides what to do with each byte.
+        let regs = self.regs();
+        drain_rx_fifo(regs, |ch| uart_putc(regs, ch));
     }
 }
 ```

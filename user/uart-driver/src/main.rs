@@ -14,7 +14,9 @@
 #![deny(unsafe_code)]
 
 use lockjaw_userlib::driver_runtime::{run_event_server, DriverCtx, EventEngine};
-use lockjaw_userlib::pl011::{write_byte_deadline, Flag, Imsc, Pl011};
+use lockjaw_userlib::pl011::{
+    drain_rx_fifo, set_interrupt_masks, write_byte_deadline, Imsc, Pl011,
+};
 use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, Nanos};
 use lockjaw_userlib::{driver_main, puts, sys_exit, PL011_HASH};
 use lockjaw_mmio::region::MappedRegs;
@@ -81,13 +83,15 @@ impl EventEngine for UartEngine {
 
     fn on_irq(&mut self) {
         // Drain the RX FIFO; echo each character (CR also produces LF).
-        while !self.regs().flag().contains(Flag::RXFE) {
-            let ch = (self.regs().read_data() & 0xFF) as u8;
-            uart_putc(self.regs(), ch);
+        // Framework `drain_rx_fifo` owns the FIFO-empty check; the
+        // closure decides what to do with each byte.
+        let regs = self.regs();
+        drain_rx_fifo(regs, |ch| {
+            uart_putc(regs, ch);
             if ch == b'\r' {
-                uart_putc(self.regs(), b'\n');
+                uart_putc(regs, b'\n');
             }
-        }
+        });
     }
 }
 
@@ -100,10 +104,13 @@ impl EventEngine for UartEngine {
 fn uart_main(ctx: DriverCtx<Pl011>) -> ! {
     let mut engine = UartEngine { regs: ctx.regs };
 
-    // Enable PL011 RX interrupt. Bit ops over Imsc (BitOr is emitted
-    // by the generated flags newtype); we OR RXIM into the current
-    // mask, preserving TXIM and any future bits the spec adds.
-    engine.regs().set_imsc(engine.regs().imsc() | Imsc::RXIM);
+    // Enable PL011 RX interrupt via write-replace (not RMW): the
+    // framework helper writes the full intended mask, clobbering
+    // any prior IMSC contents. TXIM clears as deliberate current
+    // policy — driver does TX via polling write_byte_deadline, not
+    // via TX interrupt. The non-atomic RMW race window closes by
+    // construction because there is no read step.
+    set_interrupt_masks(engine.regs(), Imsc::RXIM);
 
     // Kernel-debug-channel confirmation FIRST so the "reached here"
     // signal lands even if UART1 itself is broken — `puts` routes
