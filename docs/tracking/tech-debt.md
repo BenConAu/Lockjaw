@@ -401,22 +401,63 @@ Until that's diagnosed, all reads use CMD17 single-block (validated on Pi as M6 
 
 ---
 
-## PL011 TX wait is unbounded
+## PL011 TX wait is unbounded — **DONE (P2 of pl011 plan, 2026-05-31)**
 
-**Where:** `user/uart-driver/src/main.rs::uart_putc` (and the parallel pattern any future serial / console / device-with-a-FIFO driver will copy).
+Acceptance met: `user/uart-driver/src/main.rs::uart_putc` wraps
+`lockjaw_userlib::pl011::write_byte_deadline`, which builds on the
+shared `lockjaw_userlib::time::spin_until_or_deadline` primitive
+added in P1 (commit `41cb644`). On `TxTimeout` the byte is dropped
+and the driver continues — no more infinite-loop on a stuck FIFO.
 
-**What:** `uart_putc` spins on `Flag::TXFF` with `core::hint::spin_loop` and no timeout. If the PL011 ever stops draining its TX FIFO (marginal board, clock misconfiguration, controller wedge), the driver hangs in this loop forever — not crashes, not reports an error, hangs. Phase 5 deliberately did NOT extend `make illegal states unrepresentable` to "wait forever for the device to maybe respond"; the principle stops at safety, not liveness. But every future driver author who copies `uart_putc` as a template inherits the unbounded-wait pattern, and by the third copy it's the de facto idiom.
+Per-board deadline at `TX_TIMEOUT_NANOS = Nanos(10_000_000)` (10 ms)
+in `uart-driver/src/main.rs`, tunable without touching lockjaw-userlib.
 
-The Phase 5 banner-ordering fix in `uart_main` (kernel-debug puts BEFORE UART1 banner) mitigates the symptom for THIS driver — a TX-broken board now shows "uart-driver: server ready" on the kernel UART before the spin engages, so a person can diagnose. But the spin still hangs the server thread; the driver is dead in the water for IPC TX requests.
+Trade-off (documented in plan): current callsites (banner / IPC TX
+/ IRQ echo) discard `TxTimeout` via `let _`; re-architecting every
+TX caller to propagate the error is out of this plan's scope. The
+visible improvement is "driver cannot hang," not "every TX failure
+visible to caller."
 
-**Fix:** Introduce a deadline-bounded wait primitive in `lockjaw-userlib`:
-- `spin_until_or_deadline<F: FnMut() -> bool>(check: F, deadline: MonoTicks) -> Result<(), TimeoutError>` — wraps the `core::hint::spin_loop` pattern with a `MonoTicks` deadline cap.
-- `uart_putc(regs, c, deadline) -> Result<(), TxError>` — propagates the deadline; callers must hold one.
-- Then update the EventEngine `on_ipc` contract to either (a) accept a per-IPC deadline derived from a server-default, or (b) document that on_ipc implementations are responsible for deadline discipline.
+The SDHCI bare-`>=` poll-loop carryforward is its own entry below
+("SDHCI poll loops should adopt `spin_until_or_deadline`").
 
-The bigger architectural move: `uart_putc` is one instance of "poll a hardware bit until it changes or we give up." The same shape appears in SDHCI (`poll_until_clear` / `poll_until_set` in emmc2-driver), in virtio (config-status readback after FEATURES_OK), in any device with a busy bit. A shared `poll_until_deadline` primitive belongs in `lockjaw-userlib` alongside the barriers.
+---
 
-**Why bootstrap:** today's two converted drivers run in QEMU where TX always drains; the hang is only theoretical. Adding deadline plumbing without a concrete liveness failure to debug against would be speculative. Revisit when (a) the first Pi-hardware bring-up surfaces a real spin-forever incident, or (b) the second event-loop driver lands (probably a console for posix) — whichever comes first.
+## SDHCI poll loops should adopt `spin_until_or_deadline`
+
+**Where:** `user/lockjaw-userlib/src/sdhci.rs:282-293` (`soft_reset_all`),
+the `INT_CLK_STABLE` wait in `configure_clock`, and any other SDHCI
+poll that follows the `monotonic_now() >= deadline` shape.
+
+**What:** These loops compute the deadline via `MonoTicks::deadline_in(...)`
+(which saturates at `NO_DEADLINE - 1`, never producing the sentinel)
+and then compare with bare `>=`. The comparison is functionally safe
+today — every deadline reaching these loops is finite-from-`deadline_in`,
+so `now >= deadline` evaluates correctly. A future caller that
+constructs a `NO_DEADLINE` deadline another way (explicit
+`MonoTicks(NO_DEADLINE)` to mean "wait indefinitely") would need the
+named `MonoTicks::has_expired` accessor for the sentinel to be honored.
+
+The shared `lockjaw_userlib::time::spin_until_or_deadline` primitive
+(added P1 of the pl011 plan, commit `41cb644`) uses `has_expired`
+internally and is the structural answer.
+
+**Fix:** Migrate `soft_reset_all` + `configure_clock`'s `INT_CLK_STABLE`
+wait + any other SDHCI poll loop to
+`spin_until_or_deadline(|| condition, deadline)`. The body shrinks
+(drop the `loop { ... }` skeleton, drop the explicit
+`core::hint::spin_loop()`, drop the bare `>=` comparison) and the
+sentinel handling becomes structural.
+
+**Why bootstrap / fix-when:** the bare-comparison loops are
+functionally correct today. The migration is correctness-by-construction
+work — preventing the third instance of the pattern from entrenching
+the bare-comparison habit — not closing an active bug. **Scheduled
+for P4 of the pl011 framework-mediation plan**, immediately after
+P3's IMSC + drain refactor lands — the primitive is in tree and
+consumed by P2's `write_byte_deadline`, so migrating the SDHCI
+loops is the natural "primitive is genuinely shared" proof, not a
+vague-trigger follow-up parked behind the pl011 plan.
 
 ---
 

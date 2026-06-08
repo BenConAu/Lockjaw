@@ -14,9 +14,18 @@
 #![deny(unsafe_code)]
 
 use lockjaw_userlib::driver_runtime::{run_event_server, DriverCtx, EventEngine};
+use lockjaw_userlib::pl011::{write_byte_deadline, Flag, Imsc, Pl011};
+use lockjaw_userlib::time::{cntfreq_hz, monotonic_now, Nanos};
 use lockjaw_userlib::{driver_main, puts, sys_exit, PL011_HASH};
 use lockjaw_mmio::region::MappedRegs;
-use lockjaw_userlib::pl011::{Flag, Imsc, Pl011};
+
+// Per-board TX-spin deadline. 10 ms ≈ 115 byte-times at 115200 baud
+// — well over any transient FIFO stall, well under human-perceptible
+// hang. Tunable per-board without touching lockjaw-userlib. If QEMU CI
+// surfaces a flake on a loaded host, raise to 50 ms or 100 ms; if a
+// real board exhibits hung-FIFO behavior, the 10 ms ceiling is what
+// proves the rewrite worked (driver continues instead of hangs).
+const TX_TIMEOUT_NANOS: Nanos = Nanos(10_000_000);
 
 // ---------------------------------------------------------------------------
 // PL011 helpers (the only "device behaviour" the driver expresses —
@@ -25,12 +34,14 @@ use lockjaw_userlib::pl011::{Flag, Imsc, Pl011};
 // cannot name lockjaw_regs directly per check-driver-unsafe).
 // ---------------------------------------------------------------------------
 
-/// Write a byte to the UART, spinning while the TX FIFO is full.
+/// Write a byte to the UART, bounded by `TX_TIMEOUT_NANOS`. On
+/// timeout the byte is dropped (no error propagation path exists at
+/// the current callsites — banner / IPC TX / IRQ echo all discard
+/// the result). The visible improvement over the pre-P2 unbounded
+/// spin is that the driver cannot infinite-loop on a stuck FIFO.
 fn uart_putc(regs: &Pl011, c: u8) {
-    while regs.flag().contains(Flag::TXFF) {
-        core::hint::spin_loop();
-    }
-    regs.write_data(c as u32);
+    let deadline = monotonic_now().deadline_in(TX_TIMEOUT_NANOS, cntfreq_hz());
+    let _ = write_byte_deadline(regs, c, deadline);
 }
 
 /// Write a string to the UART, converting `\n` to `\r\n` (PL011 expects
@@ -94,15 +105,12 @@ fn uart_main(ctx: DriverCtx<Pl011>) -> ! {
     // mask, preserving TXIM and any future bits the spec adds.
     engine.regs().set_imsc(engine.regs().imsc() | Imsc::RXIM);
 
-    // Kernel-debug-channel confirmation FIRST: proves driver code
-    // reached this point regardless of UART1 state. Only AFTER that
-    // do we write the UART1 banner through `uart_putc`'s unbounded
-    // TXFF spin-loop. On a board with a marginal PL011 (or any TX-
-    // broken state) the spin would otherwise hang the driver here
-    // and the "server ready" log line would never appear, leading
-    // to a misdiagnosis as init failure. See docs/tracking/tech-debt.md
-    // ("PL011 TX wait is unbounded") for the deadline-bounded
-    // follow-up that makes the spin itself fail-fast.
+    // Kernel-debug-channel confirmation FIRST so the "reached here"
+    // signal lands even if UART1 itself is broken — `puts` routes
+    // through `sys_debug_puts`, independent of the user PL011.
+    // The UART1 banner follows via `uart_putc`, which since P2 is
+    // bounded by `TX_TIMEOUT_NANOS` (10 ms per byte): a stuck FIFO
+    // drops bytes instead of hanging the driver.
     puts("uart-driver: server ready\n");
     uart_puts(engine.regs(), "uart-driver: UART1 active\n");
 
