@@ -229,8 +229,10 @@ against the four regime rules:
 3. No raw `syscall::*` path beyond the allowlist (`sys_exit`,
    `sys_debug_puts`).
 4. No reference to a `(crate, module)` pair in
-   `BANNED_DRIVER_MODULE_PATHS` (currently `lockjaw_regs::sdhci`
-   and `lockjaw_regs::pl011`) via any path/use/macro/alias/raw-ident
+   `BANNED_DRIVER_MODULE_PATHS` (currently all five driver-imported
+   families: `lockjaw_regs::sdhci`, `lockjaw_regs::pl011`,
+   `lockjaw_regs::cprman`, `lockjaw_regs::fw_cfg`,
+   `lockjaw_regs::virtio_mmio`) via any path/use/macro/alias/raw-ident
    shape — drivers consume those module families through the
    `lockjaw-userlib` re-exports instead. See
    [`../architecture/patterns/operation-envelope.md`](../architecture/patterns/operation-envelope.md)

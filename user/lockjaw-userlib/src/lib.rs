@@ -6,6 +6,7 @@ pub mod process;
 pub mod virtual_memory;
 pub mod block;
 pub mod clock;
+pub mod cprman;
 pub mod devmgr;
 pub mod dma;
 pub mod dma_sync;

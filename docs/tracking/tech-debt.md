@@ -526,14 +526,25 @@ controller without first opening the operation layer. See
 [`../architecture/patterns/operation-envelope.md`](../architecture/patterns/operation-envelope.md)
 for the family pattern + the canonical SDHCI consumer.
 
-Outstanding follow-up: extend the `lockjaw-userlib::*` re-export
-regime to the four non-SDHCI device families that still import
-`lockjaw_regs::<module>` directly in driver source — `cprman`,
-`fw_cfg`, `pl011`, `virtio_mmio`. The `check-driver-unsafe` ban
-in `xtask/src/check_driver_unsafe.rs::BANNED_DRIVER_MODULE_PATHS`
-currently lists only `(lockjaw_regs, sdhci)`; each non-SDHCI
-driver's framework-side migration adds its module to that list and
-removes the corresponding `lockjaw_regs::<module>` import from the
-driver. Rule-of-two extraction for the operation-envelope pattern
-fires when a second consumer (emmc1, a NIC, etc.) needs the same
-shape — see the pattern doc's "Variants" section.
+Follow-up **DONE (rename + regime extension plan, 2026-06-07)**:
+the four non-SDHCI device families are all migrated.
+- `pl011` — pl011 framework-mediation plan, commits
+  `41cb644..788c106` (re-export + ban + helpers + SDHCI poll-loop
+  follow-on).
+- `cprman`, `fw_cfg`, `virtio_mmio` — Phase B of the rename +
+  regime extension plan. `lockjaw_userlib::cprman` created;
+  `lockjaw_userlib::fwcfg` extended with `pub use FwCfg`;
+  `virtio-blk-driver` source was already structurally clean
+  (consumed through `lockjaw_userlib::virtio::*` since the SDHCI
+  plan landed) — Phase B's ban entry locks in the existing
+  property.
+`BANNED_DRIVER_MODULE_PATHS` now lists all five families and the
+xtask reports `5 driver crates clean`. The structural property —
+"no driver source has an AST-level `lockjaw_regs::<module>` use or
+path reference" — is now uniform across the codebase. (Some driver
+comments still spell `lockjaw_regs::<module>` as intentional ban
+self-documentation; the syn-based checker doesn't read comment
+text, so they're not part of the enforced contract.) Rule-of-two
+extraction for the operation-envelope pattern still waits for a
+second consumer
+(emmc1, a NIC, etc.) — see the pattern doc's "Variants" section.

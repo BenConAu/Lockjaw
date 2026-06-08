@@ -7,11 +7,14 @@ edition = "2021"
 
 [dependencies]
 lockjaw-userlib = { path = "../lockjaw-userlib" }
-# Generated typed register layer for fw_cfg. Replaces hand-rolled
-# FWCFG_DATA / FWCFG_SEL / FWCFG_DMA offsets and BE conversion.
-lockjaw-regs = { path = "../lockjaw-regs" }
 # Direct lockjaw-mmio dep for MappedRegs in the engine field.
 lockjaw-mmio = { path = "../lockjaw-mmio" }
+# Note: lockjaw-regs is NOT a dependency — drivers reach the
+# generated fw_cfg register surface only through
+# lockjaw_userlib::fwcfg's curated re-export. The xtask
+# check-driver-unsafe regime forbids naming `lockjaw_regs`
+# anywhere in `user/*-driver` source (the (lockjaw_regs, fw_cfg)
+# entry in BANNED_DRIVER_MODULE_PATHS).
 # Direct lockjaw-types dep for the fwcfg DTOs (FwCfgDmaAccess,
 # RamfbConfig, FwCfgFile). Same pattern as virtio-blk-driver
 # (lockjaw_types::virtio for virtio DTOs).

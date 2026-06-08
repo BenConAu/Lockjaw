@@ -19,11 +19,10 @@ use lockjaw_userlib::dma::{
     alloc_dma_backing, close_dma_backing, BuddyOrigin, DmaMappingView, OwnedDmaMapping,
 };
 use lockjaw_userlib::driver_runtime::standard_init_no_irq;
-use lockjaw_userlib::fwcfg::{dma_write, find_file};
+use lockjaw_userlib::fwcfg::{dma_write, find_file, FwCfg};
 use lockjaw_userlib::handle::PageSetHandle;
 use lockjaw_userlib::{boot_stub, puts, sys_exit, FW_CFG_HASH};
 use lockjaw_mmio::region::MappedRegs;
-use lockjaw_regs::fw_cfg::FwCfg;
 use lockjaw_types::fwcfg::{RamfbConfig, RAMFB_CONFIG_WIRE_SIZE, RAMFB_FORMAT_XRGB8888};
 
 // ---------------------------------------------------------------------------

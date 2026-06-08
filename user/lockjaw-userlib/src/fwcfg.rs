@@ -21,8 +21,9 @@
 //! helpers instead of re-implementing.
 
 use crate::dma::{BuddyOrigin, DmaMappingView, OwnedDmaMapping};
-use lockjaw_regs::fw_cfg::FwCfg;
 use lockjaw_types::fwcfg::{FwCfgDmaAccess, FwCfgFile, FW_CFG_FILE_DIR};
+
+pub use lockjaw_regs::fw_cfg::FwCfg;
 
 /// Read `N` raw bytes from the currently-selected fw_cfg item via
 /// the data-port stream. Each `read_data()` consumes one byte; the

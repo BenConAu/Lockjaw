@@ -9,7 +9,12 @@ edition = "2021"
 lockjaw-userlib = { path = "../lockjaw-userlib" }
 lockjaw-types = { path = "../../lockjaw-types" }
 lockjaw-mmio = { path = "../lockjaw-mmio" }
-lockjaw-regs = { path = "../lockjaw-regs" }
+# Note: lockjaw-regs is NOT a dependency — drivers reach the
+# generated CPRMAN register surface only through
+# lockjaw_userlib::cprman's curated re-export. The xtask
+# check-driver-unsafe regime forbids naming `lockjaw_regs`
+# anywhere in `user/*-driver` source (the (lockjaw_regs, cprman)
+# entry in BANNED_DRIVER_MODULE_PATHS).
 
 [profile.release]
 panic = "abort"

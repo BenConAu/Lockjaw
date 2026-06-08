@@ -81,7 +81,10 @@ const SYSCALL_ALLOWLIST: &[&str] = &["sys_exit", "sys_debug_puts"];
 /// source must consume these via a `lockjaw_userlib::<module>`
 /// re-export rather than naming the underlying crate directly.
 ///
-/// Today: `lockjaw_regs::sdhci` and `lockjaw_regs::pl011`.
+/// Today: all five driver-imported `lockjaw_regs::<module>` families
+/// are banned — `sdhci`, `pl011`, `cprman`, `fw_cfg`, `virtio_mmio`.
+/// Drivers consume the safe surface of each through
+/// `lockjaw_userlib::<module>` re-exports.
 ///
 /// `lockjaw_userlib::sdhci` re-exports the safe SDHCI surface
 /// (Sdhci, register-field newtypes, operation envelope, init helpers)
@@ -90,20 +93,23 @@ const SYSCALL_ALLOWLIST: &[&str] = &["sys_exit", "sys_debug_puts"];
 /// property from P9.11/SdhciCommandInit (O7 of the operation-level
 /// construction safety plan).
 ///
-/// `lockjaw_userlib::pl011` re-exports the safe PL011 surface (P1 of
-/// the pl011 framework-mediation plan); P2 and P3 add deadline-bounded
-/// TX (`write_byte_deadline`) and write-replace IMSC (`set_interrupt_masks`)
-/// helpers to close the unbounded-spin tech-debt and the non-atomic
-/// IMSC RMW correctness gap respectively.
+/// `lockjaw_userlib::pl011` re-exports the safe PL011 surface plus
+/// deadline-bounded TX (`write_byte_deadline`), write-replace IMSC
+/// (`set_interrupt_masks`), and the FIFO-drain helper
+/// (`drain_rx_fifo`) — pl011 framework-mediation plan P1-P4.
 ///
-/// Not banned yet (other drivers still import `lockjaw_regs::<module>`
-/// directly): `cprman`, `fw_cfg`, `virtio_mmio`. Tracked as
-/// tech-debt — when each non-SDHCI driver's family helper lands in
-/// lockjaw-userlib, its module gets added here and the corresponding
-/// `lockjaw_regs::<module>` import in the driver gets removed.
+/// `lockjaw_userlib::cprman`, `lockjaw_userlib::fwcfg`, and the
+/// `VirtioMmio` re-export in `lockjaw_userlib::virtio` cover the
+/// remaining three families' driver-side surfaces. Phase B of the
+/// rename + regime extension plan added the ban entries; the
+/// virtio-blk-driver source was already structurally clean (consumed
+/// through `lockjaw_userlib::virtio::*`).
 const BANNED_DRIVER_MODULE_PATHS: &[(&str, &str)] = &[
     ("lockjaw_regs", "sdhci"),
     ("lockjaw_regs", "pl011"),
+    ("lockjaw_regs", "cprman"),
+    ("lockjaw_regs", "fw_cfg"),
+    ("lockjaw_regs", "virtio_mmio"),
 ];
 
 pub fn run() {
@@ -1038,6 +1044,42 @@ mod tests {
         let f = syscall_findings("use lockjaw_regs::pl011::Pl011;\nfn _f() {}");
         assert!(
             f.iter().any(|s| s.contains("banned module path") && s.contains("lockjaw_regs::pl011")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn flags_bare_use_of_cprman_ban_pair() {
+        // cprman added to BANNED_DRIVER_MODULE_PATHS in Phase B of the
+        // rename + regime extension plan. Representative test.
+        let f = syscall_findings("use lockjaw_regs::cprman::Cprman;\nfn _f() {}");
+        assert!(
+            f.iter().any(|s| s.contains("banned module path") && s.contains("lockjaw_regs::cprman")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn flags_bare_use_of_fw_cfg_ban_pair() {
+        // fw_cfg added to BANNED_DRIVER_MODULE_PATHS in Phase B of the
+        // rename + regime extension plan. Representative test.
+        let f = syscall_findings("use lockjaw_regs::fw_cfg::FwCfg;\nfn _f() {}");
+        assert!(
+            f.iter().any(|s| s.contains("banned module path") && s.contains("lockjaw_regs::fw_cfg")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn flags_bare_use_of_virtio_mmio_ban_pair() {
+        // virtio_mmio added to BANNED_DRIVER_MODULE_PATHS in Phase B of
+        // the rename + regime extension plan. virtio-blk-driver was
+        // already structurally clean (consumes through
+        // lockjaw_userlib::virtio::*); the ban entry locks in the
+        // existing property. Representative test.
+        let f = syscall_findings("use lockjaw_regs::virtio_mmio::VirtioMmio;\nfn _f() {}");
+        assert!(
+            f.iter().any(|s| s.contains("banned module path") && s.contains("lockjaw_regs::virtio_mmio")),
             "{f:?}"
         );
     }

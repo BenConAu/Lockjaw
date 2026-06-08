@@ -21,7 +21,7 @@ use lockjaw_userlib::clock::{
 use lockjaw_userlib::driver_runtime::{standard_init_no_irq, ProbeClaimError};
 use lockjaw_userlib::{boot_stub, put_decimal, puts, sys_exit};
 use lockjaw_mmio::region::MappedRegs;
-use lockjaw_regs::cprman::{CmEmmc2Ctl, CmEmmc2CtlSrc, CmEmmc2Div, Cprman};
+use lockjaw_userlib::cprman::{CmEmmc2Ctl, CmEmmc2CtlSrc, CmEmmc2Div, Cprman};
 use lockjaw_types::device::BCM2711_CPRMAN_HASH;
 
 // ---------------------------------------------------------------------------
