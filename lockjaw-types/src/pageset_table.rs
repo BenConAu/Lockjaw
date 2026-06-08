@@ -141,7 +141,7 @@ pub struct PageSetHeader {
     /// Allocator-of-origin for the data pages, stored as raw u64
     /// (NOT the typed enum). Reading a typed enum from possibly-
     /// uninitialised memory is UB; storing raw and decoding via
-    /// `origin()` -> `Option<PageSetOrigin>` keeps Tier 3 #13's
+    /// `origin()` -> `Option<PageSetOrigin>` keeps Tier 3 #14's
     /// "zero-init read is observably invalid" guarantee live at the
     /// type-system layer instead of relying on convention. Direct
     /// field access is `pub` only so the alloc paths can write it;
@@ -185,7 +185,7 @@ impl PageSetHeader {
 
     /// Decode the stored origin via `PageSetOrigin::from_raw`. Returns
     /// `None` if the page-resident header was never initialised (raw=0
-    /// is observably invalid by Tier 3 #13) or carries an unknown
+    /// is observably invalid by Tier 3 #14) or carries an unknown
     /// discriminant. Callers MUST go through this accessor — direct
     /// `header.origin_raw` reads bypass the explicit-init guarantee.
     pub fn origin(&self) -> Option<PageSetOrigin> {
@@ -882,7 +882,7 @@ mod tests {
         // has origin_raw = 0, which is NOT a valid PageSetOrigin
         // discriminant. The accessor must surface that as None so
         // kernel callers can reject. This is the load-bearing test
-        // for Tier 3 #13: explicit init enforced by the type system.
+        // for Tier 3 #14: explicit init enforced by the type system.
         let h = PageSetHeader {
             count: 0,
             header_pages: 1,

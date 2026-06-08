@@ -20,7 +20,7 @@ tension between them.
    model across multiple subsystems should be paid down ahead of
    feature work, even when local workarounds exist.** This is the
    prioritization meta-rule. Most debt waits its turn (see Tier 4
-   #17 — "debt is stuff we need but can't build yet"). Substrate
+   #18 — "debt is stuff we need but can't build yet"). Substrate
    debt is the exception: it keeps the surface working but biases
    downstream design into the wrong shape, so polishing on top of
    it compounds the problem rather than progressing past it.
@@ -88,21 +88,35 @@ How tier 1 manifests in the kernel's shape.
 9. **Don't use unsafe types — make wrappers that force the
    unsafety to only be exposed at creation.**
 
+10. **The kernel allocates memory only during bootstrap.**
+
+    After the bootstrap→userspace handoff, no syscall handler may
+    grow *kernel-owned* memory — no calls into
+    `kvm::alloc_kernel_pages` or any other surface that produces
+    fresh kernel-virtual mapping for kernel-object backing.
+    Kernel-object creation follows donate-and-claim: userspace passes
+    a PageSet handle, the kernel calls `kvm::map_existing` and
+    constructs the object in-place. The legitimate carve-out:
+    `page_alloc::alloc_page` called from `sys_alloc_pages` — that
+    path hands a physical frame to userspace, which owns it. Audit,
+    fix plan, and structural enforcement proposal:
+    [docs/architecture/no-kernel-alloc.md].
+
 ## Tier 3 — Type-System Idioms
 
 Specific Rust patterns that implement tiers 1 and 2.
 
-10. **Use Rust per-enum values where you can to be correct by
+11. **Use Rust per-enum values where you can to be correct by
     construction.**
 
-11. **In general use strong typing wherever possible** — even
+12. **In general use strong typing wherever possible** — even
     if it does not survive the syscall boundary, it still
     enforces correctness.
 
-12. **Use RAII wherever possible rather than rely on manual
+13. **Use RAII wherever possible rather than rely on manual
     cleanup.**
 
-13. **Explicit initialization everywhere — no code path may rely
+14. **Explicit initialization everywhere — no code path may rely
     on a zero-default value coincidentally being correct.** Every
     constructor and setter takes the discriminating fields as
     explicit parameters. New `#[repr(uN)]` enums whose value is
@@ -131,24 +145,24 @@ Specific Rust patterns that implement tiers 1 and 2.
 
 Working rules that aren't directly about correctness.
 
-14. **Drivers should be split between bit bangers and protocol
+15. **Drivers should be split between bit bangers and protocol
     drivers.** UART buffering should not be repeated everywhere,
     block management should not be repeated everywhere; think of
     KMD vs UMD in Windows.
 
-15. **Prefer clean code and abstractions over feature richness.**
+16. **Prefer clean code and abstractions over feature richness.**
 
-16. **Back compatibility is not a concern until much later** —
+17. **Back compatibility is not a concern until much later** —
     we should feel free to refactor anything and change any
     protocol.
 
-17. **YAGNI is for things you can build now but don't need; debt
+18. **YAGNI is for things you can build now but don't need; debt
     is stuff we need but can't build yet.** The Tier 1 #3
     counterpoint: substrate debt is need-but-can't-build-yet
     debt that *also* keeps the surface working — the surface
     working is not a reason to defer it.
 
-18. **Codex reviews must be reminded of these principles.** A
+19. **Codex reviews must be reminded of these principles.** A
     fresh `codex review` session starts without project context,
     so its baseline taste is "idiomatic Rust", not "Lockjaw
     architectural rules". Every review prompt (review of a plan,
@@ -165,7 +179,7 @@ Working rules that aren't directly about correctness.
     the implementation. Prompt template:
 
     > "Reviewing <diff/plan>. See `docs/process/ben_principles.md` for
-    > Lockjaw's architectural rules — especially Tier 3 #13
+    > Lockjaw's architectural rules — especially Tier 3 #14
     > (explicit init / no zero-default discriminants) and Tier 2
     > #6 (reach for userspace before reaching for the kernel).
     > Flag any violations even if the diff is internally consistent."

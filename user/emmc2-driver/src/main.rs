@@ -604,7 +604,7 @@ fn emmc2_entry() -> ! {
 
     // Surrender the &Sdhci borrow + drop the typestate. CardInfo is
     // the proof token Emmc2BlockEngine::new requires — no other path
-    // to construct one (Tier 3 #13).
+    // to construct one (Tier 3 #14).
     let card_info = card.into_parts();
     let rca = card_info.rca();
     let capacity_bytes = card_info.csd().capacity_bytes;

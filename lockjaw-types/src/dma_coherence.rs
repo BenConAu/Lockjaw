@@ -12,7 +12,7 @@
 
 /// Direction of a DMA region, from the device's point of view.
 ///
-/// Discriminants start at 1 (ben_principles Tier 3 #13): although a
+/// Discriminants start at 1 (ben_principles Tier 3 #14): although a
 /// `DmaDir` is an API argument rather than a value read out of memory,
 /// the 1-based convention keeps a zero pattern observably non-default
 /// should this type ever be serialised.

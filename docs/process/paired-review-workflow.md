@@ -87,10 +87,10 @@ the same output file via `; echo "codex exit $?"`.
 
 ### What to put in the prompt
 
-The Codex-reminder rule in `docs/process/ben_principles.md` Tier 4 #18 is
+The Codex-reminder rule in `docs/process/ben_principles.md` Tier 4 #19 is
 load-bearing: *every* prompt points at `docs/process/ben_principles.md` and
 calls out the relevant tier (most commonly Tier 1 #1 correctness-by-
-construction, Tier 3 #13 explicit-init / no-coincidental-defaults,
+construction, Tier 3 #14 explicit-init / no-coincidental-defaults,
 Tier 2 #6 reach-for-userspace-before-kernel). Without the reminder,
 codex defaults to "idiomatic Rust", not Lockjaw's rules.
 
@@ -155,7 +155,7 @@ You are reviewing a STAGED git diff in the Lockjaw kernel repo at
 First read docs/process/reviewer-mode.md in full and adopt it as your operating
 instructions (it defines your review format and standard). Also read
 docs/process/ben_principles.md (especially Tier 1 #1 correctness-by-
-construction, Tier 3 #13 explicit init).
+construction, Tier 3 #14 explicit init).
 
 Context: <one paragraph: what this commit does in Lockjaw vocabulary>.
 
@@ -332,4 +332,4 @@ Three places to spend or save cycles:
 - `docs/process/paired-review-workflow.md` — *this file*. The orchestrator's
   side. **You read.**
 - `docs/process/ben_principles.md` — both reviewers read. **You point at it from
-  every prompt** (Tier 4 #18).
+  every prompt** (Tier 4 #19).

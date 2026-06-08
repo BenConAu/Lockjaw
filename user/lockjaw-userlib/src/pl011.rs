@@ -44,7 +44,7 @@ pub fn write_byte_deadline(
 /// Write the full interrupt mask in one register write — **not** a
 /// read-modify-write. The caller passes the complete desired mask;
 /// every IMSC bit not set in `masks` is cleared. This is the Tier 3
-/// #13 explicit-init shape: name what you want, do not OR-against-
+/// #14 explicit-init shape: name what you want, do not OR-against-
 /// what-was-there. The non-atomic RMW race window (read → modify →
 /// write, with no synchronization against a concurrent writer)
 /// closes by construction because there is no read step.

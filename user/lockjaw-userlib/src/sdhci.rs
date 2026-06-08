@@ -617,7 +617,7 @@ pub enum DataDirection {
 /// `ARGUMENT2`. Multi-block (CMD18/CMD25) re-introduction will land
 /// the additional fields as part of the same commit that adds the
 /// MULTI/BLK_CNT_EN/AUTO_CMD23 + ARGUMENT2 kick logic, so the API
-/// surface always matches what the kick actually programs (Tier 3 #13
+/// surface always matches what the kick actually programs (Tier 3 #14
 /// — illegal states unrepresentable).
 pub struct SdhciDataTransfer {
     /// The SD command — CMD17 (ReadSingleBlock) for reads, CMD24

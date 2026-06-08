@@ -6,7 +6,7 @@ this file is for higher-level items that don't fit those.
 
 - **DDK / DDI documentation, split by driver type** — both
   hardware (bit-banger) and protocol drivers. Mirrors principle
-  #11 from `ben_principles.md`.
+  #15 from `ben_principles.md`.
 
 - **Reorganize docs directory, group book-of-lockjaw stuff.**
 

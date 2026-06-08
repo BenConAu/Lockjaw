@@ -538,7 +538,7 @@ pub fn free_by_header_kva(header_kva: KernelVa) {
     // M6: data pages return to the allocator that owned them. The
     // alloc paths write origin via set_count; a None reading here
     // would indicate a header that was never properly initialised
-    // (Tier 3 #13 — bug at the alloc site). Panic rather than
+    // (Tier 3 #14 — bug at the alloc site). Panic rather than
     // silently leak: this code is on the cleanup hot path and a
     // missed origin tag would compound into ownership corruption.
     let origin = backed.raw().origin()
@@ -647,7 +647,7 @@ impl PageSetRef {
     /// PageSet whose alloc path explicitly wrote origin via
     /// `set_count(_, origin)`; returns `None` if the page-resident
     /// header carries a zero or unknown discriminant (signals a bug
-    /// at the alloc site — Tier 3 #13's typed-error surface). Used
+    /// at the alloc site — Tier 3 #14's typed-error surface). Used
     /// by every kernel path that would map the pages cacheably to
     /// reject DmaPool-origin PageSets (sys_map_pages, create_process,
     /// KVM remap, donate-as-kernel-object).
