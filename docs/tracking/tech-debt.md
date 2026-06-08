@@ -423,41 +423,36 @@ The SDHCI bare-`>=` poll-loop carryforward is its own entry below
 
 ---
 
-## SDHCI poll loops should adopt `spin_until_or_deadline`
+## SDHCI poll loops should adopt `spin_until_or_deadline` — **DONE (P4 of pl011 plan, 2026-06-07)**
 
-**Where:** `user/lockjaw-userlib/src/sdhci.rs:282-293` (`soft_reset_all`),
-the `INT_CLK_STABLE` wait in `configure_clock`, and any other SDHCI
-poll that follows the `monotonic_now() >= deadline` shape.
+Acceptance met across all eight bare-`>=` poll loops in
+`user/lockjaw-userlib/src/sdhci.rs`. Two clean simple-spin loops
+migrated to `spin_until_or_deadline` directly:
+- `soft_reset_all` (SW_RST_ALL clear wait).
+- `configure_clock`'s INT_CLK_STABLE wait.
 
-**What:** These loops compute the deadline via `MonoTicks::deadline_in(...)`
-(which saturates at `NO_DEADLINE - 1`, never producing the sentinel)
-and then compare with bare `>=`. The comparison is functionally safe
-today — every deadline reaching these loops is finite-from-`deadline_in`,
-so `now >= deadline` evaluates correctly. A future caller that
-constructs a `NO_DEADLINE` deadline another way (explicit
-`MonoTicks(NO_DEADLINE)` to mean "wait indefinitely") would need the
-named `MonoTicks::has_expired` accessor for the sentinel to be honored.
+Six loops kept their loop structure but swapped bare `>=` for
+`deadline.has_expired(monotonic_now())` — the helper would have lost
+load-bearing local context:
+- `issue_no_data` pre-issue inhibit poll (captures `ps.bits()` in
+  `InhibitStuck` error).
+- `issue_no_data` CMD_COMPLETE / ERROR poll (three exits with W1C
+  side-effects and response-register reads).
+- `SdhciDataCompletion` DAT_INHIBIT drain (captures `ps.bits()` in
+  `DatInhibitStuck` error).
+- `issue_data_transfer` pre-kick inhibit poll (captures `ps.bits()`
+  in `InhibitStuck` error).
+- `MmcCard<Ready>::power_up_to_ready` ACMD41 loop (10 ms `sleep_for`
+  between CMD55+ACMD41 retries; tightening to a busy-spin would
+  violate SD §4.2.3.1 timing).
+- `MmcCard<Stby>::select` CMD7 DAT0 busy poll (success path does
+  the typestate transition with CSD capture inline).
 
-The shared `lockjaw_userlib::time::spin_until_or_deadline` primitive
-(added P1 of the pl011 plan, commit `41cb644`) uses `has_expired`
-internally and is the structural answer.
-
-**Fix:** Migrate `soft_reset_all` + `configure_clock`'s `INT_CLK_STABLE`
-wait + any other SDHCI poll loop to
-`spin_until_or_deadline(|| condition, deadline)`. The body shrinks
-(drop the `loop { ... }` skeleton, drop the explicit
-`core::hint::spin_loop()`, drop the bare `>=` comparison) and the
-sentinel handling becomes structural.
-
-**Why bootstrap / fix-when:** the bare-comparison loops are
-functionally correct today. The migration is correctness-by-construction
-work — preventing the third instance of the pattern from entrenching
-the bare-comparison habit — not closing an active bug. **Scheduled
-for P4 of the pl011 framework-mediation plan**, immediately after
-P3's IMSC + drain refactor lands — the primitive is in tree and
-consumed by P2's `write_byte_deadline`, so migrating the SDHCI
-loops is the natural "primitive is genuinely shared" proof, not a
-vague-trigger follow-up parked behind the pl011 plan.
+Both shapes get the same correctness benefit: the named
+`MonoTicks::has_expired` accessor handles the `NO_DEADLINE` sentinel
+correctly. No callsite uses the sentinel today; the structural
+property is that a future caller passing `MonoTicks(NO_DEADLINE)` to
+mean "wait indefinitely" would be honored.
 
 ---
 

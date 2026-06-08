@@ -66,7 +66,7 @@ use lockjaw_types::sdhci::response::{R0, R1, R1b, R2, R3, R6, R6Response, R7};
 
 use crate::dma_transfer::{run_dma_transfer, DmaCompletion, DmaRegion, DmaTransferError};
 use crate::irq::BoundIrq;
-use crate::time::{monotonic_now, sleep_for, Nanos};
+use crate::time::{monotonic_now, sleep_for, spin_until_or_deadline, Nanos};
 
 use lockjaw_types::syscall::SyscallError;
 
@@ -170,7 +170,7 @@ impl<'a> SdhciCommandInit<'a, OpIdle> {
             if !ps.contains(PresentState::CMD_INHIBIT) {
                 break;
             }
-            if monotonic_now() >= inhibit_deadline {
+            if inhibit_deadline.has_expired(monotonic_now()) {
                 return Err(SdhciCommandError::InhibitStuck {
                     present_state: ps.bits(),
                 });
@@ -238,7 +238,7 @@ impl<'a> SdhciCommandInit<'a, OpIdle> {
                 let decoded = R::decode(r);
                 return Ok((decoded, self));
             }
-            if monotonic_now() >= deadline {
+            if deadline.has_expired(monotonic_now()) {
                 return Err(SdhciCommandError::NoResponse);
             }
             core::hint::spin_loop();
@@ -279,18 +279,15 @@ pub fn soft_reset_all(sdhci: &Sdhci) -> Result<(), SdhciInitError> {
     sdhci.set_software_reset(SoftwareReset::SW_RST_ALL, &tk);
     let deadline =
         monotonic_now().deadline_in(Nanos::from_millis(200), crate::time::cntfreq_hz());
-    loop {
-        if !sdhci
-            .software_reset(&tk)
-            .contains(SoftwareReset::SW_RST_ALL)
-        {
-            return Ok(());
-        }
-        if monotonic_now() >= deadline {
-            return Err(SdhciInitError::ResetTimeout);
-        }
-        core::hint::spin_loop();
-    }
+    spin_until_or_deadline(
+        || {
+            !sdhci
+                .software_reset(&tk)
+                .contains(SoftwareReset::SW_RST_ALL)
+        },
+        deadline,
+    )
+    .map_err(|_| SdhciInitError::ResetTimeout)
 }
 
 /// Configure the SD clock to `target_hz` from a `base_hz` reference,
@@ -320,15 +317,11 @@ pub fn configure_clock(
     );
     let deadline =
         monotonic_now().deadline_in(Nanos::from_millis(100), crate::time::cntfreq_hz());
-    loop {
-        if sdhci.clock_control(&tk).int_clk_stable() {
-            break;
-        }
-        if monotonic_now() >= deadline {
-            return Err(SdhciInitError::ClockUnstable);
-        }
-        core::hint::spin_loop();
-    }
+    spin_until_or_deadline(
+        || sdhci.clock_control(&tk).int_clk_stable(),
+        deadline,
+    )
+    .map_err(|_| SdhciInitError::ClockUnstable)?;
     // Stable: enable the clock output to the card slot.
     sdhci.modify_clock_control(|cc| cc.with_sd_clk_en(true), &tk);
     Ok(())
@@ -589,7 +582,7 @@ impl DmaCompletion for SdhciDataCompletion<'_> {
             if !ps.contains(PresentState::DAT_INHIBIT) {
                 return Ok(());
             }
-            if monotonic_now() >= drain_deadline {
+            if drain_deadline.has_expired(monotonic_now()) {
                 return Err(SdhciDataCompletionError::DatInhibitStuck {
                     present_state: ps.bits(),
                 });
@@ -706,7 +699,7 @@ impl<'a> SdhciCommandInit<'a, OpIdle> {
             {
                 break;
             }
-            if monotonic_now() >= inhibit_deadline {
+            if inhibit_deadline.has_expired(monotonic_now()) {
                 return Err(SdhciDataTransferError::InhibitStuck {
                     present_state: ps.bits(),
                 });
@@ -967,7 +960,7 @@ impl<'a> MmcCard<'a, Idle> {
                 next.ocr = Some(ocr);
                 return Ok(next);
             }
-            if monotonic_now() >= deadline {
+            if deadline.has_expired(monotonic_now()) {
                 return Err(MmcCardError::Acmd41Timeout);
             }
             let _ = sleep_for(Nanos::from_millis(10));
@@ -1063,7 +1056,7 @@ impl<'a> MmcCard<'a, Stby> {
                 next.csd = Some(csd);
                 return Ok(next);
             }
-            if monotonic_now() >= deadline {
+            if deadline.has_expired(monotonic_now()) {
                 return Err(MmcCardError::Cmd7BusyStuck {
                     present_state: ps.bits(),
                 });
