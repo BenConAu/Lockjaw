@@ -8,9 +8,11 @@
 //! All policy lives in `lockjaw_types::kvm` (free-list, walk
 //! state machines, PTE construction). This module only does:
 //! - the `unsafe` PTE reads/writes
-//! - page allocation for backing frames and L2/L3 page-table pages
+//! - page allocation for backing frames (L2/L3 page-table pages
+//!   are pre-allocated at bootstrap by `kvm_init`; runtime
+//!   walks read pre-populated parent PTEs, never grow the tree)
 //! - TLB invalidation around mappings
-//! - boot-time L0 install
+//! - boot-time L0 install + full L1/L2/L3 forest pre-allocation
 //!
 //! GKL serializes all kernel state, so the allocator's state lives
 //! in a single `UnsafeCell`-wrapped singleton without internal
@@ -20,10 +22,11 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use lockjaw_types::addr::KernelVa;
+use lockjaw_types::addr::{KernelVa, PAGE_SIZE};
 use lockjaw_types::kvm::{
     KvmFreeList, KvmFreeStep, KvmFreeWalk, KvmMapStep, KvmMapWalk,
-    KVM_L0_INDEX,
+    BOOTSTRAP_CONTIGUOUS_RESERVE, KVM_BOOTSTRAP_TABLE_PAGES,
+    KVM_L0_INDEX, KVM_L2_TABLES_COUNT, KVM_L3_TABLES_COUNT,
 };
 use lockjaw_types::page_table::{PageTable, PageTableEntry};
 
@@ -200,10 +203,21 @@ unsafe fn tlbi_vae1(kva: KernelVa) {
 // kvm_init
 // ---------------------------------------------------------------------------
 
-/// One-shot install of the KVM L1 table at `KERNEL_L0[KVM_L0_INDEX]`.
+/// One-shot install of the KVM L1 table at `KERNEL_L0[KVM_L0_INDEX]`,
+/// AND pre-allocation of the full L2/L3 page-table forest covering
+/// `KVM_POOL_USABLE_SIZE`. After this call, the page-table tree is
+/// fully populated for the working pool; `alloc_kernel_pages` /
+/// `map_existing` walks pre-existing parent PTEs and only ever
+/// allocates *backing* frames — no metadata growth at runtime.
+///
+/// Bootstrap budget: `KVM_BOOTSTRAP_TABLE_PAGES` (514 today) page-
+/// table pages. The buddy rounds up to `BOOTSTRAP_CONTIGUOUS_RESERVE`
+/// (1024 today) as one contiguous block; the extra padding stays
+/// reserved (inert) as part of the block.
+///
 /// Must be called after `enable_higher_half` (TTBR1 must be active)
-/// and after `page_alloc::init_with_gap` (we allocate the L1 page),
-/// and before any caller of `alloc_kernel_pages`.
+/// and after `page_alloc::init_with_gap` (we allocate the table
+/// pages), and before any caller of `alloc_kernel_pages`.
 ///
 /// # Safety
 /// Must be called exactly once. Race-free under GKL.
@@ -212,10 +226,76 @@ pub unsafe fn kvm_init() {
         panic!("kvm_init called twice");
     }
 
-    // Allocate and zero the L1 table page.
-    let l1_page = page_alloc::alloc_page().expect("kvm_init: no page for KVM L1");
-    let l1_paddr = l1_page.start_addr();
-    page_alloc::zero_page(l1_paddr);
+    // Acquire `KVM_BOOTSTRAP_TABLE_PAGES` of contiguous physical
+    // memory for the L1 + L2 + L3 forest. The buddy rounds up to
+    // the next power of two (`BOOTSTRAP_CONTIGUOUS_RESERVE`), and
+    // the extra padding stays reserved as part of the block.
+    //
+    // Fallback: if `alloc_pages_contiguous` returns `None` (tiny
+    // QEMU configs / exhausted buddy at bootstrap), panic with a
+    // descriptive message. The contiguous path is the only one
+    // exercised by current targets; the per-page fallback is
+    // tracked as tech-debt to land before NK2 enlarges the budget.
+    let first_page = page_alloc::alloc_pages_contiguous(
+        KVM_BOOTSTRAP_TABLE_PAGES,
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "kvm_init: alloc_pages_contiguous failed for bootstrap KVM \
+             page-table forest (bootstrap memory pressure)"
+        )
+    });
+    let base_paddr = first_page.start_addr();
+
+    // Slice the contiguous run: page 0 → L1, pages 1..1+L2_COUNT → L2s,
+    // remaining → L3s. For 1 GiB usable: 1 + 1 + 512 = 514.
+    let l1_paddr = base_paddr;
+    let l2_base = PhysAddr::new(base_paddr.as_u64() + PAGE_SIZE);
+    let l3_base = PhysAddr::new(
+        base_paddr.as_u64() + ((1 + KVM_L2_TABLES_COUNT) as u64) * PAGE_SIZE,
+    );
+
+    // Zero every table page so residual bytes can't masquerade as
+    // valid PTEs.
+    for i in 0..KVM_BOOTSTRAP_TABLE_PAGES {
+        let p = PhysAddr::new(base_paddr.as_u64() + (i as u64) * PAGE_SIZE);
+        page_alloc::zero_page(p);
+    }
+
+    // Stitch parent PTEs. For each L1 entry, point at its L2 table;
+    // for each L2 entry, point at its L3 table. L3 PTEs themselves
+    // stay zero until alloc_kernel_pages / map_existing writes
+    // backing-frame entries at runtime.
+    for l2_idx in 0..KVM_L2_TABLES_COUNT {
+        let l2_paddr = PhysAddr::new(
+            l2_base.as_u64() + (l2_idx as u64) * PAGE_SIZE,
+        );
+        let l1_pte_paddr = PhysAddr::new(
+            l1_paddr.as_u64() + (l2_idx as u64) * 8,
+        );
+        let l1_entry = PageTableEntry::new_table(
+            lockjaw_types::addr::PhysAddr::new(l2_paddr.as_u64()),
+        );
+        write_pte(l1_pte_paddr, l1_entry.raw());
+
+        // Each L2 covers up to 512 L3 PTEs.
+        for sub in 0..512usize {
+            let global_l3_idx = l2_idx * 512 + sub;
+            if global_l3_idx >= KVM_L3_TABLES_COUNT {
+                break;
+            }
+            let l3_paddr = PhysAddr::new(
+                l3_base.as_u64() + (global_l3_idx as u64) * PAGE_SIZE,
+            );
+            let l2_pte_paddr = PhysAddr::new(
+                l2_paddr.as_u64() + (sub as u64) * 8,
+            );
+            let l2_entry = PageTableEntry::new_table(
+                lockjaw_types::addr::PhysAddr::new(l3_paddr.as_u64()),
+            );
+            write_pte(l2_pte_paddr, l2_entry.raw());
+        }
+    }
 
     // Install KERNEL_L0[KVM_L0_INDEX] -> L1 table.
     let l0_paddr = crate::arch::aarch64::mmu::kernel_l0_paddr();
@@ -238,8 +318,14 @@ pub unsafe fn kvm_init() {
     asm!("isb", options(nostack, preserves_flags));
 
     crate::kprintln!(
-        "  KVM allocator initialized at L0[", KVM_L0_INDEX,
-        "] -> L1 paddr ", crate::print::Hex(l1_paddr.as_u64()),
+        "  KVM allocator initialized: ",
+        KVM_BOOTSTRAP_TABLE_PAGES,
+        " page-table pages pre-allocated (",
+        BOOTSTRAP_CONTIGUOUS_RESERVE,
+        " pages reserved as a contiguous block) at L0[",
+        KVM_L0_INDEX,
+        "] -> L1 paddr ",
+        crate::print::Hex(l1_paddr.as_u64()),
     );
 }
 
@@ -687,18 +773,19 @@ pub unsafe fn boot_self_test() {
     free_kernel_pages(range);
 
     let post_free = page_alloc::free_count();
-    // After free we should have returned the N backing frames to
-    // the allocator. L2/L3 page-table pages stay allocated (the
-    // plan defers their reclamation), so the only acceptable delta
-    // is `pre_free - post_free == page_table_overhead`. For a
-    // 33-page range at KVM_POOL_BASE: 1 L2 + 1 L3 = 2 pages.
-    // (kvm_init already allocated the L1 before pre_free was
-    // captured, so it doesn't count here.)
-    let leaked = pre_free.saturating_sub(post_free);
-    assert!(
-        leaked <= 4,
-        "kvm self-test: leaked {} pages (expected ≤ 4 for L2/L3 overhead)",
-        leaked,
+    // After NK1, the KVM tree is fully pre-allocated at boot — no
+    // L2/L3 page-table growth happens during alloc_kernel_pages. The
+    // only allocations the test causes are backing frames, all of
+    // which it frees. Use direct equality (NOT saturating_sub) so an
+    // over-release bug (post_free > pre_free) surfaces as a test
+    // failure instead of getting clamped to 0.
+    assert_eq!(
+        pre_free,
+        post_free,
+        "kvm self-test: page-allocator free count drifted \
+         (pre={}, post={})",
+        pre_free,
+        post_free,
     );
 
     // Cleanup: return the odd-indexed pre-fragmentation pages to

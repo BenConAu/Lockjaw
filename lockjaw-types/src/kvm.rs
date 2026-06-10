@@ -35,17 +35,124 @@ use crate::page_table::{
 /// never shares an L0 slot with the linear map.
 pub const KVM_POOL_BASE: u64 = 0xFFFF_8000_0000_0000;
 
-/// Size of the KVM pool: one L1 entry (512 GiB) of address space.
-/// The pool is a virtual reservation; physical memory is only
-/// consumed as ranges get filled in.
-pub const KVM_POOL_SIZE: u64 = 1u64 << 39;
+/// VA reservation for the KVM pool: one L1 entry (512 GiB) of address
+/// space. This is the carve-out size at the L0/L1 level — only the
+/// `KVM_POOL_USABLE_SIZE` prefix has pre-allocated L2/L3 page-table
+/// metadata. Addresses above `KVM_POOL_BASE + KVM_POOL_USABLE_SIZE`
+/// are inside the L0 carve-out but have no walker-reachable mapping,
+/// so `free()`'s bounds check uses `KVM_POOL_END` (the full span)
+/// while `KvmFreeList::new()` sizes only against the usable prefix.
+pub const KVM_POOL_VA_SPAN: u64 = 1u64 << 39;
 
-pub const KVM_POOL_END: u64 = KVM_POOL_BASE + KVM_POOL_SIZE;
+pub const KVM_POOL_END: u64 = KVM_POOL_BASE + KVM_POOL_VA_SPAN;
 
 /// Index of the KVM pool's L0 entry. With a 4 KB granule the L0
 /// index is bits 47:39 of the VA. For `KVM_POOL_BASE`:
 /// `(0xFFFF_8000_0000_0000 >> 39) & 0x1FF == 0x100 == 256`.
 pub const KVM_L0_INDEX: usize = 256;
+
+// ---------------------------------------------------------------------------
+// Working pool sizing & bootstrap page-table-tree budget
+//
+// Pre-allocating L2/L3 metadata for the *full* 512 GiB carve-out
+// would cost ~1 GiB of RAM (512 L2 + 262144 L3 × 4 KiB). Unworkable
+// on Pi 4B (2 GiB). Resolution: split the concept — KVM_POOL_VA_SPAN
+// is the L0/L1 reservation (kept at 512 GiB so the L0 entry is
+// dedicated to KVM), KVM_POOL_USABLE_SIZE is the working portion
+// whose L2/L3 tree gets pre-allocated at bootstrap. Working size is
+// anchored to the kernel-object hard caps (MAX_PAGESETS, MAX_THREADS)
+// so the bound is computable, not arbitrary.
+// ---------------------------------------------------------------------------
+
+/// Maximum header-page count for a single PageSet. Encoded by
+/// `header_pages_for` in `lockjaw-types/src/pageset_table.rs` — 33 is
+/// the largest the header table reaches today (1 page per 64 entries
+/// across the 2048-entry maximum allocation).
+pub const MAX_HEADER_PAGES_PER_PAGESET: usize = 33;
+
+/// Per-process worst-case KVM page count: ProcessObject (1) +
+/// HandleTable (1) + L0/L1/L2 page tables (3) + generous L3 pool
+/// from V14's per-process page-table donation (~16).
+pub const PAGES_PER_PROCESS_WORST_CASE: usize = 1 + 1 + 3 + 16;
+
+/// Budget — PageSets. Until NK2 lands the dedicated header pool,
+/// every PageSet header carves from KVM.
+pub const KVM_BUDGET_PAGESETS: usize =
+    crate::pageset_table::MAX_PAGESETS * MAX_HEADER_PAGES_PER_PAGESET;
+
+/// Budget — threads. TCB + kernel stack = 2 KVM pages per thread.
+pub const KVM_BUDGET_THREADS: usize = crate::scheduler::MAX_THREADS * 2;
+
+/// Budget — processes. No explicit MAX_PROCESSES exists today;
+/// process count is bounded by thread count (every process holds
+/// ≥1 thread), so MAX_THREADS is the upper bound for processes too.
+/// This overcounts safely: distinct from the thread budget because
+/// process-level kernel objects (ProcessObject, HandleTable, page
+/// tables) are not the same pages as the thread budget's TCBs and
+/// stacks.
+pub const KVM_BUDGET_PROCESSES: usize =
+    crate::scheduler::MAX_THREADS * PAGES_PER_PROCESS_WORST_CASE;
+
+/// Sum of audited kernel-object KVM consumption at the current caps.
+pub const KVM_BUDGET_TOTAL: usize =
+    KVM_BUDGET_PAGESETS + KVM_BUDGET_THREADS + KVM_BUDGET_PROCESSES;
+
+/// Working budget = total + 30% headroom for kernel objects not yet
+/// enumerated (kernel-side caps that NK6/NK7 will surface).
+/// Integer 30%: ×13/10.
+pub const KVM_BUDGET_WORKING: usize = KVM_BUDGET_TOTAL * 13 / 10;
+
+/// Working portion of the pool that gets pre-allocated L2/L3 metadata
+/// at bootstrap. 1 GiB is the next-power-of-two ceiling above
+/// `KVM_BUDGET_WORKING` (~140 MiB today, ~7× headroom), and snaps
+/// cleanly to one L1 entry's worth of L2 at the 4 KiB granule
+/// (1 L2 covers 1 GiB). If a future workload approaches the budget,
+/// raise `MAX_PAGESETS` / `MAX_THREADS` first and the formula tells
+/// you the new pool size.
+pub const KVM_POOL_USABLE_SIZE: u64 = 1u64 << 30;
+
+const _USABLE_COVERS_BUDGET: () = assert!(
+    (KVM_POOL_USABLE_SIZE as usize) >= KVM_BUDGET_WORKING * (PAGE_SIZE as usize),
+    "KVM_POOL_USABLE_SIZE must cover the cap-driven working budget",
+);
+
+const _USABLE_FITS_VA_SPAN: () = assert!(
+    KVM_POOL_USABLE_SIZE <= KVM_POOL_VA_SPAN,
+    "KVM_POOL_USABLE_SIZE cannot exceed KVM_POOL_VA_SPAN",
+);
+
+const _USABLE_PAGE_ALIGNED: () = assert!(
+    KVM_POOL_USABLE_SIZE % PAGE_SIZE == 0,
+    "KVM_POOL_USABLE_SIZE must be a multiple of PAGE_SIZE — \
+     KvmFreeList::new and the L2/L3 table-count formulas assume it",
+);
+
+/// Bytes covered by one L1 PTE at the 4 KiB granule (= 1 GiB).
+const L1_ENTRY_BYTES: u64 = 1u64 << 30;
+/// Bytes covered by one L2 PTE at the 4 KiB granule (= 2 MiB).
+const L2_ENTRY_BYTES: u64 = 1u64 << 21;
+
+/// Number of L2 page tables required to cover `KVM_POOL_USABLE_SIZE`.
+/// For 1 GiB usable: 1 L2 table.
+pub const KVM_L2_TABLES_COUNT: usize =
+    ((KVM_POOL_USABLE_SIZE + L1_ENTRY_BYTES - 1) / L1_ENTRY_BYTES) as usize;
+
+/// Number of L3 page tables required to cover `KVM_POOL_USABLE_SIZE`.
+/// Each L3 covers 2 MiB. For 1 GiB usable: 512 L3 tables.
+pub const KVM_L3_TABLES_COUNT: usize =
+    ((KVM_POOL_USABLE_SIZE + L2_ENTRY_BYTES - 1) / L2_ENTRY_BYTES) as usize;
+
+/// Page-table pages the bootstrap pre-allocates: 1 L1 + L2s + L3s.
+/// For 1 GiB usable: 1 + 1 + 512 = 514.
+pub const KVM_BOOTSTRAP_TABLE_PAGES: usize =
+    1 + KVM_L2_TABLES_COUNT + KVM_L3_TABLES_COUNT;
+
+/// Next-power-of-two contiguous block the buddy allocator returns
+/// when asked for `KVM_BOOTSTRAP_TABLE_PAGES`. For 514 → 1024.
+/// The extra pages stay reserved as inert padding for the contiguous
+/// block.
+pub const BOOTSTRAP_CONTIGUOUS_RESERVE: usize =
+    KVM_BOOTSTRAP_TABLE_PAGES.next_power_of_two();
 
 /// Decompose a KVA in the KVM pool into (L0, L1, L2, L3) page-table
 /// indices. Reuses `vmem::page_table_indices` so all 4-level
@@ -118,7 +225,7 @@ impl KvmFreeList {
         }; KVM_MAX_FREE_REGIONS];
         regions[0] = KvmFreeRegion {
             start: KernelVa::new(KVM_POOL_BASE),
-            pages: (KVM_POOL_SIZE / PAGE_SIZE) as usize,
+            pages: (KVM_POOL_USABLE_SIZE / PAGE_SIZE) as usize,
         };
         Self { regions, count: 1 }
     }
@@ -182,7 +289,16 @@ impl KvmFreeList {
         }
         let start_va = start.as_u64();
         let end_va = start_va + (pages as u64) * PAGE_SIZE;
-        if start_va < KVM_POOL_BASE || end_va > KVM_POOL_END {
+        // Bounds-check against the *usable* end, not KVM_POOL_END
+        // (which spans the full VA reservation). Addresses in
+        // `[KVM_POOL_BASE + KVM_POOL_USABLE_SIZE, KVM_POOL_END)` are
+        // inside the L0 carve-out but have no pre-allocated L2/L3
+        // metadata; accepting a free there would let try_alloc later
+        // return a VA whose walker hits an unallocated parent PTE,
+        // re-introducing the V15/V16 runtime metadata growth NK1
+        // eliminated.
+        let usable_end = KVM_POOL_BASE + KVM_POOL_USABLE_SIZE;
+        if start_va < KVM_POOL_BASE || end_va > usable_end {
             return Err(KvmFreeListError::OutOfPool);
         }
 
@@ -728,7 +844,7 @@ mod tests {
         assert_eq!(fl.region_count(), 1);
         let r = fl.region(0).unwrap();
         assert_eq!(r.start.as_u64(), KVM_POOL_BASE);
-        assert_eq!(r.pages, (KVM_POOL_SIZE / PAGE_SIZE) as usize);
+        assert_eq!(r.pages, (KVM_POOL_USABLE_SIZE / PAGE_SIZE) as usize);
     }
 
     #[test]
@@ -738,7 +854,7 @@ mod tests {
         assert_eq!(kva.as_u64(), KVM_POOL_BASE);
         let r = fl.region(0).unwrap();
         assert_eq!(r.start.as_u64(), KVM_POOL_BASE + 33 * PAGE_SIZE);
-        assert_eq!(r.pages, (KVM_POOL_SIZE / PAGE_SIZE) as usize - 33);
+        assert_eq!(r.pages, (KVM_POOL_USABLE_SIZE / PAGE_SIZE) as usize - 33);
     }
 
     #[test]
@@ -777,7 +893,7 @@ mod tests {
         // right — three-way coalesce into one region covering the pool.
         fl.free(b, 1).unwrap();
         assert_eq!(fl.region_count(), 1);
-        assert_eq!(fl.free_pages(), (KVM_POOL_SIZE / PAGE_SIZE) as usize);
+        assert_eq!(fl.free_pages(), (KVM_POOL_USABLE_SIZE / PAGE_SIZE) as usize);
     }
 
     #[test]
@@ -818,7 +934,7 @@ mod tests {
         let r = fl.region(0).unwrap();
         // Remaining region is shifted by exactly 10 pages.
         assert_eq!(r.start.as_u64(), KVM_POOL_BASE + 10 * PAGE_SIZE);
-        assert_eq!(r.pages, (KVM_POOL_SIZE / PAGE_SIZE) as usize - 10);
+        assert_eq!(r.pages, (KVM_POOL_USABLE_SIZE / PAGE_SIZE) as usize - 10);
     }
 
     #[test]
@@ -828,6 +944,22 @@ mod tests {
             fl.free(KernelVa::new(0xFFFF_0000_0000_0000), 1),
             Err(KvmFreeListError::OutOfPool),
         );
+    }
+
+    #[test]
+    fn free_rejects_inside_va_span_but_outside_usable() {
+        // The L0 carve-out reaches KVM_POOL_BASE + KVM_POOL_VA_SPAN
+        // (512 GiB), but only the KVM_POOL_USABLE_SIZE (1 GiB) prefix
+        // has pre-allocated L2/L3 metadata. A free starting at the
+        // first VA past the usable end is "inside the L0 reservation"
+        // by `KVM_POOL_END`'s definition, but the walker would fault
+        // on the missing parent PTE if try_alloc later handed it out.
+        // The bounds check must use the usable end, not the VA-span
+        // end, so a free here returns OutOfPool — locks the contract
+        // that the free list never reaches an unallocated parent.
+        let mut fl = KvmFreeList::new();
+        let past_usable = KernelVa::new(KVM_POOL_BASE + KVM_POOL_USABLE_SIZE);
+        assert_eq!(fl.free(past_usable, 1), Err(KvmFreeListError::OutOfPool));
     }
 
     #[test]
@@ -1052,6 +1184,6 @@ mod tests {
     #[test]
     fn pool_constants_consistent() {
         assert_eq!(KVM_L0_INDEX, ((KVM_POOL_BASE >> 39) & 0x1FF) as usize);
-        assert_eq!(KVM_POOL_END - KVM_POOL_BASE, KVM_POOL_SIZE);
+        assert_eq!(KVM_POOL_END - KVM_POOL_BASE, KVM_POOL_VA_SPAN);
     }
 }

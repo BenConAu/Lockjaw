@@ -152,9 +152,21 @@ with a typed error rather than the kernel growing its own pool.
 | V16 | `src/mm/kvm.rs:407` | same | KVM L3 (allocator metadata) |
 
 The KVM tree itself grows when a caller asks for an L3 it hasn't
-seen before. **Fix shape**: pre-allocate the entire KVM page-table
-tree at bootstrap to cover the full KVM pool, sized once. One-time
-bootstrap cost; eliminates per-`alloc_kernel_pages` growth entirely.
+seen before. **Fix shape**: at bootstrap, pre-allocate the KVM
+page-table tree sized to cover the **working portion** of the KVM
+pool (`KVM_POOL_USABLE_SIZE`), distinct from the L0/L1 carve-out
+(`KVM_POOL_VA_SPAN`). Working-size is driven by a cap-anchored
+formula over `MAX_PAGESETS`, `MAX_THREADS`, and the audited
+per-process kernel-object footprint, with explicit headroom for
+kernel objects not yet enumerated. Pre-allocating the full VA span
+would cost ~1 GiB of metadata — unworkable on Pi 4B; the
+working-pool split is the workable shape. After this,
+`kvm::alloc_kernel_pages` never grows its own metadata at runtime;
+it only walks pre-existing PTEs and binds physical frames.
+
+Delivered in NK1-A (commit reference: post-NK1-A `git log`); the
+walker variants for the unreachable growth path get deleted in
+NK1-B's pure-types cleanup.
 
 ### Already-correct surfaces
 
