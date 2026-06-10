@@ -68,11 +68,13 @@ pub const KVM_L0_INDEX: usize = 256;
 // so the bound is computable, not arbitrary.
 // ---------------------------------------------------------------------------
 
-/// Maximum header-page count for a single PageSet. Encoded by
-/// `header_pages_for` in `lockjaw-types/src/pageset_table.rs` — 33 is
-/// the largest the header table reaches today (1 page per 64 entries
-/// across the 2048-entry maximum allocation).
-pub const MAX_HEADER_PAGES_PER_PAGESET: usize = 33;
+/// Worst-case header pages per PageSet. Re-exported from
+/// `crate::pageset_table` (which derives it as
+/// `header_pages_for(MAX_PRACTICAL_PAGES_PER_SET)`) so this
+/// budget and the pool's `POOL_TOTAL_PAGES` are wired to one
+/// source of truth — no silent drift if the practical cap or
+/// header layout changes.
+pub use crate::pageset_table::MAX_HEADER_PAGES_PER_PAGESET;
 
 /// Per-process worst-case KVM page count: ProcessObject (1) +
 /// HandleTable (1) + L0/L1/L2 page tables (3) + generous L3 pool

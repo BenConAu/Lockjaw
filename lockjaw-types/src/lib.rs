@@ -12,6 +12,7 @@ pub mod ipc_token;
 pub mod kvm;
 pub mod notification_state;
 pub mod object;
+pub mod pageset_header_pool;
 pub mod pageset_table;
 pub mod process;
 pub mod scheduler;

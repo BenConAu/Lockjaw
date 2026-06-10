@@ -165,6 +165,11 @@ pub const fn header_pages_for(count: usize) -> usize {
     (bytes + (PAGE_SIZE as usize) - 1) / (PAGE_SIZE as usize)
 }
 
+/// Worst-case header-page count for any single PageSet, computed
+/// from the practical cap. Single source of truth: `kvm::KVM_BUDGET_PAGESETS`
+/// and `pageset_header_pool::POOL_TOTAL_PAGES` both derive from this.
+pub const MAX_HEADER_PAGES_PER_PAGESET: usize = header_pages_for(MAX_PRACTICAL_PAGES_PER_SET);
+
 impl PageSetHeader {
     /// An empty header — a 24-byte stack value with zero data pages
     /// and `header_pages = 1`. Required `origin` parameter: there is

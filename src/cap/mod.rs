@@ -4,6 +4,7 @@ pub mod process_obj;
 pub mod rights;
 pub mod handle_table;
 pub mod pageset;
+pub mod pageset_header_pool;
 pub mod pageset_table;
 pub mod dma_pool;
 pub mod revoke;

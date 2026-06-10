@@ -200,6 +200,11 @@ pub extern "C" fn kmain() -> ! {
     unsafe {
         mm::kvm::kvm_init();
         mm::kvm::boot_self_test();
+        // NK2-A: pre-allocate the PageSet header pool now that KVM
+        // is live and the self-test has run. Must precede DTB
+        // registration below, which goes through the pool after
+        // NK2-B.
+        cap::pageset_header_pool::init();
     }
 
     // Verify DTB is readable at its higher-half VA (DTB discovered by platform::discover)

@@ -58,6 +58,16 @@ impl SyscallError {
     /// real handlers go live.
     pub const NOT_SUPPORTED: Self = SyscallError(13);
 
+    /// The kernel's pre-allocated PageSet header pool is exhausted
+    /// (`MAX_PAGESETS` slots all claimed), or the PageSet table is
+    /// full. Distinct from `OUT_OF_MEMORY` (the page allocator
+    /// itself) and from `HANDLE_TABLE_FULL` (the caller's handle
+    /// table). Bounded resource: userspace must close PageSet
+    /// handles before retrying. Introduced by NK2 of the
+    /// no-kernel-alloc migration; see
+    /// `docs/architecture/no-kernel-alloc.md`.
+    pub const OUT_OF_PAGE_SETS: Self = SyscallError(14);
+
     /// An unknown or unrecoverable error occurred.
     pub const UNKNOWN: Self = SyscallError(u64::MAX);
 
