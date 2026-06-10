@@ -165,8 +165,10 @@ impl Drop for MappedKvmRangeGuard {
 pub enum KvmError {
     /// Free list could not satisfy the VA request.
     OutOfVirtualMemory,
-    /// `page_alloc::alloc_page` failed for a backing frame or for a
-    /// page-table page (L2/L3) the walker wanted to allocate.
+    /// `page_alloc::alloc_page` failed for a backing frame. After
+    /// NK1 the walker never asks for L2/L3 table pages at runtime
+    /// (those are pre-allocated at `kvm_init`), so this variant
+    /// only surfaces from the WantBacking step.
     OutOfPhysicalFrames,
 }
 
@@ -339,17 +341,16 @@ pub unsafe fn kvm_init() {
 /// On success the returned `OwnedKvmRange` owns:
 /// - the VA reservation in the free list
 /// - the per-page backing frames (PTEs in the KVM tree point at them)
-/// - any L2/L3 page-table pages newly allocated to extend the tree
 ///
-/// On failure (OOM either for VA or for any backing/table frame):
+/// On failure (OOM for VA or for any backing frame):
 /// - the partial PTE writes are torn down via `free_kernel_pages` on
 ///   the partial range — backing frames already allocated are
 ///   returned to the page allocator
 /// - the VA reservation is returned to the free list
-/// - L2/L3 page-table pages allocated mid-walk are NOT reclaimed
-///   (deferred per the plan; bounded waste, doesn't violate
-///   correctness — the tree is consistent, just keeps an empty
-///   sub-tree branch around)
+///
+/// The L2/L3 page-table forest is pre-allocated at `kvm_init` and
+/// owned by the allocator for the kernel's lifetime; no L2/L3
+/// frames are allocated or freed here.
 pub fn alloc_kernel_pages(pages: usize) -> Result<OwnedKvmRange, KvmError> {
     if !ALLOCATOR.initialized.load(Ordering::Acquire) {
         panic!("alloc_kernel_pages before kvm_init");
@@ -430,10 +431,17 @@ pub fn map_existing(page: PhysPage) -> Result<MappedKvmRange, KvmError> {
     let result = drive_map_walk(&mut walk, &mut pages_done, |_| Ok(backing));
 
     if let Err(e) = result {
-        // L2/L3 may have failed to allocate. The caller-supplied
-        // backing was never claimed by us, so rollback only needs to
-        // clear any PTE we wrote (none, since pages_done==0 unless
-        // WritePagePte ran) and return the VA range.
+        // After NK1-B, drive_map_walk's only Err return is from the
+        // next_backing closure. This call site passes a closure that
+        // always returns Ok(backing) — so this branch is functionally
+        // unreachable today; a Faulted walker panics inside
+        // drive_map_walk before ever returning. Kept for the
+        // type-level contract symmetry with alloc_kernel_pages and
+        // to safely handle a future closure that could fail.
+        // The caller-supplied backing was never claimed by us, so
+        // rollback only needs to clear any PTE we wrote (none, since
+        // pages_done==0 unless WritePagePte ran) and return the VA
+        // range.
         if pages_done > 0 {
             // SAFETY: rollback path, but with dealloc_backing=false —
             // the backing came from the caller and isn't ours to free.
@@ -469,41 +477,9 @@ where
                 let raw = unsafe { read_pte(l1_pte_paddr) };
                 walk.step_l1(raw);
             }
-            KvmMapStep::AllocL2 { parent_pte_paddr } => {
-                let l2 = match page_alloc::alloc_page() {
-                    Some(p) => p,
-                    None => return Err(KvmError::OutOfPhysicalFrames),
-                };
-                let l2_paddr = l2.start_addr();
-                page_alloc::zero_page(l2_paddr);
-                let entry = PageTableEntry::new_table(
-                    lockjaw_types::addr::PhysAddr::new(l2_paddr.as_u64()),
-                );
-                unsafe {
-                    write_pte(parent_pte_paddr, entry.raw());
-                    asm!("dsb ish", options(nostack, preserves_flags));
-                }
-                walk.step_l2_allocated(l2_paddr.as_u64());
-            }
             KvmMapStep::ReadL2Pte { l2_pte_paddr } => {
                 let raw = unsafe { read_pte(l2_pte_paddr) };
                 walk.step_l2(raw);
-            }
-            KvmMapStep::AllocL3 { parent_pte_paddr } => {
-                let l3 = match page_alloc::alloc_page() {
-                    Some(p) => p,
-                    None => return Err(KvmError::OutOfPhysicalFrames),
-                };
-                let l3_paddr = l3.start_addr();
-                page_alloc::zero_page(l3_paddr);
-                let entry = PageTableEntry::new_table(
-                    lockjaw_types::addr::PhysAddr::new(l3_paddr.as_u64()),
-                );
-                unsafe {
-                    write_pte(parent_pte_paddr, entry.raw());
-                    asm!("dsb ish", options(nostack, preserves_flags));
-                }
-                walk.step_l3_allocated(l3_paddr.as_u64());
             }
             KvmMapStep::ReadL3Pte { l3_pte_paddr } => {
                 let raw = unsafe { read_pte(l3_pte_paddr) };
@@ -520,11 +496,20 @@ where
             }
             KvmMapStep::Done => return Ok(()),
             KvmMapStep::Fault => {
-                // KvmMapWalk faults are kernel bugs (block descriptor
-                // where a table is expected, or a live L3 entry for a
-                // VA the freelist said was free). Panic loudly rather
-                // than silently corrupt the page tree.
-                panic!("KvmMapWalk fault during map");
+                // KvmMapWalk faults are kernel bugs. Post-NK1 the
+                // dominant cause is a missing parent PTE (bootstrap
+                // undersized the working pool, or the kernel walked
+                // a VA outside KVM_POOL_USABLE_SIZE — KvmFreeList's
+                // bounds check should have prevented the latter).
+                // Other causes: block descriptor where a table is
+                // expected; live L3 entry for a VA the freelist
+                // said was free. Panic loudly rather than silently
+                // corrupt the page tree.
+                panic!(
+                    "KvmMapWalk fault during map (missing parent PTE \
+                     or page-table topology drift — bootstrap \
+                     undersized?)"
+                );
             }
         }
     }
@@ -553,8 +538,10 @@ fn tlbi_range(kva: KernelVa, pages: usize) {
 
 /// Free a previously-allocated KVM range. Tears down the per-page
 /// PTEs (with TLBI), returns each backing frame to the page
-/// allocator, and returns the VA range to the free list. L2/L3
-/// page-table pages are not reclaimed in v1 (see module docs).
+/// allocator, and returns the VA range to the free list. The L2/L3
+/// page-table pages stay owned by the allocator for the kernel's
+/// lifetime (pre-allocated at `kvm_init`); free only touches L3
+/// PTE writes + TLBI + backing-frame dealloc + free-list return.
 ///
 /// # Safety
 /// `range` must come from a prior `alloc_kernel_pages` and must not

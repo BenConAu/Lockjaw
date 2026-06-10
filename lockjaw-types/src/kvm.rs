@@ -18,7 +18,11 @@
 //!
 //! The kernel side (`src/mm/kvm.rs`) holds the singleton, performs
 //! the raw PTE reads/writes and TLB invalidations, and calls
-//! `page_alloc::alloc_page` for backing frames and page-table pages.
+//! `page_alloc::alloc_page` for backing frames. The L1/L2/L3
+//! page-table tree itself is pre-allocated at `kvm_init` and never
+//! grown at runtime, so the walker has no "allocate a fresh table"
+//! step — a missing parent PTE post-init signals a kernel bug
+//! (`Faulted`), not a normal path.
 
 use crate::addr::{KernelVa, PhysAddr, PAGE_SIZE};
 use crate::page_table::{
@@ -416,15 +420,8 @@ pub enum KvmMapStep {
     /// via `step_l1`. The kernel obtains the L1 table paddr from
     /// `KERNEL_L0[KVM_L0_INDEX]` (set up once at `kvm_init`).
     ReadL1Pte { l1_pte_paddr: PhysAddr },
-    /// L2 table is missing here — allocate a fresh page-table page,
-    /// install it as a table descriptor at `parent_pte_paddr`, and
-    /// then call `step_l2_allocated` with the new L2's paddr.
-    AllocL2 { parent_pte_paddr: PhysAddr },
     /// Read the L2 PTE at this physical address; feed via `step_l2`.
     ReadL2Pte { l2_pte_paddr: PhysAddr },
-    /// L3 table is missing here — allocate a page-table page, install
-    /// it at `parent_pte_paddr`, and call `step_l3_allocated`.
-    AllocL3 { parent_pte_paddr: PhysAddr },
     /// Read the target L3 PTE so the walker can verify the slot is
     /// invalid before writing — symmetric with `KvmFreeWalk`'s L3
     /// read. Without this check the allocator would trust the
@@ -444,11 +441,14 @@ pub enum KvmMapStep {
     WritePagePte { pte_paddr: PhysAddr, entry: PageTableEntry },
     /// All pages in the range have been mapped.
     Done,
-    /// An invariant was violated. Possible causes: an L1/L2 entry
-    /// exists but is a block descriptor (not a table); the target
-    /// L3 slot is already valid (alloc would overwrite a live
-    /// mapping — freelist/page-table drift). Surfaces as a kernel
-    /// bug.
+    /// An invariant was violated. Possible causes: an L1/L2 PTE is
+    /// missing or is a block descriptor (post-NK1 the page-table
+    /// tree is fully pre-allocated at `kvm_init`, so a missing
+    /// parent here is a kernel bug — bootstrap undersized the pool
+    /// or the kernel walked a VA outside the working pool); the
+    /// target L3 slot is already valid (alloc would overwrite a
+    /// live mapping — freelist/page-table drift). Surfaces as a
+    /// kernel bug.
     Fault,
 }
 
@@ -474,15 +474,8 @@ pub struct KvmMapWalk {
 enum PageState {
     /// About to read L1 PTE for the current page.
     NeedL1,
-    /// L1 entry was empty — kernel must allocate a fresh L2 table,
-    /// then call `step_l2_allocated`.
-    NeedAllocL2,
-    /// L1 has been resolved (existing or freshly allocated); about
-    /// to read L2 PTE.
+    /// L1 has been resolved; about to read L2 PTE.
     NeedL2,
-    /// L2 entry was empty — kernel must allocate a fresh L3 table,
-    /// then call `step_l3_allocated`.
-    NeedAllocL3,
     /// L2 has been resolved; about to read the target L3 PTE to
     /// verify the slot is invalid (must be unmapped before alloc
     /// writes a new entry there).
@@ -527,14 +520,8 @@ impl KvmMapWalk {
             PageState::NeedL1 => KvmMapStep::ReadL1Pte {
                 l1_pte_paddr: PhysAddr::new(self.l1_paddr + (l1 as u64) * 8),
             },
-            PageState::NeedAllocL2 => KvmMapStep::AllocL2 {
-                parent_pte_paddr: PhysAddr::new(self.l1_paddr + (l1 as u64) * 8),
-            },
             PageState::NeedL2 => KvmMapStep::ReadL2Pte {
                 l2_pte_paddr: PhysAddr::new(self.l2_paddr + (l2 as u64) * 8),
-            },
-            PageState::NeedAllocL3 => KvmMapStep::AllocL3 {
-                parent_pte_paddr: PhysAddr::new(self.l2_paddr + (l2 as u64) * 8),
             },
             PageState::NeedL3 => KvmMapStep::ReadL3Pte {
                 l3_pte_paddr: PhysAddr::new(self.l3_paddr + (l3 as u64) * 8),
@@ -557,17 +544,16 @@ impl KvmMapWalk {
         }
     }
 
-    /// Feed the L1 PTE the kernel just read. State becomes
-    /// `NeedAllocL2` if the entry is empty, `NeedL2` if it's a
-    /// table, or `Faulted` if it's a block descriptor.
+    /// Feed the L1 PTE the kernel just read. State becomes `NeedL2`
+    /// if the entry is a valid table descriptor, or `Faulted`
+    /// otherwise. Post-NK1 every L1 entry inside the working pool
+    /// is pre-populated at `kvm_init`, so reaching `Faulted` here
+    /// signals a kernel bug (bootstrap undersized, or the walker
+    /// was started on a VA outside the working pool).
     pub fn step_l1(&mut self, pte_raw: u64) {
         debug_assert!(self.state == PageState::NeedL1);
         let pte = PageTableEntry::from_raw(pte_raw);
-        if !pte.is_valid() {
-            self.state = PageState::NeedAllocL2;
-            return;
-        }
-        if !pte.is_table() {
+        if !pte.is_valid() || !pte.is_table() {
             self.state = PageState::Faulted;
             return;
         }
@@ -575,39 +561,16 @@ impl KvmMapWalk {
         self.state = PageState::NeedL2;
     }
 
-    /// The kernel has allocated and installed a fresh L2 table at
-    /// the L1 slot. Walker advances to reading the L2 PTE (which
-    /// will return 0 for a freshly-zeroed table → AllocL3 next).
-    pub fn step_l2_allocated(&mut self, l2_paddr: u64) {
-        debug_assert!(self.state == PageState::NeedAllocL2);
-        self.l2_paddr = l2_paddr;
-        self.state = PageState::NeedL2;
-    }
-
-    /// Feed the L2 PTE the kernel just read.
+    /// Feed the L2 PTE the kernel just read. Same shape as
+    /// `step_l1` — Faulted on missing/non-table parent.
     pub fn step_l2(&mut self, pte_raw: u64) {
         debug_assert!(self.state == PageState::NeedL2);
         let pte = PageTableEntry::from_raw(pte_raw);
-        if !pte.is_valid() {
-            self.state = PageState::NeedAllocL3;
-            return;
-        }
-        if !pte.is_table() {
+        if !pte.is_valid() || !pte.is_table() {
             self.state = PageState::Faulted;
             return;
         }
         self.l3_paddr = pte.output_addr().as_u64();
-        self.state = PageState::NeedL3;
-    }
-
-    /// The kernel has allocated and installed a fresh L3 table at
-    /// the L2 slot. Walker still reads the target L3 PTE for
-    /// symmetry with the existing-table path (the read will
-    /// return 0 for a fresh-and-zeroed table, matching the
-    /// invariant).
-    pub fn step_l3_allocated(&mut self, l3_paddr: u64) {
-        debug_assert!(self.state == PageState::NeedAllocL3);
-        self.l3_paddr = l3_paddr;
         self.state = PageState::NeedL3;
     }
 
@@ -1000,43 +963,27 @@ mod tests {
     }
 
     #[test]
-    fn map_walk_single_page_into_empty_l1_allocs_l2_and_l3() {
+    fn map_walk_fault_on_missing_l1_parent() {
+        // Post-NK1 the L1 table is fully pre-populated at kvm_init
+        // for every entry covering the working pool. A walker that
+        // reads an empty L1 PTE here indicates either a kernel bug
+        // (bootstrap undersized) or the walker was started on a VA
+        // outside the working pool — either way, Fault, not grow.
         let l1_paddr = 0xAAAA_0000;
         let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 1, l1_paddr);
-        // First step: read the L1 PTE. Index = (KVM_POOL_BASE >> 30) & 0x1FF.
-        let (_l0, l1, _l2, _l3) = kvm_pool_indices(KernelVa::new(KVM_POOL_BASE));
-        assert_eq!(
-            walk.current_step(),
-            KvmMapStep::ReadL1Pte { l1_pte_paddr: PhysAddr::new(l1_paddr + (l1 as u64) * 8) },
-        );
-        // L1 entry is empty → next step is AllocL2.
         walk.step_l1(0);
-        assert!(matches!(walk.current_step(), KvmMapStep::AllocL2 { .. }));
-        // Kernel allocates an L2 page at 0xBBBB_0000.
-        walk.step_l2_allocated(0xBBBB_0000);
-        assert!(matches!(walk.current_step(), KvmMapStep::ReadL2Pte { .. }));
-        // L2 entry empty → AllocL3.
+        assert_eq!(walk.current_step(), KvmMapStep::Fault);
+    }
+
+    #[test]
+    fn map_walk_fault_on_missing_l2_parent() {
+        // Same shape as the L1 case, one level down.
+        let mut walk = KvmMapWalk::start(KernelVa::new(KVM_POOL_BASE), 1, 0xAAAA_0000);
+        // Populated L1 (table descriptor) so we reach NeedL2.
+        walk.step_l1(PageTableEntry::new_table(PhysAddr::new(0xBBBB_0000)).raw());
+        // Empty L2 → Fault.
         walk.step_l2(0);
-        assert!(matches!(walk.current_step(), KvmMapStep::AllocL3 { .. }));
-        // Kernel allocates an L3 page → walker reads the target L3 PTE.
-        walk.step_l3_allocated(0xCCCC_0000);
-        assert!(matches!(walk.current_step(), KvmMapStep::ReadL3Pte { .. }));
-        // L3 PTE is zero (fresh table) → walker requests backing.
-        walk.step_l3(0);
-        assert_eq!(walk.current_step(), KvmMapStep::WantBacking);
-        // Kernel supplies a backing paddr; walker emits WritePagePte.
-        walk.supply_backing(PhysAddr::new(0x4020_0000));
-        let pte = match walk.current_step() {
-            KvmMapStep::WritePagePte { pte_paddr, entry } => {
-                assert_eq!(pte_paddr.as_u64(), 0xCCCC_0000); // L3 index = 0
-                entry
-            }
-            other => panic!("expected WritePagePte, got {:?}", other),
-        };
-        assert!(pte.is_uxn() && pte.is_pxn() && pte.ap() == AP_RW_EL1);
-        assert_eq!(pte.output_addr().as_u64(), 0x4020_0000);
-        walk.step_pte_written();
-        assert_eq!(walk.current_step(), KvmMapStep::Done);
+        assert_eq!(walk.current_step(), KvmMapStep::Fault);
     }
 
     #[test]
