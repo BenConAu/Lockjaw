@@ -142,12 +142,25 @@ pub extern "C" fn _start() -> ! {
     }
     let child_stack_top = child_stack_va + 4096;
 
+    // NK3: sys_create_thread takes two donated PageSet handles
+    // for the kernel stack and TCB. Allocate both as 1-page
+    // Buddy-origin PageSets — kernel consumes them on success.
+    let kstack_ps = match sys_alloc_pages(1) {
+        Ok(h) => h,
+        Err(_) => { puts("neon-canary: kstack alloc FAILED\n"); sys_exit(); }
+    };
+    let tcb_ps = match sys_alloc_pages(1) {
+        Ok(h) => h,
+        Err(_) => { puts("neon-canary: tcb alloc FAILED\n"); sys_exit(); }
+    };
+
     // --- Spawn child thread (becomes thread_id = 1) ---
     if sys_create_thread(
         child_entry as *const () as u64,
         child_stack_top,
         child_stack_va,
         /* arg = */ 1,
+        kstack_ps, tcb_ps,
     ).is_err() {
         puts("neon-canary: spawn child FAILED\n"); sys_exit();
     }

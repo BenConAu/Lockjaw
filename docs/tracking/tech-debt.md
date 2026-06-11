@@ -42,23 +42,33 @@ Known limitations introduced for bootstrapping. Each item documents what we did,
 
 ## Kernel-side allocation in process creation (violates microkernel principle)
 
-**Where:** `src/process.rs::provision_resources` (4 sites: `proc_range`, `ht_range`, `tcb_stack_range`, `tcb_range`); `src/syscall/handler.rs::sys_create_thread` (2 sites: `stack_range`, `tcb_range`); `src/arch/aarch64/vmem.rs::AddressSpaceBuilder::new` + `map_batch` (page-table internal nodes).
+**Status (post-NK3, 2026-06-10):** PageSet-header allocation closed by
+NK2-A/NK2-B (bootstrap-allocated pool). `sys_create_thread`
+TCB+stack allocation closed by NK3 (donate-and-claim). The KVM
+page-table tree's own L2/L3 growth closed by NK1. **Remaining
+runtime `kvm::alloc_kernel_pages` / `page_alloc::alloc_page`
+callers:** `src/process.rs::provision_resources` (4 sites:
+`proc_range`, `ht_range`, `tcb_stack_range`, `tcb_range`) plus
+`src/arch/aarch64/vmem.rs::AddressSpaceBuilder::new` + `map_batch`
+for per-process page-table internal nodes. NK4+NK5 close these per
+the migration plan at `docs/architecture/no-kernel-alloc.md`.
 
-**What:** `sys_create_process` and `sys_create_thread` allocate kernel-side pages internally via `kvm::alloc_kernel_pages` and `page_alloc::alloc_page`. Every alloc point is a potential `OUT_OF_MEMORY` syscall return that complicates error paths and weakens the type-level "kernel cannot fail from memory" invariant.
+**Where:** `src/process.rs::provision_resources` (4 sites: `proc_range`, `ht_range`, `tcb_stack_range`, `tcb_range`); `src/arch/aarch64/vmem.rs::AddressSpaceBuilder::new` + `map_batch` (page-table internal nodes).
 
-The endpoint/notification/reply syscalls already follow the seL4-style "user donates a page, kernel transmutes it in place" pattern (`kvm::map_existing` rather than `kvm::alloc_kernel_pages`). Process creation deviates: ProcessObject, HandleTable, TCB, and the per-thread kernel stack are all kernel-allocated rather than user-donated.
+**What:** `sys_create_process` allocates kernel-side pages internally via `kvm::alloc_kernel_pages` and `page_alloc::alloc_page`. Every alloc point is a potential `OUT_OF_MEMORY` syscall return that complicates error paths and weakens the type-level "kernel cannot fail from memory" invariant.
+
+The endpoint/notification/reply/thread-creation syscalls now follow the seL4-style "user donates a page, kernel transmutes it in place" pattern (`kvm::map_existing` via `donate_one_kernel_page` rather than `kvm::alloc_kernel_pages`). Process creation deviates: ProcessObject, HandleTable, TCB, and the per-thread kernel stack are all kernel-allocated rather than user-donated.
 
 **Why bootstrap:** Adding more PageSet arguments to `sys_create_process` was deferred — userspace would need to allocate 4 additional pages and donate them before each spawn, which the early-bootstrap init code wasn't yet ready to do.
 
 **Categories with their fix paths:**
 
-- *ProcessObject / HandleTable storage / TCB / kernel stack* — all donate-able. Should follow the endpoint pattern: spawn syscall takes additional PageSet handles, kernel calls `kvm::map_existing` per donated page. Removes 4–6 OOM sites with no architectural cost beyond a wider syscall signature.
-- *Page-table internal nodes (L1/L2/L3 inside `AddressSpaceBuilder`)* — genuinely harder. seL4's strict model has userspace explicitly insert each page-table level via separate caps (verbose). The pragmatic compromise everyone takes is kernel-on-demand allocation. Could move to a per-process pre-allocated "page-table pool" (user donates N pages at spawn, kernel carves from them) — same shape as the run-queue fix above.
-- *PageSet header (`src/cap/pageset_table.rs::alloc_and_insert_header`)* — kernel-side allocation of the metadata page that tracks user-donated pages. Self-referential (can't be donated as part of the same PageSet it would track). Could take an extra PageSet for the header, or carve the header out of the donated data range.
+- *ProcessObject / HandleTable storage / TCB / kernel stack* — all donate-able. NK4 follows the `sys_create_thread` pattern just landed: spawn syscall takes additional PageSet handles, kernel calls `donate_one_kernel_page` per donated page. Removes 4 OOM sites with no architectural cost beyond a wider syscall signature.
+- *Page-table internal nodes (L1/L2/L3 inside `AddressSpaceBuilder`)* — genuinely harder. seL4's strict model has userspace explicitly insert each page-table level via separate caps (verbose). The pragmatic compromise everyone takes is kernel-on-demand allocation. NK5 takes a per-process pre-allocated "page-table pool" (user donates N pages at spawn, kernel carves from them) — same shape as the run-queue fix above.
 
-**Fix order:** ProcessObject and TCB first (lowest friction, removes the most-frequently-hit OOM sites). Then HandleTable and kernel stack. Then page-table pools. The donate-pattern syscalls are easier to add than the page-table case because the user already allocates the per-thread user stack PageSet — adding 4 more PageSet args is mechanical.
+**Fix order (per NK plan):** NK4 = ProcessObject + HandleTable + TCB + kernel stack via donate-and-claim. NK5 = per-process page-table pool. NK6 = `BootstrapAllocator`/`RuntimeAllocator` typestate refactor (Mechanism A from the architecture doc). The donate-pattern syscalls are easier to add than the page-table case because the user already allocates the per-thread user stack PageSet — adding 4 more PageSet args is mechanical.
 
-**Why this is a real violation, not just style:** every kernel alloc site is a runtime failure that needs error handling, type-level OOM in syscall returns, and rollback code on the failure path. The endpoint/notification/reply syscalls have zero of these because they don't allocate. Closing the remaining sites would shrink the kernel's failure surface meaningfully and make `OUT_OF_MEMORY` rare enough to treat as a hard invariant rather than a routine return.
+**Why this is a real violation, not just style:** every kernel alloc site is a runtime failure that needs error handling, type-level OOM in syscall returns, and rollback code on the failure path. The endpoint/notification/reply/thread-creation syscalls have zero of these because they don't allocate. Closing the remaining sites would shrink the kernel's failure surface meaningfully and make `OUT_OF_MEMORY` rare enough to treat as a hard invariant rather than a routine return.
 
 ---
 
@@ -191,9 +201,16 @@ The endpoint/notification/reply syscalls already follow the seL4-style "user don
 
 ## Audit: drop guards for resource cleanup
 
-**Where:** `src/syscall/handler.rs` (sys_create_thread), and any kernel path that allocates multiple resources and rolls back manually on failure.
+**Status (post-NK3, 2026-06-10):** `sys_create_thread`'s manual
+rollback is gone — donate-and-claim + `MappedKvmRangeGuard` (inside
+`donate_one_kernel_page`) + scheduler `has_room()` preflight
+replaced it. The remaining manual-rollback paths are in
+`src/process.rs` (process creation) and will be cleaned up by
+NK4+NK5 as those phases migrate to donate-and-claim.
 
-**What:** The `HeaderPageGuard` pattern in `src/cap/pageset_table.rs` is the model: RAII guards that free resources on drop unless explicitly taken. `create_process` now uses `PageGuard` + `Ttbr0Guard` bundled into a `ProvisionedResources` struct returned by `provision_resources`; the orchestrator defuses each guard explicitly before handing the addresses off to apply. The pattern still needs to spread to other manual-rollback paths — most visibly `sys_create_thread` in `src/syscall/handler.rs` (around line 757) where TCB and stack pages are deallocated by hand on error.
+**Where:** Any kernel path that allocates multiple resources and rolls back manually on failure. After NK3, the prominent remaining example is `src/process.rs` (process creation), where ProcessObject / HandleTable / TCB / stack allocations are still rolled back by hand.
+
+**What:** The `HeaderPageGuard` pattern in `src/cap/pageset_table.rs` is the model: RAII guards that free resources on drop unless explicitly taken. `create_process` uses `PageGuard` + `Ttbr0Guard` bundled into a `ProvisionedResources` struct returned by `provision_resources`; the orchestrator defuses each guard explicitly before handing the addresses off to apply. NK3's `donate_one_kernel_page` uses `MappedKvmRangeGuard` to recover the KVA range on init-failure paths.
 
 **Fix:** Continue applying the guard pattern to remaining manual-rollback paths. Each new fallible allocation chain should reach for guards by default; multi-resource allocations should bundle them in a struct so future additions force an explicit defuse step.
 

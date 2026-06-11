@@ -119,11 +119,43 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
 /// VA range to the KVM free list (the donated physical frame still
 /// leaks in that path — same as the pre-migration leak when no
 /// destroy path exists; tracked in `docs/tracking/tech-debt.md`).
-fn create_kernel_object_kvm(
+/// Donate a single Buddy-origin PageSet's data page as a
+/// kernel-internal page, returning the KVA where it's now mapped.
+///
+/// Implements the full validate→apply contract:
+/// 1. Validate the PageSet handle (lookup, WRITE rights, type).
+/// 2. Validate the donation (Buddy origin, 1-page count).
+/// 3. consume_pageset_validate (precondition for apply).
+/// 4. Reserve the KVA via `map_existing` (PTE writes only).
+/// 5. Run `init_fn(ObjectInitPage, KernelVa)` to write the new
+///    object's bytes — this is the LAST fallible step that the
+///    caller can recover from.
+/// 6. `consume_pageset_apply` (irreversible: revokes cross-process
+///    handles, frees the PageSet header). Runs ONLY if init_fn
+///    returns Ok.
+///
+/// On `init_fn` failure, the PageSet is NOT consumed (caller still
+/// owns the handle, the page bytes are unchanged); the KVA mapping
+/// is recovered by `MappedKvmRangeGuard` on Drop.
+///
+/// Used by:
+/// - `create_kernel_object_kvm` (NK0-era; wraps this with
+///   handle-table insert for endpoint/notification/reply)
+/// - `sys_create_thread` (NK3; called twice — once for the stack
+///   page with a no-op init_fn, once for the TCB page with a
+///   `create_tcb` init_fn)
+///
+/// The init-before-consume ordering is load-bearing for NK3's
+/// case-3 failure mode: if TCB init fails after the stack PageSet
+/// is consumed, the caller has lost the stack but retains the TCB
+/// PageSet (init_fn ran before consume_pageset_apply).
+fn donate_one_kernel_page(
     ps_handle: u32,
-    make_kind: fn(lockjaw_types::addr::KernelVa) -> lockjaw_types::object::HandleKind,
-    init_fn: fn(crate::mm::addr::ObjectInitPage) -> Result<(), crate::cap::object::CreateError>,
-) -> Result<u64, SyscallError> {
+    init_fn: impl FnOnce(
+        crate::mm::addr::ObjectInitPage,
+        lockjaw_types::addr::KernelVa,
+    ) -> Result<(), crate::cap::object::CreateError>,
+) -> Result<lockjaw_types::addr::KernelVa, SyscallError> {
     let ht = CurrentThread::handle_table();
     // Require WRITE rights — destructive operation that consumes the PageSet.
     let entry = ht.lookup(ps_handle, Rights::from_bits(RIGHT_WRITE), ObjectType::PageSet)?;
@@ -179,46 +211,70 @@ fn create_kernel_object_kvm(
     }
 
     // Reserve the KVA mapping for the donated frame. PTE writes only —
-    // does not touch the frame's contents. If this fails, the caller
-    // still holds their PageSet handle and the page bytes are
-    // unchanged.
+    // does not touch the frame's contents.
     let mapped = crate::mm::kvm::map_existing(crate::mm::addr::PhysPage::containing(
         PhysAddr::new(page_paddr),
     )).map_err(|_| SyscallError::OUT_OF_MEMORY)?;
     let mut guard = crate::mm::kvm::MappedKvmRangeGuard::new(mapped);
+    let kva = guard.kva();
 
-    // Init writes the new object's bytes through the linear map; the
-    // same bytes are visible through the KVA reserved above. This is
-    // the first destructive step on the caller's frame, but the only
-    // remaining work is consume_pageset_apply (infallible) and
-    // ht.insert (residual fallible — leaks the donated frame on the
-    // failure path same as before, but the KVA range is recovered by
-    // the guard's Drop).
-    if init_fn(init_page).is_err() {
+    // Init writes the new object's bytes through the linear map and/or
+    // KVA. This is the LAST fallible step before the irreversible
+    // boundary — if it fails, consume_pageset_apply does NOT run, so
+    // the caller still owns the PageSet handle.
+    if init_fn(init_page, kva).is_err() {
         return Err(SyscallError::UNKNOWN);
     }
 
-    // -- Apply phase: every step here must be infallible (or its
-    //    failure must leave a self-cleaning footprint). --
+    // -- Apply phase: irreversible. --
 
     // Phase 2: revoke every cross-process handle, clear PTEs,
     // dec refcount/map_count, unlink and free the header.
     // Cannot fail under the validate→apply contract.
     crate::cap::pageset_table::consume_pageset_apply(header_kva);
 
-    let kva = guard.kva();
+    // Transfer KVA ownership to the caller (success path).
+    guard.take();
+    Ok(kva)
+}
+
+/// Wraps `donate_one_kernel_page` with handle-table insertion for
+/// the canonical "donate one page → create one kernel object →
+/// return a handle to userspace" path used by
+/// `sys_create_endpoint` / `sys_create_notification` /
+/// `sys_create_reply`.
+///
+/// `init_fn` runs through the linear map (via `ObjectInitPage`),
+/// matching the existing factory contract; the KVA returned by the
+/// donate helper is then packaged into `HandleKind` via `make_kind`
+/// and inserted into the caller's handle table.
+fn create_kernel_object_kvm(
+    ps_handle: u32,
+    make_kind: fn(lockjaw_types::addr::KernelVa) -> lockjaw_types::object::HandleKind,
+    init_fn: fn(crate::mm::addr::ObjectInitPage) -> Result<(), crate::cap::object::CreateError>,
+) -> Result<u64, SyscallError> {
+    let kva = donate_one_kernel_page(ps_handle, |init_page, _kva| init_fn(init_page))?;
+
+    // ht.insert is the one residual fallible step after the
+    // irreversible boundary. On failure the donated frame leaks
+    // (no destroy path for kernel-object-backing frames yet), but
+    // the KVA range is recovered when we drop ownership — except
+    // we already took ownership above. Free it explicitly here.
+    let ht = CurrentThread::handle_table();
     match ht.insert(Rights::from_bits(RIGHT_READ | RIGHT_WRITE), make_kind(kva)) {
-        Ok(h) => {
-            // Success: transfer KVA ownership to the handle.
-            guard.take();
-            Ok(h as u64)
-        }
+        Ok(h) => Ok(h as u64),
         Err(e) => {
-            // ht.insert is the one residual fallible step after the
-            // irreversible boundary — pre-migration this leaked the
-            // donated page (no destroy path). Now the donated frame
-            // still leaks, but the guard's Drop returns the KVA to
-            // the KVM free list so the VA pool doesn't bleed.
+            // Recover the KVA range; the donated physical frame is
+            // not recovered (it's now kernel-owned and there's no
+            // destroy path yet — same pre-NK3 leak behaviour).
+            // SAFETY: kva came from a successful map_existing inside
+            // donate_one_kernel_page; the caller holds no references.
+            unsafe {
+                crate::mm::kvm::unmap_existing(crate::mm::kvm::MappedKvmRange {
+                    kva,
+                    pages: 1,
+                });
+            }
             Err(e)
         }
     }
@@ -1111,20 +1167,42 @@ fn sys_query_pageset_phys(ctx: &mut ExceptionContext) -> Result<u64, SyscallErro
         .ok_or(SyscallError::INVALID_PARAMETER)
 }
 
-/// sys_create_thread(entry, stack_top, stack_base, arg) — create a new thread
-/// in the calling process. The new thread shares the caller's address space
-/// and handle table. Starts at `entry` with SP=stack_top and x0=arg.
+/// sys_create_thread(entry, stack_top, stack_base, arg, stack_ps, tcb_ps) —
+/// create a new thread in the calling process via donate-and-claim
+/// (NK3). The new thread shares the caller's address space and handle
+/// table. Starts at `entry` with SP=stack_top and x0=arg.
 ///
 /// x0 = user entry point VA, x1 = stack top VA (16-byte aligned),
-/// x2 = stack base VA (< stack_top), x3 = argument (passed in x0).
+/// x2 = stack base VA (< stack_top), x3 = argument (passed in x0 to child),
+/// x4 = kernel stack PageSet handle (donated 1-page Buddy-origin),
+/// x5 = TCB PageSet handle           (donated 1-page Buddy-origin).
 ///
 /// Kernel policy: VA range is validated (must be in user range), but mapping
 /// existence is NOT checked. A thread with unmapped entry/stack faults at EL0.
+///
+/// **Failure modes**:
+/// - INVALID_PARAMETER: entry/stack VAs out of user range, or stack
+///   misaligned.
+/// - QUEUE_FULL: scheduler slot table is full. Detected via
+///   `scheduler::has_room()` BEFORE any PageSet donation — both
+///   PageSets remain caller-owned.
+/// - INVALID_HANDLE / INVALID_PARAMETER from the donate helpers if
+///   either PageSet handle is bad (wrong type, wrong origin, wrong
+///   page count). If the stack PageSet validates ok but the TCB
+///   PageSet fails validate, the stack PageSet is permanently
+///   kernel-consumed (one-way) — the TCB PageSet remains
+///   caller-owned. The plan's case-2 asymmetric loss.
+/// - UNKNOWN if TCB init (`tcb::create_tcb`) returns an error. By
+///   the init-before-consume contract, the TCB PageSet is NOT
+///   consumed in this case — but the stack PageSet still is
+///   (case-3 asymmetric loss).
 fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
     let entry_point = ctx.gpr[0];
     let stack_top = ctx.gpr[1];
     let stack_base = ctx.gpr[2];
     let user_arg = ctx.gpr[3];
+    let stack_ps_handle = ctx.gpr[4] as u32;
+    let tcb_ps_handle = ctx.gpr[5] as u32;
 
     // Validate VAs are in user range
     const USER_VA_END: u64 = lockjaw_types::constants::USER_VA_END;
@@ -1141,61 +1219,61 @@ fn sys_create_thread(ctx: &mut ExceptionContext) -> SyscallError {
     // Get caller's process (returns the KVA of its ProcessObject).
     let process_kva = crate::sched::current::CurrentThread::process_kva();
 
-    // Allocate kernel stack + TCB page — both live in the KVM pool.
-    let stack_range = match crate::mm::kvm::alloc_kernel_pages(1) {
-        Ok(r) => r,
-        Err(_) => return SyscallError::OUT_OF_MEMORY,
-    };
-    let stack_kva = stack_range.kva;
-    let tcb_range = match crate::mm::kvm::alloc_kernel_pages(1) {
-        Ok(r) => r,
-        Err(_) => {
-            // SAFETY: stack_range is the one we just allocated.
-            unsafe { crate::mm::kvm::free_kernel_pages(stack_range); }
-            return SyscallError::OUT_OF_MEMORY;
-        }
-    };
-    let tcb_kva = tcb_range.kva;
-
-    // Create TCB — reuses process_entry which reads TTBR0 from the
-    // shared ProcessObject and drops to EL0.
-    unsafe {
-        if crate::sched::tcb::create_tcb(
-            &crate::sched::tcb::TcbCreateInfo {
-                entry: crate::process::process_entry,
-                stack: lockjaw_types::thread::KernelStackBase::Pool(stack_kva),
-                process_kva,
-                user_entry_point: entry_point,
-                user_stack_top: stack_top,
-                user_stack_base: stack_base,
-                user_arg,
-                name: *b"thread\0\0\0\0\0\0\0\0\0\0",
-            },
-            tcb_kva,
-        ).is_err() {
-            crate::mm::kvm::free_kernel_pages(tcb_range);
-            crate::mm::kvm::free_kernel_pages(stack_range);
-            return SyscallError::UNKNOWN;
-        }
+    // Preflight: scheduler must have room BEFORE any donate. Under
+    // GKL this answer is stable for the remainder of this syscall
+    // (no concurrent mutation possible). Mirrors
+    // sys_create_process's preflight at src/process.rs:190.
+    if !scheduler::has_room() {
+        return SyscallError::QUEUE_FULL;
     }
 
-    // Increment process thread count
+    // Donate the kernel-stack page (Buddy-origin 1-page PageSet).
+    // Stack init is a no-op — the page just becomes thread stack
+    // memory; create_tcb writes the canary + thread_entry bootstrap
+    // through stack_kva below.
+    let stack_kva = match donate_one_kernel_page(stack_ps_handle, |_, _| Ok(())) {
+        Ok(kva) => kva,
+        Err(e) => return e,
+    };
+
+    // Donate the TCB page. The init closure writes the Tcb struct
+    // in place via the freshly-mapped TCB KVA AND uses the stack_kva
+    // captured above. Per the init-before-consume contract: if
+    // create_tcb fails, the TCB PageSet is NOT consumed (caller
+    // retains it); the stack PageSet was already consumed by the
+    // first donate (case-3 asymmetric loss).
+    let info = crate::sched::tcb::TcbCreateInfo {
+        entry: crate::process::process_entry,
+        stack: lockjaw_types::thread::KernelStackBase::Pool(stack_kva),
+        process_kva,
+        user_entry_point: entry_point,
+        user_stack_top: stack_top,
+        user_stack_base: stack_base,
+        user_arg,
+        name: *b"thread\0\0\0\0\0\0\0\0\0\0",
+    };
+    let tcb_kva = match donate_one_kernel_page(tcb_ps_handle, |_, kva| {
+        // SAFETY: kva is the freshly-mapped KVA of the donated TCB
+        // page; the donate helper guarantees exclusive access.
+        unsafe { crate::sched::tcb::create_tcb(&info, kva) }
+    }) {
+        Ok(kva) => kva,
+        Err(e) => return e,
+    };
+
+    // Increment process thread count.
     crate::cap::process_obj::process_inc_thread_count(process_kva);
 
-    // Register with scheduler
+    // Register with scheduler. After the has_room preflight, this
+    // is an invariant — failure is a kernel bug, not a recoverable
+    // condition. Panic with a descriptive message rather than try
+    // to roll back (the donated pages are kernel-owned now and
+    // cannot be returned to the caller).
     if !scheduler::add_thread(tcb_kva) {
-        // Rollback: dealloc pages, then dec thread count.
-        // Invariant: caller is still alive, so dec cannot return LastThread.
-        // SAFETY: tcb_range / stack_range are the ones we just allocated;
-        // no live refs.
-        unsafe {
-            crate::mm::kvm::free_kernel_pages(tcb_range);
-            crate::mm::kvm::free_kernel_pages(stack_range);
-        }
-        crate::cap::process_obj::process_dec_thread_count(process_kva);
-        // Scheduler slot table exhausted — distinct from physical
-        // OOM. Same fix as sys_create_process's SchedulerFull path.
-        return SyscallError::QUEUE_FULL;
+        panic!(
+            "scheduler::add_thread failed after has_room preflight — \
+             invariant violation in sys_create_thread"
+        );
     }
 
     SyscallError::OK

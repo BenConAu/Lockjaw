@@ -552,10 +552,29 @@ pub fn sys_query_pageset_phys(ps: PageSetHandle, page_index: u64) -> Result<u64,
     if err == 0 { Ok(val) } else { Err(SyscallError(err)) }
 }
 
-/// Create a new thread in the calling process. The thread shares the
-/// caller's address space and handle table. Starts at `entry` with
-/// SP=stack_top and x0=arg.
-pub fn sys_create_thread(entry: u64, stack_top: u64, stack_base: u64, arg: u64) -> Result<(), SyscallError> {
+/// Create a new thread in the calling process via donate-and-claim
+/// (NK3). The thread shares the caller's address space and handle
+/// table. Starts at `entry` with SP=stack_top and x0=arg.
+///
+/// Caller MUST pre-allocate two 1-page Buddy-origin PageSets via
+/// `sys_alloc_pages(1)` and pass their handles as `stack_ps` (for
+/// the new thread's kernel stack) and `tcb_ps` (for its TCB). Both
+/// PageSets are CONSUMED on success — the kernel takes ownership.
+///
+/// Asymmetric loss on certain failure paths: if `stack_ps` validates
+/// ok and is consumed but `tcb_ps` validate fails, the stack PageSet
+/// is permanently kernel-owned (one-way). Similarly if `tcb_ps`
+/// validates ok but `tcb::create_tcb` rejects the donation, the
+/// stack is gone but the TCB PageSet remains caller-owned (by
+/// init-before-consume contract).
+pub fn sys_create_thread(
+    entry: u64,
+    stack_top: u64,
+    stack_base: u64,
+    arg: u64,
+    stack_ps: PageSetHandle,
+    tcb_ps: PageSetHandle,
+) -> Result<(), SyscallError> {
     let err: u64;
     unsafe {
         asm!(
@@ -564,6 +583,8 @@ pub fn sys_create_thread(entry: u64, stack_top: u64, stack_base: u64, arg: u64) 
             in("x1") stack_top,
             in("x2") stack_base,
             in("x3") arg,
+            in("x4") stack_ps.0,
+            in("x5") tcb_ps.0,
             in("x8") SYS_CREATE_THREAD,
         );
     }

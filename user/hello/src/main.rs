@@ -63,11 +63,24 @@ pub extern "C" fn _start() -> ! {
         sys_exit();
     }
 
+    // NK3: sys_create_thread now takes two donated PageSet handles
+    // for the kernel stack and TCB. Allocate both as 1-page
+    // Buddy-origin PageSets; the kernel consumes them on success.
+    let kstack_ps = match sys_alloc_pages(1) {
+        Ok(h) => h,
+        Err(_) => { puts("[THREAD-TEST] kstack alloc FAILED\n"); sys_exit(); }
+    };
+    let tcb_ps = match sys_alloc_pages(1) {
+        Ok(h) => h,
+        Err(_) => { puts("[THREAD-TEST] tcb alloc FAILED\n"); sys_exit(); }
+    };
+
     // Spawn child thread: entry = thread_test_entry, stack top = VA + 4K,
     // arg = shared_va (where to write the marker)
     let stack_top = thread_stack_va + 4096;
     if sys_create_thread(
         thread_test_entry as *const () as u64, stack_top, thread_stack_va, shared_va,
+        kstack_ps, tcb_ps,
     ).is_err() {
         puts("[THREAD-TEST] create FAILED\n");
         sys_exit();

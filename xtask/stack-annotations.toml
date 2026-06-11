@@ -23,13 +23,25 @@
 "<usize as core::fmt::Display>::fmt" = "fmt-internal"
 "<&str as core::fmt::Display>::fmt" = "fmt-internal"
 
-# create_kernel_object_kvm dispatches through init_fn: fn(ObjectInitPage)
-# — a function pointer parameter. All three real callers (create_endpoint,
-# create_notification, create_reply) write one fixed-size header into the
-# donated page, then map_existing exposes the same frame at a KVA so the
-# new handle slot can carry `HandleKind::{Endpoint, Notification, Reply}
-# { kva }`.
+# donate_one_kernel_page (NK3) dispatches through an `impl FnOnce`
+# init_fn parameter; each instantiation gets a separate symbol per
+# the closure that monomorphises into it. The create_kernel_object_kvm
+# wrapper's closure ultimately calls one of the three IPC-object
+# factories via the underlying init_fn: fn(ObjectInitPage) — write
+# one fixed-size header into the donated page, then map_existing
+# exposes the same frame at a KVA so the new handle slot can carry
+# `HandleKind::{Endpoint, Notification, Reply} { kva }`.
+#
+# create_kernel_object_kvm itself still contains a BLR at the
+# init_fn fn-pointer call inside its closure body (the closure
+# captures init_fn: fn(ObjectInitPage)); the same 3 factories are
+# the only possible targets.
 "lockjaw::syscall::handler::create_kernel_object_kvm" = [
+    "lockjaw::ipc::endpoint::create_endpoint",
+    "lockjaw::ipc::notification::create_notification",
+    "lockjaw::ipc::reply::create_reply",
+]
+"lockjaw::syscall::handler::donate_one_kernel_page::<lockjaw::syscall::handler::create_kernel_object_kvm::{closure#0}>" = [
     "lockjaw::ipc::endpoint::create_endpoint",
     "lockjaw::ipc::notification::create_notification",
     "lockjaw::ipc::reply::create_reply",
