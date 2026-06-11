@@ -37,8 +37,6 @@ use lockjaw_types::pageset_header_pool::{
     PageSetHeaderPoolState, MAX_HEADER_PAGES_PER_PAGESET,
 };
 use lockjaw_types::pageset_table::MAX_PAGESETS;
-use lockjaw_types::syscall::SyscallError;
-
 use crate::mm::kernel_ptr::KernelMut;
 use crate::mm::kvm;
 
@@ -142,16 +140,18 @@ fn kva_to_slot(kva: KernelVa) -> usize {
 /// bytes are zeroed before return so callers don't need their
 /// own `write_bytes` loop.
 ///
-/// Returns `Err(SyscallError::OUT_OF_PAGE_SETS)` if the pool is
-/// exhausted or `header_pages` is out of range.
-pub fn claim(header_pages: usize) -> Result<KernelVa, SyscallError> {
+/// Returns `None` if the pool is exhausted or `header_pages` is
+/// out of range. Callers categorise the exhaustion into their
+/// typed error (e.g. `AllocError::HeaderPoolExhausted` in
+/// `src/cap/pageset_table.rs`).
+pub fn claim(header_pages: usize) -> Option<KernelVa> {
     if !POOL.initialized.load(Ordering::Acquire) {
         panic!("pageset_header_pool::claim before init");
     }
 
     // SAFETY: GKL serializes access; see module SAFETY note.
     let state = unsafe { &mut *POOL.state.get() };
-    let slot = state.claim(header_pages).ok_or(SyscallError::OUT_OF_PAGE_SETS)?;
+    let slot = state.claim(header_pages)?;
     let kva = slot_kva(slot);
 
     // Zero the claimed prefix so callers drop their own zeroing.
@@ -166,7 +166,42 @@ pub fn claim(header_pages: usize) -> Result<KernelVa, SyscallError> {
         );
     }
 
-    Ok(kva)
+    Some(kva)
+}
+
+/// RAII guard: on drop, calls `release(kva)` unless `take()` was
+/// called first. Mirrors `OwnedKvmRangeGuard` (`src/mm/kvm.rs`)
+/// — same shape, different release fn. Callers wrap a claim in
+/// the guard, do downstream fallible work, then `take()` on
+/// success to transfer ownership without releasing.
+pub struct HeaderSlotGuard {
+    kva: Option<KernelVa>,
+}
+
+impl HeaderSlotGuard {
+    pub fn new(kva: KernelVa) -> Self {
+        Self { kva: Some(kva) }
+    }
+
+    /// Claim the slot, preventing release on drop. Panics if
+    /// already taken.
+    pub fn take(&mut self) -> KernelVa {
+        self.kva.take().expect("HeaderSlotGuard already taken")
+    }
+
+    /// The underlying KVA without releasing ownership. Panics if
+    /// already taken.
+    pub fn kva(&self) -> KernelVa {
+        self.kva.expect("HeaderSlotGuard already taken")
+    }
+}
+
+impl Drop for HeaderSlotGuard {
+    fn drop(&mut self) {
+        if let Some(kva) = self.kva.take() {
+            release(kva);
+        }
+    }
 }
 
 /// Release a previously-claimed slot. Panics on double-release

@@ -255,7 +255,9 @@ pub extern "C" fn kmain() -> ! {
         }
         let dtb_ps_id = cap::pageset_table::register_existing(
             layout.page_count, &dtb_pages[..layout.page_count])
-            .unwrap_or_else(|| panic!("DTB PageSet registration failed"));
+            .unwrap_or_else(|e| panic!(
+                "DTB PageSet registration failed: {:?}", e
+            ));
         DTB_PAGESET_ID.set(dtb_ps_id);
         DTB_IN_PAGE_OFFSET.set(layout.in_page_offset as u64);
         kprintln!(

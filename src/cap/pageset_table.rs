@@ -1,6 +1,6 @@
+use crate::cap::pageset_header_pool::{self, HeaderSlotGuard};
 use crate::mm::addr::{PhysAddr, PhysPage, PAGE_SIZE};
 use crate::mm::kernel_ptr::KernelMut;
-use crate::mm::kvm::{self, OwnedKvmRange, OwnedKvmRangeGuard};
 use crate::mm::page_alloc;
 use core::cell::UnsafeCell;
 use lockjaw_types::addr::KernelVa;
@@ -8,6 +8,49 @@ use lockjaw_types::pageset_table::{
     header_pages_for, PageSetEntry, PageSetHeader, PageSetOrigin, PageSetTable,
     MAX_PRACTICAL_PAGES_PER_SET,
 };
+use lockjaw_types::syscall::SyscallError;
+
+/// Categorised failure causes for PageSet allocation. Replaces the
+/// pre-NK2-B `Option<u64>` returns that conflated header-pool
+/// exhaustion with buddy-OOM, DMA-pool-OOM, table-full, and
+/// invalid-count — the syscall layer maps each variant to the
+/// correct typed `SyscallError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocError {
+    /// `count` is 0 or exceeds the per-PageSet cap.
+    InvalidCount,
+    /// `pageset_header_pool::claim` returned None — `MAX_PAGESETS`
+    /// slots all claimed.
+    HeaderPoolExhausted,
+    /// `PageSetTable::insert` returned `TableFull` —
+    /// `MAX_PAGESETS` table entries all live (currently the same
+    /// bound as the header pool, but the table is the second gate).
+    PageSetTableFull,
+    /// `page_alloc::alloc_page` returned None — buddy is out of
+    /// physical frames for the data pages.
+    BuddyExhausted,
+    /// `dma_pool::alloc_pages` returned an error — no contiguous
+    /// run of the requested size in the boot-reserved DMA pool.
+    DmaPoolExhausted,
+}
+
+impl From<AllocError> for SyscallError {
+    /// Map cap-layer failure causes to the syscall ABI error
+    /// codes per the NK2 plan. Header-pool and table-full both
+    /// surface as `OUT_OF_PAGE_SETS` (both are the bounded-PageSet
+    /// resource class). Buddy and DMA exhaustion still surface as
+    /// `OUT_OF_MEMORY` until NK4-NK5 eliminate the kernel-side
+    /// backing-frame paths.
+    fn from(e: AllocError) -> Self {
+        match e {
+            AllocError::InvalidCount => SyscallError::INVALID_PARAMETER,
+            AllocError::HeaderPoolExhausted => SyscallError::OUT_OF_PAGE_SETS,
+            AllocError::PageSetTableFull => SyscallError::OUT_OF_PAGE_SETS,
+            AllocError::BuddyExhausted => SyscallError::OUT_OF_MEMORY,
+            AllocError::DmaPoolExhausted => SyscallError::OUT_OF_MEMORY,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PageSetTable singleton
@@ -39,10 +82,11 @@ static TABLE: PageSetTableWrapper = PageSetTableWrapper::new();
 
 /// Insert an already-initialized header range into the global table.
 /// Does NOT own the header range — the caller is responsible for
-/// cleanup on failure (typically via OwnedKvmRangeGuard). `origin`
-/// records which allocator owns the DATA pages (header pages always
-/// come from buddy via KVM); the kernel reads this in every mapping
-/// path to enforce the post-C1 attribute rules — see
+/// cleanup on failure (typically via `HeaderSlotGuard`). `origin`
+/// records which allocator owns the DATA pages (header pages come
+/// from the bootstrap-allocated `pageset_header_pool`); the kernel
+/// reads this in every mapping path to enforce the post-C1
+/// attribute rules — see
 /// `sys_map_pages` for the matrix (DmaPool → Normal Cacheable only;
 /// Buddy → Normal Cacheable or Device; ExternallyOwned → Normal or
 /// Device). The same `origin` field also gates the donate-as-kernel-
@@ -70,30 +114,20 @@ fn insert_into_table(
 /// allocate these pages and will not free them).
 fn alloc_and_insert_header(
     page_addrs: &[u64], count: usize, origin: PageSetOrigin,
-) -> Option<u64> {
+) -> Result<u64, AllocError> {
     let header_pages = header_pages_for(count);
-    let range = kvm::alloc_kernel_pages(header_pages).ok()?;
-    let mut guard = OwnedKvmRangeGuard::new(range);
-    let header_kva = guard.kva();
+    // Header storage now comes from the bootstrap-allocated pool
+    // (NK2-A). `claim` zeroes the slot prefix so the manual
+    // write_bytes loop is gone. None → pool exhausted.
+    let header_kva = pageset_header_pool::claim(header_pages)
+        .ok_or(AllocError::HeaderPoolExhausted)?;
+    let mut guard = HeaderSlotGuard::new(header_kva);
 
-    // Zero the header range. KVM pages are freshly allocated but
-    // page_alloc returns whatever's in the buddy free list — zero
-    // explicitly so a partially-initialized header reads as count=0
-    // to any stale viewer.
-    // SAFETY: header_kva is a freshly-allocated KVM range; we hold
-    // exclusive access via the guard.
-    unsafe {
-        let mut p = KernelMut::<u8>::from_kva(header_kva);
-        core::ptr::write_bytes(p.as_mut_ptr(),
-            0,
-            header_pages * (PAGE_SIZE as usize));
-    }
-
-    // SAFETY: header_kva is a freshly allocated, virtually-contiguous
-    // KVM range backed by header_pages_for(count) pages.
+    // SAFETY: header_kva is a freshly-claimed pool slot, virtually
+    // contiguous over `header_pages` pages, zeroed by `claim`.
     // backed_mut(count) derives backing_pages = header_pages_for(count)
     // internally; the wrapper's pointer arithmetic is sound because
-    // KVM stitched the backing frames into a contiguous VA.
+    // the pool slot is one contiguous KVA range.
     let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_kva(header_kva) };
     let mut backed = unsafe { header_ref.get_mut().backed_mut(count) };
     backed.init(page_addrs, origin);
@@ -104,11 +138,13 @@ fn alloc_and_insert_header(
         origin,
     };
     // SAFETY: single-core, IRQs masked — exclusive table access.
-    let id = unsafe { (*TABLE.ptr()).insert(entry).ok()? };
+    let id = unsafe {
+        (*TABLE.ptr()).insert(entry).map_err(|_| AllocError::PageSetTableFull)?
+    };
 
-    // Success — header range now belongs to the pageset table.
+    // Success — pool slot now belongs to the pageset table.
     guard.take();
-    Some(id as u64)
+    Ok(id as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -121,34 +157,24 @@ fn alloc_and_insert_header(
 /// (in a variable-size array starting at byte offset 24 from the
 /// header — 16 bytes of u32 counters + 8 bytes of origin enum),
 /// avoiding large stack arrays.
-/// Returns the PageSet ID, or `None` if out of memory or table full.
-pub fn alloc_pages(count: usize) -> Option<u64> {
+/// Returns the PageSet ID, or a typed `AllocError` describing
+/// which exhaustion class fired. Callers translate to typed
+/// `SyscallError` via the `From<AllocError>` impl.
+pub fn alloc_pages(count: usize) -> Result<u64, AllocError> {
     if count == 0 || count > MAX_PRACTICAL_PAGES_PER_SET {
-        return None;
+        return Err(AllocError::InvalidCount);
     }
 
     let header_pages = header_pages_for(count);
-    let range = kvm::alloc_kernel_pages(header_pages).ok()?;
-    let mut guard = OwnedKvmRangeGuard::new(range);
-    let header_kva = guard.kva();
+    let header_kva = pageset_header_pool::claim(header_pages)
+        .ok_or(AllocError::HeaderPoolExhausted)?;
+    let mut guard = HeaderSlotGuard::new(header_kva);
 
-    // Zero the header range so set_page writes happen into known
-    // state and any partial-init failure leaves the header reading
-    // as inert.
-    // SAFETY: header_kva is a freshly-allocated KVM range; we hold
-    // exclusive access via the guard.
-    unsafe {
-        let mut p = KernelMut::<u8>::from_kva(header_kva);
-        core::ptr::write_bytes(p.as_mut_ptr(),
-            0,
-            header_pages * (PAGE_SIZE as usize));
-    }
-
-    // SAFETY: header_kva is a freshly allocated, zeroed KVM range
-    // virtually backed by header_pages_for(count) pages. The wrapper
-    // tracks count internally; set_count below writes header.count +
-    // header.header_pages to the on-disk header so downstream readers
-    // see the same value.
+    // SAFETY: header_kva is a freshly-claimed pool slot, zeroed by
+    // `claim`, virtually contiguous over header_pages_for(count).
+    // The wrapper tracks count internally; set_count below writes
+    // header.count + header.header_pages to the on-disk header so
+    // downstream readers see the same value.
     let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_kva(header_kva) };
     let mut backed = unsafe { header_ref.get_mut().backed_mut(count) };
     backed.set_count(count, PageSetOrigin::Buddy);
@@ -166,21 +192,22 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
             }
             None => {
                 // Roll back: free data pages allocated so far.
-                // Header range freed by guard on return.
+                // Pool slot released by guard on return.
                 for j in 0..i {
                     let paddr = backed.get_page(j).unwrap();
                     page_alloc::dealloc_page(
                         PhysPage::containing(PhysAddr::new(paddr))
                     );
                 }
-                return None;
+                return Err(AllocError::BuddyExhausted);
             }
         }
     }
 
-    let id = insert_into_table(count, header_kva, PageSetOrigin::Buddy)?;
-    guard.take(); // success — table owns the header range now
-    Some(id)
+    let id = insert_into_table(count, header_kva, PageSetOrigin::Buddy)
+        .ok_or(AllocError::PageSetTableFull)?;
+    guard.take(); // success — table owns the pool slot now
+    Ok(id)
 }
 
 /// Allocate `count` physically contiguous pages and register as a PageSet.
@@ -188,10 +215,10 @@ pub fn alloc_pages(count: usize) -> Option<u64> {
 /// tracks the full rounded allocation (no leaked tail pages). The caller
 /// gets at least `count` contiguous pages; extra pages are uninitialized.
 /// The header pages are allocated separately (not contiguous with data).
-/// Returns the PageSet ID, or `None` if out of memory or table full.
-pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
+/// Returns the PageSet ID, or a typed `AllocError`.
+pub fn alloc_pages_contiguous(count: usize) -> Result<u64, AllocError> {
     if count == 0 || count > MAX_PRACTICAL_PAGES_PER_SET {
-        return None;
+        return Err(AllocError::InvalidCount);
     }
 
     // The buddy allocator rounds up to 2^order. Track the full allocation
@@ -199,31 +226,22 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
     let order = lockjaw_types::buddy::BuddyAllocator::order_for_count(count);
     let actual_count = 1 << order;
     if actual_count > MAX_PRACTICAL_PAGES_PER_SET {
-        return None;
+        return Err(AllocError::InvalidCount);
     }
 
     let header_pages = header_pages_for(actual_count);
-    let range = kvm::alloc_kernel_pages(header_pages).ok()?;
-    let mut guard = OwnedKvmRangeGuard::new(range);
-    let header_kva = guard.kva();
-    // SAFETY: header_kva is a freshly-allocated KVM range.
-    unsafe {
-        let mut p = KernelMut::<u8>::from_kva(header_kva);
-        core::ptr::write_bytes(p.as_mut_ptr(),
-            0,
-            header_pages * (PAGE_SIZE as usize));
-    }
+    let header_kva = pageset_header_pool::claim(header_pages)
+        .ok_or(AllocError::HeaderPoolExhausted)?;
+    let mut guard = HeaderSlotGuard::new(header_kva);
 
     // Allocate contiguous data pages (actual_count, not count)
     let first_data = match page_alloc::alloc_pages_contiguous(count) {
         Some(page) => page,
-        None => return None, // guard frees header range
+        None => return Err(AllocError::BuddyExhausted), // guard releases pool slot
     };
 
-    // SAFETY: header_kva is a freshly allocated, zeroed KVM range
-    // virtually backed by header_pages_for(actual_count) pages. The
-    // wrapper tracks actual_count internally; set_count writes the
-    // header.count + header.header_pages fields.
+    // SAFETY: header_kva is a freshly-claimed pool slot, zeroed by
+    // claim, virtually contiguous over header_pages_for(actual_count).
     let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_kva(header_kva) };
     let mut backed = unsafe { header_ref.get_mut().backed_mut(actual_count) };
     backed.set_count(actual_count, PageSetOrigin::Buddy);
@@ -238,13 +256,13 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
 
     match insert_into_table(actual_count, header_kva, PageSetOrigin::Buddy) {
         Some(id) => {
-            guard.take(); // success — table owns the header range now
-            Some(id)
+            guard.take(); // success — table owns the pool slot now
+            Ok(id)
         }
         None => {
-            // Table full — free data pages. Header range freed by guard.
+            // Table full — free data pages. Pool slot released by guard.
             page_alloc::dealloc_pages_contiguous(first_data, count);
-            None
+            Err(AllocError::PageSetTableFull)
         }
     }
 }
@@ -253,9 +271,10 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
 /// register as a PageSet with origin = DmaPool. Used for ADMA2
 /// descriptor tables and buffers (M6 sub-commit 2b).
 ///
-/// The header pages come from buddy/KVM as usual (regular cacheable
-/// kernel memory — only the DATA pages are DMA-pool-origin). Post
-/// C1 of the cacheable-DMA migration the data pages are mapped
+/// The header pages come from the bootstrap-allocated `pageset_header_pool`
+/// (regular cacheable kernel memory — only the DATA pages are
+/// DMA-pool-origin). Post C1 of the cacheable-DMA migration the
+/// data pages are mapped
 /// `Normal` Cacheable in every reachable mapping (kernel TTBR1
 /// direct map + per-process user mappings); `sys_map_pages` rejects
 /// `NormalNonCacheable` and `Device` attributes for DmaPool origin.
@@ -265,26 +284,21 @@ pub fn alloc_pages_contiguous(count: usize) -> Option<u64> {
 /// stacks and kernel-object donations have no sync-discipline call
 /// sites and would slip through the contract by accident).
 ///
-/// Returns the PageSet ID, or `None` if:
-/// - count is 0 or > MAX_PRACTICAL_PAGES_PER_SET
-/// - DMA pool is exhausted (no contiguous run of `count` free pages)
-/// - KVM/buddy out of memory for the header pages
-/// - PageSet table is full
-pub fn alloc_dma_pages(count: usize) -> Option<u64> {
+/// Returns the PageSet ID, or a typed `AllocError`:
+/// - `InvalidCount` — count is 0 or > MAX_PRACTICAL_PAGES_PER_SET
+///   or > DMA_POOL_PAGES
+/// - `DmaPoolExhausted` — no contiguous run of `count` free pages
+/// - `HeaderPoolExhausted` — `MAX_PAGESETS` slots all claimed
+/// - `PageSetTableFull` — table has no free slot
+pub fn alloc_dma_pages(count: usize) -> Result<u64, AllocError> {
     if count == 0 || count > MAX_PRACTICAL_PAGES_PER_SET {
-        return None;
+        return Err(AllocError::InvalidCount);
     }
 
     let header_pages = header_pages_for(count);
-    let range = kvm::alloc_kernel_pages(header_pages).ok()?;
-    let mut guard = OwnedKvmRangeGuard::new(range);
-    let header_kva = guard.kva();
-
-    // SAFETY: header_kva is a freshly-allocated KVM range.
-    unsafe {
-        let mut p = KernelMut::<u8>::from_kva(header_kva);
-        core::ptr::write_bytes(p.as_mut_ptr(), 0, header_pages * (PAGE_SIZE as usize));
-    }
+    let header_kva = pageset_header_pool::claim(header_pages)
+        .ok_or(AllocError::HeaderPoolExhausted)?;
+    let mut guard = HeaderSlotGuard::new(header_kva);
 
     // Allocate DMA pool pages. Pool returns the first PA of a
     // contiguous run. We do NOT zero on alloc — pool pages may
@@ -301,14 +315,25 @@ pub fn alloc_dma_pages(count: usize) -> Option<u64> {
     // must zero it themselves.
     let first_data = match crate::cap::dma_pool::alloc_pages(count) {
         Ok(phys) => phys,
-        Err(_) => return None, // guard frees header range
+        // Preserve DmaPool's two distinct failure causes: a too-large
+        // count is an InvalidCount (→ INVALID_PARAMETER), not pool
+        // exhaustion. The pre-alloc bound check uses
+        // MAX_PRACTICAL_PAGES_PER_SET; counts in
+        // (DMA_POOL_PAGES, MAX_PRACTICAL_PAGES_PER_SET] reach here.
+        Err(lockjaw_types::dma_pool::DmaPoolError::InvalidCount) => {
+            return Err(AllocError::InvalidCount); // guard releases pool slot
+        }
+        Err(lockjaw_types::dma_pool::DmaPoolError::Exhausted) => {
+            return Err(AllocError::DmaPoolExhausted);
+        }
     };
 
-    // SAFETY: header_kva is freshly allocated, zeroed KVM range
-    // backed by header_pages_for(count) pages. set_count takes origin
-    // explicitly so the page-resident header's origin field is the
-    // commit point for "this PageSet is DmaPool-origin" — no separate
-    // post-write needed, no zero-default to coincidentally line up.
+    // SAFETY: header_kva is a freshly-claimed pool slot, zeroed by
+    // claim, virtually contiguous over header_pages_for(count).
+    // set_count takes origin explicitly so the page-resident header's
+    // origin field is the commit point for "this PageSet is
+    // DmaPool-origin" — no separate post-write needed, no zero-default
+    // to coincidentally line up.
     let mut header_ref = unsafe { KernelMut::<PageSetHeader>::from_kva(header_kva) };
     let mut backed = unsafe { header_ref.get_mut().backed_mut(count) };
     backed.set_count(count, PageSetOrigin::DmaPool);
@@ -321,13 +346,13 @@ pub fn alloc_dma_pages(count: usize) -> Option<u64> {
     match insert_into_table(count, header_kva, PageSetOrigin::DmaPool) {
         Some(id) => {
             guard.take();
-            Some(id)
+            Ok(id)
         }
         None => {
-            // Table full — return data pages to the pool. Header
-            // range freed by guard.
+            // Table full — return data pages to the pool. Pool slot
+            // released by guard.
             crate::cap::dma_pool::free_pages(first_data, count);
-            None
+            Err(AllocError::PageSetTableFull)
         }
     }
 }
@@ -357,11 +382,14 @@ pub const MAX_REGISTER_EXISTING_PAGES: usize = 64;
 /// `lockjaw_types::dtb_layout` for the canonical pattern).
 ///
 /// Capped at `MAX_REGISTER_EXISTING_PAGES` so the per-call stack
-/// temporary stays small. Returns `None` if `count` is zero, exceeds
-/// the cap, or is larger than the supplied slice.
-pub fn register_existing(count: usize, pages: &[PhysPage]) -> Option<u64> {
+/// temporary stays small. Returns `Err(AllocError::InvalidCount)`
+/// if `count` is zero, exceeds the cap, or is larger than the
+/// supplied slice; `Err(AllocError::HeaderPoolExhausted)` if the
+/// pool is exhausted; `Err(AllocError::PageSetTableFull)` if the
+/// table has no free slot.
+pub fn register_existing(count: usize, pages: &[PhysPage]) -> Result<u64, AllocError> {
     if count == 0 || count > MAX_REGISTER_EXISTING_PAGES || pages.len() < count {
-        return None;
+        return Err(AllocError::InvalidCount);
     }
 
     // Materialise page-base PhysAddrs for the header. PhysPage stores
@@ -373,18 +401,18 @@ pub fn register_existing(count: usize, pages: &[PhysPage]) -> Option<u64> {
         addrs[i] = pages[i].start_addr().as_u64();
     }
 
-    // Header pages freed by guard on insert failure.
+    // Pool slot released by guard on insert failure.
     // Data pages are firmware-placed — tagged ExternallyOwned so the
     // free path skips dealloc (the kernel didn't allocate them).
     alloc_and_insert_header(&addrs[..count], count, PageSetOrigin::ExternallyOwned)
 }
 
 /// Wrap a physical MMIO address as a 1-page PageSet (no allocation from pool, just tracking).
-/// Allocates one header page to store the MMIO address.
-/// Header page freed by guard on insert failure. The MMIO data page is
+/// Allocates one header page from the pool to store the MMIO address.
+/// Pool slot released by guard on insert failure. The MMIO data page is
 /// device memory and is never freed — tagged ExternallyOwned so the
 /// free path skips dealloc (the kernel never allocated it).
-pub fn register_device_page(phys_addr: u64) -> Option<u64> {
+pub fn register_device_page(phys_addr: u64) -> Result<u64, AllocError> {
     alloc_and_insert_header(&[phys_addr], 1, PageSetOrigin::ExternallyOwned)
 }
 
@@ -392,18 +420,14 @@ pub fn register_device_page(phys_addr: u64) -> Option<u64> {
 /// Used to roll back device page registration when the handle table is
 /// full — MMIO data pages are device memory and must not be freed.
 pub fn free_header_page(header_kva: KernelVa) {
-    // Look up header_pages from the PageSetTable BEFORE consuming, so
-    // a corrupt header.header_pages cannot redirect kvm::free_kernel_pages
-    // to free the wrong range size. SAFETY: GKL held.
-    let (_count, header_pages) = unsafe {
-        trusted_layout_or_panic(header_kva, "free_header_page")
-    };
     consume_by_header_kva(header_kva);
-    // SAFETY: range came from kvm::alloc_kernel_pages and the
-    // PageSetTable just released its claim — no live references remain.
-    unsafe {
-        kvm::free_kernel_pages(OwnedKvmRange { kva: header_kva, pages: header_pages });
-    }
+    // The pool tracks the per-slot claimed_pages internally, so the
+    // pre-NK2-B trusted_layout lookup is no longer needed for the
+    // header free. Pool slot returns to the free list; the slot's
+    // physical KVA range stays mapped in the bootstrap-allocated
+    // pool region (no PTE clear, no TLBI — slot reuse is just a
+    // bitmap bit flip).
+    pageset_header_pool::release(header_kva);
 }
 
 /// Decrement refcount for a PageSet. If both refcount and map_count
@@ -463,17 +487,6 @@ pub fn consume_pageset_validate(
 /// Data pages are NOT freed — the caller takes ownership of them
 /// (consume is the ownership-transfer path).
 pub fn consume_pageset_apply(header_kva: KernelVa) {
-    // Look up header_pages from the PageSetTable BEFORE revoke_apply /
-    // consume_by_header_kva. Two reasons: (1) consume_by_header_kva
-    // unlinks the table entry, after which trusted_layout would fail;
-    // (2) using the table's tracked count rather than the on-disk
-    // header.header_pages prevents a corrupt header from steering
-    // kvm::free_kernel_pages to free the wrong range size.
-    // SAFETY: GKL held.
-    let (_count, header_pages) = unsafe {
-        trusted_layout_or_panic(header_kva, "consume_pageset_apply")
-    };
-
     // Phase 2: clear cross-process handles, dec refcount/map_count,
     // clear PTEs. After this returns, header.refcount == 0 and
     // header.map_count == 0; no handle or PTE anywhere references
@@ -494,16 +507,14 @@ pub fn consume_pageset_apply(header_kva: KernelVa) {
     // Unlink from the global PageSet table.
     consume_by_header_kva(header_kva);
 
-    // Free the KVM-pool header range — safe because revoke cleared
-    // every reference. Replaces the previous tombstone-leak pattern:
-    // exported handles in other processes are no longer a hazard
-    // because revoke walked their tables too.
-    // SAFETY: range came from kvm::alloc_kernel_pages and revoke
-    // cleared every cross-process reference; no live KernelMut/Ref
-    // can remain.
-    unsafe {
-        kvm::free_kernel_pages(OwnedKvmRange { kva: header_kva, pages: header_pages });
-    }
+    // Return the pool slot to the free list. Pool tracks the per-
+    // slot claimed_pages internally; no trusted_layout lookup
+    // needed (the pre-NK2-B path had to look up header_pages to
+    // guard against a corrupt on-disk header redirecting
+    // kvm::free_kernel_pages). Revoke cleared every cross-process
+    // reference, so no live KernelMut/Ref can remain into the
+    // slot post-release.
+    pageset_header_pool::release(header_kva);
 }
 
 /// Remove a PageSet from the table by its header KVA.
@@ -521,13 +532,15 @@ pub fn consume_by_header_kva(header_kva: KernelVa) -> bool {
     }
 }
 
-/// Remove a PageSet from the table AND free its data pages + KVM
-/// header range. Used to roll back a failed sys_alloc_pages when
+/// Remove a PageSet from the table AND free its data pages + pool
+/// header slot. Used to roll back a failed sys_alloc_pages when
 /// the handle table is full.
 pub fn free_by_header_kva(header_kva: KernelVa) {
-    // Trusted bounds for the data-free loop AND the header dealloc.
+    // Trusted bounds for the data-free loop only — the pool tracks
+    // its own claimed_pages so the header dealloc no longer needs
+    // header_pages here.
     // SAFETY: GKL held; trusted_layout reads only PageSetTable state.
-    let (count, header_pages) = unsafe {
+    let (count, _header_pages) = unsafe {
         trusted_layout_or_panic(header_kva, "free_by_header_kva")
     };
 
@@ -582,13 +595,9 @@ pub fn free_by_header_kva(header_kva: KernelVa) {
     // Remove from global table.
     consume_by_header_kva(header_kva);
 
-    // Free the KVM-pool header range — size from PageSetTable, not
-    // from the on-disk header.
-    // SAFETY: range came from kvm::alloc_kernel_pages; refs above
-    // have been dropped before this call.
-    unsafe {
-        kvm::free_kernel_pages(OwnedKvmRange { kva: header_kva, pages: header_pages });
-    }
+    // Return the pool slot to the free list. Pool tracks per-slot
+    // claimed_pages; refs above have been dropped before this call.
+    pageset_header_pool::release(header_kva);
 }
 
 /// Look up a PageSet by ID. Returns the data page count and header KVA.

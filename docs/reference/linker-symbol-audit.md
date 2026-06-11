@@ -59,12 +59,12 @@ and any unclassified addition fails CI.
 | 157  | PA-prepivot    | `__kernel_end`   | same |
 | 159  | PA-prepivot    | `__per_cpu_stacks` | same |
 | 161  | PA-prepivot    | `__per_cpu_stacks_end` | same |
-| 269  | PA-prepivot    | `__guard_page_0` | `setup_guard_pages` (expects PA) |
-| 271  | PA-prepivot    | `__guard_page_1` | same |
-| 273  | PA-prepivot    | `__guard_page_2` | same |
-| 275  | PA-prepivot    | `__guard_page_3` | same |
-| 332  | PA-prepivot    | `_secondary_start` (`fn` cast) | PSCI cpu_on entry — needs PA |
-| 616  | VA-image       | `__stack_bottom` | wrapped as `KernelImageVa::new(...)` → `create_boot_tcb` (CPU 0 boot TCB, becomes init) |
+| 276  | PA-prepivot    | `__guard_page_0` | `setup_guard_pages` (expects PA) |
+| 278  | PA-prepivot    | `__guard_page_1` | same |
+| 280  | PA-prepivot    | `__guard_page_2` | same |
+| 282  | PA-prepivot    | `__guard_page_3` | same |
+| 339  | PA-prepivot    | `_secondary_start` (`fn` cast) | PSCI cpu_on entry — needs PA |
+| 623  | VA-image       | `__stack_bottom` | wrapped as `KernelImageVa::new(...)` → `create_boot_tcb` (CPU 0 boot TCB, becomes init) |
 
 ### `src/mm/stack.rs` — stack canary helpers
 

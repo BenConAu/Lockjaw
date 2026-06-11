@@ -367,11 +367,15 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
         return Err(SyscallError::INVALID_PARAMETER);
     }
 
+    // AllocError → SyscallError via the From impl (NK2-B): pool
+    // exhaustion and table-full both surface as OUT_OF_PAGE_SETS;
+    // buddy exhaustion stays as OUT_OF_MEMORY until NK4-NK5;
+    // invalid-count surfaces as INVALID_PARAMETER.
     let id = if flags & lockjaw_types::syscall::ALLOC_FLAG_CONTIGUOUS != 0 {
-        crate::cap::pageset_table::alloc_pages_contiguous(count)
+        crate::cap::pageset_table::alloc_pages_contiguous(count)?
     } else {
-        crate::cap::pageset_table::alloc_pages(count)
-    }.ok_or(SyscallError::OUT_OF_MEMORY)?;
+        crate::cap::pageset_table::alloc_pages(count)?
+    };
 
     // Insert a PageSet handle into the caller's handle table.
     // The handle points to the header KVA so sys_export_handle can
@@ -416,8 +420,10 @@ fn sys_alloc_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
 /// ADMA descriptor targets.
 fn sys_alloc_dma_pages(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let count = ctx.gpr[0] as usize;
-    let id = crate::cap::pageset_table::alloc_dma_pages(count)
-        .ok_or(SyscallError::OUT_OF_MEMORY)?;
+    // AllocError → SyscallError via the From impl (NK2-B):
+    // OUT_OF_PAGE_SETS for header-pool / table-full, OUT_OF_MEMORY
+    // for DMA-pool / buddy exhaustion.
+    let id = crate::cap::pageset_table::alloc_dma_pages(count)?;
     let (_, header_kva) = crate::cap::pageset_table::get_pageset(id)
         .ok_or(SyscallError::UNKNOWN)?;
     let ht = CurrentThread::handle_table();
@@ -1063,8 +1069,8 @@ fn sys_get_boot_info(ctx: &mut ExceptionContext) -> SyscallReturn {
 /// PageSets for drivers. Drivers then map via sys_map_pages with the handle.
 fn sys_register_device_page(ctx: &mut ExceptionContext) -> Result<u64, SyscallError> {
     let phys_addr = ctx.gpr[0];
-    let id = crate::cap::pageset_table::register_device_page(phys_addr)
-        .ok_or(SyscallError::OUT_OF_MEMORY)?;
+    // AllocError → SyscallError via the From impl (NK2-B).
+    let id = crate::cap::pageset_table::register_device_page(phys_addr)?;
     let (_, header_kva) = crate::cap::pageset_table::get_pageset(id)
         .ok_or(SyscallError::UNKNOWN)?;
     let ht = CurrentThread::handle_table();
