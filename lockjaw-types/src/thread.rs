@@ -41,6 +41,29 @@ use crate::wait::MAX_WAIT_OBJECTS;
 pub enum KernelStackBase {
     Image(KernelImageVa),
     Pool(KernelVa),
+    /// NK4+: kernel stack allocated from a donated PageSet at process
+    /// creation. KVA = `paddr + KERNEL_VA_OFFSET` (TTBR1 direct map).
+    /// Freed via `page_alloc::dealloc_page` at `finish_exit`. The same
+    /// regime tag drives both kstack and TCB free per the shared
+    /// "kstack and TCB allocated from the same source" invariant —
+    /// see `regime()` below.
+    DirectMap(KernelVa),
+}
+
+/// Discriminant of `KernelStackBase`, without the carried KVA.
+/// `finish_exit` reads this off `tcb.stack_base.regime()` to dispatch
+/// both kstack and TCB free per the regime, without needing to
+/// duplicate the regime field on the TCB.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThreadResourceRegime {
+    /// Boot CPU 0 stack lives in the kernel image and is not freed.
+    Image,
+    /// KVM-pool kstack/TCB — NK3-era `sys_create_thread`. Freed via
+    /// `kvm::free_kernel_pages`.
+    Pool,
+    /// TTBR1 direct-map kstack/TCB — NK4+ `sys_create_process`. Freed
+    /// via `page_alloc::dealloc_page` after KVA→paddr reverse.
+    DirectMap,
 }
 
 impl KernelStackBase {
@@ -51,6 +74,20 @@ impl KernelStackBase {
         match self {
             KernelStackBase::Image(va) => va.as_u64(),
             KernelStackBase::Pool(va) => va.as_u64(),
+            KernelStackBase::DirectMap(va) => va.as_u64(),
+        }
+    }
+
+    /// Discriminant alone — used by `finish_exit` to pick the free
+    /// path for both kstack and TCB. The invariant that the TCB
+    /// regime follows the kstack regime is enforced by the create
+    /// path (same call allocates both pages from the same source);
+    /// see TD4 for the future per-resource typed regime.
+    pub fn regime(self) -> ThreadResourceRegime {
+        match self {
+            KernelStackBase::Image(_) => ThreadResourceRegime::Image,
+            KernelStackBase::Pool(_) => ThreadResourceRegime::Pool,
+            KernelStackBase::DirectMap(_) => ThreadResourceRegime::DirectMap,
         }
     }
 }

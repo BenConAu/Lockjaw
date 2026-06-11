@@ -20,7 +20,10 @@ impl HandleTableRef {
     /// Wrap a known-valid handle table KVA.
     ///
     /// # Safety
-    /// `kva` must point to a live HandleTableObject mapped in the KVM pool.
+    /// `kva` must point to a live HandleTableObject in a kernel-writable
+    /// region — either the KVM pool (NK3-era / bootstrap-time paths) or
+    /// the TTBR1 direct map at `paddr + KERNEL_VA_OFFSET` (NK4+
+    /// sys_create_process via donate_process_pages).
     pub unsafe fn from_kva(kva: KernelVa) -> Self {
         HandleTableRef(kva)
     }

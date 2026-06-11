@@ -149,10 +149,12 @@ fn check_stack_for_profile(profile: &str, elf_path: &str) {
         }
         // External symbols may be absent in optimized builds
         let is_external = sym.starts_with("core::")
+            || sym.starts_with("compiler_builtins::")
             || sym.starts_with("OUTLINED_FUNCTION")
             || sym == "memcpy"
             || sym == "memset"
-            || sym == "memcmp";
+            || sym == "memcmp"
+            || sym == "memmove";
         if is_external {
             // Absent external — silently skip, not needed for analysis
             continue;

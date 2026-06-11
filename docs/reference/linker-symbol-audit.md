@@ -86,7 +86,7 @@ and any unclassified addition fails CI.
 
 | Line | Classification | Symbol | Consumer / notes |
 |------|---|---|---|
-| 73   | VA-image       | `thread_entry` (`fn` cast) | bootstrap `lr` — kernel code VA |
+| 82   | VA-image       | `thread_entry` (`fn` cast) | bootstrap `lr` — kernel code VA |
 
 ### `src/arch/aarch64/mmu.rs` — boot page tables + L0[1] kernel-image map
 

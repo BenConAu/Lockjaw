@@ -68,6 +68,16 @@ impl SyscallError {
     /// `docs/architecture/no-kernel-alloc.md`.
     pub const OUT_OF_PAGE_SETS: Self = SyscallError(14);
 
+    /// The kernel ran out of page-table workspace during process
+    /// creation: the donated PageSet does not contain enough free
+    /// pages to back the L0/L1/L2/L3 tree for the requested mapping
+    /// set, OR the per-process `MAX_L3_TABLES` cap was exceeded
+    /// regardless of donation size. Distinct from
+    /// `OUT_OF_PAGE_SETS` (header pool slots) and `OUT_OF_MEMORY`
+    /// (page allocator). Introduced by NK4+NK5; see
+    /// `docs/architecture/no-kernel-alloc.md`.
+    pub const OUT_OF_PAGE_TABLES: Self = SyscallError(15);
+
     /// An unknown or unrecoverable error occurred.
     pub const UNKNOWN: Self = SyscallError(u64::MAX);
 

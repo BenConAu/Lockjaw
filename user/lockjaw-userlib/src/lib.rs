@@ -36,6 +36,7 @@ pub use lockjaw_types::vmem::MapMemoryAttribute;
 pub use lockjaw_types::syscall::SyscallError;
 pub use lockjaw_types::wait::WaitEntry;
 pub use lockjaw_types::process::ProcessCreateInfo;
+pub use lockjaw_types::vmem::PROCESS_RECOMMENDED_PAGES;
 pub use lockjaw_types::device::{
     PL011_HASH, FW_CFG_HASH, BCM2711_EMMC2_HASH,
     CMD_CLAIM_DEVICE, CLAIM_OK, CLAIM_ERR,

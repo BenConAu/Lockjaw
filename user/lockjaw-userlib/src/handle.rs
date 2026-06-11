@@ -1,25 +1,15 @@
-/// Typed handle wrappers for kernel objects.
-///
-/// Each kernel object type has its own newtype handle. The compiler
-/// prevents passing an EndpointHandle where a PageSetHandle is expected.
-/// The raw syscall ABI is still u64 — these wrappers convert at the
-/// boundary.
+//! Typed handle wrappers for kernel objects, with userlib-side RAII
+//! guards.
+//!
+//! The bare handle newtypes (`PageSetHandle` etc.) now live in
+//! `lockjaw-types::handle` so the kernel can read them directly from
+//! user memory via `UserAddressSpace::read<ProcessCreateInfo>`. We
+//! re-export them here so existing userlib consumers see no change.
+//! The RAII guards (`PageSetGuard`, `NotificationGuard`) and the
+//! `Exportable` trait stay in userlib because they reference syscall
+//! wrappers that the kernel does not.
 
-/// PageSet handle — from sys_alloc_pages, used with sys_map_pages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PageSetHandle(pub u64);
-
-/// Endpoint handle — from sys_create_endpoint, used with sys_call/receive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EndpointHandle(pub u64);
-
-/// Notification handle — from sys_create_notification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NotificationHandle(pub u64);
-
-/// Reply handle — from sys_create_reply, used with sys_call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReplyHandle(pub u64);
+pub use lockjaw_types::handle::{PageSetHandle, EndpointHandle, NotificationHandle, ReplyHandle};
 
 /// Any handle that can be exported via sys_export_handle or closed
 /// via sys_close_handle.

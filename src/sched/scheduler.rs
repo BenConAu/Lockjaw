@@ -102,8 +102,12 @@ static IDLE_SP: IdleSpSlots = IdleSpSlots(UnsafeCell::new([0; MAX_CPUS]));
 /// in one place rather than at every call site.
 pub struct Scheduler {
     state: UnsafeCell<SchedState>,
-    /// TCB addresses for each scheduled thread. TCBs live in the
-    /// KVM pool, addressed through KernelVa. See kernel-vmem-roadmap.md.
+    /// TCB addresses for each scheduled thread. TCBs live in a
+    /// kernel-writable page — pre-NK4 the KVM pool, post-NK4 the
+    /// TTBR1 direct map (donated PageSet slot 3). Either regime is
+    /// addressable through `KernelVa`; `finish_exit` dispatches the
+    /// free path via `tcb.stack_base.regime()`. See
+    /// kernel-vmem-roadmap.md and docs/architecture/no-kernel-alloc.md.
     threads: UnsafeCell<[Option<lockjaw_types::addr::KernelVa>; MAX_THREADS]>,
     active: UnsafeCell<bool>,
 }
@@ -275,8 +279,10 @@ pub fn tick() {
 }
 
 /// Return the KVA of the currently running thread's TCB.
-/// TCBs live in the KVM pool (kernel-vmem-roadmap.md). Used by
-/// syscall handlers to look up the caller's handle table and TTBR0.
+/// Pre-NK4 the TCB lived in the KVM pool; post-NK4 sys_create_process
+/// places it in the TTBR1 direct map (donated PageSet slot 3). The
+/// regime is opaque to syscall handlers — `KernelVa` works for both.
+/// See kernel-vmem-roadmap.md and docs/architecture/no-kernel-alloc.md.
 ///
 /// **Precondition**: this CPU has a current thread. Holds in syscall
 /// handlers (the caller's thread is current), IRQ handlers entered from
@@ -484,7 +490,9 @@ pub fn wake_expired_deadlines(now: lockjaw_types::time::MonoTicks) {
         let state = &mut *SCHEDULER.state_ptr();
         for idx in 0..MAX_THREADS {
             let Some(kva) = threads[idx] else { continue };
-            // SAFETY: live KVM-mapped TCB; GKL held — no concurrent mutation. (See module doc above.)
+            // Live TCB page in KVM pool or TTBR1 direct map per
+            // Scheduler::threads doc; GKL held — no concurrent mutation.
+            // SAFETY: KVA is a valid kernel-writable TCB page.
             let tcb_ptr = kva.as_u64() as *mut Tcb;
             let deadline = MonoTicks((*tcb_ptr).wait_deadline);
             if deadline.is_no_deadline() { continue; }
@@ -655,20 +663,41 @@ fn finish_exit() {
     // SAFETY: stack and tcb pages came from prior allocations at
     // thread create time; finish_exit holds the GKL and no live
     // references into either page exist by this point.
-    use lockjaw_types::thread::KernelStackBase;
+    use lockjaw_types::thread::{KernelStackBase, ThreadResourceRegime};
+    use crate::mm::addr::KERNEL_VA_OFFSET;
+    let regime = stack_base.regime();
     let stack_kva = match stack_base {
-        KernelStackBase::Pool(kva) => kva,
+        KernelStackBase::Pool(kva) | KernelStackBase::DirectMap(kva) => kva,
         KernelStackBase::Image(_) => {
             panic!("finish_exit: boot TCB exited (Image-region stack must not be freed)");
         }
     };
-    unsafe {
-        crate::mm::kvm::free_kernel_pages(
-            crate::mm::kvm::OwnedKvmRange { kva: stack_kva, pages: 1 }
-        );
-        crate::mm::kvm::free_kernel_pages(
-            crate::mm::kvm::OwnedKvmRange { kva: pending.tcb_kva, pages: 1 }
-        );
+    // Free path branches on the regime — TD4 will split it into a
+    // per-resource typed regime once V5-V6 migrates sys_create_thread.
+    // Until then the invariant "TCB regime follows kstack regime" is
+    // enforced at create time (both pages from one source) and read
+    // here via tcb.stack_base.regime().
+    match regime {
+        ThreadResourceRegime::Pool => unsafe {
+            crate::mm::kvm::free_kernel_pages(
+                crate::mm::kvm::OwnedKvmRange { kva: stack_kva, pages: 1 }
+            );
+            crate::mm::kvm::free_kernel_pages(
+                crate::mm::kvm::OwnedKvmRange { kva: pending.tcb_kva, pages: 1 }
+            );
+        },
+        ThreadResourceRegime::DirectMap => {
+            // KVA→paddr reverse: kstack and TCB pages live in TTBR1
+            // linear map at paddr + KERNEL_VA_OFFSET. Free the
+            // backing frame directly via the buddy allocator; no
+            // KVM tree footprint to tear down.
+            page_alloc::dealloc_page(PhysPage::containing(
+                PhysAddr::new(stack_kva.as_u64() - KERNEL_VA_OFFSET)));
+            page_alloc::dealloc_page(PhysPage::containing(
+                PhysAddr::new(pending.tcb_kva.as_u64() - KERNEL_VA_OFFSET)));
+        }
+        ThreadResourceRegime::Image => unreachable!(
+            "finish_exit: Image regime handled by the panic above"),
     }
 
     // Step 4: Decrement process thread count via narrow op + pure model
@@ -746,31 +775,36 @@ fn finish_exit() {
                         });
                     }
                     TeardownStep::FreeHandleTable { page_count } => {
-                        // HandleTable lives in the KVM pool; tear down
-                        // the KVA range, returning the backing frames
-                        // to page_alloc and the VA to the KVM free list.
-                        // SAFETY: ht_kva came from a prior
-                        // kvm::alloc_kernel_pages(N) at process create
-                        // time; no live references into the pages now.
-                        unsafe {
-                            crate::mm::kvm::free_kernel_pages(
-                                crate::mm::kvm::OwnedKvmRange { kva: ht_kva, pages: *page_count as usize }
-                            );
+                        // HandleTable lives in the TTBR1 direct map post-NK4
+                        // (sys_create_process allocates it from a donated
+                        // PageSet). HT is single-page by construction
+                        // (HANDLE_SLOTS_PER_PAGE = 127 fits one page). Free
+                        // each backing frame directly via the buddy allocator
+                        // — there is no KVM tree footprint to tear down.
+                        //
+                        // TD: ProcessObject/HandleTable lack a regime tag
+                        // analogous to KernelStackBase::regime(). Until that
+                        // lands (tracked alongside TD4 in
+                        // docs/tracking/tech-debt.md), assert direct-map
+                        // origin here so a future code path that revives the
+                        // KVM-pool ProcessObject/HT regime fails loudly
+                        // rather than silently corrupting buddy.
+                        assert_direct_map_kva(ht_kva, "FreeHandleTable");
+                        for i in 0..*page_count as u64 {
+                            let kva_i = ht_kva.as_u64() + i * crate::mm::addr::PAGE_SIZE;
+                            page_alloc::dealloc_page(PhysPage::containing(
+                                PhysAddr::new(kva_i - crate::mm::addr::KERNEL_VA_OFFSET)));
                         }
                         pages_freed += *page_count as u32;
                     }
                     TeardownStep::FreeProcessPage => {
-                        // ProcessObject lives in the KVM pool; tear down
-                        // the KVA range, returning the backing frame to
-                        // page_alloc and the VA to the KVM free list.
-                        // SAFETY: process_kva came from a prior
-                        // kvm::alloc_kernel_pages(1) at process create
-                        // time; no live KernelMut/Ref into the page now.
-                        unsafe {
-                            crate::mm::kvm::free_kernel_pages(
-                                crate::mm::kvm::OwnedKvmRange { kva: process_kva, pages: 1 }
-                            );
-                        }
+                        // ProcessObject lives in the TTBR1 direct map
+                        // post-NK4. Same regime as HT: dealloc_page on the
+                        // backing frame, no KVM tree footprint.
+                        // See the TD note above on FreeHandleTable.
+                        assert_direct_map_kva(process_kva, "FreeProcessPage");
+                        page_alloc::dealloc_page(PhysPage::containing(
+                            PhysAddr::new(process_kva.as_u64() - crate::mm::addr::KERNEL_VA_OFFSET)));
                         pages_freed += 1;
                     }
                 }
@@ -787,6 +821,29 @@ fn finish_exit() {
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
+
+/// Assert a KVA lives in the TTBR1 direct-map range (i.e. corresponds
+/// to a physical RAM page via `paddr + KERNEL_VA_OFFSET`). Used by
+/// `FreeHandleTable` / `FreeProcessPage` to catch a future code path
+/// that revives the KVM-pool regime for ProcessObject/HandleTable
+/// before the structural fix (per-resource regime tag, TD4) lands.
+///
+/// Direct-map KVAs satisfy `kva >= KERNEL_VA_OFFSET && kva <
+/// KERNEL_VA_OFFSET + KERNEL_DIRECT_MAP_SIZE`. KVM-pool KVAs sit in
+/// a disjoint VA range above the linear map, so the bounds check
+/// rejects them loudly.
+fn assert_direct_map_kva(kva: lockjaw_types::addr::KernelVa, step: &'static str) {
+    use crate::mm::addr::KERNEL_VA_OFFSET;
+    use lockjaw_types::kvm::KVM_POOL_BASE;
+    let raw = kva.as_u64();
+    assert!(
+        raw >= KERNEL_VA_OFFSET && raw < KVM_POOL_BASE,
+        "{}: kva not in TTBR1 direct map; a non-direct-map \
+         ProcessObject/HandleTable reached the dealloc_page path. \
+         See TD4 (per-resource regime tag).",
+        step,
+    );
+}
 
 fn thread_index_for(kva: lockjaw_types::addr::KernelVa) -> Option<usize> {
     // SAFETY: GKL held — read-only access.

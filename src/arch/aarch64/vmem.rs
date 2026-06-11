@@ -1,11 +1,15 @@
 use crate::mm::addr::{PhysAddr, PhysPage, KERNEL_VA_OFFSET};
 use crate::mm::page_alloc;
 use crate::mm::page_table::*;
+use crate::syscall::handler::ProcessPagesDonation;
 use core::ptr;
 
 // Re-export from lockjaw-types — single source of truth.
 pub use lockjaw_types::vmem::{Mapping, MAPPINGS_PER_PAGE};
-use lockjaw_types::vmem::{L3RegionTracker, L3Lookup, MAX_L3_TABLES, build_process_page};
+use lockjaw_types::vmem::{
+    L3RegionTracker, L3Lookup, MAX_L3_TABLES, PROCESS_KERNEL_OBJ_PAGES,
+    PageTableWorkspace, build_process_page,
+};
 
 /// Errors returned by virtual memory operations.
 pub enum VmemError {
@@ -13,6 +17,11 @@ pub enum VmemError {
     TooManyL3Regions,
     OutOfPages,
     InvalidParameter,
+    /// The donated page-table workspace ran out of pages before the
+    /// L0/L1/L2/L3 tree was complete. Distinct from `OutOfPages`
+    /// (the page allocator). Surfaces post-NK4 as
+    /// `SyscallError::OUT_OF_PAGE_TABLES`.
+    OutOfPageTables,
 }
 
 /// Incremental page table builder for user address spaces.
@@ -32,69 +41,73 @@ pub enum VmemError {
 /// 16MB (8 × 2MB), this will fail with TooManyL3Regions. Fix by
 /// switching to a dynamic Vec-like allocator or walking the L2 table
 /// directly instead of caching L3 pointers in a fixed array.
-pub struct AddressSpaceBuilder {
+pub struct AddressSpaceBuilder<'a> {
+    workspace: PageTableWorkspace,
+    donation: &'a ProcessPagesDonation,
     l0_paddr: PhysAddr,
     l2_va: *mut PageTable,
     tracker: L3RegionTracker,
     l3_ptrs: [*mut PageTable; MAX_L3_TABLES],
 }
 
-impl AddressSpaceBuilder {
-    /// Allocate L0/L1/L2 page tables and set up kernel identity map + device MMIO.
+impl<'a> AddressSpaceBuilder<'a> {
+    /// Allocate L0/L1/L2 page tables from the donated workspace
+    /// slice (donation indices PROCESS_KERNEL_OBJ_PAGES..).
     ///
-    /// Automatically includes the kernel identity map (RAM + device MMIO)
-    /// so that exception vectors and kernel code remain reachable.
+    /// Returns `VmemError::OutOfPageTables` if the workspace is
+    /// too small to hold L0/L1/L2 (the absolute minimum) — that
+    /// surfaces to userspace as `SyscallError::OUT_OF_PAGE_TABLES`.
     ///
-    /// # Safety
-    /// Requires the page allocator to be initialized.
-    pub unsafe fn new() -> Result<Self, VmemError> {
-        // Allocate L0
-        let l0_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
-        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-        let l0_va = (l0_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
-        ptr::write_bytes(l0_va, 0, 1);
+    /// No `unsafe`: the workspace pages are already physically
+    /// allocated and validated by `donate_process_pages`; this
+    /// constructor only reads paddrs and writes via the linear map.
+    pub fn new(
+        donation: &'a ProcessPagesDonation,
+        workspace: PageTableWorkspace,
+    ) -> Result<Self, VmemError> {
+        let mut workspace = workspace;
+        let l0_paddr = claim_zeroed(&mut workspace, donation)?;
+        let l1_paddr = claim_zeroed(&mut workspace, donation)?;
+        let l2_paddr = claim_zeroed(&mut workspace, donation)?;
 
-        // Construct builder early — Drop handles cleanup if later steps fail.
-        // free_address_space handles partial trees by checking is_table()
-        // at each level before recursing.
-        let mut builder = Self {
-            l0_paddr: l0_page.start_addr(),
-            l2_va: core::ptr::null_mut(),
-            tracker: L3RegionTracker::new(),
-            l3_ptrs: [core::ptr::null_mut(); MAX_L3_TABLES],
-        };
+        // SAFETY: l0/l1/l2 pages are Buddy-origin via the donation
+        // (validate_buddy_pageset enforced), reachable in the TTBR1
+        // linear map at paddr + KERNEL_VA_OFFSET, and just zero-init'd
+        // by claim_zeroed under GKL serialisation — no live aliasing
+        // kernel write into the same paddr in this critical section.
+        unsafe {
+            // SAFETY: TTBR1 linear-map cast; donation page is Buddy-origin.
+            let l0_va = (l0_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+            // SAFETY: TTBR1 linear-map cast; donation page is Buddy-origin.
+            let l1_va = (l1_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+            // SAFETY: TTBR1 linear-map cast; donation page is Buddy-origin.
+            let l2_va = (l2_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+            // L0[0] → L1
+            (*l0_va).entries[0] = PageTableEntry::new_table(l1_paddr);
+            // L1[0] → L2 (user pages live in the first 1 GB of TTBR0).
+            (*l1_va).entries[0] = PageTableEntry::new_table(l2_paddr);
 
-        // We need L1 for entry [0] (covers VA 0x00000000-0x3FFFFFFF, where user pages live)
-        // and L1 entry [1] for the kernel identity map (0x40000000-0x7FFFFFFF)
-        let l1_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
-        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-        let l1_va = (l1_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
-        ptr::write_bytes(l1_va, 0, 1);
+            // No kernel identity in user TTBR0 anymore. Pre-relink, every
+            // user TTBR0 carried L1[1] (1 GB block of kernel RAM) + L2[4]
+            // (device MMIO) because some kernel-mode code path on EL0
+            // entry depended on it (see docs/history/relink-notes.md "Phase 0:
+            // what depended on the user-TTBR0 kernel identity"). After
+            // the relink (commit 1b), the kernel image lives in L0[1]
+            // (TTBR1) and no longer references lower-half PAs, so the
+            // identity is dead weight. Userspace device MMIO mappings
+            // still flow through the normal sys_map_pages path with
+            // MapMemoryAttribute::Device — drivers that need a device
+            // get a per-process mapping, not the kernel's.
 
-        // L0[0] → L1
-        (*l0_va).entries[0] = PageTableEntry::new_table(l1_page.start_addr());
-
-        // L1[0] → L2 (user pages live in the first 1 GB of TTBR0).
-        let l2_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
-        // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-        let l2_va = (l2_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
-        ptr::write_bytes(l2_va, 0, 1);
-        (*l1_va).entries[0] = PageTableEntry::new_table(l2_page.start_addr());
-
-        // No kernel identity in user TTBR0 anymore. Pre-relink, every
-        // user TTBR0 carried L1[1] (1 GB block of kernel RAM) + L2[4]
-        // (device MMIO) because some kernel-mode code path on EL0
-        // entry depended on it (see docs/history/relink-notes.md "Phase 0:
-        // what depended on the user-TTBR0 kernel identity"). After
-        // the relink (commit 1b), the kernel image lives in L0[1]
-        // (TTBR1) and no longer references lower-half PAs, so the
-        // identity is dead weight. Userspace device MMIO mappings
-        // still flow through the normal sys_map_pages path with
-        // MapMemoryAttribute::Device — drivers that need a device
-        // get a per-process mapping, not the kernel's.
-
-        builder.l2_va = l2_va;
-        Ok(builder)
+            Ok(Self {
+                workspace,
+                donation,
+                l0_paddr,
+                l2_va,
+                tracker: L3RegionTracker::new(),
+                l3_ptrs: [core::ptr::null_mut(); MAX_L3_TABLES],
+            })
+        }
     }
 
     /// Map a batch of page mappings into the address space.
@@ -103,9 +116,11 @@ impl AddressSpaceBuilder {
     /// Uses L3RegionTracker for L3 table dedup and build_process_page for
     /// permission policy — both from lockjaw-types (host-tested).
     ///
-    /// # Safety
-    /// All physical addresses in mappings must be valid allocated pages.
-    pub unsafe fn map_batch(&mut self, mappings: &[Mapping]) -> Result<(), VmemError> {
+    /// Returns `VmemError::OutOfPageTables` if the donated workspace
+    /// is exhausted before L3 allocation is complete, OR
+    /// `VmemError::TooManyL3Regions` if the L3 tracker cap
+    /// (`MAX_L3_TABLES`) is reached regardless of donation size.
+    pub fn map_batch(&mut self, mappings: &[Mapping]) -> Result<(), VmemError> {
         for m in mappings {
             let (_, _, l2_idx, l3_idx) = lockjaw_types::vmem::page_table_indices(m.virt_addr);
 
@@ -113,12 +128,12 @@ impl AddressSpaceBuilder {
             let l3_va = match self.tracker.lookup(l2_idx) {
                 L3Lookup::Existing { slot } => self.l3_ptrs[slot],
                 L3Lookup::NeedAlloc { slot } => {
-                    let l3_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
-                    // SAFETY: kernel VA (via KERNEL_VA_OFFSET)
-                    let va = (l3_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
-                    ptr::write_bytes(va, 0, 1);
-
-                    (*self.l2_va).entries[l2_idx] = PageTableEntry::new_table(l3_page.start_addr());
+                    let l3_paddr = claim_zeroed(&mut self.workspace, self.donation)?;
+                    // SAFETY: linear-map cast; claim_zeroed just zero-init'd the page; GKL-held.
+                    let va = (l3_paddr.as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+                    unsafe {
+                        (*self.l2_va).entries[l2_idx] = PageTableEntry::new_table(l3_paddr);
+                    }
                     self.l3_ptrs[slot] = va;
                     self.tracker.register(slot, l2_idx);
                     va
@@ -126,43 +141,134 @@ impl AddressSpaceBuilder {
                 L3Lookup::Full => return Err(VmemError::TooManyL3Regions),
             };
 
-            // Build page entry with appropriate permissions (policy in lockjaw-types)
-            (*l3_va).entries[l3_idx] = build_process_page(m.phys_addr, m.user_accessible, m.executable);
+            // Build page entry with appropriate permissions (policy in lockjaw-types).
+            // SAFETY: l3_va points at a zeroed page-table backed by a
+            // workspace claim above.
+            unsafe {
+                (*l3_va).entries[l3_idx] = build_process_page(m.phys_addr, m.user_accessible, m.executable);
+            }
         }
         Ok(())
     }
 
-    /// Finalize the address space and return the L0 physical address (for TTBR0).
-    /// Consumes the builder, defusing the Drop-based cleanup.
-    pub fn finish(self) -> PhysAddr {
+    /// Finalize the address space and return `(l0_paddr,
+    /// workspace_claimed_count)`. The claimed count tells
+    /// `ProcessPagesDonation::into_consumed` how many workspace
+    /// pages are now kernel-owned (the rest return to buddy as
+    /// unclaimed slack).
+    ///
+    /// Consumes the builder; `Drop` is a no-op so this is just a
+    /// move-out.
+    pub fn finish(self) -> (PhysAddr, usize) {
         let paddr = self.l0_paddr;
+        let claimed = self.workspace.claimed_count();
         core::mem::forget(self);
-        paddr
+        (paddr, claimed)
     }
 }
 
-impl Drop for AddressSpaceBuilder {
+impl<'a> Drop for AddressSpaceBuilder<'a> {
     fn drop(&mut self) {
-        // SAFETY: l0_paddr was allocated by new() and points to a valid
-        // (possibly partially constructed) page table tree.
-        // free_address_space walks L0→L1→L2→L3 checking is_table() at
-        // each level, so partial trees are handled correctly.
-        unsafe { free_address_space(self.l0_paddr); }
+        // Pre-finish failure: workspace pages stay owned by the
+        // caller's PageSet (via the ProcessPagesDonation guard).
+        // The orchestrator calls `donation.into_caller_owned()` on
+        // the failure path; userspace recovers via sys_close_handle.
+        // No tree teardown here — the workspace pages are not yet
+        // kernel-owned, and the existing free_address_space would
+        // dealloc_page them back to buddy, double-freeing the
+        // caller-owned PageSet on the recovery path.
     }
 }
 
-/// Allocate a fresh set of page tables and map the given pages.
-/// Returns the physical address of the L0 table (for TTBR0).
+/// Bootstrap-only address-space construction. Allocates L0/L1/L2/L3
+/// tables from `page_alloc` (the bootstrap-time allocator path that
+/// Tier 2 #10 whitelists). Used by `main.rs` to bring up init —
+/// before any process exists to donate pages.
 ///
-/// Convenience wrapper around AddressSpaceBuilder for callers that have
-/// all mappings available in a single contiguous slice.
+/// User-mode `sys_create_process` (NK4+) goes through
+/// `AddressSpaceBuilder::new(&donation, workspace)` instead, which
+/// consumes pages from a donated PageSet rather than allocating
+/// fresh ones.
 ///
 /// # Safety
 /// All physical addresses in mappings must be valid allocated pages.
+/// The page allocator must be initialised. Failed mid-build, the
+/// constructed tree is leaked (bootstrap-only — userspace can't
+/// reach this path).
 pub unsafe fn create_address_space(mappings: &[Mapping]) -> Result<PhysAddr, VmemError> {
-    let mut builder = AddressSpaceBuilder::new()?;
-    builder.map_batch(mappings)?;
-    Ok(builder.finish())
+    let l0_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
+    // SAFETY: bootstrap-only; freshly alloc'd Buddy page in linear map.
+    let l0_va = (l0_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+    ptr::write_bytes(l0_va, 0, 1);
+
+    let l1_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
+    // SAFETY: bootstrap-only; freshly alloc'd Buddy page in linear map.
+    let l1_va = (l1_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+    ptr::write_bytes(l1_va, 0, 1);
+    (*l0_va).entries[0] = PageTableEntry::new_table(l1_page.start_addr());
+
+    let l2_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
+    // SAFETY: bootstrap-only; freshly alloc'd Buddy page in linear map.
+    let l2_va = (l2_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+    ptr::write_bytes(l2_va, 0, 1);
+    (*l1_va).entries[0] = PageTableEntry::new_table(l2_page.start_addr());
+
+    let mut tracker = L3RegionTracker::new();
+    let mut l3_ptrs: [*mut PageTable; MAX_L3_TABLES] = [core::ptr::null_mut(); MAX_L3_TABLES];
+
+    for m in mappings {
+        let (_, _, l2_idx, l3_idx) = lockjaw_types::vmem::page_table_indices(m.virt_addr);
+        let l3_va = match tracker.lookup(l2_idx) {
+            L3Lookup::Existing { slot } => l3_ptrs[slot],
+            L3Lookup::NeedAlloc { slot } => {
+                let l3_page = page_alloc::alloc_page().ok_or(VmemError::OutOfPages)?;
+                // SAFETY: bootstrap-only; freshly alloc'd Buddy page in linear map.
+                let va = (l3_page.start_addr().as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+                ptr::write_bytes(va, 0, 1);
+                (*l2_va).entries[l2_idx] = PageTableEntry::new_table(l3_page.start_addr());
+                l3_ptrs[slot] = va;
+                tracker.register(slot, l2_idx);
+                va
+            }
+            L3Lookup::Full => return Err(VmemError::TooManyL3Regions),
+        };
+        (*l3_va).entries[l3_idx] = build_process_page(m.phys_addr, m.user_accessible, m.executable);
+    }
+    Ok(l0_page.start_addr())
+}
+
+/// Claim the next workspace page, zero-init it, and return its
+/// physical address. Returns `VmemError::OutOfPageTables` if the
+/// workspace is exhausted.
+fn claim_zeroed(
+    workspace: &mut PageTableWorkspace,
+    donation: &ProcessPagesDonation,
+) -> Result<PhysAddr, VmemError> {
+    let workspace_idx = workspace.claim()
+        .ok_or(VmemError::OutOfPageTables)?;
+    let donation_idx = PROCESS_KERNEL_OBJ_PAGES + workspace_idx;
+    let paddr = donation.page_paddr(donation_idx)
+        .ok_or(VmemError::OutOfPageTables)?;
+    // SAFETY:
+    // - Buddy-origin verified by validate_buddy_pageset, so the page
+    //   is in the TTBR1 linear map at paddr + KERNEL_VA_OFFSET
+    //   (per enable_higher_half).
+    // - The donation guard's typestate keeps the PageSet registered
+    //   until into_consumed, so the paddr remains the data page of
+    //   slot `donation_idx` until finish() runs.
+    // - The workspace_idx claim guarantees this builder is the sole
+    //   writer to this workspace slot within this call site.
+    // - validate_buddy_pageset rejects donations with map_count != 0,
+    //   so no concurrent user write can race the kernel zero-init via
+    //   an active user mapping. (Pre-fix this relied on GKL +
+    //   Phase 5 revoke_apply; the map_count rejection makes the
+    //   guarantee structural at validate time.)
+    unsafe {
+        // SAFETY: see block above — Buddy-origin, GKL-held, sole writer.
+        let va = (paddr.as_u64() + KERNEL_VA_OFFSET) as *mut PageTable;
+        ptr::write_bytes(va, 0, 1);
+    }
+    Ok(paddr)
 }
 
 /// Free all page table pages allocated by create_address_space.

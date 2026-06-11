@@ -51,11 +51,12 @@ unsafe impl crate::user_pod::UserPod for ProcessMapping {}
 /// `align(64)` is load-bearing: the kernel's `UserAddressSpace::read`
 /// rejects reads that cross a 4 KiB page boundary, so the struct must
 /// fit within a single page from any aligned address. `repr(C,
-/// align(64))` pads the struct to 64 bytes (7 × u64 = 56 bytes of
-/// fields + 8 bytes trailing padding). With size = 64 and align = 64
-/// (and 64 divides 4096), every aligned position `p` has
-/// `p + 64 <= floor(p / 4096 + 1) * 4096`, making the intra-page
-/// contract construction-guaranteed rather than carried by comments.
+/// align(64))` pads the struct to 64 bytes (8 × u64 = 64 bytes of
+/// fields, no trailing padding after NK4+NK5's `process_resources_ps`
+/// field). With size = 64 and align = 64 (and 64 divides 4096), every
+/// aligned position `p` has `p + 64 <= floor(p / 4096 + 1) * 4096`,
+/// making the intra-page contract construction-guaranteed rather
+/// than carried by comments.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct ProcessCreateInfo {
@@ -74,19 +75,25 @@ pub struct ProcessCreateInfo {
     pub parent_handle_to_copy: u64,
     /// User VA of the 16-byte process name (zero-padded).
     pub name_va: u64,
+    /// NK4+NK5 donated PageSet (Buddy-origin, ≥`PROCESS_MIN_PAGES`
+    /// data pages). Kernel reads ProcessObject / HandleTable /
+    /// kernel-stack / TCB from pages 0-3 and uses pages 4..N as
+    /// the page-table workspace. Consumed by the kernel on success;
+    /// stays caller-owned on any failure path.
+    pub process_resources_ps: crate::handle::PageSetHandle,
 }
 
-// SAFETY: ProcessCreateInfo is repr(C) with only u64 fields — every bit pattern valid.
+// SAFETY: ProcessCreateInfo is repr(C, align(64)) with 7 u64 fields +
+// one PageSetHandle (#[repr(transparent)] u64). All fields admit every
+// bit pattern; no niches.
 unsafe impl crate::user_pod::UserPod for ProcessCreateInfo {}
 
 // Layout lockdown — the struct is the kernel/user ABI boundary, so a
 // silent field/size change here would silently change what the kernel
 // reads. These asserts fail-compile on drift.
 const _: () = {
-    // align(64) pads the struct to a multiple of 64; with 7 × u64 = 56
-    // bytes of fields, the total size is 64 (56 fields + 8 trailing
-    // padding). The padding is what makes the alignment work — fits
-    // the intra-page proof in the doc.
+    // 7 × u64 + 1 × PageSetHandle (repr(transparent) u64) = 64 bytes
+    // of fields; align(64) matches naturally with no padding.
     assert!(core::mem::size_of::<ProcessCreateInfo>() == 64);
     assert!(core::mem::align_of::<ProcessCreateInfo>() == 64);
     assert!(core::mem::offset_of!(ProcessCreateInfo, mappings_ptr) == 0);
@@ -96,6 +103,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ProcessCreateInfo, scratch_pageset_id) == 32);
     assert!(core::mem::offset_of!(ProcessCreateInfo, parent_handle_to_copy) == 40);
     assert!(core::mem::offset_of!(ProcessCreateInfo, name_va) == 48);
+    assert!(core::mem::offset_of!(ProcessCreateInfo, process_resources_ps) == 56);
 };
 
 /// Outcome of a thread exiting from a process.

@@ -314,6 +314,123 @@ pub fn build_user_page(phys: crate::addr::PhysAddr, attr: u8, sh: u8) -> crate::
 /// and the kernel must allocate dynamically.
 pub const MAX_L3_TABLES: usize = 8;
 
+// ---------------------------------------------------------------------------
+// Process-creation page budget (NK4+NK5 donate-and-claim)
+// ---------------------------------------------------------------------------
+
+/// Kernel-object pages in the per-process donation: ProcessObject (idx 0),
+/// HandleTable (idx 1), kernel stack (idx 2), TCB (idx 3).
+pub const PROCESS_KERNEL_OBJ_PAGES: usize = 4;
+
+/// Minimum page-table workspace: L0 + L1 + L2 + up to `MAX_L3_TABLES` L3s.
+/// Worst case is a process spanning the maximum-tracked 2MB regions.
+pub const WORKSPACE_MIN_PAGES: usize = 3 + MAX_L3_TABLES;
+
+/// Upper bound on workspace pages the kernel will accept per process.
+/// `[Option<PhysAddr>; WORKSPACE_MAX_PAGES]` is the snapshot array
+/// in `into_consumed`; the const_assert below ties the array size to
+/// `PROCESS_MAX_PAGES - PROCESS_KERNEL_OBJ_PAGES`. Keep these
+/// consistent.
+pub const WORKSPACE_MAX_PAGES: usize = 32;
+
+/// Recommended workspace size for userspace defaults. Userland adds
+/// `PROCESS_KERNEL_OBJ_PAGES` to get `PROCESS_RECOMMENDED_PAGES`.
+pub const WORKSPACE_RECOMMENDED: usize = 16;
+
+/// Minimum donation `donate_process_pages` accepts. Below this the
+/// workspace cannot fit the worst-case page-table tree.
+pub const PROCESS_MIN_PAGES: usize = PROCESS_KERNEL_OBJ_PAGES + WORKSPACE_MIN_PAGES;
+
+/// Maximum donation `donate_process_pages` accepts. Above this the
+/// fixed-size snapshot array would OOB.
+pub const PROCESS_MAX_PAGES: usize = PROCESS_KERNEL_OBJ_PAGES + WORKSPACE_MAX_PAGES;
+
+/// Userspace default (4 kernel-objects + 16 workspace headroom).
+pub const PROCESS_RECOMMENDED_PAGES: usize = PROCESS_KERNEL_OBJ_PAGES + WORKSPACE_RECOMMENDED;
+
+// The snapshot array `[Option<PhysAddr>; WORKSPACE_MAX_PAGES]` inside
+// `ProcessPagesDonation::into_consumed` must hold every unclaimed
+// workspace page. With `donate_process_pages` validating
+// `data_page_count <= PROCESS_MAX_PAGES`, the unclaimed-tail
+// `data_page_count - PROCESS_KERNEL_OBJ_PAGES` cannot exceed
+// `WORKSPACE_MAX_PAGES`. Lock the relation.
+const _: () = assert!(
+    PROCESS_MAX_PAGES - PROCESS_KERNEL_OBJ_PAGES == WORKSPACE_MAX_PAGES
+);
+
+// ---------------------------------------------------------------------------
+// PageTableWorkspace — claim-counter for the per-process workspace slice
+// ---------------------------------------------------------------------------
+
+/// Linear claim-counter for the donated workspace pages. The kernel
+/// passes one to `AddressSpaceBuilder::new`; each L0/L1/L2/L3 table
+/// claim consumes the next workspace index. After `finish()` the
+/// claimed count tells `into_consumed` how much of the workspace is
+/// kernel-owned vs. should be returned to buddy as unclaimed slack.
+///
+/// Pure host-testable structure; the kernel maps the workspace index
+/// to a donation page index by adding `PROCESS_KERNEL_OBJ_PAGES`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PageTableWorkspace {
+    capacity: usize,
+    claimed: usize,
+}
+
+impl PageTableWorkspace {
+    pub const fn new(capacity: usize) -> Self {
+        Self { capacity, claimed: 0 }
+    }
+
+    pub fn claim(&mut self) -> Option<usize> {
+        if self.claimed >= self.capacity {
+            return None;
+        }
+        let i = self.claimed;
+        self.claimed += 1;
+        Some(i)
+    }
+
+    pub fn claimed_count(&self) -> usize {
+        self.claimed
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+#[cfg(test)]
+mod page_table_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn claims_advance_until_capacity() {
+        let mut w = PageTableWorkspace::new(3);
+        assert_eq!(w.claim(), Some(0));
+        assert_eq!(w.claim(), Some(1));
+        assert_eq!(w.claim(), Some(2));
+        assert_eq!(w.claim(), None);
+        assert_eq!(w.claimed_count(), 3);
+    }
+
+    #[test]
+    fn zero_capacity_immediately_full() {
+        let mut w = PageTableWorkspace::new(0);
+        assert_eq!(w.claim(), None);
+        assert_eq!(w.claimed_count(), 0);
+    }
+
+    #[test]
+    fn min_capacity_holds_l012_plus_max_l3s() {
+        // The smallest valid workspace covers L0 + L1 + L2 + MAX_L3_TABLES.
+        let mut w = PageTableWorkspace::new(WORKSPACE_MIN_PAGES);
+        for expected in 0..WORKSPACE_MIN_PAGES {
+            assert_eq!(w.claim(), Some(expected));
+        }
+        assert_eq!(w.claim(), None);
+    }
+}
+
 /// Result of looking up an L2 index in the L3 region tracker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum L3Lookup {

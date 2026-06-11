@@ -94,6 +94,8 @@
 "memcpy" = 0
 "memset" = 0
 "memcmp" = 0
+"memmove" = 0
+"compiler_builtins::mem::memmove" = 0
 
 # LLVM code de-duplication artifact. Small outlined sequences.
 "OUTLINED_FUNCTION_0" = 0

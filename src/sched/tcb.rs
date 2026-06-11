@@ -28,10 +28,14 @@ pub use lockjaw_types::thread::{KernelStackBase, Tcb, TcbCreateInfo, ThreadBoots
 /// allows IRQ delivery.
 ///
 /// # Safety
-/// `base_kva` must be a KVM-allocated page. `info.stack` must be a
-/// `KernelStackBase::Pool(KernelVa)` for dynamically-allocated stacks
-/// (the only kind that goes through this constructor; the CPU 0
-/// boot TCB uses `create_boot_tcb` with `KernelStackBase::Image`).
+/// `base_kva` must be a kernel-writable VA in one of two regimes:
+/// - KVM-allocated page (`info.stack == KernelStackBase::Pool(_)`,
+///   NK3-era `sys_create_thread`); or
+/// - TTBR1 direct-map page from a donated PageSet
+///   (`info.stack == KernelStackBase::DirectMap(_)`, NK4+
+///   `sys_create_process`).
+/// The CPU 0 boot TCB uses `create_boot_tcb` with
+/// `KernelStackBase::Image` and never reaches this path.
 pub unsafe fn create_tcb(
     info: &TcbCreateInfo,
     base_kva: KernelVa,
@@ -44,10 +48,15 @@ pub unsafe fn create_tcb(
         return Err(CreateError::InvalidParameter);
     }
     let stack_kva = match info.stack {
-        KernelStackBase::Pool(kva) => kva,
+        // Both regimes carry a usable kstack KVA at variant payload;
+        // create_tcb writes the saved-context frame the same way for
+        // both. finish_exit later dispatches the free path per
+        // stack_base.regime() (see lockjaw-types/src/thread.rs).
+        KernelStackBase::Pool(kva) | KernelStackBase::DirectMap(kva) => kva,
         KernelStackBase::Image(_) => {
-            // create_tcb requires a Pool stack — Image stacks belong
-            // to the CPU 0 boot TCB which uses create_boot_tcb.
+            // Image stacks belong to the CPU 0 boot TCB which uses
+            // create_boot_tcb; reaching this branch is an invariant
+            // violation.
             return Err(CreateError::InvalidParameter);
         }
     };

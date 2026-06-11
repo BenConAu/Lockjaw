@@ -24,7 +24,6 @@ use lockjaw_types::vmem::{ScratchAction, ScratchCursor};
 struct Ttbr0Guard(Option<PhysAddr>);
 impl Ttbr0Guard {
     fn new(paddr: PhysAddr) -> Self { Self(Some(paddr)) }
-    fn addr(&self) -> PhysAddr { self.0.unwrap() }
     fn defuse(&mut self) { self.0 = None; }
 }
 impl Drop for Ttbr0Guard {
@@ -45,6 +44,11 @@ pub enum CreateProcessError {
     InvalidUserMemory,
     TooManyOwnedPages,
     AddressSpaceMappingFailed,
+    /// The donated page-table workspace was too small for the
+    /// requested mapping set (NK4+NK5). Distinct from
+    /// `AddressSpaceMappingFailed` so the SyscallError carries
+    /// `OUT_OF_PAGE_TABLES`, not the collapsed `OUT_OF_MEMORY`.
+    OutOfPageTables,
     PlanError(CreateProcessPlanError),
     ConsumeValidateFailed { #[allow(dead_code)] idx: usize },
 }
@@ -57,6 +61,8 @@ impl CreateProcessError {
             CreateProcessError::OutOfMemory
             | CreateProcessError::AddressSpaceMappingFailed =>
                 SyscallError::OUT_OF_MEMORY,
+            CreateProcessError::OutOfPageTables =>
+                SyscallError::OUT_OF_PAGE_TABLES,
             // Scheduler slot table is full — distinct failure class
             // from memory OOM. Previously collapsed into OUT_OF_MEMORY,
             // which conflated "ran out of pages" with "ran out of
@@ -102,21 +108,40 @@ fn log_create_process_oom(step: &'static str) {
     );
 }
 
-/// Bundle returned by `provision_resources`: every kernel page the
-/// new process needs, under guards. The guards are dropped on
-/// failure (freeing the pages); on success the orchestrator defuses
-/// each one before handing the addresses off to apply.
+/// Bundle returned by `provision_resources` (NK4+NK5): the donated
+/// PageSet that backs every kernel page the new process needs, plus
+/// resolved KVAs and the workspace-claimed count for finish.
+///
+/// The donation typestate is the single guard for all four
+/// kernel-object pages AND the page-table workspace. On failure
+/// before `into_consumed`, the donation stays caller-owned and
+/// userspace recovers via `sys_close_handle`. On success the
+/// orchestrator calls `donation.into_consumed(workspace_claimed)`
+/// which runs the single `consume_pageset_apply` for the
+/// process-resources PageSet and frees unclaimed workspace pages
+/// to buddy.
 struct ProvisionedResources {
-    /// ProcessObject lives in the KVM pool; the guard frees the KVA
-    /// range (and its backing frame) on drop unless taken.
-    proc: crate::mm::kvm::OwnedKvmRangeGuard,
-    ttbr0: Ttbr0Guard,
-    /// HandleTable also lives in the KVM pool.
-    handle_table: crate::mm::kvm::OwnedKvmRangeGuard,
-    /// Per-thread kernel stack also lives in the KVM pool.
-    tcb_stack: crate::mm::kvm::OwnedKvmRangeGuard,
-    /// TCB also lives in the KVM pool.
-    tcb: crate::mm::kvm::OwnedKvmRangeGuard,
+    donation: crate::syscall::handler::ProcessPagesDonation,
+    /// TTBR0 L0 physical address from `AddressSpaceBuilder::finish`.
+    /// Held bare (not under `Ttbr0Guard`) because pre-`into_consumed`
+    /// failure leaves the page-table workspace caller-owned (donation
+    /// guard), and post-`into_consumed` the orchestrator arms its
+    /// own `Ttbr0Guard` directly. Holding it under a guard inside
+    /// `provision_resources` would risk a stale guard firing through
+    /// `free_address_space` on workspace pages still owned by the
+    /// caller's PageSet.
+    ttbr0: PhysAddr,
+    /// Resolved direct-map KVAs needed by Phase 5: ProcessObject
+    /// (for the consume-validate loop and HT insertion), HandleTable
+    /// (for parent_copy_apply), and TCB (for scheduler::add_thread).
+    /// kstack KVA is consumed inside Phase 4 of `provision_resources`
+    /// when building the TCB; it's not needed in the orchestrator.
+    proc_kva: KernelVa,
+    ht_kva: KernelVa,
+    tcb_kva: KernelVa,
+    /// Number of workspace pages claimed by `AddressSpaceBuilder`;
+    /// passed to `donation.into_consumed` at finish.
+    workspace_claimed: usize,
     /// Scratch capacity discovered while doing the lookups —
     /// returned because `validate(...)` needs it and the caller
     /// has no other way to learn it without redoing the lookup.
@@ -157,10 +182,17 @@ pub fn create_process(
     stack_pageset_id: u64,
     scratch_pageset_id: u64,
     parent_handle_to_copy: u64,
+    process_resources_ps: u32,
     name: [u8; 16],
 ) -> Result<(), CreateProcessError> {
     let mut plan_builder = ProcessCreationPlanBuilder::new();
-    let mut resources = provision_resources(
+    // provision_resources runs Phases 1-4 of the NK4+NK5 design:
+    // donate → init ProcessObject + mapping iteration + late
+    // validate → build TTBR0 from workspace → init HT/kstack/TCB.
+    // On any failure the donation stays caller-owned (no consume
+    // has run); userspace recovers via sys_close_handle on the
+    // donated PageSet handle.
+    let resources = provision_resources(
         addr_space,
         mappings_va,
         mapping_count,
@@ -168,50 +200,79 @@ pub fn create_process(
         stack_pageset_id,
         scratch_pageset_id,
         parent_handle_to_copy,
+        process_resources_ps,
         name,
         &mut plan_builder,
     )?;
 
-    // Validate the plan (pure structural checks: capacity, scheduler
-    // room, post-consume handle-table capacity invariant). The token
-    // is the only way to get headers_to_consume() and parent_copy()
-    // for the apply phase.
-    // unique_header_count is sourced from the proc-page storage —
-    // the single source of truth for the deduplicated headers list.
-    // Passing it explicitly into validate prevents any possibility
-    // of drift between the kernel-owned dedup count and a builder-
-    // side mirror.
-    let proc_kva = resources.proc.kva();
-    let unique_header_count =
-        crate::cap::process_obj::process_consumed_header_count(proc_kva) as usize;
-    let plan = plan_builder
-        .validate(
-            resources.scratch_capacity,
-            scheduler::has_room(),
-            unique_header_count,
-        )
-        .map_err(CreateProcessError::PlanError)?;
+    // ============ Phase 5: Apply (infallible) ============
 
-    // Validate that revoking every consumed PageSet header would
-    // succeed. consume_pageset_validate is read-only — Err here
-    // leaves every parent's handle table and page table untouched.
-    // Headers live in the proc page (off the kernel stack); read
-    // them by index. The proc-page storage is a polymorphic u64
-    // array — interpret the entries as PageSet header KVAs.
+    // Validate the plan from Phase-2 state (proc-page consumed-header
+    // storage is the single source of truth for unique header count;
+    // see the comment in provision_resources Phase 2).
+    let unique_header_count =
+        crate::cap::process_obj::process_consumed_header_count(resources.proc_kva) as usize;
+    let plan = match plan_builder.validate(
+        resources.scratch_capacity,
+        scheduler::has_room(),
+        unique_header_count,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            // Pre-`into_consumed`: donation must stay caller-owned
+            // to keep the typestate resolved. Without this branch
+            // `resources` drops and `ProcessPagesDonation::drop`
+            // panics on unresolved-drop.
+            resources.donation.into_caller_owned();
+            return Err(CreateProcessError::PlanError(e));
+        }
+    };
+
+    // consume_pageset_validate for every unique mapping header — read-only
+    // pairing for the apply loop below. Err here leaves every parent's
+    // handle table and page table untouched AND the donation
+    // caller-owned (since into_consumed hasn't run).
     for idx in 0..plan.unique_header_count() {
-        let hdr = crate::cap::process_obj::process_consumed_header(proc_kva, idx)
+        let hdr = crate::cap::process_obj::process_consumed_header(resources.proc_kva, idx)
             .expect("header index < unique_header_count by construction");
-        crate::cap::pageset_table::consume_pageset_validate(hdr)
-            .map_err(|_| CreateProcessError::ConsumeValidateFailed { idx })?;
+        if crate::cap::pageset_table::consume_pageset_validate(hdr).is_err() {
+            resources.donation.into_caller_owned();
+            return Err(CreateProcessError::ConsumeValidateFailed { idx });
+        }
     }
 
-    // ============ Apply phase: all infallible commits ============
+    // Phase-5 apply ordering:
+    //   (a) into_consumed: single consume_pageset_apply on the
+    //       process-resources PageSet, free unclaimed workspace.
+    //   (b) Ttbr0Guard arms the workspace pages as kernel-owned.
+    //   (c) I-cache flush before any thread can start running.
+    //   (d) init_process_header + per-mapping consume_pageset_apply
+    //       loop + parent_copy_apply (all infallible by contract).
+    //   (e) Defuse Ttbr0Guard + add_thread.
+    let proc_kva = resources.proc_kva;
+    let ht_kva = resources.ht_kva;
+    let tcb_kva = resources.tcb_kva;
+    let ttbr0 = resources.ttbr0;
+    resources.donation.into_consumed(resources.workspace_claimed);
 
-    // Apply consume for each unique header. revoke_apply walks every
-    // process's handle table (including the parent's), clears PTEs
-    // for active mappings, decrements refcount/map_count per cleared
-    // slot, then unlinks and frees the header. Cannot fail under the
-    // validate→apply contract (GKL held throughout).
+    let mut ttbr0_guard = Ttbr0Guard::new(ttbr0);
+
+    // I-cache flush before the new process can fetch its first
+    // instruction. Load-bearing: the kernel just wrote ELF text into
+    // pages via the linear-map alias; the i-cache can hold stale
+    // lines if the same paddrs were ever instruction-mapped before
+    // for the kernel image. (ProcessObject header + thread count
+    // were written in Phase 4 of provision_resources so the
+    // create_tcb precondition was satisfied.)
+    // SAFETY: standard cache-maintenance ops; broadcast via dsb ish.
+    unsafe { core::arch::asm!("ic iallu", "dsb ish", "isb") };
+
+    // Per-mapping consume_pageset_apply loop. Infallibility
+    // precondition: the consume_pageset_validate loop above ran
+    // within the same GKL-held critical section. revoke_apply walks
+    // every process's handle table (including the parent's), clears
+    // PTEs for active mappings, decrements refcount/map_count per
+    // cleared slot, then unlinks and frees the header.
     for idx in 0..plan.unique_header_count() {
         let hdr = crate::cap::process_obj::process_consumed_header(proc_kva, idx)
             .expect("header index < unique_header_count by construction");
@@ -244,9 +305,9 @@ pub fn create_process(
             other => other,
         };
 
-        // SAFETY: handle_table KVA was initialized as a valid handle
-        // table in provision_resources.
-        let child_ht = unsafe { HandleTableRef::from_kva(resources.handle_table.kva()) };
+        // SAFETY: ht_kva was initialized as a valid handle table in
+        // provision_resources Phase 4.
+        let child_ht = unsafe { HandleTableRef::from_kva(ht_kva) };
         // Cannot fail: the child table was freshly allocated empty
         // with HANDLE_SLOTS_PER_PAGE empty slots, and the post-consume
         // capacity invariant was checked in the pure validate. Avoid
@@ -257,18 +318,8 @@ pub fn create_process(
         }
     }
 
-    // Capture the TCB KVA before taking — take() drops the guard's
-    // ownership, after which kva() would panic.
-    let tcb_kva = resources.tcb.kva();
-
-    // Defuse drop guards — child now owns all its resources.
-    // OwnedKvmRangeGuard transfers ownership via take() (drops the
-    // guard's claim without freeing). Ttbr0Guard uses defuse().
-    let _ = resources.proc.take();
-    let _ = resources.handle_table.take();
-    resources.ttbr0.defuse();
-    let _ = resources.tcb_stack.take();
-    let _ = resources.tcb.take();
+    // Defuse TTBR0 guard — child now owns its address space.
+    ttbr0_guard.defuse();
 
     // Enqueue the thread. Cannot fail because has_room() above
     // returned true and GKL has been held throughout.
@@ -301,9 +352,19 @@ fn provision_resources(
     stack_pageset_id: u64,
     scratch_pageset_id: u64,
     parent_handle_to_copy: u64,
+    process_resources_ps: u32,
     name: [u8; 16],
     plan_builder: &mut ProcessCreationPlanBuilder,
 ) -> Result<ProvisionedResources, CreateProcessError> {
+    // ============ Phase 1: Pure prerequisites + donation ============
+
+    // has_room() before any donate so a full scheduler doesn't
+    // burn through the donate-and-claim cycle.
+    if !scheduler::has_room() {
+        return Err(CreateProcessError::PlanError(
+            CreateProcessPlanError::SchedulerFull));
+    }
+
     // Look up stack and scratch PageSets from handle table.
     // These are handle indices, not raw pageset IDs.
     let ht = CurrentThread::handle_table();
@@ -394,8 +455,55 @@ fn provision_resources(
         return Err(CreateProcessError::PlanError(CreateProcessPlanError::BufferCapacityExceeded));
     }
 
-    // Set up first scratch page
-    let scratch_paddr = scratch_ps.page(0).ok_or(CreateProcessError::InvalidUserMemory)?;
+    // Donate the multi-page process-resources PageSet (NK4+NK5).
+    // Validates Buddy origin, page count in [PROCESS_MIN, PROCESS_MAX].
+    // Does NOT consume — the donation guard holds the typestate until
+    // Phase 5's into_consumed call.
+    let donation = crate::syscall::handler::donate_process_pages(process_resources_ps)
+        .map_err(|e| match e {
+            SyscallError::INVALID_HANDLE | SyscallError::INSUFFICIENT_RIGHTS =>
+                CreateProcessError::BadHandle,
+            _ => CreateProcessError::InvalidUserMemory,
+        })?;
+
+    // Resolve kernel-object KVAs from the donation. idx 0=ProcessObject,
+    // 1=HandleTable, 2=kstack, 3=TCB; idx 4..N is the page-table
+    // workspace. All four live in the TTBR1 direct map
+    // (paddr + KERNEL_VA_OFFSET).
+    //
+    // `obj_kva` returns `Option` for indices outside the donation, but
+    // `donate_process_pages` validated `data_page_count >=
+    // PROCESS_MIN_PAGES = 15`, so indices 0..=3 are infallibly present.
+    // `expect` keeps the unresolved-drop enforcement zone tight: between
+    // `donate_process_pages` and the `phase_2_4` closure below we must
+    // hold zero fallible `?` sites — otherwise `ProcessPagesDonation`'s
+    // Drop would panic on an unresolved drop, which is louder than the
+    // kernel-invariant assertion these `expect`s carry.
+    let proc_kva = donation.obj_kva(0).expect("donation idx 0 within PROCESS_MIN_PAGES");
+    let ht_kva = donation.obj_kva(1).expect("donation idx 1 within PROCESS_MIN_PAGES");
+    let kstack_kva = donation.obj_kva(2).expect("donation idx 2 within PROCESS_MIN_PAGES");
+    let tcb_kva = donation.obj_kva(3).expect("donation idx 3 within PROCESS_MIN_PAGES");
+
+    // ============ Phase 2: ProcessObject init + mapping iteration + validate ============
+
+    // Zero-init proc_kva (kernel-object page 0).
+    // SAFETY: proc_kva derives from a Buddy-origin donation page;
+    // sole writer under GKL; page is in the direct map.
+    unsafe {
+        let mut p = crate::mm::kernel_ptr::KernelMut::<u8>::from_kva(proc_kva);
+        core::ptr::write_bytes(p.as_mut_ptr(), 0, PAGE_SIZE as usize);
+    }
+
+    // Set up first scratch page (for the temporary Mapping buffer the
+    // AddressSpaceBuilder consumes — scratch lives in the caller's
+    // scratch PageSet, NOT the donated process-resources PageSet).
+    //
+    // `scratch_ps.page(0)` is infallible here: the `scratch_count == 0`
+    // rejection at line 442 (see above) ran before `donate_process_pages`,
+    // so by this point `scratch_count >= 1` and idx 0 is valid. The
+    // `expect` keeps the donate→closure window free of `?` that would
+    // drop `donation` unresolved.
+    let scratch_paddr = scratch_ps.page(0).expect("scratch idx 0 valid after scratch_count > 0 check");
     page_alloc::zero_page(scratch_paddr);
     // SAFETY: scratch_paddr is a kernel-allocated page; we use it as a
     // temporary Mapping buffer for AddressSpaceBuilder.
@@ -403,191 +511,239 @@ fn provision_resources(
     let mut mappings = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), MAPPINGS_PER_PAGE) };
     let mut cursor = ScratchCursor::new(scratch_count);
 
-    // Allocate process page early (in the KVM pool) so we can write
-    // owned_pages directly into it during mapping resolution. The KVM
-    // alloc returns an OwnedKvmRange whose backing frame is fresh and
-    // zero-initialized via the explicit write_bytes below.
-    let proc_range = crate::mm::kvm::alloc_kernel_pages(1)
-        .map_err(|_| { log_create_process_oom("proc_range"); CreateProcessError::OutOfMemory })?;
-    let proc_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(proc_range);
-    let proc_kva = proc_guard.kva();
-    // SAFETY: proc_kva is a freshly-allocated KVM range; we own it.
-    unsafe {
-        let mut p = crate::mm::kernel_ptr::KernelMut::<u8>::from_kva(proc_kva);
-        core::ptr::write_bytes(p.as_mut_ptr(), 0, PAGE_SIZE as usize);
-    }
-
-    // Create incremental address space builder — Drop handles cleanup on failure.
-    let mut as_builder = unsafe { AddressSpaceBuilder::new() }
-        .map_err(|_| { log_create_process_oom("AddressSpaceBuilder::new"); CreateProcessError::OutOfMemory })?;
-
-    for i in 0..mapping_count {
-        // Read ProcessMapping from user memory via page table walk (TTBR1).
-        let entry_va = mappings_va + (i as u64) * core::mem::size_of::<ProcessMapping>() as u64;
-        let user_mapping: ProcessMapping = addr_space.read(entry_va)
-            .ok_or(CreateProcessError::InvalidUserMemory)?;
-
-        // Resolve the PageSet handle to a physical address
-        let ps_entry = ht.lookup(user_mapping.pageset_id as u32,
-            crate::cap::rights::Rights::from_bits(crate::cap::rights::RIGHT_READ),
-            crate::cap::object::ObjectType::PageSet)
-            .map_err(|_| CreateProcessError::BadHandle)?;
-        let ps_kva = match ps_entry.kind {
-            lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
-            _ => return Err(CreateProcessError::BadHandle),
-        };
-        // SAFETY: kva from a PageSet handle — registered header KVA.
-        let ps = unsafe { PageSetRef::from_header_kva(ps_kva) };
-        // M6: process mappings get installed as cacheable Normal
-        // PTEs by AddressSpaceBuilder::map_batch (no per-mapping
-        // attribute selector — this is the create_process path, not
-        // sys_map_pages). DmaPool PageSets must not enter this path;
-        // uninit origin is rejected as a typed bug signal.
-        match ps.origin() {
-            Some(lockjaw_types::pageset_table::PageSetOrigin::Buddy) => {}
-            _ => return Err(CreateProcessError::BadHandle),
+    // ============ Phase 2-4 body (fallible) =====================
+    //
+    // All fallible work between donate and Phase 5 runs inside this
+    // inner block. The donation borrow stays alive for the block; on
+    // Err the outer scope below calls `donation.into_caller_owned()`
+    // so the PageSet stays caller-owned. On Ok we return the values
+    // needed for ProvisionedResources and Phase 5 in the orchestrator.
+    //
+    // map_vmem_err narrows VmemError::OutOfPageTables to its own
+    // CreateProcessError variant (so it surfaces as
+    // SyscallError::OUT_OF_PAGE_TABLES, not the collapsed
+    // OUT_OF_MEMORY). All four VmemError-producing sites
+    // (AddressSpaceBuilder::new + three map_batch calls) thread
+    // through this mapper.
+    let map_vmem_err = |e: crate::arch::aarch64::vmem::VmemError| match e {
+        // Both "donation workspace exhausted" and "L3RegionTracker
+        // hit MAX_L3_TABLES" surface as OUT_OF_PAGE_TABLES — they
+        // are the two ways a process can run out of page-table
+        // backing for its mappings. Userspace distinguishes them
+        // via the donation page count it provides; both signal
+        // "ran out of page-table space" rather than the broader
+        // OUT_OF_MEMORY (kernel-internal exhaustion).
+        crate::arch::aarch64::vmem::VmemError::OutOfPageTables
+        | crate::arch::aarch64::vmem::VmemError::TooManyL3Regions =>
+            CreateProcessError::OutOfPageTables,
+        _ => {
+            log_create_process_oom("vmem builder");
+            CreateProcessError::AddressSpaceMappingFailed
         }
-        let page_idx = user_mapping.page_index as usize;
-        let phys = ps.page(page_idx).ok_or(CreateProcessError::InvalidUserMemory)?;
+    };
 
-        mappings[cursor.offset()] = Mapping {
-            virt_addr: user_mapping.virt_addr,
-            phys_addr: phys,
-            user_accessible: true,
-            executable: (user_mapping.flags & PROCESS_MAP_FLAG_EXECUTABLE) != 0,
-        };
+    let phase_2_4 = (|| -> Result<(PhysAddr, usize), CreateProcessError> {
+        // ============ Phase 3: AddressSpaceBuilder from donation workspace ============
 
-        match cursor.advance() {
-            ScratchAction::Continue => {}
-            ScratchAction::FlushAndAdvance { next_page_idx } => {
-                unsafe { as_builder.map_batch(&mappings[..MAPPINGS_PER_PAGE]) }
-                    .map_err(|_| { log_create_process_oom("map_batch flush"); CreateProcessError::AddressSpaceMappingFailed })?;
-                let next = scratch_ps.page(next_page_idx).ok_or(CreateProcessError::InvalidUserMemory)?;
-                page_alloc::zero_page(next);
-                buf = unsafe { KernelMut::<Mapping>::from_paddr(next) };
-                mappings = unsafe {
-                    core::slice::from_raw_parts_mut(buf.as_mut_ptr(), MAPPINGS_PER_PAGE)
-                };
-                cursor.did_advance();
+        let workspace_capacity =
+            donation.data_page_count() - lockjaw_types::vmem::PROCESS_KERNEL_OBJ_PAGES;
+        let workspace = lockjaw_types::vmem::PageTableWorkspace::new(workspace_capacity);
+        let mut as_builder = AddressSpaceBuilder::new(&donation, workspace)
+            .map_err(map_vmem_err)?;
+
+            for i in 0..mapping_count {
+            // Read ProcessMapping from user memory via page table walk (TTBR1).
+            let entry_va = mappings_va + (i as u64) * core::mem::size_of::<ProcessMapping>() as u64;
+            let user_mapping: ProcessMapping = addr_space.read(entry_va)
+                .ok_or(CreateProcessError::InvalidUserMemory)?;
+
+            // Resolve the PageSet handle to a physical address
+            let ps_entry = ht.lookup(user_mapping.pageset_id as u32,
+                crate::cap::rights::Rights::from_bits(crate::cap::rights::RIGHT_READ),
+                crate::cap::object::ObjectType::PageSet)
+                .map_err(|_| CreateProcessError::BadHandle)?;
+            let ps_kva = match ps_entry.kind {
+                lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
+                _ => return Err(CreateProcessError::BadHandle),
+            };
+            // Reject self-aliasing: if userspace passes the process-
+            // resources donation handle as a mapping pageset_id, the
+            // Phase 5 per-mapping consume loop would call
+            // consume_pageset_apply on the donation header AFTER
+            // into_consumed already did, tripping
+            // pageset_header_pool::release's double-release assertion.
+            // The donation handle has WRITE rights (for donate) and
+            // implicit READ (so the mapping lookup succeeds); the
+            // header-KVA comparison closes the alias gap by
+            // construction.
+            if ps_kva == donation.header_kva() {
+                return Err(CreateProcessError::BadHandle);
+            }
+            // SAFETY: kva from a PageSet handle — registered header KVA.
+            let ps = unsafe { PageSetRef::from_header_kva(ps_kva) };
+            // M6: process mappings get installed as cacheable Normal
+            // PTEs by AddressSpaceBuilder::map_batch (no per-mapping
+            // attribute selector — this is the create_process path, not
+            // sys_map_pages). DmaPool PageSets must not enter this path;
+            // uninit origin is rejected as a typed bug signal.
+            match ps.origin() {
+                Some(lockjaw_types::pageset_table::PageSetOrigin::Buddy) => {}
+                _ => return Err(CreateProcessError::BadHandle),
+            }
+            let page_idx = user_mapping.page_index as usize;
+            let phys = ps.page(page_idx).ok_or(CreateProcessError::InvalidUserMemory)?;
+
+            mappings[cursor.offset()] = Mapping {
+                virt_addr: user_mapping.virt_addr,
+                phys_addr: phys,
+                user_accessible: true,
+                executable: (user_mapping.flags & PROCESS_MAP_FLAG_EXECUTABLE) != 0,
+            };
+
+            match cursor.advance() {
+                ScratchAction::Continue => {}
+                ScratchAction::FlushAndAdvance { next_page_idx } => {
+                    as_builder.map_batch(&mappings[..MAPPINGS_PER_PAGE])
+                        .map_err(map_vmem_err)?;
+                    let next = scratch_ps.page(next_page_idx).ok_or(CreateProcessError::InvalidUserMemory)?;
+                    page_alloc::zero_page(next);
+                    buf = unsafe { KernelMut::<Mapping>::from_paddr(next) };
+                    mappings = unsafe {
+                        core::slice::from_raw_parts_mut(buf.as_mut_ptr(), MAPPINGS_PER_PAGE)
+                    };
+                    cursor.did_advance();
+                }
+            }
+
+            // Record data page directly in ProcessObject (no stack array)
+            if !crate::cap::process_obj::process_push_owned_page(
+                proc_kva, phys.as_u64()
+            ) {
+                return Err(CreateProcessError::TooManyOwnedPages);
+            }
+            record_mapping_into_plan(
+                plan_builder, proc_kva, ps_kva,
+            )?;
+        }
+
+        // Add stack pages contiguously at USER_STACK_BASE
+        let stack_va: u64 = lockjaw_types::constants::USER_STACK_BASE;
+        for s in 0..stack_ps.count() {
+            let phys = stack_ps.page(s).ok_or(CreateProcessError::InvalidUserMemory)?;
+            mappings[cursor.offset()] = Mapping {
+                virt_addr: stack_va + (s as u64) * PAGE_SIZE,
+                phys_addr: phys,
+                user_accessible: true,
+                executable: false,
+            };
+
+            match cursor.advance() {
+                ScratchAction::Continue => {}
+                ScratchAction::FlushAndAdvance { next_page_idx } => {
+                    as_builder.map_batch(&mappings[..MAPPINGS_PER_PAGE])
+                        .map_err(map_vmem_err)?;
+                    let next = scratch_ps.page(next_page_idx).ok_or(CreateProcessError::InvalidUserMemory)?;
+                    page_alloc::zero_page(next);
+                    buf = unsafe { KernelMut::<Mapping>::from_paddr(next) };
+                    mappings = unsafe {
+                        core::slice::from_raw_parts_mut(buf.as_mut_ptr(), MAPPINGS_PER_PAGE)
+                    };
+                    cursor.did_advance();
+                }
+            }
+
+            // Record stack pages directly in ProcessObject
+            if !crate::cap::process_obj::process_push_owned_page(
+                proc_kva, phys.as_u64()
+            ) {
+                return Err(CreateProcessError::TooManyOwnedPages);
             }
         }
-
-        // Record data page directly in ProcessObject (no stack array)
-        if !crate::cap::process_obj::process_push_owned_page(
-            proc_kva, phys.as_u64()
-        ) {
-            return Err(CreateProcessError::TooManyOwnedPages);
-        }
-        record_mapping_into_plan(
-            plan_builder, proc_kva, ps_kva,
+        record_stack_into_plan(
+            plan_builder, proc_kva, stack_kva, stack_ps.count(),
         )?;
-    }
 
-    // Add stack pages contiguously at USER_STACK_BASE
-    let stack_va: u64 = lockjaw_types::constants::USER_STACK_BASE;
-    for s in 0..stack_ps.count() {
-        let phys = stack_ps.page(s).ok_or(CreateProcessError::InvalidUserMemory)?;
-        mappings[cursor.offset()] = Mapping {
-            virt_addr: stack_va + (s as u64) * PAGE_SIZE,
-            phys_addr: phys,
-            user_accessible: true,
-            executable: false,
-        };
+        // Final flush of pending mappings and finalize address space
+        if cursor.has_pending() {
+            as_builder.map_batch(&mappings[..cursor.pending_count()])
+                .map_err(map_vmem_err)?;
+        }
+        let (ttbr0, workspace_claimed) = as_builder.finish();
 
-        match cursor.advance() {
-            ScratchAction::Continue => {}
-            ScratchAction::FlushAndAdvance { next_page_idx } => {
-                unsafe { as_builder.map_batch(&mappings[..MAPPINGS_PER_PAGE]) }
-                    .map_err(|_| { log_create_process_oom("map_batch flush"); CreateProcessError::AddressSpaceMappingFailed })?;
-                let next = scratch_ps.page(next_page_idx).ok_or(CreateProcessError::InvalidUserMemory)?;
-                page_alloc::zero_page(next);
-                buf = unsafe { KernelMut::<Mapping>::from_paddr(next) };
-                mappings = unsafe {
-                    core::slice::from_raw_parts_mut(buf.as_mut_ptr(), MAPPINGS_PER_PAGE)
-                };
-                cursor.did_advance();
-            }
+        // ============ Phase 4: Init HandleTable + ProcessObject + TCB ============
+        // No i-cache flush here — it moves to Phase 5 in
+        // create_process, after into_consumed transfers ownership.
+
+        // SAFETY: ht_kva is a Buddy-origin direct-map page (donation
+        // index 1); GKL-held, sole writer.
+        unsafe {
+            create_handle_table(
+                &HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
+                ht_kva,
+            ).map_err(|_| { log_create_process_oom("create_handle_table"); CreateProcessError::OutOfMemory })?;
         }
 
-        // Record stack pages directly in ProcessObject
-        if !crate::cap::process_obj::process_push_owned_page(
-            proc_kva, phys.as_u64()
-        ) {
-            return Err(CreateProcessError::TooManyOwnedPages);
+        // Write the ProcessObject header now so `create_tcb`'s
+        // `process_ttbr0(proc_kva) != 0` invariant check sees a
+        // populated TTBR0 field. owned_pages was populated by Phase 2
+        // and is preserved by init_process_header (it only writes the
+        // header fields).
+        crate::cap::process_obj::init_process_header(
+            proc_kva,
+            ttbr0.as_u64(),
+            ht_kva.as_u64(),
+            false, // not immortal
+            &name,
+        );
+        // First thread — increment via narrow op (count 0 → 1).
+        // Bringing this into Phase 4 mirrors the create_tcb
+        // precondition: the TCB belongs to a process whose thread
+        // count is already accounted for.
+        crate::cap::process_obj::process_inc_thread_count(proc_kva);
+
+        // SAFETY: kstack_kva and tcb_kva are Buddy-origin direct-map
+        // pages (donation indices 2 and 3); GKL-held, sole writer.
+        // KernelStackBase::DirectMap carries the kstack KVA; the
+        // finish_exit free path matches the regime via
+        // stack_base.regime() (TD4 future-tracks splitting the
+        // regime per-resource).
+        unsafe {
+            create_tcb(
+                &TcbCreateInfo {
+                    entry: process_entry,
+                    stack: lockjaw_types::thread::KernelStackBase::DirectMap(kstack_kva),
+                    process_kva: proc_kva,
+                    user_entry_point: entry_point,
+                    user_stack_top: stack_va + (stack_ps.count() as u64) * PAGE_SIZE,
+                    user_stack_base: stack_va,
+                    user_arg: 0,
+                    name,
+                },
+                tcb_kva,
+            ).map_err(|_| { log_create_process_oom("create_tcb"); CreateProcessError::OutOfMemory })?;
         }
-    }
-    record_stack_into_plan(
-        plan_builder, proc_kva, stack_kva, stack_ps.count(),
-    )?;
 
-    // Final flush of pending mappings and finalize address space
-    if cursor.has_pending() {
-        unsafe { as_builder.map_batch(&mappings[..cursor.pending_count()]) }
-            .map_err(|_| { log_create_process_oom("map_batch final"); CreateProcessError::AddressSpaceMappingFailed })?;
-    }
-    let ttbr0 = as_builder.finish();
-    let ttbr0_guard = Ttbr0Guard::new(ttbr0);
+        Ok((ttbr0, workspace_claimed))
+    })();
 
-    // Flush I-cache
-    unsafe { core::arch::asm!("ic iallu", "dsb ish", "isb") };
-
-    // Create handle table in the KVM pool.
-    let ht_range = crate::mm::kvm::alloc_kernel_pages(1)
-        .map_err(|_| { log_create_process_oom("ht_range"); CreateProcessError::OutOfMemory })?;
-    let ht_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(ht_range);
-    let ht_kva = ht_guard.kva();
-    // SAFETY: ht_kva is a freshly allocated KVM range.
-    unsafe {
-        create_handle_table(
-            &HandleTableCreateInfo { slot_count: lockjaw_types::object::HANDLE_SLOTS_PER_PAGE },
-            ht_kva,
-        ).map_err(|_| { log_create_process_oom("create_handle_table"); CreateProcessError::OutOfMemory })?;
-    }
-
-    // Write ProcessObject header (owned_pages already populated above).
-    crate::cap::process_obj::init_process_header(
-        proc_kva,
-        ttbr0_guard.addr().as_u64(),
-        ht_kva.as_u64(),
-        false, // not immortal
-        &name,
-    );
-
-    // First thread — increment via narrow op (count 0 → 1)
-    crate::cap::process_obj::process_inc_thread_count(proc_kva);
-
-    // Create TCB — first thread in this process. Both the TCB page
-    // and the per-thread kernel stack live in the KVM pool.
-    let tcb_stack_range = crate::mm::kvm::alloc_kernel_pages(1)
-        .map_err(|_| { log_create_process_oom("tcb_stack_range"); CreateProcessError::OutOfMemory })?;
-    let tcb_stack_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(tcb_stack_range);
-    let tcb_range = crate::mm::kvm::alloc_kernel_pages(1)
-        .map_err(|_| { log_create_process_oom("tcb_range"); CreateProcessError::OutOfMemory })?;
-    let tcb_guard = crate::mm::kvm::OwnedKvmRangeGuard::new(tcb_range);
-
-    // SAFETY: stack and TCB are freshly allocated kernel pages.
-    unsafe {
-        create_tcb(
-            &TcbCreateInfo {
-                entry: process_entry,
-                stack: lockjaw_types::thread::KernelStackBase::Pool(tcb_stack_guard.kva()),
-                process_kva: proc_kva,
-                user_entry_point: entry_point,
-                user_stack_top: stack_va + (stack_ps.count() as u64) * PAGE_SIZE,
-                user_stack_base: stack_va,
-                user_arg: 0,
-                name,
-            },
-            tcb_guard.kva(),
-        ).map_err(|_| { log_create_process_oom("create_tcb"); CreateProcessError::OutOfMemory })?;
-    }
+    let (ttbr0, workspace_claimed) = match phase_2_4 {
+        Ok(v) => v,
+        Err(e) => {
+            // Any failure between donate and Phase 5's into_consumed
+            // leaves the donation caller-owned: userspace can
+            // sys_close_handle to recover every donated page.
+            donation.into_caller_owned();
+            return Err(e);
+        }
+    };
 
     Ok(ProvisionedResources {
-        proc: proc_guard,
-        ttbr0: ttbr0_guard,
-        handle_table: ht_guard,
-        tcb_stack: tcb_stack_guard,
-        tcb: tcb_guard,
+        donation,
+        ttbr0,
+        proc_kva,
+        ht_kva,
+        tcb_kva,
+        workspace_claimed,
         scratch_capacity,
     })
 }

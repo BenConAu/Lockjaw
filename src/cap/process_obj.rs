@@ -12,8 +12,12 @@ use lockjaw_types::process::{self, ProcessLifecycle, TransferError, MAX_CONSUMED
 /// thread_count tracks live threads; when it hits zero, process resources
 /// are freed (unless immortal).
 ///
-/// ProcessObjects live in the KVM pool — kernel callers reach them via
-/// `KernelMut::<ProcessObject>::from_kva`. See kernel-vmem-roadmap.md.
+/// ProcessObject lives in a kernel-writable page — pre-NK4 the KVM
+/// pool, post-NK4 the TTBR1 direct map at `paddr + KERNEL_VA_OFFSET`
+/// (donated PageSet slot 0). Kernel callers reach it via
+/// `KernelMut::<ProcessObject>::from_kva`; the eventual free path in
+/// `scheduler.rs::finish_exit` matches the create regime. See
+/// kernel-vmem-roadmap.md and docs/architecture/no-kernel-alloc.md.
 #[repr(C)]
 pub struct ProcessObject {
     pub header: ObjectHeader,
@@ -47,7 +51,9 @@ pub struct ProcessObject {
 // ProcessObject must fit in a single donated 4KB page.
 const _: () = assert!(core::mem::size_of::<ProcessObject>() <= 4096);
 
-/// Initialize a ProcessObject in a KVM-mapped page.
+/// Initialize a ProcessObject in a kernel-writable page (KVM pool
+/// pre-NK4; donated TTBR1 direct map post-NK4 — same regime split
+/// documented on the ProcessObject struct).
 /// thread_count starts at 0. The caller must immediately call
 /// process_inc_thread_count() for the first thread.
 pub fn create_process_object(
@@ -59,7 +65,9 @@ pub fn create_process_object(
 ) {
     // Zero the page first — owned_pages (1024 bytes) starts as zeros
     // without constructing a large struct literal on the stack.
-    // SAFETY: process_kva came from kvm::alloc_kernel_pages; we own it.
+    // SAFETY: process_kva came from a kernel-writable page (KVM pool
+    // pre-NK4; donated TTBR1 direct map post-NK4); the caller owns it
+    // for the duration of this init call (GKL held, no live aliases).
     unsafe {
         let mut p = KernelMut::<u8>::from_kva(process_kva);
         core::ptr::write_bytes(p.as_mut_ptr(), 0, crate::mm::addr::PAGE_SIZE as usize);
@@ -67,8 +75,10 @@ pub fn create_process_object(
     init_process_header(process_kva, ttbr0_paddr, handle_table_kva, immortal, name);
 }
 
-/// Write ProcessObject header fields into an already-zeroed KVM page.
-/// Used by create_process when owned_pages was populated first.
+/// Write ProcessObject header fields into an already-zeroed page.
+/// Used by create_process when owned_pages was populated first. The
+/// page may live in the KVM pool (bootstrap path) or the TTBR1 direct
+/// map (NK4+ sys_create_process via donate_process_pages).
 pub fn init_process_header(
     process_kva: KernelVa,
     ttbr0_paddr: u64,
@@ -76,7 +86,11 @@ pub fn init_process_header(
     immortal: bool,
     name: &[u8; 16],
 ) {
-    // SAFETY: process_kva is a zeroed, kernel-owned page in the KVM pool.
+    // SAFETY: process_kva is a zeroed, kernel-owned page. Pre-NK4 it
+    // lived in the KVM pool; post-NK4 sys_create_process supplies a
+    // TTBR1 direct-map page from a donated PageSet. Either regime
+    // satisfies KernelMut::from_kva — the kernel writes through the
+    // KVA; the eventual free path matches the create regime.
     let mut slot = unsafe { KernelMut::<ProcessObject>::from_kva(process_kva) };
     // Write only the header fields. owned_page_count and owned_pages
     // are preserved (may already be populated by process_push_owned_page).
@@ -109,7 +123,12 @@ pub fn process_ttbr0(process_kva: KernelVa) -> u64 {
 }
 
 /// Read the handle table KVA for this process.
-/// HandleTable lives in the KVM pool (kernel-vmem-roadmap.md).
+/// Pre-NK4 the HandleTable lived in the KVM pool; post-NK4
+/// sys_create_process places it in the TTBR1 direct map (donated
+/// PageSet slot 1). The accessor returns whatever KVA the
+/// ProcessObject carries — its regime is the responsibility of the
+/// creation path and the matching free path in
+/// `scheduler.rs::finish_exit`.
 pub fn process_handle_table(process_kva: KernelVa) -> KernelVa {
     // SAFETY: process_kva is a valid ProcessObject.
     let p = unsafe { KernelRef::<ProcessObject>::from_kva(process_kva) };

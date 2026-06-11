@@ -9,13 +9,18 @@ use lockjaw_types::addr::KernelVa;
 // Kernel-only: create_handle_table (unsafe, writes to KVM-mapped memory)
 // ---------------------------------------------------------------------------
 
-/// Initialize a HandleTable in a KVM-mapped page (or pages, for multi-
-/// page tables).
+/// Initialize a HandleTable in a kernel-writable page.
+///
+/// `base_kva` may live in either the KVM pool (NK3-era /
+/// bootstrap-time paths) OR the TTBR1 direct map at
+/// `paddr + KERNEL_VA_OFFSET` (NK4+ sys_create_process via
+/// donate_process_pages). create_handle_table only writes through
+/// the KVA; the free path matches the create regime.
 ///
 /// # Safety
-/// `base_kva` must point to a kernel-owned KVM range of at least
-/// `query_handle_table_size(info).pages` pages, with no live references
-/// into it.
+/// `base_kva` must point to a kernel-owned page (or pages, for
+/// multi-page tables) of at least `query_handle_table_size(info).pages`
+/// pages, with no live references into it.
 pub unsafe fn create_handle_table(
     info: &HandleTableCreateInfo,
     base_kva: KernelVa,

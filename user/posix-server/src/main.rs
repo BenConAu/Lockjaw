@@ -853,6 +853,15 @@ pub extern "C" fn _start() -> ! {
     name_buf[..11].copy_from_slice(b"posix-hello");
 
     puts("posix-server: spawning posix-hello...\n");
+    // NK4+NK5 process-resources PageSet — see init's spawn_elf for
+    // the donate-and-claim regime. Kernel consumes on success; we
+    // close-handle on failure so the pages return to buddy.
+    let process_resources_ps = match sys_alloc_pages(
+        lockjaw_types::vmem::PROCESS_RECOMMENDED_PAGES as u64
+    ) {
+        Ok(id) => id,
+        Err(_) => { puts("posix-server: alloc process_resources FAILED\n"); halt(); }
+    };
     let info = lockjaw_types::process::ProcessCreateInfo {
         mappings_ptr: map_array_va,
         mapping_count: mapping_count as u64,
@@ -861,8 +870,12 @@ pub extern "C" fn _start() -> ! {
         scratch_pageset_id: scratch_ps.0,
         parent_handle_to_copy: syscall_ep.raw(),
         name_va: name_buf.as_ptr() as u64,
+        process_resources_ps,
     };
     let result = sys_create_process(&info);
+    if !result.is_ok() {
+        let _ = sys_close_handle(process_resources_ps);
+    }
     if !result.is_ok() {
         puts("posix-server: spawn FAILED\n");
         halt();

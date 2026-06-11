@@ -119,18 +119,85 @@ pub fn handle_syscall(ctx: &mut ExceptionContext) {
 /// VA range to the KVM free list (the donated physical frame still
 /// leaks in that path — same as the pre-migration leak when no
 /// destroy path exists; tracked in `docs/tracking/tech-debt.md`).
+/// Validate a Buddy-origin PageSet handle: WRITE rights, PageSet
+/// type, Buddy origin (reject DmaPool / ExternallyOwned), and page
+/// count within `page_count_range`. Does NOT consume the PageSet.
+///
+/// Returns `(header_kva, data_page_count)` so callers don't re-fetch
+/// `read_header_backed` for a count this function already computed
+/// for range-checking.
+///
+/// Shared between `donate_one_kernel_page` (1..=1) and
+/// `donate_process_pages` (`PROCESS_MIN_PAGES..=PROCESS_MAX_PAGES`)
+/// — Tier 1 #2 fix-the-class for the Buddy-origin reject matrix.
+/// Behavior matches the previous donate_one_kernel_page errno
+/// shape: handle/type/origin issues → INVALID_HANDLE or
+/// INVALID_PARAMETER per the original NK3 path.
+fn validate_buddy_pageset(
+    ps_handle: u32,
+    page_count_range: core::ops::RangeInclusive<usize>,
+) -> Result<(lockjaw_types::addr::KernelVa, usize), SyscallError> {
+    let ht = CurrentThread::handle_table();
+    // Require WRITE rights — donate is destructive on the success path.
+    let entry = ht.lookup(ps_handle, Rights::from_bits(RIGHT_WRITE), ObjectType::PageSet)?;
+    let header_kva = match entry.kind {
+        lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
+        _ => return Err(SyscallError::INVALID_HANDLE),
+    };
+    // SAFETY: PageSet handle → registered header.
+    let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
+    // Origin gate — same matrix donate_one_kernel_page used in NK3:
+    //   - DmaPool: post C1 of the cacheable-DMA migration the
+    //     attribute would be compatible (both kernel direct map
+    //     and KVM use Normal Cacheable), but the OWNERSHIP
+    //     transfer is wrong — a DmaPool page consumed here would
+    //     never return to `dma_pool::free_pages` (the page's
+    //     lifetime is now controlled by the kernel object), so
+    //     the pool's bitmap entry leaks. Pool reservation is a
+    //     tight 2 MiB budget; leaking entries starves the actual
+    //     DMA path.
+    //   - ExternallyOwned: kernel doesn't own these pages, can't
+    //     take ownership of something it didn't allocate.
+    //   - None: uninit origin is an alloc-site bug.
+    match backed.raw().origin() {
+        Some(lockjaw_types::pageset_table::PageSetOrigin::Buddy) => {}
+        Some(_) => return Err(SyscallError::INVALID_PARAMETER),
+        None => return Err(SyscallError::INVALID_HANDLE),
+    }
+    // Reject donations of mapped PageSets — the caller (or any other
+    // process holding a copied handle) could write through their
+    // mapping while the kernel reads/writes the same paddr via the
+    // linear map. The GKL serialises *kernel* code paths but not EL0
+    // execution on other CPUs (docs/reference/smp.md), so an active
+    // user mapping makes the donor pages a race target between the
+    // donate-validate point and Phase 5's consume_pageset_apply,
+    // where revoke_apply finally clears the cross-process PTEs.
+    // NK3 callers (sys_create_endpoint / sys_create_notification /
+    // sys_create_reply / sys_create_thread) all allocate-then-donate
+    // without an intervening sys_map_pages, so this rejects only
+    // hostile or buggy donations.
+    if backed.raw().map_count != 0 {
+        return Err(SyscallError::INVALID_PARAMETER);
+    }
+    let count = backed.data_page_count();
+    if !page_count_range.contains(&count) {
+        return Err(SyscallError::INVALID_PARAMETER);
+    }
+    Ok((header_kva, count))
+}
+
 /// Donate a single Buddy-origin PageSet's data page as a
 /// kernel-internal page, returning the KVA where it's now mapped.
 ///
 /// Implements the full validate→apply contract:
-/// 1. Validate the PageSet handle (lookup, WRITE rights, type).
-/// 2. Validate the donation (Buddy origin, 1-page count).
-/// 3. consume_pageset_validate (precondition for apply).
-/// 4. Reserve the KVA via `map_existing` (PTE writes only).
-/// 5. Run `init_fn(ObjectInitPage, KernelVa)` to write the new
+/// 1. Validate the PageSet via `validate_buddy_pageset(.., 1..=1)`
+///    — handle, WRITE rights, type, Buddy origin, page count.
+/// 2. consume_pageset_validate (precondition for apply).
+/// 3. Reserve the KVA via `map_existing` (PTE writes only).
+/// 4. Run `init_fn(ObjectInitPage, KernelVa)` to write the new
 ///    object's bytes — this is the LAST fallible step that the
 ///    caller can recover from.
-/// 6. `consume_pageset_apply` (irreversible: revokes cross-process
+/// 5. `consume_pageset_apply` (irreversible: revokes cross-process
 ///    handles, frees the PageSet header). Runs ONLY if init_fn
 ///    returns Ok.
 ///
@@ -156,40 +223,9 @@ fn donate_one_kernel_page(
         lockjaw_types::addr::KernelVa,
     ) -> Result<(), crate::cap::object::CreateError>,
 ) -> Result<lockjaw_types::addr::KernelVa, SyscallError> {
-    let ht = CurrentThread::handle_table();
-    // Require WRITE rights — destructive operation that consumes the PageSet.
-    let entry = ht.lookup(ps_handle, Rights::from_bits(RIGHT_WRITE), ObjectType::PageSet)?;
-    let header_kva = match entry.kind {
-        lockjaw_types::object::HandleKind::PageSet { kva, .. } => kva,
-        _ => return Err(SyscallError::INVALID_HANDLE),
-    };
-
-    // SAFETY: PageSet handle → registered header.
+    let (header_kva, _) = validate_buddy_pageset(ps_handle, 1..=1)?;
+    // SAFETY: PageSet handle → registered header (validated above).
     let backed = unsafe { crate::cap::pageset_table::read_header_backed(header_kva) };
-    // donate-as-kernel-object remaps the donated frame as Normal
-    // Cacheable in KVM (build_kernel_page) and TAKES OWNERSHIP of
-    // the frame from the PageSet (consume_pageset_apply). Only
-    // Buddy-origin pages are eligible:
-    //   - DmaPool: post C1 of the cacheable-DMA migration the
-    //     attribute would be compatible (both kernel direct map
-    //     and KVM use Normal Cacheable), but the OWNERSHIP
-    //     transfer is wrong — a DmaPool page consumed here would
-    //     never return to `dma_pool::free_pages` (the page's
-    //     lifetime is now controlled by the kernel object), so
-    //     the pool's bitmap entry leaks. Pool reservation is a
-    //     tight 2 MiB budget; leaking entries starves the actual
-    //     DMA path.
-    //   - ExternallyOwned: kernel doesn't own these pages, can't
-    //     take ownership of something it didn't allocate.
-    //   - None: uninit origin is an alloc-site bug.
-    match backed.raw().origin() {
-        Some(lockjaw_types::pageset_table::PageSetOrigin::Buddy) => {}
-        Some(_) => return Err(SyscallError::INVALID_PARAMETER),
-        None => return Err(SyscallError::INVALID_HANDLE),
-    }
-    if backed.data_page_count() != 1 {
-        return Err(SyscallError::INVALID_PARAMETER);
-    }
     let page_paddr = backed.get_page(0).ok_or(SyscallError::INVALID_HANDLE)?;
     // SAFETY: page came from a registered PageSet — valid kernel page.
     let init_page = unsafe { crate::mm::addr::ObjectInitPage::new(PhysAddr::new(page_paddr)) };
@@ -236,6 +272,153 @@ fn donate_one_kernel_page(
     // Transfer KVA ownership to the caller (success path).
     guard.take();
     Ok(kva)
+}
+
+// ===========================================================================
+// donate_process_pages — multi-page Buddy-origin donation for process
+// creation (NK4+NK5). Returns a `ProcessPagesDonation` typestate guard.
+// ===========================================================================
+
+/// Multi-page Buddy-origin donation backing one process creation.
+///
+/// Holds **only** the header KVA + a construction-time
+/// `data_page_count` snapshot + a `resolved` bool. Accessors
+/// re-fetch `BackedHeader` on demand through the still-registered
+/// header so post-consume access panics loudly via
+/// `trusted_layout_or_panic` rather than reading a re-allocated slot
+/// (construction-safety vs. a stored `BackedHeader<'static>`).
+///
+/// The caller must resolve the typestate before drop, either with
+/// `into_consumed(workspace_claimed)` on success or
+/// `into_caller_owned()` on the recovery path. Drop without
+/// resolution panics — a future maintainer cannot silently leave
+/// the donation in an undefined state.
+pub struct ProcessPagesDonation {
+    header_kva: lockjaw_types::addr::KernelVa,
+    /// Snapshot at construction; lifetime ≤ Phase 5 `into_consumed`,
+    /// so the count cannot drift relative to the registered header.
+    data_page_count: usize,
+    resolved: bool,
+}
+
+impl ProcessPagesDonation {
+    /// Read the paddr of the `idx`-th data page by re-fetching
+    /// `BackedHeader`. Pre-consume: returns `Some(paddr)`.
+    /// Post-consume: the underlying `trusted_layout_or_panic` would
+    /// fire (PageSet slot released) — loud, not silent UB.
+    pub fn page_paddr(&self, idx: usize) -> Option<PhysAddr> {
+        // SAFETY: caller holds the donation typestate; the header is
+        // registered until `into_consumed` runs.
+        let backed = unsafe {
+            crate::cap::pageset_table::read_header_backed(self.header_kva)
+        };
+        backed.get_page(idx).map(PhysAddr::new)
+    }
+
+    /// KVA for a kernel-object page (idx 0=ProcessObject,
+    /// 1=HandleTable, 2=kstack, 3=TCB). Lives in TTBR1 direct map
+    /// (`paddr + KERNEL_VA_OFFSET`).
+    pub fn obj_kva(&self, idx: usize) -> Option<lockjaw_types::addr::KernelVa> {
+        self.page_paddr(idx).map(|p|
+            lockjaw_types::addr::KernelVa::new(p.as_u64() + crate::mm::addr::KERNEL_VA_OFFSET))
+    }
+
+    pub fn data_page_count(&self) -> usize { self.data_page_count }
+
+    /// The donated PageSet's header KVA. Used by `provision_resources`
+    /// to reject self-aliasing: if any `ProcessMapping.pageset_id`
+    /// resolves to this same header, the per-mapping consume loop in
+    /// Phase 5 would call `consume_pageset_apply` on the donation
+    /// header AFTER `into_consumed` already did, triggering
+    /// `pageset_header_pool::release`'s double-release assertion.
+    pub fn header_kva(&self) -> lockjaw_types::addr::KernelVa { self.header_kva }
+
+    /// Success path. Snapshots unclaimed workspace paddrs into a
+    /// local fixed-size array, then `consume_pageset_apply`, then
+    /// frees the snapshot back to buddy. The snapshot is detached
+    /// from any header-backed view at the moment of consume — see
+    /// the doc on the struct.
+    ///
+    /// `consume_pageset_apply` is treated as infallible-by-contract
+    /// here: the donate path verified the PageSet is Buddy-origin
+    /// and the caller has not (per the donate-and-claim regime)
+    /// inserted additional handles. In the common case
+    /// revoke_apply walks exactly ONE handle — the caller's own
+    /// donating handle — and clears no PTEs. In the hostile/edge
+    /// case where the caller pre-mapped the PageSet, revoke clears
+    /// those PTEs synchronously inside this GKL-held critical
+    /// section before any thread re-enters user mode.
+    pub fn into_consumed(mut self, workspace_claimed: usize) {
+        let n = self.data_page_count;
+        let workspace_total = n - lockjaw_types::vmem::PROCESS_KERNEL_OBJ_PAGES;
+        assert!(
+            workspace_claimed <= workspace_total,
+            "into_consumed: workspace_claimed > total",
+        );
+        // Fixed-size snapshot sized to WORKSPACE_MAX_PAGES; the
+        // const_assert in lockjaw-types/src/vmem.rs links this to
+        // PROCESS_MAX_PAGES so OOB is unrepresentable.
+        let mut unclaimed: [Option<PhysAddr>; lockjaw_types::vmem::WORKSPACE_MAX_PAGES] =
+            [None; lockjaw_types::vmem::WORKSPACE_MAX_PAGES];
+        let start = lockjaw_types::vmem::PROCESS_KERNEL_OBJ_PAGES + workspace_claimed;
+        for (i, idx) in (start..n).enumerate() {
+            // page_paddr re-fetches BackedHeader; valid pre-consume.
+            unclaimed[i] = self.page_paddr(idx);
+        }
+        // Mark resolved BEFORE consume so a future-bug-induced
+        // panic in consume doesn't trigger Drop double-panic
+        // during unwinding. The contract above is the real
+        // guarantee.
+        self.resolved = true;
+        crate::cap::pageset_table::consume_pageset_apply(self.header_kva);
+        // After consume: no self.page_paddr / self.obj_kva calls
+        // (would panic at trusted_layout_or_panic). Free unclaimed
+        // workspace pages from the local snapshot.
+        for slot in unclaimed.iter().take(n - start) {
+            if let Some(paddr) = slot {
+                crate::mm::page_alloc::dealloc_page(
+                    crate::mm::addr::PhysPage::containing(*paddr));
+            }
+        }
+    }
+
+    /// Failure-path disposition. PageSet stays caller-owned; no
+    /// consume runs. Userspace can `sys_close_handle` to recover
+    /// every donated page back to buddy.
+    pub fn into_caller_owned(mut self) {
+        self.resolved = true;
+    }
+}
+
+impl Drop for ProcessPagesDonation {
+    fn drop(&mut self) {
+        if !self.resolved {
+            panic!(
+                "ProcessPagesDonation dropped without resolution — \
+                 caller forgot into_consumed or into_caller_owned"
+            );
+        }
+    }
+}
+
+/// Donate a multi-page Buddy-origin PageSet for one process
+/// creation. Validates the donation but does NOT consume; consume
+/// is deferred to `ProcessPagesDonation::into_consumed` at Phase 5
+/// of `provision_resources`.
+///
+/// Returns INVALID_HANDLE for handle/type issues and
+/// INVALID_PARAMETER for non-Buddy origin or page count outside
+/// `PROCESS_MIN_PAGES..=PROCESS_MAX_PAGES`. Never returns
+/// OUT_OF_PAGE_TABLES — that is a Phase 3 builder error.
+pub fn donate_process_pages(
+    ps_handle: u32,
+) -> Result<ProcessPagesDonation, SyscallError> {
+    let (header_kva, data_page_count) = validate_buddy_pageset(
+        ps_handle,
+        lockjaw_types::vmem::PROCESS_MIN_PAGES
+            ..=lockjaw_types::vmem::PROCESS_MAX_PAGES,
+    )?;
+    Ok(ProcessPagesDonation { header_kva, data_page_count, resolved: false })
 }
 
 /// Wraps `donate_one_kernel_page` with handle-table insertion for
@@ -643,6 +826,7 @@ fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
         info.stack_pageset_id,
         info.scratch_pageset_id,
         info.parent_handle_to_copy,
+        info.process_resources_ps.0 as u32,
         name,
     ) {
         Ok(()) => SyscallError::OK,

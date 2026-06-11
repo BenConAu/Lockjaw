@@ -247,6 +247,18 @@ fn spawn_elf(
         Err(_) => { puts("init: alloc stack FAILED\n"); return false; }
     };
 
+    // NK4+NK5 process-resources PageSet — backs the new process's
+    // ProcessObject (idx 0), HandleTable (idx 1), kernel stack
+    // (idx 2), TCB (idx 3), and page-table workspace (idx 4..N).
+    // Kernel consumes the PageSet on successful sys_create_process;
+    // on failure it stays caller-owned, and we close-handle below.
+    let process_resources_ps = match sys_alloc_pages(
+        PROCESS_RECOMMENDED_PAGES as u64
+    ) {
+        Ok(id) => id,
+        Err(_) => { puts("init: alloc process_resources FAILED\n"); return false; }
+    };
+
     // Build a 16-byte NUL-padded name for the kernel TCB
     let mut name_buf = [0u8; 16];
     let name_bytes = name.as_bytes();
@@ -265,8 +277,16 @@ fn spawn_elf(
         scratch_pageset_id: scratch_ps.0,
         parent_handle_to_copy: handle_to_copy.raw(),
         name_va: name_buf.as_ptr() as u64,
+        process_resources_ps,
     };
     let result = sys_create_process(&info);
+    if !result.is_ok() {
+        // On failure the kernel did not consume process_resources_ps;
+        // the handle is still ours. Close it so the pages return to
+        // buddy. (Success path: kernel consumes; handle becomes invalid
+        // server-side; userspace must NOT close.)
+        let _ = sys_close_handle(process_resources_ps);
+    }
 
     if result.is_ok() {
         puts("init: ");

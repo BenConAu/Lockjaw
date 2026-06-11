@@ -27,6 +27,7 @@ pub mod page_table;
 pub mod posix;
 pub mod posix_fd;
 pub mod exception;
+pub mod handle;
 pub mod handle_ops;
 pub mod rights;
 pub mod thread;
