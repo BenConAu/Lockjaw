@@ -257,15 +257,16 @@ fn spawn_elf(
     puts(name);
     puts("...\n");
 
-    let result = sys_create_process(
-        map_array_va,
-        mapping_count as u64,
-        elf_info.entry_point,
-        stack_ps,
-        scratch_ps,
-        handle_to_copy.raw(),
-        name_buf.as_ptr() as u64,
-    );
+    let info = ProcessCreateInfo {
+        mappings_ptr: map_array_va,
+        mapping_count: mapping_count as u64,
+        entry_point: elf_info.entry_point,
+        stack_pageset_id: stack_ps.0,
+        scratch_pageset_id: scratch_ps.0,
+        parent_handle_to_copy: handle_to_copy.raw(),
+        name_va: name_buf.as_ptr() as u64,
+    };
+    let result = sys_create_process(&info);
 
     if result.is_ok() {
         puts("init: ");

@@ -36,7 +36,8 @@ impl UserAddressSpace {
     ///
     /// Walks the caller's page table to translate user_va to a kernel VA,
     /// then reads T through TTBR1. Returns None if the user VA is not
-    /// mapped or crosses a page boundary.
+    /// mapped, crosses a page boundary, or is not aligned to T's
+    /// alignment requirement.
     ///
     /// The `UserPod` bound guarantees T is safe to construct from arbitrary
     /// bytes — no niches, no references, no enums with restricted
@@ -52,9 +53,19 @@ impl UserAddressSpace {
         if !lockjaw_types::vmem::validate_intra_page(user_va, size) {
             return None;
         }
+        // Alignment check — core::ptr::read requires the pointer to be
+        // aligned to T. An unaligned user_va would translate to an
+        // unaligned kernel_va (the low bits round-trip through the page
+        // table walk) and produce a misaligned typed load, which is UB.
+        // Reject before translation.
+        let align = mem::align_of::<T>() as u64;
+        if user_va & (align - 1) != 0 {
+            return None;
+        }
         // SAFETY: self.0 was validated at construction as a live L0 table.
         let kernel_va = unsafe { vmem::translate_user_va(self.0, user_va) }?;
-        // SAFETY: translated via page table walk (TTBR1)
+        // SAFETY: translated via page table walk (TTBR1); alignment
+        // confirmed above; bounds checked above.
         Some(unsafe { core::ptr::read(kernel_va as *const T) })
     }
 

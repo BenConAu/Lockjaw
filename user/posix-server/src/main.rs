@@ -853,15 +853,16 @@ pub extern "C" fn _start() -> ! {
     name_buf[..11].copy_from_slice(b"posix-hello");
 
     puts("posix-server: spawning posix-hello...\n");
-    let result = sys_create_process(
-        map_array_va,
-        mapping_count as u64,
-        elf_info.entry_point,
-        stack_ps,
-        scratch_ps,
-        syscall_ep.raw(),
-        name_buf.as_ptr() as u64,
-    );
+    let info = lockjaw_types::process::ProcessCreateInfo {
+        mappings_ptr: map_array_va,
+        mapping_count: mapping_count as u64,
+        entry_point: elf_info.entry_point,
+        stack_pageset_id: stack_ps.0,
+        scratch_pageset_id: scratch_ps.0,
+        parent_handle_to_copy: syscall_ep.raw(),
+        name_va: name_buf.as_ptr() as u64,
+    };
+    let result = sys_create_process(&info);
     if !result.is_ok() {
         puts("posix-server: spawn FAILED\n");
         halt();

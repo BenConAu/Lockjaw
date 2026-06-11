@@ -39,6 +39,65 @@ pub const PROCESS_MAPPINGS_PER_PAGE: usize =
 // SAFETY: ProcessMapping is repr(C) with only u64 fields — every bit pattern valid.
 unsafe impl crate::user_pod::UserPod for ProcessMapping {}
 
+/// The argument-pack for `sys_create_process`. Userspace builds this on
+/// its stack and passes the pointer in `x0`; the kernel reads it via
+/// `UserAddressSpace::read::<ProcessCreateInfo>`. Single source of
+/// truth shared between kernel and userlib.
+///
+/// Replaces the 7-register positional ABI to leave room for NK4+NK5's
+/// donated PageSet handle without exceeding the AArch64 PCS 8-arg
+/// limit on `x0`-`x7`. See `docs/architecture/no-kernel-alloc.md`.
+///
+/// `align(64)` is load-bearing: the kernel's `UserAddressSpace::read`
+/// rejects reads that cross a 4 KiB page boundary, so the struct must
+/// fit within a single page from any aligned address. `repr(C,
+/// align(64))` pads the struct to 64 bytes (7 × u64 = 56 bytes of
+/// fields + 8 bytes trailing padding). With size = 64 and align = 64
+/// (and 64 divides 4096), every aligned position `p` has
+/// `p + 64 <= floor(p / 4096 + 1) * 4096`, making the intra-page
+/// contract construction-guaranteed rather than carried by comments.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct ProcessCreateInfo {
+    /// User VA of the `[ProcessMapping; mapping_count]` array.
+    pub mappings_ptr: u64,
+    /// Number of `ProcessMapping` entries at `mappings_ptr`.
+    pub mapping_count: u64,
+    /// Initial PC of the new process's first thread.
+    pub entry_point: u64,
+    /// Handle (in caller's HT) of the PageSet backing the user stack.
+    pub stack_pageset_id: u64,
+    /// Handle of the PageSet used as the kernel-side scratch buffer.
+    pub scratch_pageset_id: u64,
+    /// Handle to copy into the child's handle table at slot 0, or
+    /// `u64::MAX` for none. Typically the bootstrap endpoint.
+    pub parent_handle_to_copy: u64,
+    /// User VA of the 16-byte process name (zero-padded).
+    pub name_va: u64,
+}
+
+// SAFETY: ProcessCreateInfo is repr(C) with only u64 fields — every bit pattern valid.
+unsafe impl crate::user_pod::UserPod for ProcessCreateInfo {}
+
+// Layout lockdown — the struct is the kernel/user ABI boundary, so a
+// silent field/size change here would silently change what the kernel
+// reads. These asserts fail-compile on drift.
+const _: () = {
+    // align(64) pads the struct to a multiple of 64; with 7 × u64 = 56
+    // bytes of fields, the total size is 64 (56 fields + 8 trailing
+    // padding). The padding is what makes the alignment work — fits
+    // the intra-page proof in the doc.
+    assert!(core::mem::size_of::<ProcessCreateInfo>() == 64);
+    assert!(core::mem::align_of::<ProcessCreateInfo>() == 64);
+    assert!(core::mem::offset_of!(ProcessCreateInfo, mappings_ptr) == 0);
+    assert!(core::mem::offset_of!(ProcessCreateInfo, mapping_count) == 8);
+    assert!(core::mem::offset_of!(ProcessCreateInfo, entry_point) == 16);
+    assert!(core::mem::offset_of!(ProcessCreateInfo, stack_pageset_id) == 24);
+    assert!(core::mem::offset_of!(ProcessCreateInfo, scratch_pageset_id) == 32);
+    assert!(core::mem::offset_of!(ProcessCreateInfo, parent_handle_to_copy) == 40);
+    assert!(core::mem::offset_of!(ProcessCreateInfo, name_va) == 48);
+};
+
 /// Outcome of a thread exiting from a process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessLifecycle {

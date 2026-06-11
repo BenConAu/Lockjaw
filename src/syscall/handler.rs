@@ -602,30 +602,49 @@ fn sys_map_pages(ctx: &mut ExceptionContext) -> SyscallError {
     }
 }
 
-/// sys_create_process(mappings_ptr, mapping_count, entry_point, stack_handle, scratch_handle)
-/// x0 = pointer to ProcessMapping array in caller's memory
-/// x1 = number of mappings
-/// x2 = entry point VA for the new process
-/// x3 = PageSet handle for the stack page(s)
-/// x4 = PageSet handle for a scratch page (kernel uses as Mapping buffer, caller keeps)
+/// sys_create_process(info_va)
+/// x0 = user VA of a `ProcessCreateInfo` struct (the argument-pack)
+///
+/// The struct ABI replaces the 7-register positional shape because
+/// NK4+NK5 (see docs/architecture/no-kernel-alloc.md) needs to
+/// thread an additional donated PageSet handle and the AArch64 PCS
+/// limit on x0-x7 leaves no room. `ProcessCreateInfo` carries
+/// `repr(C, align(64))`, which makes the intra-page contract
+/// (required by `UserAddressSpace::read`) structural for stack
+/// locals — see the doc on the type. Hostile / raw callers can
+/// still pass an unmapped or unaligned info_va; that path
+/// surfaces here as INVALID_PARAMETER before any downstream
+/// validation — a new fault class vs. the register-arg ABI.
 fn sys_create_process(ctx: &mut ExceptionContext) -> SyscallError {
-    let mappings_va = ctx.gpr[0];
-    let mapping_count = ctx.gpr[1] as usize;
-    let entry_point = ctx.gpr[2];
-    let stack_pageset_id = ctx.gpr[3];
-    let scratch_pageset_id = ctx.gpr[4];
-    let parent_handle_to_copy = ctx.gpr[5];
-    let name_va = ctx.gpr[6];
+    let info_va = ctx.gpr[0];
 
     let addr_space = match CurrentThread::address_space() {
         Some(a) => a,
         None => return SyscallError::INVALID_PARAMETER,
     };
 
-    // Read process name from user memory (16 bytes, NUL-padded)
-    let name: [u8; 16] = addr_space.read(name_va).unwrap_or([0u8; 16]);
+    // Read the argument-pack from user memory. UserAddressSpace::read
+    // validates intra-page and translates via the live TTBR0 walk;
+    // a malformed info_va (unmapped, no UserPod alignment) returns
+    // INVALID_PARAMETER here.
+    let info: lockjaw_types::process::ProcessCreateInfo = match addr_space.read(info_va) {
+        Some(i) => i,
+        None => return SyscallError::INVALID_PARAMETER,
+    };
 
-    match crate::process::create_process(&addr_space, mappings_va, mapping_count, entry_point, stack_pageset_id, scratch_pageset_id, parent_handle_to_copy, name) {
+    // Read process name from user memory (16 bytes, NUL-padded)
+    let name: [u8; 16] = addr_space.read(info.name_va).unwrap_or([0u8; 16]);
+
+    match crate::process::create_process(
+        &addr_space,
+        info.mappings_ptr,
+        info.mapping_count as usize,
+        info.entry_point,
+        info.stack_pageset_id,
+        info.scratch_pageset_id,
+        info.parent_handle_to_copy,
+        name,
+    ) {
         Ok(()) => SyscallError::OK,
         Err(e) => e.to_syscall_error(),
     }

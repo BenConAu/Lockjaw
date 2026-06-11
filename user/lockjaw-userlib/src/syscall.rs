@@ -113,18 +113,18 @@ pub fn sys_map_pages(
     SyscallError(err)
 }
 
-pub fn sys_create_process(mappings_ptr: u64, mapping_count: u64, entry_point: u64, stack_ps: PageSetHandle, scratch_ps: PageSetHandle, handle_to_copy: u64, name_ptr: u64) -> SyscallError {
+/// Create a new process from a `ProcessCreateInfo` argument-pack.
+/// The kernel reads the struct from caller memory via the user-VA
+/// passed in x0 — single source of truth for the syscall ABI.
+/// See `lockjaw_types::process::ProcessCreateInfo` and the
+/// `docs/architecture/no-kernel-alloc.md` migration plan.
+pub fn sys_create_process(info: &lockjaw_types::process::ProcessCreateInfo) -> SyscallError {
     let err: u64;
+    let info_va = info as *const _ as u64;
     unsafe {
         asm!(
             "svc #0",
-            inlateout("x0") mappings_ptr => err,
-            in("x1") mapping_count,
-            in("x2") entry_point,
-            in("x3") stack_ps.0,
-            in("x4") scratch_ps.0,
-            in("x5") handle_to_copy,
-            in("x6") name_ptr,
+            inlateout("x0") info_va => err,
             in("x8") SYS_CREATE_PROCESS,
         );
     }
